@@ -1,7 +1,7 @@
 ;; CRUCIBLE Tue Jan 27 09:46:23 CET 2026
-(ingot :id "i1" :status molten :solo t :grade 1 :heat 2 :max 5 :proof "test -d slag" :work "Create slag project directory")
+(ingot :id "i1" :status forged :solo t :grade 1 :heat 5 :max 5 :proof "test -d slag" :work "Create slag project directory")
 (ingot :id "i2" :status forged :solo t :grade 1 :heat 1 :max 5 :proof "test -f slag/package.json && grep -q vite slag/package.json" :work "Initialize vite project in slag")
-(ingot :id "i3" :status forged :solo t :grade 1 :heat 2 :max 5 :proof "test -f slag/wrangler.toml && grep -q slag-dev slag/wrangler.toml" :work "Configure wrangler for slag.dev deployment")
+(ingot :id "i3" :status forged :solo t :grade 1 :heat 3 :max 5 :proof "test -f slag/wrangler.toml && grep -q slag-dev slag/wrangler.toml" :work "Configure wrangler for slag.dev deployment")
 (ingot :id "i4" :status forged :solo nil :grade 1 :heat 3 :max 5 :proof "test -f slag/index.html && grep -q viewport slag/index.html" :work "Cast mobile-first HTML foundation")
 (ingot :id "i5" :status forged :solo nil :grade 2 :heat 1 :max 5 :proof "test -f slag/src/main.css && grep -q '@media' slag/src/main.css" :work "Forge terminal-ui styles with mobile breakpoints")
 (ingot :id "i6" :status forged :solo nil :grade 2 :heat 1 :max 5 :proof "test -f slag/src/main.js && node --check slag/src/main.js" :work "Build interactive terminal display logic")

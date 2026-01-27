@@ -7,5 +7,6 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #344 | 9:51 AM | ✅ | Vite npm scripts configured in package.json | ~144 |
 | #337 | 9:50 AM | 🟣 | Configured Vite build system with package.json | ~196 |
 </claude-mem-context>
