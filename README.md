@@ -1,5 +1,7 @@
 # slag
 
+[slag.dev](https://slag.dev)
+
 **Smelt ideas, skim the bugs, forge the product.**
 
 A bash orchestrator for AI-powered development. Give it a product requirement, and it breaks it into verifiable tasks, executes them via Claude, and proves each one passed before moving on. No human review needed -- every task carries its own machine-verifiable acceptance test.
