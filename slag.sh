@@ -1,6 +1,82 @@
 #!/usr/bin/env bash
-# slag - smelt the ore, skim the dross, forge the steel
-# Usage: bash slag.sh "Your Commission"
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SLAG - smelt the ore, skim the dross, forge the steel                    ║
+# ║  Usage: bash slag.sh "Your Commission"                                    ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │                           SLAG WORKFLOW                                 │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │                                                                         │
+# │   PRD.md (Ore)                                                          │
+# │       │                                                                 │
+# │       ▼                                                                 │
+# │   ┌───────────┐    ┌─────────────┐                                      │
+# │   │ SURVEYOR  │───▶│ BLUEPRINT.md│  ◉ Extended Thinking                 │
+# │   │ (analyze) │    │ (analysis)  │  Deep planning phase                 │
+# │   └───────────┘    └──────┬──────┘                                      │
+# │                           │                                             │
+# │                           ▼                                             │
+# │   ┌───────────┐    ┌─────────────┐                                      │
+# │   │ FOUNDER   │───▶│  PLAN.md    │  ◉ Extended Thinking                 │
+# │   │ (design)  │    │ (crucible)  │  Creates S-expr ingots               │
+# │   └───────────┘    └──────┬──────┘                                      │
+# │                           │                                             │
+# │                           ▼                                             │
+# │   ┌─────────────────────────────────────────┐                           │
+# │   │              FORGE LOOP                 │                           │
+# │   │  ┌─────────────────────────────────┐    │                           │
+# │   │  │  Pick ingot (:status ore)       │    │                           │
+# │   │  └───────────────┬─────────────────┘    │                           │
+# │   │                  ▼                      │                           │
+# │   │  ┌─────────────────────────────────┐    │                           │
+# │   │  │  grade < 3: Normal Smith        │    │                           │
+# │   │  │  grade ≥ 3: ◉ Extended Thinking │    │                           │
+# │   │  └───────────────┬─────────────────┘    │                           │
+# │   │                  ▼                      │                           │
+# │   │  ┌─────────────────────────────────┐    │                           │
+# │   │  │  Execute CMD from response      │    │                           │
+# │   │  └───────────────┬─────────────────┘    │                           │
+# │   │                  ▼                      │                           │
+# │   │  ┌─────────────────────────────────┐    │                           │
+# │   │  │  Run :proof acceptance test     │    │                           │
+# │   │  └───────────────┬─────────────────┘    │                           │
+# │   │           ┌──────┴──────┐               │                           │
+# │   │           ▼             ▼               │                           │
+# │   │        PASS          FAIL               │                           │
+# │   │     :forged      :heat++ retry          │                           │
+# │   │         │        (until :max)           │                           │
+# │   │         │             │                 │                           │
+# │   │         │             ▼                 │                           │
+# │   │         │        :cracked               │                           │
+# │   │         └──────┬──────┘                 │                           │
+# │   │                ▼                        │                           │
+# │   │         Next ingot                      │                           │
+# │   └─────────────────────────────────────────┘                           │
+# │                    │                                                    │
+# │                    ▼                                                    │
+# │   ┌─────────────────────────────────────────┐                           │
+# │   │  All :forged? ──▶ SUCCESS              │                           │
+# │   │  Any :cracked? ──▶ FAILURE             │                           │
+# │   └─────────────────────────────────────────┘                           │
+# │                                                                         │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │  FILES:                         INGOT S-EXPRESSION:                     │
+# │  ├── PRD.md        (ore)        (ingot :id "i1"                         │
+# │  ├── BLUEPRINT.md  (analysis)          :status ore|molten|forged|cracked│
+# │  ├── PLAN.md       (crucible)          :solo t|nil                      │
+# │  ├── AGENTS.md     (recipes)           :grade 1-5                       │
+# │  ├── PROGRESS.md   (ledger)            :heat 0                          │
+# │  └── logs/         (slag heap)         :max 5                           │
+# │                                        :proof "test -f file"            │
+# │  PALETTE:                              :work "description")             │
+# │  ▱ cold/ore    (gray)                                                   │
+# │  ▰ warm        (red)           PARALLEL: :solo t ingots can run         │
+# │  ▰ hot/molten  (orange)        on multiple anvils simultaneously        │
+# │  ▰ bright      (yellow)                                                 │
+# │  ▰ pure/forged (white)         THINKING: grade ≥ 3 uses extended        │
+# │  ✗ cracked     (red)           thinking budget for complex work         │
+# └─────────────────────────────────────────────────────────────────────────┘
 
 if [[ -z "${BASH_VERSION:-}" ]]; then
     echo "Error: Requires bash. Run: bash $0 $*"
@@ -10,21 +86,30 @@ fi
 set -e
 set -o pipefail
 
-# --- Smiths ---
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Smiths (AI agents)
 SMITH="${SLAG_SMITH:-claude --dangerously-skip-permissions}"
 SMITH_THINK="${SLAG_SMITH_THINK:-claude --dangerously-skip-permissions --thinking-budget 10000}"
 
-# --- Files ---
-BLUEPRINT="BLUEPRINT.md"  # surveyor's analysis
-CRUCIBLE="PLAN.md"        # the mold
-ORE_FILE="PRD.md"         # raw requirements
-ALLOY_FILE="AGENTS.md"    # recipes & techniques
-LEDGER="PROGRESS.md"      # smithy records
-LOG_DIR="logs"
-MAX_ANVILS=3
+# Files
+BLUEPRINT="BLUEPRINT.md"  # surveyor's deep analysis
+CRUCIBLE="PLAN.md"        # ingot mold (s-expressions)
+ORE_FILE="PRD.md"         # raw commission
+ALLOY_FILE="AGENTS.md"    # learned recipes
+LEDGER="PROGRESS.md"      # work history
+LOG_DIR="logs"            # slag heap (debug logs)
+
+# Behavior
+MAX_ANVILS=3              # max parallel workers
 HIGH_GRADE=3              # grade >= this uses extended thinking
 
-# --- Heated Metal Palette ---
+# ═══════════════════════════════════════════════════════════════════════════
+# PALETTE (cold ore → hot metal → pure steel)
+# ═══════════════════════════════════════════════════════════════════════════
+
 BOLD='\033[1m'
 DIM='\033[2m'
 GRAY='\033[0;90m'
@@ -34,20 +119,24 @@ YELLOW='\033[38;5;220m'
 WHITE='\033[1;37m'
 NC='\033[0m'
 
-COLD="$GRAY"
-WARM="$RED"
-HOT="$ORANGE"
-BRIGHT="$YELLOW"
-PURE="$WHITE"
+COLD="$GRAY"       # ore, waiting
+WARM="$RED"        # heating
+HOT="$ORANGE"      # molten, working
+BRIGHT="$YELLOW"   # near complete
+PURE="$WHITE"      # forged, success
 
-# --- TUI ---
+# ═══════════════════════════════════════════════════════════════════════════
+# TUI HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
 SPARK_FRAMES=('ite' '·te' '··e' '···' 'i··' 'it·')
 THINK_FRAMES=('◐' '◓' '◑' '◒')
 SPARK_PID=""
 
 sparks_start() {
-    local msg="$1" frames_ref="$2"
-    local -n frames="${frames_ref:-SPARK_FRAMES}"
+    local msg="$1" mode="$2"
+    local frames
+    [[ "$mode" == "think" ]] && frames=("${THINK_FRAMES[@]}") || frames=("${SPARK_FRAMES[@]}")
     local len=${#frames[@]}
     (
         local i=0
@@ -79,6 +168,7 @@ header() {
 
 status_line() { printf "  ${2}%s${NC} %s\n" "$1" "$3"; }
 
+# Status: ▰forged ▣molten ▱ore ✗cracked
 ingot_status() {
     local total forged cracked molten ore
     total=$(grep -c "^(ingot" "$CRUCIBLE" 2>/dev/null) || total=0
@@ -98,6 +188,7 @@ ingot_status() {
     printf "${GRAY}]${NC}"
 }
 
+# Progress: gradient from cold to hot
 temper_bar() {
     local total forged pct filled empty i
     total=$(grep -c "^(ingot" "$CRUCIBLE" 2>/dev/null) || total=0
@@ -122,8 +213,12 @@ show_banner() {
     printf "${GRAY}  │${NC}  ${GRAY}▱▱▱${NC}${RED}▰${NC}${ORANGE}▰${NC}${YELLOW}▰${NC}${WHITE}▰${NC}  ${BOLD}${WHITE}SLAG${NC}  ${WHITE}▰${NC}${YELLOW}▰${NC}${ORANGE}▰${NC}${RED}▰${NC}${GRAY}▱▱▱${NC}  ${GRAY}│${NC}\n"
     printf "${GRAY}  │${NC}  ${GRAY}cold      hot       pure${NC}  ${GRAY}│${NC}\n"
     printf "${GRAY}  └─────────────────────────────────────┘${NC}\n"
-    printf "    ${GRAY}survey · smelt · forge · temper${NC}\n"
+    printf "    ${GRAY}survey · design · forge · temper${NC}\n"
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════
 
 mkdir -p "$LOG_DIR"
 
@@ -135,10 +230,12 @@ log() {
     echo "[$ts] [$1] $file" >> "$LOG_DIR/stream.log"
 }
 
+# BSD/GNU sed compatibility
 sed_i() {
     if [[ "$OSTYPE" == darwin* ]]; then sed -i '' "$@"; else sed -i "$@"; fi
 }
 
+# S-expression field extractors
 sexp_get() {
     echo "$1" | grep -o ":$2 [^ )]*" | head -1 | sed "s/:$2 //" | tr -d '"'
 }
@@ -152,112 +249,123 @@ truncate_str() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SURVEYOR · deep analysis before casting
+# PHASE 1: SURVEYOR
+# Analyzes the commission deeply before any work begins.
+# Uses extended thinking to create a comprehensive blueprint.
+# Output: BLUEPRINT.md
 # ═══════════════════════════════════════════════════════════════════════════
+
 run_surveyor() {
-    header "SURVEYOR · analyzing the commission"
+    header "SURVEYOR · deep analysis"
     local ore prompt raw
     ore=$(cat "$ORE_FILE")
     
-    prompt="ROLE: Master Surveyor. Analyze this commission deeply before we cast the mold.
+    prompt="ROLE: Master Surveyor. Analyze this commission deeply before casting.
 
 COMMISSION:
 $ore
 
-Create a thorough BLUEPRINT covering:
+Create a thorough BLUEPRINT:
 
 ## 1. OVERVIEW
-What are we building? Summarize in 2-3 sentences.
+What are we building? 2-3 sentence summary.
 
 ## 2. COMPONENTS
-Major pieces needed. List each with:
+List each major piece:
 - Name
 - Purpose
 - Complexity (1-5)
-- Dependencies
+- Dependencies (what it needs)
 
 ## 3. ARCHITECTURE
-How do pieces fit together?
-- File structure
-- Data flow
-- Key interfaces
+\`\`\`
+dir/
+├── file structure
+└── layout
+\`\`\`
+Key interfaces and data flow.
 
 ## 4. DEPENDENCY GRAPH
-What must be forged first? Draw the order:
 \`\`\`
-[component] -> [depends on]
+[A] ──▶ [B] ──▶ [C]
+         │
+         └────▶ [D]
 \`\`\`
+What must be forged first?
 
-## 5. RISKS & COMPLEXITY
-What could crack? What needs careful forging?
-- High complexity areas (grade 3+)
-- Integration points
+## 5. RISKS
+- High complexity areas
+- Integration dangers
 - External dependencies
 
 ## 6. FORGING SEQUENCE
-Optimal order to forge ingots:
-1. Foundation pieces (no deps)
+Optimal order:
+1. Foundation (no deps, parallel ok)
 2. Core logic
 3. Integration
 4. Polish
 
 ## 7. ACCEPTANCE CRITERIA
-How do we know when FULLY forged?
-- Tests to pass
-- Features to verify
+How do we know it's done?
+- Tests
+- Features
 - Quality checks
 
-Be thorough. This blueprint guides all subsequent forging.
+Be thorough. This guides all forging.
 Output clean markdown."
 
     log "SURVEY_PROMPT" "$prompt"
-    sparks_start "deep analysis..." "THINK_FRAMES"
+    sparks_start "surveying commission..." "think"
     raw=$($SMITH_THINK <<< "$prompt") || { sparks_stop; status_line "✗" "$RED" "Survey failed"; exit 1; }
     sparks_stop
     log "SURVEY_RAW" "$raw"
     
     echo "$raw" > "$BLUEPRINT"
-    status_line "▰" "$PURE" "Blueprint ready: $BLUEPRINT"
+    status_line "▰" "$PURE" "Blueprint: $BLUEPRINT"
     
-    # Show summary
+    # Preview
     echo ""
-    local lines=$(wc -l < "$BLUEPRINT")
-    lines=${lines//[^0-9]/}
-    head -25 "$BLUEPRINT" | while IFS= read -r line; do
+    local lines
+    lines=$(wc -l < "$BLUEPRINT"); lines=${lines//[^0-9]/}
+    head -20 "$BLUEPRINT" | while IFS= read -r line; do
         printf "  ${GRAY}%s${NC}\n" "$line"
     done
-    [[ $lines -gt 25 ]] && printf "\n  ${GRAY}... +%d lines (see %s)${NC}\n" $((lines - 25)) "$BLUEPRINT"
+    [[ $lines -gt 20 ]] && printf "\n  ${GRAY}... +%d lines${NC}\n" $((lines - 20))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FOUNDER · casting the mold based on blueprint
+# PHASE 2: FOUNDER
+# Designs the mold based on blueprint. Creates S-expression ingots.
+# Uses extended thinking for optimal task breakdown.
+# Output: PLAN.md (crucible)
 # ═══════════════════════════════════════════════════════════════════════════
+
 run_founder() {
-    header "FOUNDER · casting the mold"
+    header "FOUNDER · casting mold"
     local ore blueprint prompt raw ingots count
     ore=$(cat "$ORE_FILE")
-    blueprint=$(cat "$BLUEPRINT" 2>/dev/null || echo "No blueprint available")
+    blueprint=$(cat "$BLUEPRINT" 2>/dev/null || echo "No blueprint")
     
-    prompt="ROLE: Master Founder. Cast ingots based on blueprint analysis.
+    prompt="ROLE: Master Founder. Cast ingots from blueprint.
 
 COMMISSION:
 $ore
 
-BLUEPRINT (from Surveyor):
+BLUEPRINT:
 $blueprint
 
-OUTPUT: S-expressions only. One ingot per line. No prose. No markdown.
+OUTPUT: S-expressions only. One per line. No prose.
 
 TEMPLATE:
-(ingot :id \"i1\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"SHELL_CMD\" :work \"What to forge\")
+(ingot :id \"i1\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"SHELL\" :work \"Task\")
 
 EXAMPLES:
-(ingot :id \"i1\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"test -f package.json && grep three package.json\" :work \"Smelt base with three.js\")
-(ingot :id \"i2\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"test -f index.html\" :work \"Cast HTML crucible\")
-(ingot :id \"i3\" :status ore :solo nil :grade 2 :heat 0 :max 5 :proof \"node --check src/main.js\" :work \"Forge main entry\")
-(ingot :id \"i4\" :status ore :solo nil :grade 4 :heat 0 :max 8 :proof \"npm test\" :work \"Complex integration - needs deep thinking\")
+(ingot :id \"i1\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"test -f package.json\" :work \"Init npm project\")
+(ingot :id \"i2\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"test -f index.html\" :work \"Create HTML shell\")
+(ingot :id \"i3\" :status ore :solo nil :grade 2 :heat 0 :max 5 :proof \"node --check src/main.js\" :work \"Main entry point\")
+(ingot :id \"i4\" :status ore :solo nil :grade 4 :heat 0 :max 8 :proof \"npm test\" :work \"Integration tests\")
 
-PROOF COMMANDS (assay the metal):
+PROOF COMMANDS:
 - test -f FILE
 - test -d DIR
 - grep -q PAT FILE
@@ -265,72 +373,68 @@ PROOF COMMANDS (assay the metal):
 - npm test
 
 FIELDS:
-- :status = ore (always start as ore)
-- :solo t = can forge independently (no deps)
-- :solo nil = requires prior ingots forged first
-- :grade 1-5 = complexity (1=trivial, 5=complex)
-  - grade 1-2: simple, quick forge
-  - grade 3+: complex, uses extended thinking
-- :heat = current attempt (always 0)
-- :max = max heats (5 for simple, 8+ for complex)
-- :proof = shell command to verify quality
+- :id = unique (i1, i2, ...)
+- :status = ore (always start here)
+- :solo = t (parallel ok) | nil (sequential)
+- :grade = 1-5 complexity
+  - 1-2: simple, quick
+  - 3+: complex, gets extended thinking
+- :heat = 0 (current attempt)
+- :max = max attempts (5 simple, 8+ complex)
+- :proof = shell command to verify
 
 RULES:
-- Follow blueprint's dependency graph
-- Split complex work into smaller ingots when possible
-- High grade (3+) ingots get more :max heats
+- Follow blueprint dependency graph
+- Prefer small ingots (grade 1-2)
+- Complex work (3+) gets more :max
 - Every :proof must be valid shell
+- :solo t = no dependencies, can parallel
 
 OUTPUT ONLY S-EXPRESSIONS:"
 
     log "FOUNDER_PROMPT" "$prompt"
-    sparks_start "casting mold..." "THINK_FRAMES"
+    sparks_start "designing mold..." "think"
     raw=$($SMITH_THINK <<< "$prompt") || { sparks_stop; status_line "✗" "$RED" "Founder failed"; exit 1; }
     sparks_stop
     log "FOUNDER_RAW" "$raw"
     
     ingots=$(echo "$raw" | grep "^(ingot" || true)
-    [[ -z "$ingots" ]] && { status_line "✗" "$RED" "No ingots cast"; echo "$raw"; exit 1; }
+    [[ -z "$ingots" ]] && { status_line "✗" "$RED" "No ingots"; echo "$raw"; exit 1; }
     
-    { echo ";; CRUCIBLE $(date)"; echo ";; Based on: $BLUEPRINT"; echo "$ingots"; } > "$CRUCIBLE"
+    { echo ";; CRUCIBLE $(date)"; echo ";; Blueprint: $BLUEPRINT"; echo "$ingots"; } > "$CRUCIBLE"
     count=$(echo "$ingots" | wc -l | tr -d ' '); count=${count//[^0-9]/}
     
     # Count by grade
     local simple=0 complex=0
     while IFS= read -r ing; do
-        local g=$(sexp_get "$ing" "grade")
-        g=${g:-1}
+        local g=$(sexp_get "$ing" "grade"); g=${g:-1}
         ((g >= HIGH_GRADE)) && ((complex++)) || ((simple++))
     done <<< "$ingots"
     
-    status_line "▰" "$PURE" "Mold ready: ${WHITE}$count ingots${NC} (${GRAY}$simple simple${NC}, ${YELLOW}$complex complex${NC})"
+    status_line "▰" "$PURE" "Mold: ${WHITE}$count${NC} ingots (${GRAY}$simple simple${NC}, ${YELLOW}$complex complex${NC})"
     echo ""
     printf "  ${GRAY}%-5s %-3s %-4s %s${NC}\n" "ID" "GR" "SOLO" "WORK"
     local shown=0
     while IFS= read -r t; do
         [[ $shown -ge 10 ]] && break
-        local tid tgr tsolo tdesc grade_color
+        local tid tgr tsolo tdesc gc
         tid=$(sexp_get_quoted "$t" "id")
         tgr=$(sexp_get "$t" "grade"); tgr=${tgr:-1}
         tsolo=$(sexp_get "$t" "solo")
         tdesc=$(sexp_get_quoted "$t" "work")
         [[ "$tsolo" == "t" ]] && tsolo="∥" || tsolo="→"
-        
-        # Color by grade
-        grade_color="$GRAY"
-        ((tgr == 2)) && grade_color="$ORANGE"
-        ((tgr >= 3)) && grade_color="$YELLOW"
-        ((tgr >= 4)) && grade_color="$WHITE"
-        
-        printf "  ${ORANGE}%-5s${NC} ${grade_color}%-3s${NC} %-4s %s\n" "$tid" "$tgr" "$tsolo" "$(truncate_str "$tdesc" 45)"
+        gc="$GRAY"; ((tgr == 2)) && gc="$ORANGE"; ((tgr >= 3)) && gc="$YELLOW"; ((tgr >= 4)) && gc="$WHITE"
+        printf "  ${ORANGE}%-5s${NC} ${gc}%-3s${NC} %-4s %s\n" "$tid" "$tgr" "$tsolo" "$(truncate_str "$tdesc" 44)"
         ((shown++))
     done <<< "$ingots"
-    [[ $count -gt 10 ]] && printf "  ${GRAY}+%d more ingots${NC}\n" $((count - 10))
+    [[ $count -gt 10 ]] && printf "  ${GRAY}+%d more${NC}\n" $((count - 10))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FLUX · prepare context for smith
+# FLUX PREPARATION
+# Builds context for the smith including all relevant files and history.
 # ═══════════════════════════════════════════════════════════════════════════
+
 prepare_flux() {
     local ingot_sexp="$1" slag="$2"
     local id work proof heat max grade
@@ -347,46 +451,49 @@ prepare_flux() {
     cat << EOF
 === FORGE ORDER ===
 [${id}] ${work}
-Grade: ${grade} $(((grade >= HIGH_GRADE)) && echo "(COMPLEX - think deeply)")
+Grade: ${grade}$(((grade >= HIGH_GRADE)) && echo " ◉ COMPLEX - think deeply")
 Heat: ${heat}/${max}
 Proof: ${proof}
 
 === BLUEPRINT ===
-$(cat "$BLUEPRINT" 2>/dev/null || echo "No blueprint")
+$(cat "$BLUEPRINT" 2>/dev/null || echo "None")
 
-=== ALLOY RECIPES (AGENTS.md) ===
-$(cat "$ALLOY_FILE" 2>/dev/null || echo "No recipes yet")
+=== ALLOY RECIPES ===
+$(cat "$ALLOY_FILE" 2>/dev/null || echo "None yet")
 
 === CRUCIBLE STATE ===
 $(cat "$CRUCIBLE")
 
-=== SMITHY LEDGER (last 25) ===
-$(tail -25 "$LEDGER" 2>/dev/null || echo "Fresh forge")
+=== RECENT LEDGER ===
+$(tail -25 "$LEDGER" 2>/dev/null || echo "Fresh")
 
-=== RECENT WORKINGS ===
+=== GIT DIFF ===
 $(git diff --stat HEAD~3 2>/dev/null | tail -20 || echo "No history")
 
 EOF
     if [[ -n "$slag" ]]; then
-        printf "!!! CRACKED - SLAG FOUND !!!\n%s\n!!! REHEAT AND REFORGE !!!\n" "$slag"
+        printf "!!! CRACKED !!!\n%s\n!!! FIX IT !!!\n" "$slag"
     else
         cat << EOF
-=== SMITH INSTRUCTIONS ===
-1. Forge the ingot (grade $grade)
-2. Create/modify files as needed
-3. Add useful techniques to ALLOY RECIPES (AGENTS.md)
-4. MUST end with: CMD: <shell command to proof the work>
+=== INSTRUCTIONS ===
+1. Forge this ingot
+2. Create/modify files
+3. Add recipes to AGENTS.md if useful
+4. End with: CMD: <verification command>
 
-$(((grade >= HIGH_GRADE)) && echo "This is COMPLEX work (grade $grade). Think carefully. Consider edge cases.")
+$(((grade >= HIGH_GRADE)) && echo "◉ COMPLEX (grade $grade) - consider edge cases carefully")
 
-NO EXPLANATION. Forge and CMD only.
+NO prose. Code and CMD only.
 EOF
     fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SMITH · strike the ingot
+# PHASE 3: FORGE (STRIKE INGOT)
+# Actually builds each ingot. Retries on failure up to :max heats.
+# Uses extended thinking for high grade (complex) ingots.
 # ═══════════════════════════════════════════════════════════════════════════
+
 strike_ingot() {
     local ingot_sexp="$1"
     local id work proof max grade
@@ -399,48 +506,39 @@ strike_ingot() {
     [[ -z "$max" || "$max" == "0" ]] && max=5
     [[ -z "$grade" ]] && grade=1
     
-    # Select smith based on complexity
-    local active_smith="$SMITH"
-    local smith_label=""
+    # Select smith: complex work gets extended thinking
+    local active_smith="$SMITH" smith_mode="" smith_label=""
     if ((grade >= HIGH_GRADE)); then
         active_smith="$SMITH_THINK"
-        smith_label=" ${YELLOW}◉ deep${NC}"
+        smith_mode="think"
+        smith_label=" ${YELLOW}◉${NC}"
     fi
     
     local slag="" heat=0
     printf "\n  ${HOT}▣${NC} ${WHITE}[%s]${NC} %s${smith_label}\n" "$id" "$(truncate_str "$work" 45)"
-    printf "    ${GRAY}grade: %d | proof: %s${NC}\n" "$grade" "$(truncate_str "$proof" 40)"
+    printf "    ${GRAY}grade:%d proof:%s${NC}\n" "$grade" "$(truncate_str "$proof" 38)"
     
     while [[ $heat -lt $max ]]; do
         ((heat++))
         sed_i "s/:id \"$id\" \(.*\):heat [0-9]*/:id \"$id\" \1:heat $heat/" "$CRUCIBLE"
         
-        # Heat indicator
-        local heat_color="$RED"
-        ((heat > 2)) && heat_color="$ORANGE"
-        ((heat > 3)) && heat_color="$YELLOW"
-        ((heat > 4)) && heat_color="$WHITE"
-        printf "    ${heat_color}⚒ heat %d/%d${NC} " "$heat" "$max"
+        # Heat color: hotter = closer to done
+        local hc="$RED"; ((heat > 2)) && hc="$ORANGE"; ((heat > 3)) && hc="$YELLOW"; ((heat > 4)) && hc="$WHITE"
+        printf "    ${hc}⚒ %d/%d${NC} " "$heat" "$max"
         
         local flux response cmd
         flux=$(prepare_flux "$ingot_sexp" "$slag")
         log "FLUX_${id}_${heat}" "$flux"
         
-        # Use thinking animation for complex tasks
-        if ((grade >= HIGH_GRADE)); then
-            sparks_start "deep forging..." "THINK_FRAMES"
-        else
-            sparks_start "forging..."
-        fi
-        
+        [[ -n "$smith_mode" ]] && sparks_start "deep forging..." "$smith_mode" || sparks_start "forging..."
         response=$($active_smith <<< "$flux") || { sparks_stop; slag="Smith error"; printf "${RED}✗${NC}\n"; continue; }
         sparks_stop
         log "STRIKE_${id}_${heat}" "$response"
         
         cmd=$(echo "$response" | grep "^CMD:" | tail -1 | sed 's/^CMD: *//')
         if [[ -z "$cmd" ]]; then
-            slag="NO CMD: line. Must end with CMD: <proof_command>"
-            printf "${RED}✗${NC} no proof\n"
+            slag="NO CMD: line"
+            printf "${RED}✗${NC} no CMD\n"
             continue
         fi
         
@@ -452,6 +550,7 @@ strike_ingot() {
 $output"
         
         if [[ $exit_code -eq 0 ]]; then
+            # Run proof if different from CMD
             if [[ -n "$proof" && "$proof" != "$cmd" && "$proof" != "true" ]]; then
                 set +e; output=$(eval "$proof" 2>&1); exit_code=$?; set -e
                 if [[ $exit_code -ne 0 ]]; then
@@ -461,22 +560,24 @@ $output"
                     continue
                 fi
             fi
-            printf "${PURE}▰${NC} forged\n"
+            printf "${PURE}▰${NC}\n"
             git add -A 2>/dev/null || true
             git commit -m "forge($id): $work" --quiet 2>/dev/null || true
-            printf "\n## %s [%s] grade:%d\n- %s\n- heats: %d\n" "$(date '+%m-%d %H:%M')" "$id" "$grade" "$work" "$heat" >> "$LEDGER"
+            printf "\n## %s [%s] gr:%d\n- %s\n- heats:%d\n" "$(date '+%m-%d %H:%M')" "$id" "$grade" "$work" "$heat" >> "$LEDGER"
             return 0
         else
             slag="exit $exit_code: $output"
-            printf "${RED}✗${NC} cracked\n"
+            printf "${RED}✗${NC}\n"
         fi
     done
     return 1
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ANVILS · parallel forging
+# PARALLEL ANVILS
+# Runs multiple :solo t ingots simultaneously on separate anvils.
 # ═══════════════════════════════════════════════════════════════════════════
+
 run_anvils() {
     local pids=() ids=() count=0 ingots
     ingots=$(grep ":status ore" "$CRUCIBLE" | grep ":solo t" || true)
@@ -506,8 +607,10 @@ run_anvils() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FIRE FURNACE · init
+# FIRE FURNACE (INIT)
+# Sets up the smithy for a new commission.
 # ═══════════════════════════════════════════════════════════════════════════
+
 fire_furnace() {
     header "FIRING FURNACE"
     git init -b main 2>/dev/null || git init 2>/dev/null || true
@@ -517,8 +620,8 @@ fire_furnace() {
         { echo "# Commission"; echo ""; echo "$1"; } > "$ORE_FILE"
         status_line "▱" "$COLD" "Ore loaded"
     fi
-    [[ ! -f "$ALLOY_FILE" ]] && { echo "## Alloy Recipes" > "$ALLOY_FILE"; status_line "+" "$GRAY" "Recipe book ready"; }
-    [[ ! -f "$LEDGER" ]] && { echo "# Smithy Ledger"; echo "Furnace fired: $(date)" > "$LEDGER"; status_line "+" "$GRAY" "Ledger opened"; }
+    [[ ! -f "$ALLOY_FILE" ]] && { echo "## Alloy Recipes" > "$ALLOY_FILE"; status_line "+" "$GRAY" "Recipes ready"; }
+    [[ ! -f "$LEDGER" ]] && { echo "# Smithy Ledger"; echo "Fired: $(date)" > "$LEDGER"; status_line "+" "$GRAY" "Ledger open"; }
     
     git add -A 2>/dev/null || true
     git commit -m "fire: furnace lit" --quiet 2>/dev/null || true
@@ -526,23 +629,25 @@ fire_furnace() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CHECK FORGE · resume/reset
+# CHECK FORGE (RESUME/RESET)
+# Handles existing projects: continue, resurvey, recast, or start new.
 # ═══════════════════════════════════════════════════════════════════════════
+
 check_forge() {
     [[ ! -f "$ORE_FILE" ]] && return 1
     
-    local commission total forged cracked has_blueprint
+    local commission total forged cracked has_bp
     commission=$(tail -1 "$ORE_FILE" | head -c 50)
     total=$(grep -c "^(ingot" "$CRUCIBLE" 2>/dev/null) || total=0
     forged=$(grep -c ":status forged" "$CRUCIBLE" 2>/dev/null) || forged=0
     cracked=$(grep -c ":status cracked" "$CRUCIBLE" 2>/dev/null) || cracked=0
     total=${total//[^0-9]/}; forged=${forged//[^0-9]/}; cracked=${cracked//[^0-9]/}
-    [[ -f "$BLUEPRINT" ]] && has_blueprint="yes" || has_blueprint="no"
+    [[ -f "$BLUEPRINT" ]] && has_bp="yes" || has_bp="no"
     
     echo ""
     printf "  ${ORANGE}Commission:${NC} %s...\n" "$commission"
-    printf "  ${GRAY}Blueprint: %s${NC}\n" "$has_blueprint"
-    [[ $total -gt 0 ]] && printf "  ${GRAY}Progress: %d/%d forged${NC}" "$forged" "$total" && [[ $cracked -gt 0 ]] && printf " ${RED}(%d cracked)${NC}" "$cracked"
+    printf "  ${GRAY}Blueprint: %s${NC}\n" "$has_bp"
+    [[ $total -gt 0 ]] && { printf "  ${GRAY}Progress: %d/%d${NC}" "$forged" "$total"; [[ $cracked -gt 0 ]] && printf " ${RED}(%d cracked)${NC}" "$cracked"; }
     echo ""
     
     if [[ -n "$1" ]]; then
@@ -557,7 +662,7 @@ check_forge() {
             *) printf "  ${YELLOW}Continuing${NC}\n" ;;
         esac
     else
-        printf "\n  ${WHITE}[c]${NC}ontinue  ${WHITE}[s]${NC}urvey again  ${WHITE}[r]${NC}ecast  ${WHITE}[n]${NC}ew  ${WHITE}[q]${NC}uench [c]: "
+        printf "\n  ${WHITE}[c]${NC}ontinue  ${WHITE}[s]${NC}urvey  ${WHITE}[r]${NC}ecast  ${WHITE}[n]${NC}ew  ${WHITE}[q]${NC}uench [c]: "
         read -r choice
         case "$choice" in
             s|S) rm -f "$BLUEPRINT"; printf "  ${ORANGE}Resurveying${NC}\n" ;;
@@ -573,8 +678,10 @@ check_forge() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ASSAY · quality inspection
+# ASSAY (FINAL REPORT)
+# Shows final quality inspection and summary.
 # ═══════════════════════════════════════════════════════════════════════════
+
 show_assay() {
     local total forged cracked
     total=$(grep -c "^(ingot" "$CRUCIBLE" 2>/dev/null) || total=0
@@ -595,14 +702,17 @@ show_assay() {
         done
     fi
     printf "\n  ${GRAY}blueprint: %s${NC}\n" "$BLUEPRINT"
+    printf "  ${GRAY}crucible:  %s${NC}\n" "$CRUCIBLE"
     printf "  ${GRAY}slag heap: %s${NC}\n" "$LOG_DIR"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MAIN
+# MAIN EXECUTION
 # ═══════════════════════════════════════════════════════════════════════════
+
 show_banner
 
+# Check existing or init new
 if check_forge "$1"; then
     :
 elif [[ -z "$1" ]]; then
@@ -612,26 +722,33 @@ else
     fire_furnace "$1"
 fi
 
-# Phase 1: Survey (deep thinking)
+# Phase 1: Survey (deep analysis)
 [[ ! -f "$BLUEPRINT" ]] && run_surveyor
 
-# Phase 2: Found (deep thinking)
+# Phase 2: Found (design mold)
 [[ ! -f "$CRUCIBLE" ]] || ! grep -q "^(ingot" "$CRUCIBLE" && run_founder
 
-# Phase 3: Forge
+# Phase 3: Forge (strike ingots)
 header "FORGE"
 printf "  "; ingot_status; echo ""
 
 while true; do
+    # Check completion
     if ! grep -q ":status ore\|:status molten" "$CRUCIBLE"; then
         if grep -q ":status cracked" "$CRUCIBLE"; then
-            show_assay; printf "\n  ${RED}${BOLD}✗ CRACKED${NC}\n\n"; exit 1
+            show_assay
+            printf "\n  ${RED}${BOLD}✗ CRACKED${NC}\n\n"
+            exit 1
         fi
-        show_assay; printf "\n  ${PURE}${BOLD}▰ FORGED${NC}\n\n"; exit 0
+        show_assay
+        printf "\n  ${PURE}${BOLD}▰ FORGED${NC}\n\n"
+        exit 0
     fi
     
+    # Try parallel first
     run_anvils && { printf "\n  "; ingot_status; echo ""; continue; }
     
+    # Sequential fallback
     ingot=$(grep ":status ore" "$CRUCIBLE" | head -1 || true)
     [[ -z "$ingot" ]] && continue
     id=$(sexp_get_quoted "$ingot" "id")
@@ -641,7 +758,9 @@ while true; do
         sed_i "s/:id \"$id\" :status molten/:id \"$id\" :status forged/" "$CRUCIBLE"
     else
         sed_i "s/:id \"$id\" :status molten/:id \"$id\" :status cracked/" "$CRUCIBLE"
-        show_assay; printf "\n  ${RED}${BOLD}✗ CRACKED: %s${NC}\n\n" "$id"; exit 1
+        show_assay
+        printf "\n  ${RED}${BOLD}✗ CRACKED: %s${NC}\n\n" "$id"
+        exit 1
     fi
     printf "\n  "; ingot_status; echo ""
 done

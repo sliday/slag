@@ -24,3 +24,7 @@ Furnace fired: Tue Jan 27 09:46:02 CET 2026
 - Test production build compiles successfully
 - Polish copy describing slag orchestrator purpose
 - All ingots forged successfully
+
+## 01-27 09:52 [i3]
+- Configure wrangler for slag.dev deployment
+- heats: 3
