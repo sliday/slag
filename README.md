@@ -9,6 +9,7 @@
 ```bash
 curl -fsSL https://slag.dev/slag -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
 ```
+![slag-promo](https://github.com/user-attachments/assets/d12def06-6eab-4236-9634-bbbd09be6683)
 
 ## Quick start
 
