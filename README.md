@@ -6,6 +6,8 @@
 
 A bash orchestrator for AI-powered development. Give it a product requirement, and it breaks it into verifiable tasks, executes them via Claude, and proves each one passed before moving on. No human review needed -- every task carries its own machine-verifiable acceptance test.
 
+> **WARNING:** slag runs Claude with `--dangerously-skip-permissions`. This means Claude will execute shell commands, write files, and make changes to your system **without asking for confirmation**. Run it in a clean directory or container. Review the generated `PRD.md` before forging. You accept all risk.
+
 ## Why
 
 AI coding agents are powerful but chaotic. They lose context on long tasks, hallucinate completeness, and can't tell you whether their output actually works. Existing orchestrators add layers of abstraction (YAML configs, plugin systems, Docker containers) that fight the simplicity of just running shell commands.
@@ -58,12 +60,15 @@ Independent ingots (`:solo t`) run on up to 3 parallel anvils. Dependent ingots 
 
 Final report. Counts forged vs cracked ingots, shows a temperature bar, and exits 0 on full forge or 1 if anything cracked.
 
+## Install
+
+```bash
+curl -fsSL https://slag.dev/slag -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
+```
+
 ## Quick start
 
 ```bash
-# download
-curl -O https://slag.dev/slag && chmod +x slag
-
 # write your requirements
 cat > PRD.md << 'EOF'
 Build a REST API with user authentication, rate limiting,
@@ -71,13 +76,13 @@ and PostgreSQL storage. Include health check endpoint.
 EOF
 
 # forge
-./slag
+slag
 ```
 
-To start fresh with a new commission:
+Or pass the commission directly:
 
 ```bash
-./slag "Build a CLI tool that converts CSV to JSON"
+slag "Build a CLI tool that converts CSV to JSON"
 ```
 
 This writes `PRD.md` for you and runs the full pipeline.
