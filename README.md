@@ -4,9 +4,38 @@
 
 **Smelt ideas, skim the bugs, forge the product.**
 
-A bash orchestrator for AI-powered development. Give it a product requirement, and it breaks it into verifiable tasks, executes them via Claude, and proves each one passed before moving on. No human review needed -- every task carries its own machine-verifiable acceptance test.
+## Install
+
+```bash
+curl -fsSL https://slag.dev/slag -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
+```
+
+## Quick start
+
+```bash
+# write your requirements
+cat > PRD.md << 'EOF'
+Build a REST API with user authentication, rate limiting,
+and PostgreSQL storage. Include health check endpoint.
+EOF
+
+# forge
+slag
+```
+
+Or pass the commission directly:
+
+```bash
+slag "Build a CLI tool that converts CSV to JSON"
+```
+
+This writes `PRD.md` for you and runs the full pipeline.
 
 > **WARNING:** slag runs Claude with `--dangerously-skip-permissions`. This means Claude will execute shell commands, write files, and make changes to your system **without asking for confirmation**. Run it in a clean directory or container. Review the generated `PRD.md` before forging. You accept all risk.
+
+---
+
+A bash orchestrator for AI-powered development. Give it a product requirement, and it breaks it into verifiable tasks, executes them via Claude, and proves each one passed before moving on. No human review needed -- every task carries its own machine-verifiable acceptance test.
 
 ## Why
 
@@ -59,33 +88,6 @@ Independent ingots (`:solo t`) run on up to 3 parallel anvils. Dependent ingots 
 ### Phase 4: ASSAY
 
 Final report. Counts forged vs cracked ingots, shows a temperature bar, and exits 0 on full forge or 1 if anything cracked.
-
-## Install
-
-```bash
-curl -fsSL https://slag.dev/slag -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
-```
-
-## Quick start
-
-```bash
-# write your requirements
-cat > PRD.md << 'EOF'
-Build a REST API with user authentication, rate limiting,
-and PostgreSQL storage. Include health check endpoint.
-EOF
-
-# forge
-slag
-```
-
-Or pass the commission directly:
-
-```bash
-slag "Build a CLI tool that converts CSV to JSON"
-```
-
-This writes `PRD.md` for you and runs the full pipeline.
 
 ## Ingot fields
 
