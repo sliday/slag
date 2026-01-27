@@ -1,8 +1,5 @@
-# slag
-
-[slag.dev](https://slag.dev)
-
-**Smelt ideas, skim the bugs, forge the product.**
+# [slag](https://slag.dev)
+## Smelt ideas, skim the bugs, forge the product.**
 
 ## Install
 
