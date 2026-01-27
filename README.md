@@ -1,7 +1,5 @@
 # [slag](https://slag.dev)
-## Smelt ideas, skim the bugs, forge the product.**
-
-## Install
+### Smelt ideas, skim the bugs, forge the product.**
 
 ```bash
 curl -fsSL https://slag.dev/slag -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
