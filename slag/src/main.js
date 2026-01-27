@@ -1,24 +1,22 @@
-import './style.css'
-import javascriptLogo from './javascript.svg'
-import viteLogo from '/vite.svg'
-import { setupCounter } from './counter.js'
+import './main.css'
+import { exampleIngots, renderIngots, logSExpressions } from './content.js'
 
-document.querySelector('#app').innerHTML = `
-  <div>
-    <a href="https://vite.dev" target="_blank">
-      <img src="${viteLogo}" class="logo" alt="Vite logo" />
-    </a>
-    <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript" target="_blank">
-      <img src="${javascriptLogo}" class="logo vanilla" alt="JavaScript logo" />
-    </a>
-    <h1>Hello Vite!</h1>
-    <div class="card">
-      <button id="counter" type="button"></button>
-    </div>
-    <p class="read-the-docs">
-      Click on the Vite logo to learn more
-    </p>
-  </div>
-`
+// Initialize the slag terminal UI
+function init() {
+  // Render example ingots
+  renderIngots(exampleIngots);
 
-setupCounter(document.querySelector('#counter'))
+  // Log s-expressions to console for reference
+  logSExpressions(exampleIngots);
+
+  // Add interactivity for status filtering (future enhancement)
+  console.log('slag bash orchestrator initialized');
+  console.log('View s-expression format in console above');
+}
+
+// Run on DOM ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}

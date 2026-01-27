@@ -1,0 +1,33 @@
+/* Color Palette for slag terminal-ui */
+
+:root {
+  /* Background colors */
+  --bg-primary: #0a0e14;
+  --bg-secondary: #13171f;
+  --bg-tertiary: #1f2430;
+
+  /* Text colors */
+  --text-primary: #c7c7c7;
+  --text-secondary: #707a8c;
+  --text-dim: #4f5b66;
+
+  /* Accent colors */
+  --accent-green: #98c379;    /* forged status, success */
+  --accent-yellow: #e5c07b;   /* molten status, warning, ingot IDs */
+  --accent-red: #e06c75;      /* ore/cracked status, error */
+  --accent-blue: #61afef;     /* links, headings */
+  --accent-cyan: #56b6c2;     /* info, secondary accent */
+  --accent-purple: #c678dd;   /* special highlight */
+
+  /* Border and UI elements */
+  --border-color: #1f2430;
+  --border-hover: #2e3440;
+  --shadow-sm: rgba(0, 0, 0, 0.3);
+  --shadow-md: rgba(0, 0, 0, 0.5);
+
+  /* Status-specific backgrounds */
+  --status-ore-bg: rgba(224, 108, 117, 0.15);
+  --status-molten-bg: rgba(229, 192, 123, 0.15);
+  --status-forged-bg: rgba(152, 195, 121, 0.15);
+  --status-cracked-bg: rgba(224, 108, 117, 0.25);
+}
