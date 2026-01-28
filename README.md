@@ -12,12 +12,12 @@ A task orchestrator for AI-powered development. Give it a product requirement, a
 
 **Binary** (recommended):
 ```bash
-curl -sSf https://raw.githubusercontent.com/sliday/slag/main/install.sh | sh
+curl -sSf https://slag.dev/install.sh | sh
 ```
 
 **Bash version** (no build required):
 ```bash
-curl -fsSL https://slag.dev/slag -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
+curl -fsSL https://slag.dev/slag.sh -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
 ```
 
 **From source**:
@@ -39,6 +39,45 @@ slag "Build the REST API from PRD.md"
 ```
 
 slag reads `PRD.md`, analyzes it, designs tasks, executes them, and proves each one works.
+
+## Usage
+
+```
+slag [OPTIONS] [COMMISSION]... [COMMAND]
+```
+
+**Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `slag "Build X from PRD.md"` | Start a new forge from a commission |
+| `slag status` | Show crucible state (ingot counts and progress) |
+| `slag resume` | Resume an existing forge |
+| `slag update` | Self-update to latest release |
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--worktree` | off | Enable branch-per-ingot worktree isolation |
+| `--anvils N` | 3 | Max parallel anvil workers |
+
+## Progress display
+
+slag shows emoji progress in the terminal:
+
+```
+[ ✅3  🔥1  🧱5 ] 37%
+```
+
+| Emoji | Status | Meaning |
+|-------|--------|---------|
+| 🧱 | queued | Ingot is ore, waiting to be forged |
+| 🔥 | forging | Ingot is molten, currently being worked |
+| ✅ | done | Ingot is forged, proof passed |
+| ❌ | failed | Ingot cracked after exhausting all heats |
+
+The percentage shows overall progress: forged ingots / total ingots.
 
 ## Language
 
@@ -139,6 +178,7 @@ Final report. Counts forged vs cracked, writes results to `PROGRESS.md`.
 | `:skill` | default / web / ... | Tool configuration for the smith |
 | `:heat` | 0-N | Current retry attempt |
 | `:max` | 5-8+ | Max retries before cracking |
+| `:smelt` | 0-1 | Re-smelt count (0 = never, 1 = re-smelted once) |
 | `:proof` | shell command | Acceptance test (exit 0 = pass) |
 | `:work` | string | Task description for the AI |
 
