@@ -7,13 +7,19 @@ function initCopyButtons() {
     const wrapper = el.closest('.cmd-line') || el;
     const btn = document.createElement('button');
     btn.className = 'copy-btn';
-    btn.textContent = 'copy';
-    btn.addEventListener('click', () => {
+    btn.textContent = 'Copy';
+
+    const doCopy = (e) => {
+      e.stopPropagation();
       navigator.clipboard.writeText(el.textContent).then(() => {
-        btn.textContent = 'copied';
-        setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
       });
-    });
+    };
+
+    btn.addEventListener('click', doCopy);
+    wrapper.style.cursor = 'pointer';
+    wrapper.addEventListener('click', doCopy);
     wrapper.appendChild(btn);
   });
 }
