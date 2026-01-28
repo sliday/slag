@@ -28,8 +28,8 @@
         <h2>Install</h2>
         <div class="quickstart-box" box="square">
           <div class="cmd-line">
-            <span class="cmd-comment"># binary (recommended)</span>
-            <code data-copy>curl -sSf https://raw.githubusercontent.com/sliday/slag/main/install.sh | sh</code>
+            <span class="cmd-comment"># one-liner (auto-adds to PATH)</span>
+            <code data-copy>curl -sSf https://slag.dev/install.sh | sh</code>
           </div>
           <div class="cmd-line">
             <span class="cmd-comment"># bash version (no build required)</span>
@@ -199,7 +199,36 @@ EOF</code>
 
       <div is="separator"></div>
 
-      <!-- S8: INGOT EXAMPLES (JS-rendered) -->
+      <!-- S8: FAQ -->
+      <section class="decisions">
+        <h2>FAQ</h2>
+
+        <details box="square">
+          <summary>"command not found: slag" after install</summary>
+          <p>The installer adds <code>~/.slag/bin</code> to your shell profile automatically. Open a new terminal or run:</p>
+          <pre style="margin-top: 0.5lh; padding: 1ch; background: var(--background1);"><code>source ~/.zshrc  # or ~/.bashrc</code></pre>
+          <p style="margin-top: 0.5lh;">If that doesn't work, manually add to your profile: <code>export PATH="$HOME/.slag/bin:$PATH"</code></p>
+        </details>
+
+        <details box="square">
+          <summary>How do I update slag?</summary>
+          <p>Run <code>slag update</code> to self-update to the latest release. This downloads the new binary from GitHub and replaces the current one.</p>
+        </details>
+
+        <details box="square">
+          <summary>What's the difference between binary and bash versions?</summary>
+          <p>The Rust binary is faster, has better error handling, and includes self-update. The bash script is a single file with no build step &mdash; useful if you can't install Rust or want to inspect/modify the orchestrator directly.</p>
+        </details>
+
+        <details box="square">
+          <summary>Do I need Claude CLI installed?</summary>
+          <p>Yes. slag invokes <code>claude</code> via CLI. Install it from <a href="https://docs.anthropic.com/en/docs/claude-code">docs.anthropic.com</a> and ensure it's in your PATH.</p>
+        </details>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S9: INGOT EXAMPLES (JS-rendered) -->
       <section>
         <h2>Ingot Examples</h2>
         <div id="ingot-display" class="ingot-list"></div>
@@ -207,7 +236,7 @@ EOF</code>
 
       <div is="separator"></div>
 
-      <!-- S9: FIELD REFERENCE -->
+      <!-- S10: FIELD REFERENCE -->
       <section>
         <h2>Field Reference</h2>
         <table class="field-table">
