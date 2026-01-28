@@ -333,6 +333,16 @@ a:hover {
   color: var(--slag-bright);
 }
 
+.footer .easter-egg {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  text-decoration: none;
+}
+
+.footer .easter-egg:hover {
+  transform: scale(1.25);
+}
+
 /* Copy as Markdown button */
 .copy-md-btn {
   position: fixed;
