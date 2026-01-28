@@ -127,6 +127,61 @@ pub fn prepare_resmelt_flux(ingot: &Ingot, failure_logs: &str) -> String {
     )
 }
 
+/// Build the reconsider prompt — surveyor-scoped re-analysis of a twice-failed ingot.
+/// Unlike re-smelt (which tweaks proof/work), this questions the fundamental approach.
+pub fn prepare_reconsider_flux(ingot: &Ingot, failure_logs: &str) -> String {
+    let blueprint = std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "None".into());
+    let crucible = std::fs::read_to_string(CRUCIBLE).unwrap_or_else(|_| "Empty".into());
+    let git_state = git_log_and_diff();
+
+    format!(
+        "=== RECONSIDER ===\n\
+        This ingot has ALREADY been re-smelted once and cracked AGAIN. \
+        The previous re-smelt did not fix the root cause. \
+        Step back and fundamentally rethink the approach.\n\n\
+        TWICE-CRACKED INGOT:\n\
+        {ingot_sexp}\n\n\
+        BLUEPRINT:\n\
+        {blueprint}\n\n\
+        CRUCIBLE STATE:\n\
+        {crucible}\n\n\
+        FAILURE LOGS (both original and re-smelted attempts):\n\
+        {failure_logs}\n\n\
+        GIT STATE:\n\
+        {git_state}\n\n\
+        === YOUR TASK ===\n\
+        The previous approach failed twice. Do NOT tweak — rethink.\n\
+        Ask yourself:\n\
+        - Is the task description actually achievable given the codebase state?\n\
+        - Is the proof testing the right thing? Is it too brittle?\n\
+        - Should this be decomposed completely differently?\n\
+        - Are there prerequisites missing from other ingots?\n\n\
+        Choose ONE action:\n\n\
+        OPTION A - REWRITE: Fundamentally different approach to the same goal.\n\
+        OPTION B - SPLIT: Decompose into 2-4 smaller, independently verifiable tasks.\n\
+        OPTION C - IMPOSSIBLE: This genuinely cannot be done in the current codebase state.\n\n\
+        OUTPUT FORMAT (exactly one of):\n\n\
+        REWRITE:\n\
+        (ingot :id \"{id}\" :status ore :solo t :grade {grade} :skill {skill} :heat 0 :max 5 :smelt 2 :proof \"NEW_PROOF\" :work \"Fundamentally rethought task\")\n\n\
+        SPLIT:\n\
+        (ingot :id \"{id}a\" :status ore :solo t :grade G :skill S :heat 0 :max 5 :smelt 2 :proof \"PROOF\" :work \"Sub-task 1\")\n\
+        (ingot :id \"{id}b\" :status ore :solo t :grade G :skill S :heat 0 :max 5 :smelt 2 :proof \"PROOF\" :work \"Sub-task 2\")\n\n\
+        IMPOSSIBLE:\n\
+        IMPOSSIBLE: reason\n\n\
+        RULES:\n\
+        - ALL output ingots MUST have :smelt 2\n\
+        - Do NOT repeat the same proof command if it failed twice\n\
+        - Do NOT repeat the same work description\n\
+        - Think about what ACTUALLY exists in the repo right now\n\
+        - If splitting, each sub-task must be independently verifiable\n\
+        - Output ONLY the action keyword and ingot lines, nothing else\n",
+        ingot_sexp = crate::sexp::writer::write_ingot(ingot),
+        id = ingot.id,
+        grade = ingot.grade,
+        skill = ingot.skill,
+    )
+}
+
 /// Build the surveyor prompt
 pub fn surveyor_prompt(ore: &str) -> String {
     format!(

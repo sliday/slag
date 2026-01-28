@@ -16,9 +16,13 @@ pub async fn resmelt_ingot(
     ingot: &Ingot,
     smith: &dyn Smith,
 ) -> Result<(), SlagError> {
-    if ingot.smelt >= 1 {
-        println!("    \x1b[31m⚠\x1b[0m already re-smelted, truly cracked");
+    if ingot.smelt >= 2 {
+        println!("    \x1b[31m⚠\x1b[0m already reconsidered, truly cracked");
         return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
+    }
+
+    if ingot.smelt >= 1 {
+        return reconsider_ingot(crucible, ingot, smith).await;
     }
 
     println!(
@@ -108,6 +112,68 @@ fn gather_failure_logs(id: &str) -> String {
     } else {
         logs
     }
+}
+
+/// Reconsider a twice-failed ingot — surveyor-level re-analysis.
+/// Only touches this specific ingot in the crucible.
+async fn reconsider_ingot(
+    crucible: &mut Crucible,
+    ingot: &Ingot,
+    smith: &dyn Smith,
+) -> Result<(), SlagError> {
+    println!(
+        "\n  \x1b[38;5;220m⚖\x1b[0m \x1b[1;37mRECONSIDERING [{}]\x1b[0m — rethinking approach...",
+        ingot.id
+    );
+
+    let failure_logs = gather_failure_logs(&ingot.id);
+    let prompt = flux::prepare_reconsider_flux(ingot, &failure_logs);
+    log_to_file(&format!("RECONSIDER_{}", ingot.id), &prompt);
+
+    let spinner = tui::spinner("reconsidering...");
+    let response = smith.invoke(&prompt).await.map_err(|e| {
+        spinner.finish_and_clear();
+        println!("    \x1b[31m✗\x1b[0m reconsider failed");
+        SlagError::SmithFailed(e.to_string())
+    })?;
+    spinner.finish_and_clear();
+
+    log_to_file(&format!("RECONSIDER_RESULT_{}", ingot.id), &response);
+
+    if response.contains("IMPOSSIBLE:") {
+        let reason = response
+            .lines()
+            .find(|l| l.starts_with("IMPOSSIBLE:"))
+            .map(|l| l.strip_prefix("IMPOSSIBLE:").unwrap().trim())
+            .unwrap_or("unknown");
+        println!(
+            "    \x1b[31m✗\x1b[0m impossible: {}",
+            &reason[..reason.len().min(60)]
+        );
+        return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
+    }
+
+    let new_ingots = parse_crucible(&response);
+    if new_ingots.is_empty() {
+        println!("    \x1b[31m✗\x1b[0m could not parse reconsider output");
+        return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
+    }
+
+    if new_ingots.len() == 1 {
+        println!(
+            "    \x1b[38;5;220m⚖\x1b[0m rethought: {}",
+            tui::truncate(&new_ingots[0].work, 50)
+        );
+    } else {
+        println!(
+            "    \x1b[38;5;220m⚖\x1b[0m decomposed into {} sub-ingots",
+            new_ingots.len()
+        );
+    }
+
+    crucible.replace(&ingot.id, new_ingots);
+
+    Ok(())
 }
 
 fn log_to_file(label: &str, content: &str) {
