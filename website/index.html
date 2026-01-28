@@ -27,20 +27,25 @@
       <!-- S2: INSTALL -->
       <section>
         <h2>Install</h2>
-        <div class="quickstart-box" box="square">
+        <div class="install-hero" box="double">
           <div class="cmd-line">
-            <span class="cmd-comment"># one-liner (auto-adds to PATH)</span>
-            <code data-copy>curl -sSf https://slag.dev/install.sh | sh</code>
+            <code data-copy style="font-size: 1.1rem;">curl -sSf https://slag.dev/install.sh | sh</code>
           </div>
-          <div class="cmd-line">
-            <span class="cmd-comment"># bash version (no build required)</span>
-            <code data-copy>curl -fsSL https://slag.dev/slag.sh -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag</code>
-          </div>
-          <div class="cmd-line">
-            <span class="cmd-comment"># from source</span>
-            <code data-copy>cargo install --git https://github.com/sliday/slag</code>
-          </div>
+          <p style="color: var(--foreground2); font-size: 0.85rem; margin-top: 0.5lh;">One-liner that downloads the binary and adds to PATH</p>
         </div>
+        <details style="margin-top: 1lh;">
+          <summary style="color: var(--foreground2); cursor: pointer;">Other installation methods</summary>
+          <div class="quickstart-box" box="square" style="margin-top: 0.5lh;">
+            <div class="cmd-line">
+              <span class="cmd-comment"># bash version (no build required)</span>
+              <code data-copy>curl -fsSL https://slag.dev/slag.sh -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag</code>
+            </div>
+            <div class="cmd-line">
+              <span class="cmd-comment"># from source</span>
+              <code data-copy>cargo install --git https://github.com/sliday/slag</code>
+            </div>
+          </div>
+        </details>
       </section>
 
       <div is="separator"></div>
