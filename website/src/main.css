@@ -333,6 +333,33 @@ a:hover {
   color: var(--slag-bright);
 }
 
+/* Copy as Markdown button */
+.copy-md-btn {
+  position: fixed;
+  top: 1ch;
+  right: 1ch;
+  background: var(--background2);
+  color: var(--foreground1);
+  border: 1px solid var(--foreground2);
+  font-family: var(--font-family);
+  font-size: 0.75rem;
+  padding: 0.5lh 1ch;
+  cursor: pointer;
+  z-index: 100;
+  transition: all 0.15s ease;
+}
+
+.copy-md-btn:hover {
+  color: var(--slag-bright);
+  border-color: var(--slag-bright);
+}
+
+.copy-md-btn.copied {
+  color: var(--slag-pure);
+  border-color: var(--slag-pure);
+  background: var(--background3);
+}
+
 /* Responsive */
 @media (min-width: 640px) {
   body {
@@ -342,5 +369,10 @@ a:hover {
 
   h1 {
     font-size: 2.5rem;
+  }
+
+  .copy-md-btn {
+    top: 2ch;
+    right: 2ch;
   }
 }

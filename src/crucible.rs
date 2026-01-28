@@ -55,8 +55,8 @@ impl Crucible {
         }
     }
 
-    /// Save crucible to disk
-    pub fn save(&self) -> Result<(), std::io::Error> {
+    /// Build content string from crucible state
+    fn build_content(&self) -> String {
         let mut content = String::new();
         for line in &self.header_lines {
             content.push_str(line);
@@ -66,21 +66,32 @@ impl Crucible {
             content.push_str(&write_ingot(ingot));
             content.push('\n');
         }
-        std::fs::write(&self.path, content)
+        content
     }
 
-    /// Async save (for use in tokio context)
+    /// Save crucible to disk atomically (write to temp, then rename)
+    /// This prevents race conditions with git add -A during parallel anvils
+    pub fn save(&self) -> Result<(), std::io::Error> {
+        let content = self.build_content();
+
+        // Write to temp file in same directory (ensures same filesystem for atomic rename)
+        let temp_path = self.path.with_extension("tmp");
+        std::fs::write(&temp_path, &content)?;
+
+        // Atomic rename
+        std::fs::rename(&temp_path, &self.path)
+    }
+
+    /// Async save atomically (for use in tokio context)
     pub async fn save_async(&self) -> Result<(), std::io::Error> {
-        let mut content = String::new();
-        for line in &self.header_lines {
-            content.push_str(line);
-            content.push('\n');
-        }
-        for ingot in &self.ingots {
-            content.push_str(&write_ingot(ingot));
-            content.push('\n');
-        }
-        tokio::fs::write(&self.path, content).await
+        let content = self.build_content();
+
+        // Write to temp file in same directory
+        let temp_path = self.path.with_extension("tmp");
+        tokio::fs::write(&temp_path, &content).await?;
+
+        // Atomic rename
+        tokio::fs::rename(&temp_path, &self.path).await
     }
 
     /// Find ingot by id

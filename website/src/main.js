@@ -18,10 +18,33 @@ function initCopyButtons() {
   });
 }
 
+function initCopyMarkdown() {
+  const btn = document.getElementById('copy-md-btn');
+  if (!btn) return;
+
+  btn.addEventListener('click', async () => {
+    try {
+      const response = await fetch('/slag.md');
+      const markdown = await response.text();
+      await navigator.clipboard.writeText(markdown);
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = 'Copy as Markdown';
+        btn.classList.remove('copied');
+      }, 2000);
+    } catch (err) {
+      btn.textContent = 'Error';
+      setTimeout(() => { btn.textContent = 'Copy as Markdown'; }, 2000);
+    }
+  });
+}
+
 function init() {
   renderIngots(exampleIngots);
   logSExpressions(exampleIngots);
   initCopyButtons();
+  initCopyMarkdown();
 }
 
 if (document.readyState === 'loading') {
