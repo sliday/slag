@@ -5,8 +5,8 @@ use crate::error::SlagError;
 pub fn extract_cmd(response: &str) -> Option<String> {
     response
         .lines()
-        .filter(|line| line.starts_with("CMD:"))
-        .last()
+        .rev()
+        .find(|line| line.starts_with("CMD:"))
         .map(|line| line.strip_prefix("CMD:").unwrap().trim().to_string())
 }
 

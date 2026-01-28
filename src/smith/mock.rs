@@ -27,19 +27,23 @@ impl MockSmith {
     }
 
     pub fn call_count(&self) -> usize {
-        self.call_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.call_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl Smith for MockSmith {
-    fn invoke(&self, _prompt: &str) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
+    fn invoke(
+        &self,
+        _prompt: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
         let idx = self
             .call_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if self.responses.is_empty() {
-            return Box::pin(async { Err(SlagError::SmithFailed("mock smith: no responses".into())) });
+            return Box::pin(async {
+                Err(SlagError::SmithFailed("mock smith: no responses".into()))
+            });
         }
 
         let response = self.responses[idx % self.responses.len()].clone();

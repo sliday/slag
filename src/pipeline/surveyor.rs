@@ -8,8 +8,7 @@ use crate::tui;
 pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     tui::header("SURVEYOR · deep analysis");
 
-    let ore = std::fs::read_to_string(ORE_FILE)
-        .map_err(|_| SlagError::NoOre)?;
+    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
 
     let prompt = flux::surveyor_prompt(&ore);
     log_to_file("SURVEY_PROMPT", &prompt);

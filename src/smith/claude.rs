@@ -79,7 +79,10 @@ impl ClaudeSmith {
 }
 
 impl Smith for ClaudeSmith {
-    fn invoke(&self, prompt: &str) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
+    fn invoke(
+        &self,
+        prompt: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
         let prompt = prompt.to_string();
         Box::pin(async move { self.invoke_impl(&prompt).await })
     }

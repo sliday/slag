@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor, ResetColor};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::crucible::CrucibleCounts;
@@ -58,11 +58,7 @@ pub fn show_banner() {
     println!("{}░░░{}", fg(COLD), reset());
 
     println!("  {}cold      hot       pure{}", fg(COLD), reset());
-    println!(
-        "  {}survey · design · forge · temper{}",
-        fg(COLD),
-        reset()
-    );
+    println!("  {}survey · design · forge · temper{}", fg(COLD), reset());
 }
 
 pub fn ingot_status_line(counts: &CrucibleCounts) {
@@ -95,14 +91,7 @@ pub fn temper_bar(counts: &CrucibleCounts) {
     for _ in 0..empty {
         print!("{}░{}", fg(COLD), reset());
     }
-    println!(
-        "{}]{} {}{}%{}",
-        fg(COLD),
-        reset(),
-        fg(PURE),
-        pct,
-        reset()
-    );
+    println!("{}]{} {}{}%{}", fg(COLD), reset(), fg(PURE), pct, reset());
 }
 
 /// Create a spinner for long operations

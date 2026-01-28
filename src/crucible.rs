@@ -42,7 +42,10 @@ impl Crucible {
     /// Create a new crucible with header and ingots
     pub fn new(path: &Path, ingots: Vec<Ingot>) -> Self {
         let header_lines = vec![
-            format!(";; CRUCIBLE {}", chrono::Local::now().format("%Y-%m-%d %H:%M")),
+            format!(
+                ";; CRUCIBLE {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M")
+            ),
             format!(";; Blueprint: {}", crate::config::BLUEPRINT),
         ];
         Crucible {

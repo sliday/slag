@@ -23,7 +23,10 @@ pub fn parse_ingot(line: &str) -> Option<Ingot> {
     let fields = parse_fields(inner);
 
     let get = |key: &str| -> Option<String> {
-        fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
     };
 
     let id = get("id")?;

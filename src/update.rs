@@ -27,9 +27,7 @@ pub async fn self_update() -> Result<(), SlagError> {
         .build()
         .map_err(|e| SlagError::UpdateFailed(format!("http client: {e}")))?;
 
-    let url = format!(
-        "https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
-    );
+    let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
 
     let release: Release = client
         .get(&url)

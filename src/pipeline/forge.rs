@@ -76,7 +76,10 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
                         // Try resmelt
                         if let Some(ingot) = crucible.get(&id).cloned() {
                             let smith = ClaudeSmith::base(config);
-                            if resmelt::resmelt_ingot(&mut crucible, &ingot, &smith).await.is_ok() {
+                            if resmelt::resmelt_ingot(&mut crucible, &ingot, &smith)
+                                .await
+                                .is_ok()
+                            {
                                 crucible.save()?;
                             } else {
                                 crucible.set_status(&id, Status::Cracked);
@@ -117,7 +120,10 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
         } else {
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
             let base_smith = ClaudeSmith::base(config);
-            if resmelt::resmelt_ingot(&mut crucible, &ingot, &base_smith).await.is_ok() {
+            if resmelt::resmelt_ingot(&mut crucible, &ingot, &base_smith)
+                .await
+                .is_ok()
+            {
                 // Re-smelted: status already updated by resmelt
                 crucible.save()?;
             } else {
@@ -141,8 +147,16 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
         "\n  \x1b[38;5;208m▣\x1b[0m \x1b[1;37m[{}]\x1b[0m {}{}{}",
         ingot.id,
         tui::truncate(&ingot.work, 42),
-        if ingot.is_complex() { " \x1b[38;5;220m◉\x1b[0m" } else { "" },
-        if ingot.is_web() { " \x1b[38;5;208m⚡\x1b[0m" } else { "" },
+        if ingot.is_complex() {
+            " \x1b[38;5;220m◉\x1b[0m"
+        } else {
+            ""
+        },
+        if ingot.is_web() {
+            " \x1b[38;5;208m⚡\x1b[0m"
+        } else {
+            ""
+        },
     );
     println!(
         "    \x1b[90mgr:{} skill:{} proof:{}\x1b[0m",

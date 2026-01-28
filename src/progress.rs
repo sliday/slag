@@ -78,7 +78,10 @@ pub fn init_patterns_section() -> Result<(), std::io::Error> {
         .open(LEDGER)?;
 
     writeln!(f, "\n## Codebase Patterns")?;
-    writeln!(f, "_Populated during forging. Helps future ingots understand the codebase._\n")?;
+    writeln!(
+        f,
+        "_Populated during forging. Helps future ingots understand the codebase._\n"
+    )?;
 
     Ok(())
 }

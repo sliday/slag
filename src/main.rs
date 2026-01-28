@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod anvil;
 mod cli;
 mod config;
@@ -69,7 +71,10 @@ fn show_status() -> Result<(), error::SlagError> {
     }
 
     let has_bp = Path::new(config::BLUEPRINT).exists();
-    println!("  \x1b[90mBlueprint: {}\x1b[0m", if has_bp { "yes" } else { "no" });
+    println!(
+        "  \x1b[90mBlueprint: {}\x1b[0m",
+        if has_bp { "yes" } else { "no" }
+    );
 
     print!("  ");
     tui::ingot_status_line(&counts);

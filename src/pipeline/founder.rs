@@ -9,10 +9,8 @@ use crate::tui;
 pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     tui::header("FOUNDER · casting mold");
 
-    let ore = std::fs::read_to_string(ORE_FILE)
-        .map_err(|_| SlagError::NoOre)?;
-    let blueprint = std::fs::read_to_string(BLUEPRINT)
-        .unwrap_or_else(|_| "No blueprint".into());
+    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
+    let blueprint = std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "No blueprint".into());
 
     let prompt = flux::founder_prompt(&ore, &blueprint);
     log_to_file("FOUNDER_PROMPT", &prompt);
@@ -53,7 +51,10 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
 
     // Show table
     println!();
-    println!("  \x1b[90m{:<5} {:<3} {:<4} {:<7} {}\x1b[0m", "ID", "GR", "SOLO", "SKILL", "WORK");
+    println!(
+        "  \x1b[90m{:<5} {:<3} {:<4} {:<7} WORK\x1b[0m",
+        "ID", "GR", "SOLO", "SKILL"
+    );
     for (i, ingot) in ingots.iter().enumerate() {
         if i >= 10 {
             break;

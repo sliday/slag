@@ -1,8 +1,8 @@
-pub mod surveyor;
-pub mod founder;
-pub mod forge;
-pub mod resmelt;
 pub mod assay;
+pub mod forge;
+pub mod founder;
+pub mod resmelt;
+pub mod surveyor;
 
 use crate::config::SmithConfig;
 use crate::crucible::Crucible;
@@ -11,7 +11,11 @@ use crate::smith::claude::ClaudeSmith;
 use crate::tui;
 
 /// Run the full 4-phase pipeline.
-pub async fn run(commission: Option<&str>, config: &SmithConfig, max_anvils: usize) -> Result<(), SlagError> {
+pub async fn run(
+    commission: Option<&str>,
+    config: &SmithConfig,
+    max_anvils: usize,
+) -> Result<(), SlagError> {
     tui::show_banner();
 
     // Fire furnace if needed
@@ -80,10 +84,7 @@ fn fire_furnace(commission: Option<&str>) -> Result<(), SlagError> {
     }
 
     // Create PRD.md
-    std::fs::write(
-        ore_path,
-        format!("# Commission\n\n{commission}\n"),
-    )?;
+    std::fs::write(ore_path, format!("# Commission\n\n{commission}\n"))?;
     tui::status_line("░", tui::COLD, "Ore loaded");
 
     // Create AGENTS.md
@@ -98,7 +99,10 @@ fn fire_furnace(commission: Option<&str>) -> Result<(), SlagError> {
     if !ledger_path.exists() {
         std::fs::write(
             ledger_path,
-            format!("# Smithy Ledger\nFired: {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M")),
+            format!(
+                "# Smithy Ledger\nFired: {}\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M")
+            ),
         )?;
         tui::status_line("+", tui::COLD, "Ledger open");
     }

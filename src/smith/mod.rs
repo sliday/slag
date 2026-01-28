@@ -10,7 +10,10 @@ use crate::error::SlagError;
 /// Uses boxed future for dyn compatibility.
 pub trait Smith: Send + Sync {
     /// Send a prompt and receive the response text.
-    fn invoke(&self, prompt: &str) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>>;
+    fn invoke(
+        &self,
+        prompt: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>>;
 }
 
 /// Check if response text contains unresolved questions
