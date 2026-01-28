@@ -50,6 +50,13 @@ section {
   margin-bottom: 3lh;
 }
 
+/* Section separators */
+[is="separator"] {
+  border: none;
+  border-top: 1px solid var(--background3);
+  margin: 2lh 0;
+}
+
 /* Headings */
 h1 {
   color: var(--slag-pure);
@@ -262,7 +269,7 @@ a:hover {
 }
 
 .phase-card {
-  padding: 1ch;
+  padding: 1.5ch 2ch;
 }
 
 /* Phase card subtle background tints */
@@ -392,44 +399,21 @@ a:hover {
 .field-table {
   width: 100%;
   font-size: 0.8125rem;
-  border-collapse: collapse;
-  margin-top: 1lh;
-}
-
-.field-table thead {
-  border-bottom: 1px solid var(--slag-cold);
 }
 
 .field-table th {
   text-align: left;
   color: var(--slag-bright);
-  padding: 0.75lh 2ch;
-  font-weight: normal;
-  font-style: italic;
+  padding: 0.5lh 1.5ch;
 }
 
 .field-table td {
-  vertical-align: top;
-  padding: 0.75lh 2ch;
-  border-bottom: 1px solid var(--background3);
-}
-
-.field-table tbody tr:last-child td {
-  border-bottom: none;
+  vertical-align: middle;
+  padding: 0.5lh 1.5ch;
 }
 
 .field-table code {
   color: var(--slag-hot);
-}
-
-/* Emoji column - fixed width for alignment */
-.field-table td:first-child {
-  width: 6ch;
-  text-align: center;
-}
-
-.field-table th:first-child {
-  text-align: center;
 }
 
 /* Footer */
