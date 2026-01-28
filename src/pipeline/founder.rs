@@ -51,22 +51,22 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
 
     // Show table
     println!();
-    println!(
-        "  \x1b[90m{:<5} {:<3} {:<4} {:<7} WORK\x1b[0m",
-        "ID", "GR", "SOLO", "SKILL"
-    );
+    println!("  \x1b[90m{:<5} {:<10} WORK\x1b[0m", "ID", "STATUS");
     for (i, ingot) in ingots.iter().enumerate() {
         if i >= 10 {
             break;
         }
-        let solo_sym = if ingot.solo { "∥" } else { "→" };
+        let status_display = match ingot.status {
+            crate::sexp::Status::Ore => "\x1b[90m🧱 ore\x1b[0m",
+            crate::sexp::Status::Molten => "\x1b[38;5;208m🔥 hot\x1b[0m",
+            crate::sexp::Status::Forged => "✅ done",
+            crate::sexp::Status::Cracked => "\x1b[31m❌ fail\x1b[0m",
+        };
         println!(
-            "  \x1b[38;5;208m{:<5}\x1b[0m {:<3} {:<4} {:<7} {}",
+            "  \x1b[38;5;208m{:<5}\x1b[0m {:<10} {}",
             ingot.id,
-            ingot.grade,
-            solo_sym,
-            ingot.skill,
-            tui::truncate(&ingot.work, 38),
+            status_display,
+            tui::truncate(&ingot.work, 55),
         );
     }
     if count > 10 {

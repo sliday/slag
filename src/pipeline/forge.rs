@@ -47,11 +47,17 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
                 .filter_map(|id| crucible.get(id).cloned())
                 .collect();
 
-            println!(
-                "\n  \x1b[38;5;208m⚒\x1b[38;5;220m⚒\x1b[1;37m⚒\x1b[0m \x1b[90m{} anvils:\x1b[0m \x1b[1;37m{}\x1b[0m",
-                solo_ids.len(),
-                solo_ids.join(" "),
-            );
+            println!("\n  \x1b[38;5;208m⚒ ANVILS [{}]\x1b[0m", solo_ids.len());
+            let last_idx = ingot_snapshots.len().saturating_sub(1);
+            for (i, ingot) in ingot_snapshots.iter().enumerate() {
+                let prefix = if i == last_idx { "└─" } else { "├─" };
+                println!(
+                    "  \x1b[90m{}\x1b[0m \x1b[1;37m{}\x1b[0m  \x1b[38;5;208m◐\x1b[0m forging...  \x1b[90m{}\x1b[0m",
+                    prefix,
+                    ingot.id,
+                    tui::truncate(&ingot.work, 40),
+                );
+            }
 
             // Spawn parallel tasks
             let mut set = tokio::task::JoinSet::new();
@@ -179,7 +185,11 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
             4 => "\x1b[38;5;220m",
             _ => "\x1b[1;37m",
         };
-        print!("    {hc}⚒ {heat}/{}\x1b[0m ", ingot.max);
+        print!(
+            "    {hc}{} {heat}/{}\x1b[0m ",
+            tui::heat_bar(heat, ingot.max),
+            ingot.max
+        );
 
         let flux_text = flux::prepare_flux(ingot, slag.as_deref());
         log_to_file(&format!("FLUX_{}_{heat}", ingot.id), &flux_text);
@@ -213,7 +223,7 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
             Some(c) => c,
             None => {
                 slag = Some("NO CMD: line in response".into());
-                println!("\x1b[31m✗\x1b[0m no CMD");
+                println!("\x1b[31m✗\x1b[0m smith output missing \"CMD:\" line");
                 continue;
             }
         };
@@ -234,7 +244,10 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
                 let (proof_ok, proof_output) = proof::run_shell(&ingot.proof).await;
                 if !proof_ok {
                     slag = Some(format!("Proof failed [{}]: {proof_output}", ingot.proof));
-                    println!("\x1b[31m✗\x1b[0m impure");
+                    println!(
+                        "\x1b[31m✗\x1b[0m proof failed: {} (exit 1)",
+                        tui::truncate(&ingot.proof, 30)
+                    );
                     continue;
                 }
             }

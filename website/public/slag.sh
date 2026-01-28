@@ -171,7 +171,7 @@ header() {
 status_line() { printf "  ${2}%s${NC} %s\n" "$1" "$3"; }
 
 ingot_status() {
-    local total forged cracked molten ore
+    local total forged cracked molten ore pct
     total=$(grep -c "^(ingot" "$CRUCIBLE" 2>/dev/null) || total=0
     forged=$(grep -c ":status forged" "$CRUCIBLE" 2>/dev/null) || forged=0
     cracked=$(grep -c ":status cracked" "$CRUCIBLE" 2>/dev/null) || cracked=0
@@ -181,12 +181,14 @@ ingot_status() {
     cracked=${cracked//[^0-9]/}; cracked=${cracked:-0}
     molten=${molten//[^0-9]/}; molten=${molten:-0}
     ore=$((total - forged - cracked - molten))
+    [[ $total -eq 0 ]] && total=1
+    pct=$((forged * 100 / total))
     printf "${GRAY}[${NC}"
-    printf "${PURE}█%d${NC} " "$forged"
-    printf "${HOT}▣%d${NC} " "$molten"
-    printf "${COLD}░%d${NC}" "$ore"
-    [[ $cracked -gt 0 ]] && printf " ${RED}✗%d${NC}" "$cracked"
-    printf "${GRAY}]${NC}"
+    printf " ✅%d " "$forged"
+    printf "${HOT}🔥%d${NC} " "$molten"
+    printf "${COLD}🧱%d${NC}" "$ore"
+    [[ $cracked -gt 0 ]] && printf " ${RED}❌%d${NC}" "$cracked"
+    printf "${GRAY}]${NC} ${WHITE}%d%%${NC}" "$pct"
 }
 
 temper_bar() {
@@ -255,6 +257,30 @@ sexp_get_quoted() {
 
 truncate_str() {
     [[ ${#1} -gt $2 ]] && echo "${1:0:$2}..." || echo "$1"
+}
+
+heat_bar() {
+    local current="$1" max="$2" i
+    printf "["
+    for ((i=1; i<=max; i++)); do
+        if ((i <= current)); then printf "▪"; else printf "▫"; fi
+    done
+    printf "]"
+}
+
+show_legend() {
+    printf "  ${GRAY}LEGEND:${NC} 🧱 queued  🔥 forging  ✅ done  ❌ failed\n"
+}
+
+format_elapsed() {
+    local secs="$1"
+    local mins=$((secs / 60))
+    local remaining_secs=$((secs % 60))
+    if ((mins > 0)); then
+        printf "%dm%02ds" "$mins" "$remaining_secs"
+    else
+        printf "%ds" "$remaining_secs"
+    fi
 }
 
 # Detect if output contains questions (needs self-iteration)
@@ -482,20 +508,22 @@ OUTPUT ONLY S-EXPRESSIONS:"
     
     status_line "█" "$PURE" "Mold: ${WHITE}$count${NC} ingots (${GRAY}$simple simple${NC}, ${YELLOW}$complex complex${NC}, ${ORANGE}$web web${NC})"
     echo ""
-    printf "  ${GRAY}%-5s %-3s %-4s %-7s %s${NC}\n" "ID" "GR" "SOLO" "SKILL" "WORK"
+    printf "  ${GRAY}%-5s %-10s %s${NC}\n" "ID" "STATUS" "WORK"
     local shown=0
     while IFS= read -r t; do
         [[ $shown -ge 10 ]] && break
-        local tid tgr tsolo tskill tdesc gc sc
+        local tid tstatus tdesc status_emoji
         tid=$(sexp_get_quoted "$t" "id")
-        tgr=$(sexp_get "$t" "grade"); tgr=${tgr:-1}
-        tsolo=$(sexp_get "$t" "solo")
-        tskill=$(sexp_get "$t" "skill"); tskill=${tskill:-default}
+        tstatus=$(sexp_get "$t" "status"); tstatus=${tstatus:-ore}
         tdesc=$(sexp_get_quoted "$t" "work")
-        [[ "$tsolo" == "t" ]] && tsolo="∥" || tsolo="→"
-        gc="$GRAY"; ((tgr == 2)) && gc="$ORANGE"; ((tgr >= 3)) && gc="$YELLOW"; ((tgr >= 4)) && gc="$WHITE"
-        sc="$GRAY"; [[ "$tskill" == "web" ]] && sc="$ORANGE"
-        printf "  ${ORANGE}%-5s${NC} ${gc}%-3s${NC} %-4s ${sc}%-7s${NC} %s\n" "$tid" "$tgr" "$tsolo" "$tskill" "$(truncate_str "$tdesc" 38)"
+        case "$tstatus" in
+            ore)     status_emoji="${COLD}🧱 ore${NC}" ;;
+            molten)  status_emoji="${HOT}🔥 hot${NC}" ;;
+            forged)  status_emoji="✅ done" ;;
+            cracked) status_emoji="${RED}❌ fail${NC}" ;;
+            *)       status_emoji="${GRAY}$tstatus${NC}" ;;
+        esac
+        printf "  ${ORANGE}%-5s${NC} %-10s %s\n" "$tid" "$status_emoji" "$(truncate_str "$tdesc" 55)"
         ((shown++))
     done <<< "$ingots"
     [[ $count -gt 10 ]] && printf "  ${GRAY}+%d more${NC}\n" $((count - 10))
@@ -599,7 +627,7 @@ strike_ingot() {
         sed_i "s/:id \"$id\" \(.*\):heat [0-9]*/:id \"$id\" \1:heat $heat/" "$CRUCIBLE"
         
         local hc="$RED"; ((heat > 2)) && hc="$ORANGE"; ((heat > 3)) && hc="$YELLOW"; ((heat > 4)) && hc="$WHITE"
-        printf "    ${hc}⚒ %d/%d${NC} " "$heat" "$max"
+        printf "    ${hc}%s %d/%d${NC} " "$(heat_bar "$heat" "$max")" "$heat" "$max"
         
         local flux response cmd
         flux=$(prepare_flux "$ingot_sexp" "$slag")
@@ -617,7 +645,7 @@ strike_ingot() {
         cmd=$(echo "$response" | grep "^CMD:" | tail -1 | sed 's/^CMD: *//')
         if [[ -z "$cmd" ]]; then
             slag="NO CMD: line in response"
-            printf "${RED}✗${NC} no CMD\n"
+            printf "${RED}✗${NC} smith output missing \"CMD:\" line\n"
             continue
         fi
         
@@ -633,7 +661,7 @@ $output"
                 set +e; output=$(eval "$proof" 2>&1); exit_code=$?; set -e
                 if [[ $exit_code -ne 0 ]]; then
                     slag="Proof failed [$proof]: $output"
-                    printf "${RED}✗${NC} impure\n"
+                    printf "${RED}✗${NC} proof failed: %s (exit %d)\n" "$(truncate_str "$proof" 30)" "$exit_code"
                     continue
                 fi
             fi
@@ -796,18 +824,19 @@ $(tail -50 "$logfile")
 # ═══════════════════════════════════════════════════════════════════════════
 
 run_anvils() {
-    local pids=() ids=() count=0 ingots
+    local pids=() ids=() works=() count=0 ingots
     ingots=$(grep ":status ore" "$CRUCIBLE" | grep ":solo t" || true)
     [[ -z "$ingots" ]] && return 1
-    
+
     while IFS= read -r ingot; do
         [[ -z "$ingot" || $count -ge $MAX_ANVILS ]] && continue
         local id=$(sexp_get_quoted "$ingot" "id")
+        local work=$(sexp_get_quoted "$ingot" "work")
         [[ "$(sexp_get "$ingot" "solo")" != "t" ]] && continue
-        
+
         # Mark as molten before spawning
         sed_i "s/:id \"$id\" :status ore/:id \"$id\" :status molten/" "$CRUCIBLE"
-        
+
         # Spawn anvil (subshell)
         (
             if strike_ingot "$ingot"; then
@@ -819,11 +848,17 @@ run_anvils() {
                 sed_i "s/:id \"$id\" :status molten/:id \"$id\" :status cracked/" "$CRUCIBLE"
             fi
         ) &
-        pids+=($!); ids+=("$id"); ((count++))
+        pids+=($!); ids+=("$id"); works+=("$work"); ((count++))
     done <<< "$ingots"
-    
+
     if [[ ${#pids[@]} -gt 0 ]]; then
-        printf "\n  ${ORANGE}⚒${NC}${YELLOW}⚒${NC}${WHITE}⚒${NC} ${GRAY}%d anvils:${NC} ${WHITE}%s${NC}\n" "${#pids[@]}" "${ids[*]}"
+        printf "\n  ${HOT}⚒ ANVILS [%d]${NC}\n" "${#pids[@]}"
+        local last=$((${#ids[@]} - 1))
+        for i in "${!ids[@]}"; do
+            local prefix="├─"
+            [[ $i -eq $last ]] && prefix="└─"
+            printf "  ${GRAY}%s${NC} ${WHITE}%s${NC}  ${HOT}◐${NC} forging...  ${GRAY}%s${NC}\n" "$prefix" "${ids[$i]}" "$(truncate_str "${works[$i]}" 40)"
+        done
         for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
         return 0
     fi
@@ -904,15 +939,19 @@ check_forge() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 show_assay() {
-    local total forged cracked
+    local total forged cracked elapsed
     total=$(grep -c "^(ingot" "$CRUCIBLE" 2>/dev/null) || total=0
     forged=$(grep -c ":status forged" "$CRUCIBLE" 2>/dev/null) || forged=0
     cracked=$(grep -c ":status cracked" "$CRUCIBLE" 2>/dev/null) || cracked=0
     total=${total//[^0-9]/}; forged=${forged//[^0-9]/}; cracked=${cracked//[^0-9]/}
-    
+
     header "ASSAY"
     printf "  ${WHITE}%d${NC} ingots  ${PURE}%d${NC} forged" "$total" "$forged"
     [[ $cracked -gt 0 ]] && printf "  ${RED}%d${NC} cracked" "$cracked"
+    if [[ -n "$FORGE_START" ]]; then
+        elapsed=$(($(date +%s) - FORGE_START))
+        printf "  ${GRAY}⏱ %s${NC}" "$(format_elapsed $elapsed)"
+    fi
     echo ""
     temper_bar
     
@@ -952,7 +991,9 @@ fi
 [[ ! -f "$CRUCIBLE" ]] || ! grep -q "^(ingot" "$CRUCIBLE" && run_founder
 
 # Phase 3: Forge
+FORGE_START=$(date +%s)
 header "FORGE"
+show_legend
 printf "  "; ingot_status; echo ""
 
 while true; do

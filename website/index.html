@@ -285,6 +285,11 @@ EOF</code>
               <td>Max retries before cracking</td>
             </tr>
             <tr>
+              <td><code>:smelt</code></td>
+              <td>0-1</td>
+              <td>Re-smelt count (0 = never re-smelted, 1 = re-smelted once)</td>
+            </tr>
+            <tr>
               <td><code>:proof</code></td>
               <td>shell command</td>
               <td>Acceptance test (exit 0 = pass)</td>
@@ -300,7 +305,52 @@ EOF</code>
 
       <div is="separator"></div>
 
-      <!-- S10: FOOTER -->
+      <!-- S11: PROGRESS DISPLAY -->
+      <section>
+        <h2>Progress Display</h2>
+        <p>slag uses emoji indicators to show ingot status at a glance:</p>
+        <div class="quickstart-box" box="square">
+          <div class="cmd-line">
+            <code style="font-size: 1.1rem;">[ ✅3  🔥1  🧱5 ] 37%</code>
+          </div>
+        </div>
+        <table class="field-table" style="margin-top: 1lh;">
+          <thead>
+            <tr>
+              <th>Emoji</th>
+              <th>Status</th>
+              <th>Meaning</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>🧱</td>
+              <td>queued</td>
+              <td>Ingot is ore, waiting to be forged</td>
+            </tr>
+            <tr>
+              <td>🔥</td>
+              <td>forging</td>
+              <td>Ingot is molten, currently being worked</td>
+            </tr>
+            <tr>
+              <td>✅</td>
+              <td>done</td>
+              <td>Ingot is forged, proof passed</td>
+            </tr>
+            <tr>
+              <td>❌</td>
+              <td>failed</td>
+              <td>Ingot cracked after exhausting all heats</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="margin-top: 1lh;">The percentage shows overall progress: forged ingots ÷ total ingots.</p>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S12: FOOTER -->
       <footer class="footer" box="square">
         <div class="temp-bar" style="margin-top:0; margin-bottom: 0.5lh;">
           <span style="color: var(--slag-cold);">&#x25B1;&#x25B1;&#x25B1;</span><span style="color: var(--slag-warm);">&#x25B0;</span><span style="color: var(--slag-hot);">&#x25B0;</span><span style="color: var(--slag-bright);">&#x25B0;</span><span style="color: var(--slag-pure);">&#x25B0;</span>

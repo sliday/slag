@@ -7,7 +7,7 @@ use crate::sexp::Status;
 use crate::tui;
 
 /// Phase 4: Final report
-pub fn show() -> Result<(), SlagError> {
+pub fn show(elapsed_secs: Option<u64>) -> Result<(), SlagError> {
     let crucible = Crucible::load(Path::new(CRUCIBLE))?;
     let counts = crucible.counts();
 
@@ -19,6 +19,9 @@ pub fn show() -> Result<(), SlagError> {
     );
     if counts.cracked > 0 {
         print!("  \x1b[31m{}\x1b[0m cracked", counts.cracked);
+    }
+    if let Some(secs) = elapsed_secs {
+        print!("  \x1b[90m⏱ {}\x1b[0m", tui::format_elapsed(secs));
     }
     println!();
 

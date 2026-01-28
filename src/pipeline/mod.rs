@@ -39,7 +39,9 @@ pub async fn run(
     }
 
     // Phase 3: Forge
+    let forge_start = std::time::Instant::now();
     tui::header("FORGE");
+    tui::show_legend();
     let crucible = Crucible::load(crucible_path)?;
     let counts = crucible.counts();
     print!("  ");
@@ -49,7 +51,8 @@ pub async fn run(
     forge::run(config, max_anvils).await?;
 
     // Phase 4: Assay
-    assay::show()?;
+    let elapsed_secs = forge_start.elapsed().as_secs();
+    assay::show(Some(elapsed_secs))?;
 
     Ok(())
 }

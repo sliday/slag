@@ -62,14 +62,16 @@ pub fn show_banner() {
 }
 
 pub fn ingot_status_line(counts: &CrucibleCounts) {
+    let total = counts.total.max(1);
+    let pct = counts.forged * 100 / total;
     print!("{}[{}", fg(COLD), reset());
-    print!("{}█{}{} ", fg(PURE), counts.forged, reset());
-    print!("{}▣{}{} ", fg(HOT), counts.molten, reset());
-    print!("{}░{}{}", fg(COLD), counts.ore, reset());
+    print!(" ✅{} ", counts.forged);
+    print!("{}🔥{}{} ", fg(HOT), counts.molten, reset());
+    print!("{}🧱{}{}", fg(COLD), counts.ore, reset());
     if counts.cracked > 0 {
-        print!(" {}✗{}{}", fg(WARM), counts.cracked, reset());
+        print!(" {}❌{}{}", fg(WARM), counts.cracked, reset());
     }
-    print!("{}]{}", fg(COLD), reset());
+    print!("{}]{} {}{}%{}", fg(COLD), reset(), fg(PURE), pct, reset());
 }
 
 pub fn temper_bar(counts: &CrucibleCounts) {
@@ -138,6 +140,20 @@ pub fn heat_color(heat: u8) -> Color {
     }
 }
 
+/// Create a heat bar visualization like [▪▪▫▫▫]
+pub fn heat_bar(current: u8, max: u8) -> String {
+    let mut bar = String::from("[");
+    for i in 1..=max {
+        if i <= current {
+            bar.push('▪');
+        } else {
+            bar.push('▫');
+        }
+    }
+    bar.push(']');
+    bar
+}
+
 /// Grade color for display
 pub fn grade_color(grade: u8) -> Color {
     match grade {
@@ -151,6 +167,22 @@ pub fn grade_color(grade: u8) -> Color {
 /// Flush stdout
 pub fn flush() {
     let _ = std::io::stdout().flush();
+}
+
+/// Show the legend for ingot status emoji
+pub fn show_legend() {
+    println!("  {}LEGEND:{} 🧱 queued  🔥 forging  ✅ done  ❌ failed", fg(COLD), reset());
+}
+
+/// Format elapsed time as "Xm YYs" or "Xs"
+pub fn format_elapsed(secs: u64) -> String {
+    let mins = secs / 60;
+    let remaining_secs = secs % 60;
+    if mins > 0 {
+        format!("{mins}m{remaining_secs:02}s")
+    } else {
+        format!("{secs}s")
+    }
 }
 
 // Helper to create crossterm foreground color string
