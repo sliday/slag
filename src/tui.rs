@@ -171,7 +171,11 @@ pub fn flush() {
 
 /// Show the legend for ingot status emoji
 pub fn show_legend() {
-    println!("  {}LEGEND:{} 🧱 queued  🔥 forging  ✅ done  ❌ failed", fg(COLD), reset());
+    println!(
+        "  {}LEGEND:{} 🧱 queued  🔥 forging  ✅ done  ❌ failed",
+        fg(COLD),
+        reset()
+    );
 }
 
 /// Format elapsed time as "Xm YYs" or "Xs"
