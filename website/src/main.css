@@ -86,6 +86,47 @@ a:hover {
   margin-top: 1lh;
 }
 
+/* Workflow bar with subtle tints */
+.workflow-bar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 0.25em;
+  letter-spacing: normal;
+}
+
+.workflow-item {
+  padding: 0.15em 0.5em;
+  border-radius: 3px;
+  color: var(--foreground1);
+}
+
+.workflow-arrow {
+  color: var(--foreground2);
+  padding: 0 0.15em;
+}
+
+.workflow-ore {
+  background: rgba(107, 115, 133, 0.15);
+}
+
+.workflow-forge {
+  background: rgba(255, 153, 64, 0.12);
+}
+
+.workflow-done {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.workflow-fail {
+  background: rgba(224, 108, 117, 0.12);
+}
+
+.workflow-resmelt {
+  background: rgba(255, 153, 64, 0.1);
+}
+
 /* Hero install box */
 .install-hero {
   padding: 1.5ch 2ch;
@@ -163,33 +204,44 @@ a:hover {
   color: var(--slag-hot);
 }
 
-/* Copy button */
+/* Copy button - minimal SVG icon */
 .copy-btn {
   position: absolute;
-  top: 0.25lh;
-  right: 0.5ch;
-  background: var(--background2);
-  color: var(--foreground1);
-  border: 1px solid var(--foreground2);
-  font-family: var(--font-family);
-  font-size: 0.75rem;
-  padding: 0.25lh 1ch;
+  top: 50%;
+  transform: translateY(-50%);
+  right: 1ch;
+  background: none;
+  color: var(--foreground2);
+  border: none;
+  padding: 0.25em;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  opacity: 0.5;
+  transition: opacity 0.2s, color 0.2s;
+}
+
+.cmd-line:hover .copy-btn {
+  opacity: 1;
 }
 
 .copy-btn:hover {
   color: var(--slag-bright);
-  border-color: var(--slag-bright);
 }
 
 .copy-btn:focus {
   outline: none;
-  text-decoration: none;
+}
+
+.copy-btn,
+.cmd-line[style*="cursor"],
+[data-copy] {
+  cursor: pointer;
 }
 
 /* Pipeline diagrams */
 .diagram pre {
-  padding: 2ch;
+  padding: 2lh 2ch;
   overflow-x: auto;
   font-size: 0.8125rem;
   line-height: 1.4;
@@ -211,6 +263,23 @@ a:hover {
 
 .phase-card {
   padding: 1ch;
+}
+
+/* Phase card subtle background tints */
+.phase-card:nth-child(1) {
+  background: rgba(107, 115, 133, 0.08);
+}
+
+.phase-card:nth-child(2) {
+  background: rgba(255, 153, 64, 0.06);
+}
+
+.phase-card:nth-child(3) {
+  background: rgba(255, 216, 102, 0.05);
+}
+
+.phase-card:nth-child(4) {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .phase-num {
@@ -323,21 +392,44 @@ a:hover {
 .field-table {
   width: 100%;
   font-size: 0.8125rem;
+  border-collapse: collapse;
+  margin-top: 1lh;
+}
+
+.field-table thead {
+  border-bottom: 1px solid var(--slag-cold);
 }
 
 .field-table th {
   text-align: left;
   color: var(--slag-bright);
-  padding: 0.5lh 1.5ch;
+  padding: 0.75lh 2ch;
+  font-weight: normal;
+  font-style: italic;
 }
 
 .field-table td {
   vertical-align: top;
-  padding: 0.5lh 1.5ch;
+  padding: 0.75lh 2ch;
+  border-bottom: 1px solid var(--background3);
+}
+
+.field-table tbody tr:last-child td {
+  border-bottom: none;
 }
 
 .field-table code {
   color: var(--slag-hot);
+}
+
+/* Emoji column - fixed width for alignment */
+.field-table td:first-child {
+  width: 6ch;
+  text-align: center;
+}
+
+.field-table th:first-child {
+  text-align: center;
 }
 
 /* Footer */
@@ -407,3 +499,72 @@ a:hover {
     right: 2ch;
   }
 }
+
+/* FORGE HEADER FIRE EFFECTS */
+
+.forge-header {
+  position: relative;
+  overflow: visible;
+  animation: forge-breathe 4s ease-in-out infinite;
+}
+
+@keyframes forge-breathe {
+  0%, 100% { box-shadow: 0 0 6px rgba(255,152,64,0.15), 0 0 12px rgba(255,152,64,0.05); }
+  50% { box-shadow: 0 0 10px rgba(255,152,64,0.2), 0 0 20px rgba(255,152,64,0.08); }
+}
+
+.forge-effects { position: absolute; inset: 0; pointer-events: none; z-index: 0; overflow: visible; }
+.forge-header > *:not(.forge-effects) { position: relative; z-index: 1; }
+
+/* Logo - no pre tag, no gray bg */
+.hero-logo { font-size: 2.5rem; text-align: center; line-height: 1.2; position: relative; z-index: 1; }
+
+/* SVG glow */
+.forge-glow-svg { position: absolute; inset: -4px; width: calc(100% + 8px); height: calc(100% + 8px); }
+
+/* Edge glow */
+.edge-glow { opacity: 0.3; animation: edge-pulse 3s ease-in-out infinite; }
+.edge-top { animation-delay: 0s; }
+.edge-right { animation-delay: 0.75s; }
+.edge-bottom { animation-delay: 1.5s; }
+.edge-left { animation-delay: 2.25s; }
+@keyframes edge-pulse { 0%, 100% { opacity: 0.2; } 50% { opacity: 0.4; } }
+
+/* Flying Sparks - smaller, more fierce */
+.spark {
+  position: absolute; width: 2px; height: 2px; background: var(--slag-bright); border-radius: 50%;
+  box-shadow: 0 0 4px var(--slag-bright), 0 0 8px var(--slag-hot); opacity: 0;
+}
+.spark-1 { left: 20%; top: 0; animation: spark-fly-up 3s ease-out infinite; }
+.spark-2 { left: 50%; top: 0; animation: spark-fly-up 3s ease-out infinite 0.25s; }
+.spark-3 { left: 80%; top: 0; animation: spark-fly-up 3s ease-out infinite 0.5s; }
+.spark-4 { right: 0; top: 25%; animation: spark-fly-right 3s ease-out infinite 0.1s; }
+.spark-5 { right: 0; top: 50%; animation: spark-fly-right 3s ease-out infinite 0.35s; }
+.spark-6 { right: 0; top: 75%; animation: spark-fly-right 3s ease-out infinite 0.6s; }
+.spark-7 { left: 25%; bottom: 0; animation: spark-fly-down 3s ease-out infinite 0.15s; }
+.spark-8 { left: 55%; bottom: 0; animation: spark-fly-down 3s ease-out infinite 0.4s; }
+.spark-9 { left: 85%; bottom: 0; animation: spark-fly-down 3s ease-out infinite 0.65s; }
+.spark-10 { left: 0; top: 30%; animation: spark-fly-left 3s ease-out infinite 0.2s; }
+.spark-11 { left: 0; top: 55%; animation: spark-fly-left 3s ease-out infinite 0.45s; }
+.spark-12 { left: 0; top: 80%; animation: spark-fly-left 3s ease-out infinite 0.7s; }
+
+/* Rhythmic burst - sparks visible 25% of cycle (0.75s), invisible 75% */
+@keyframes spark-fly-up { 0% { opacity: 0; transform: translate(0,0) scale(0.5); } 5% { opacity: 1; transform: translate(0,-5px) scale(1); } 25% { opacity: 0; transform: translate(10px,-40px) scale(0.2); } 100% { opacity: 0; } }
+@keyframes spark-fly-right { 0% { opacity: 0; transform: translate(0,0) scale(0.5); } 5% { opacity: 1; transform: translate(5px,0) scale(1); } 25% { opacity: 0; transform: translate(40px,-15px) scale(0.2); } 100% { opacity: 0; } }
+@keyframes spark-fly-down { 0% { opacity: 0; transform: translate(0,0) scale(0.5); } 5% { opacity: 1; transform: translate(0,5px) scale(1); } 25% { opacity: 0; transform: translate(-8px,35px) scale(0.2); } 100% { opacity: 0; } }
+@keyframes spark-fly-left { 0% { opacity: 0; transform: translate(0,0) scale(0.5); } 5% { opacity: 1; transform: translate(-5px,0) scale(1); } 25% { opacity: 0; transform: translate(-35px,-10px) scale(0.2); } 100% { opacity: 0; } }
+
+/* Floating Embers - hidden (too distracting) */
+.ember { display: none; }
+
+/* Heat shimmer */
+.forge-header::before { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 0%, rgba(255,152,64,0.01) 30%, rgba(255,216,102,0.015) 50%, rgba(255,152,64,0.01) 70%, transparent 100%); animation: heat-wave 8s ease-in-out infinite; pointer-events: none; z-index: 0; }
+@keyframes heat-wave { 0%, 100% { opacity: 0.2; } 50% { opacity: 0.3; } }
+
+/* Hover boost */
+.forge-header:hover { animation: forge-breathe-intense 2s ease-in-out infinite; }
+.forge-header:hover .spark { animation-duration: 2s; }
+@keyframes forge-breathe-intense { 0%, 100% { box-shadow: 0 0 8px rgba(255,152,64,0.2), 0 0 15px rgba(255,152,64,0.1); } 50% { box-shadow: 0 0 12px rgba(255,152,64,0.25), 0 0 25px rgba(255,152,64,0.12); } }
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) { .forge-header, .forge-header::before { animation: none; } .spark, .ember { display: none; } .edge-glow { animation: none; opacity: 0.6; } }

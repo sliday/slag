@@ -12,14 +12,60 @@
     <div id="app">
 
       <!-- S1: HERO -->
-      <header box="double" style="padding: 2ch;">
-<pre class="hero-logo" style="margin: 0; line-height: 1.2; font-size: 1.5rem;">
-<span style="color: var(--slag-cold);">░░░</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-pure);">█</span>  <span style="color: var(--slag-pure); font-weight: bold;">SLAG</span>  <span style="color: var(--slag-pure);">█</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-cold);">░░░</span>
-</pre>
-        <p style="color: var(--slag-pure); margin-top: 1lh; font-size: 1.1rem; font-weight: bold;">Smelt ideas, skim the bugs, forge the product.</p>
-        <p style="margin-top: 0.5lh; color: var(--foreground1);">Task orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them via Claude agents with automatic retry, re-smelt recovery, and proof-based verification.</p>
-        <div class="temp-bar" style="margin-top: 1.5lh;">
-          <span style="color: var(--slag-cold);">🧱</span><span style="color: var(--foreground2);"> ore </span><span style="color: var(--foreground2);">&rarr;</span><span style="color: var(--slag-hot);"> 🔥</span><span style="color: var(--foreground2);"> forge </span><span style="color: var(--foreground2);">&rarr;</span><span style="color: var(--slag-pure);"> ✅</span><span style="color: var(--foreground2);"> done </span><span style="color: var(--foreground2);">&rarr;</span><span style="color: var(--slag-warm);"> ❌</span><span style="color: var(--foreground2);"> fail? </span><span style="color: var(--foreground2);">&rarr;</span><span style="color: var(--slag-hot);"> ♻️</span><span style="color: var(--foreground2);"> re-smelt</span>
+      <header class="forge-header" box="double" style="padding: 2ch 3ch; margin-bottom: 3lh;">
+        <!-- Forge Effects Layer -->
+        <div class="forge-effects" aria-hidden="true">
+          <svg class="forge-glow-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="edge-glow-h" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="transparent"/>
+                <stop offset="20%" stop-color="var(--slag-hot)"/>
+                <stop offset="50%" stop-color="var(--slag-bright)"/>
+                <stop offset="80%" stop-color="var(--slag-hot)"/>
+                <stop offset="100%" stop-color="transparent"/>
+              </linearGradient>
+              <linearGradient id="edge-glow-v" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stop-color="transparent"/>
+                <stop offset="20%" stop-color="var(--slag-hot)"/>
+                <stop offset="50%" stop-color="var(--slag-bright)"/>
+                <stop offset="80%" stop-color="var(--slag-hot)"/>
+                <stop offset="100%" stop-color="transparent"/>
+              </linearGradient>
+              <filter id="glow-blur">
+                <feGaussianBlur stdDeviation="2" result="blur"/>
+                <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+              </filter>
+            </defs>
+            <rect class="edge-glow edge-top" x="5" y="0" width="90" height="1" fill="url(#edge-glow-h)" filter="url(#glow-blur)"/>
+            <rect class="edge-glow edge-bottom" x="5" y="99" width="90" height="1" fill="url(#edge-glow-h)" filter="url(#glow-blur)"/>
+            <rect class="edge-glow edge-left" x="0" y="5" width="1" height="90" fill="url(#edge-glow-v)" filter="url(#glow-blur)"/>
+            <rect class="edge-glow edge-right" x="99" y="5" width="1" height="90" fill="url(#edge-glow-v)" filter="url(#glow-blur)"/>
+          </svg>
+          <!-- Flying Sparks -->
+          <div class="spark spark-1"></div><div class="spark spark-2"></div><div class="spark spark-3"></div>
+          <div class="spark spark-4"></div><div class="spark spark-5"></div><div class="spark spark-6"></div>
+          <div class="spark spark-7"></div><div class="spark spark-8"></div><div class="spark spark-9"></div>
+          <div class="spark spark-10"></div><div class="spark spark-11"></div><div class="spark spark-12"></div>
+          <!-- Floating Embers -->
+          <div class="ember ember-1"></div><div class="ember ember-2"></div><div class="ember ember-3"></div>
+          <div class="ember ember-4"></div><div class="ember ember-5"></div><div class="ember ember-6"></div>
+        </div>
+
+        <!-- Logo - div instead of pre (no gray bg) -->
+        <div class="hero-logo"><span style="color: var(--slag-cold);">░░░</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-pure);">█</span>  <span style="color: var(--slag-pure); font-weight: bold;">SLAG</span>  <span style="color: var(--slag-pure);">█</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-cold);">░░░</span></div>
+        <p style="color: var(--slag-pure); margin-top: 1lh; font-size: 1.1rem; font-weight: bold; text-align: center; position: relative; z-index: 1;">Smelt ideas, skim the bugs, forge the product.</p>
+        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Task orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them via Claude agents with automatic retry, re-smelt recovery, and proof-based verification.</p>
+        <div class="temp-bar workflow-bar" style="margin-top: 1.5lh; text-align: center; position: relative; z-index: 1;">
+          <span class="workflow-item workflow-ore"><span style="color: var(--slag-cold);">🧱</span> ore</span>
+          <span class="workflow-arrow">→</span>
+          <span class="workflow-item workflow-forge"><span style="color: var(--slag-hot);">🔥</span> forge</span>
+          <span class="workflow-arrow">→</span>
+          <span class="workflow-item workflow-done"><span style="color: var(--slag-pure);">✅</span> done</span>
+          <span class="workflow-arrow">→</span>
+          <span class="workflow-item workflow-fail"><span style="color: var(--slag-warm);">❌</span> fail?</span>
+          <span class="workflow-arrow">→</span>
+          <span class="workflow-item workflow-resmelt"><span style="color: var(--slag-hot);">♻️</span> re-smelt</span>
+          <span class="workflow-arrow">↩</span>
         </div>
       </header>
 
@@ -317,10 +363,10 @@ EOF</code>
         <p>slag uses emoji indicators to show ingot status at a glance:</p>
         <div class="quickstart-box" box="square">
           <div class="cmd-line">
-            <code style="font-size: 1.1rem;">[ ✅3  🔥1  🧱5 ] 37%</code>
+            <code style="font-size: 1.1rem;">[ <span style="color: var(--slag-pure);">✅</span>3  <span style="color: var(--slag-hot);">🔥</span>1  <span style="color: var(--slag-cold);">🧱</span>5 ] 37%</code>
           </div>
         </div>
-        <table class="field-table" style="margin-top: 1lh;">
+        <table class="field-table progress-table" style="margin-top: 1lh;">
           <thead>
             <tr>
               <th>Emoji</th>
@@ -330,22 +376,22 @@ EOF</code>
           </thead>
           <tbody>
             <tr>
-              <td>🧱</td>
+              <td><span style="color: var(--slag-warm);">🔶</span></td>
               <td>queued</td>
               <td>Ingot is ore, waiting to be forged</td>
             </tr>
             <tr>
-              <td>🔥</td>
+              <td><span style="color: var(--slag-hot);">🔥</span></td>
               <td>forging</td>
               <td>Ingot is molten, currently being worked</td>
             </tr>
             <tr>
-              <td>✅</td>
+              <td><span style="color: var(--slag-pure);">✅</span></td>
               <td>done</td>
               <td>Ingot is forged, proof passed</td>
             </tr>
             <tr>
-              <td>❌</td>
+              <td><span style="color: var(--slag-warm);">❌</span></td>
               <td>failed</td>
               <td>Ingot cracked after exhausting all heats</td>
             </tr>
