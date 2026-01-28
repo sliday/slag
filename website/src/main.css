@@ -1,0 +1,342 @@
+@import '@webtui/css';
+
+@layer base {
+  :root {
+    /* Cascadia Code for everything */
+    --font-family: 'Cascadia Code', monospace;
+
+    /* Slag backgrounds (cold → dark) */
+    --background0: #0a0e14;
+    --background1: #13171f;
+    --background2: #1f2430;
+    --background3: #2b3040;
+
+    /* Foreground levels */
+    --foreground0: #c7c7c7;
+    --foreground1: #6b7385;
+    --foreground2: #4f5b66;
+
+    /* Border colors */
+    --box-border-color: #6b7385;
+    --table-border-color: #6b7385;
+    --separator-color: #6b7385;
+
+    /* Slag palette — maps ANSI colors from slag.sh */
+    --slag-cold: #6b7385;    /* GRAY — dim/inactive */
+    --slag-warm: #e06c75;    /* RED — ore, cracked, errors */
+    --slag-hot: #ff9940;     /* ORANGE 208 — molten, in-progress */
+    --slag-bright: #ffd866;  /* YELLOW 220 — highlights, IDs */
+    --slag-pure: #ffffff;    /* WHITE — forged, success */
+  }
+}
+
+/* Page layout */
+body {
+  background: var(--background0);
+  color: var(--foreground0);
+  font-family: var(--font-family);
+  line-height: 1.6;
+  font-size: 14px;
+  padding: 2ch;
+}
+
+#app {
+  max-width: 80ch;
+  margin: 0 auto;
+}
+
+/* Section spacing */
+section {
+  margin-bottom: 3lh;
+}
+
+/* Headings */
+h1 {
+  color: var(--slag-pure);
+  font-size: 2rem;
+}
+
+h2 {
+  color: var(--slag-bright);
+  font-size: 1.125rem;
+  margin-bottom: 1lh;
+}
+
+h3 {
+  color: var(--foreground0);
+  font-size: 1rem;
+  margin-bottom: 0.5lh;
+}
+
+/* Links */
+a {
+  color: var(--slag-bright);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--slag-pure);
+  text-decoration: underline;
+}
+
+/* Hero temperature bar */
+.temp-bar {
+  font-size: 1.25rem;
+  letter-spacing: 0.15em;
+  margin-top: 1lh;
+}
+
+/* Quick start */
+.quickstart-box {
+  margin-top: 1lh;
+}
+
+.quickstart-box {
+  padding: 1ch;
+}
+
+.cmd-line {
+  position: relative;
+  padding: 0.25lh 1ch;
+  margin-bottom: 0.5lh;
+}
+
+.cmd-line:last-child {
+  margin-bottom: 0;
+}
+
+.cmd-comment {
+  display: block;
+  color: var(--slag-cold);
+}
+
+.cmd-line code {
+  display: block;
+}
+
+.download-btn {
+  display: inline-block;
+  margin-top: 1lh;
+  padding: 0.5lh 2ch;
+  background: var(--background1);
+  color: var(--slag-bright);
+  font-family: var(--font-family);
+  font-size: 1rem;
+  cursor: pointer;
+  border: none;
+  text-decoration: none;
+}
+
+.download-btn:hover {
+  background: var(--background2);
+  color: var(--slag-pure);
+}
+
+.disclaimer {
+  margin-top: 1lh;
+  color: var(--foreground1);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.disclaimer code {
+  color: var(--slag-hot);
+}
+
+/* Copy button */
+.copy-btn {
+  position: absolute;
+  top: 0.25lh;
+  right: 0.5ch;
+  background: var(--background2);
+  color: var(--foreground1);
+  border: 1px solid var(--foreground2);
+  font-family: var(--font-family);
+  font-size: 0.75rem;
+  padding: 0.25lh 1ch;
+  cursor: pointer;
+}
+
+.copy-btn:hover {
+  color: var(--slag-bright);
+  border-color: var(--slag-bright);
+}
+
+/* Pipeline diagrams */
+.diagram pre {
+  padding: 2ch;
+  overflow-x: auto;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+/* Phase grid — 2-col on desktop */
+.phase-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1lh;
+  margin-top: 1lh;
+}
+
+@media (min-width: 72ch) {
+  .phase-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.phase-card {
+  padding: 1ch;
+}
+
+.phase-num {
+  display: inline-block;
+  min-width: 3ch;
+  text-align: center;
+  margin-right: 1ch;
+}
+
+.phase-name {
+  color: var(--slag-pure);
+  font-weight: bold;
+}
+
+.phase-desc {
+  margin-top: 0.5lh;
+  color: var(--foreground1);
+  line-height: 1.5;
+}
+
+/* Design decisions (accordions) */
+.decisions details {
+  margin-bottom: 1lh;
+  padding: 1ch;
+}
+
+.decisions summary {
+  cursor: pointer;
+  color: var(--slag-bright);
+  font-weight: bold;
+}
+
+.decisions summary:hover {
+  color: var(--slag-pure);
+}
+
+.decisions p {
+  margin-top: 0.5lh;
+  color: var(--foreground1);
+  line-height: 1.5;
+}
+
+/* Ingot cards */
+.ingot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1lh;
+}
+
+.ingot-card {
+  padding: 1ch;
+}
+
+.ingot-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5lh;
+}
+
+.ingot-id {
+  color: var(--slag-bright);
+  font-weight: bold;
+}
+
+/* Status badge colors */
+[is~="badge"].ore {
+  --badge-color: var(--slag-warm);
+}
+
+[is~="badge"].molten {
+  --badge-color: var(--slag-hot);
+}
+
+[is~="badge"].forged {
+  --badge-color: var(--slag-pure);
+}
+
+[is~="badge"].cracked {
+  --badge-color: var(--slag-warm);
+}
+
+.ingot-work {
+  margin-bottom: 0.5lh;
+}
+
+.ingot-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2ch;
+  color: var(--foreground1);
+  font-size: 0.8125rem;
+}
+
+.ingot-proof summary {
+  color: var(--foreground1);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  margin-top: 0.5lh;
+}
+
+.ingot-proof pre {
+  margin-top: 0.5lh;
+  padding: 0.5ch;
+  background: var(--background1);
+  overflow-x: auto;
+}
+
+/* Field reference table */
+.field-table {
+  width: 100%;
+  font-size: 0.8125rem;
+}
+
+.field-table th {
+  text-align: left;
+  color: var(--slag-bright);
+  padding: 0.5lh 1.5ch;
+}
+
+.field-table td {
+  vertical-align: top;
+  padding: 0.5lh 1.5ch;
+}
+
+.field-table code {
+  color: var(--slag-hot);
+}
+
+/* Footer */
+.footer {
+  text-align: center;
+  padding: 1ch;
+}
+
+.footer a {
+  color: var(--slag-cold);
+}
+
+.footer a:hover {
+  color: var(--slag-bright);
+}
+
+/* Responsive */
+@media (min-width: 640px) {
+  body {
+    font-size: 15px;
+    padding: 3ch;
+  }
+
+  h1 {
+    font-size: 2.5rem;
+  }
+}

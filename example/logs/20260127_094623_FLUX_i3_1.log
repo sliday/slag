@@ -1,0 +1,36 @@
+=== FORGE ORDER ===
+[i3] Configure wrangler for slag.dev deployment
+Heat: 0/5
+Proof: test -f slag/wrangler.toml && grep -q slag-dev slag/wrangler.toml
+
+=== ALLOY RECIPES (AGENTS.md) ===
+## Alloy Recipes
+
+=== CRUCIBLE (PLAN.md) ===
+;; CRUCIBLE Tue Jan 27 09:46:23 CET 2026
+(ingot :id "i1" :status molten :solo t :grade 1 :heat 1 :max 5 :proof "test -d slag" :work "Create slag project directory")
+(ingot :id "i2" :status molten :solo t :grade 1 :heat 1 :max 5 :proof "test -f slag/package.json && grep -q vite slag/package.json" :work "Initialize vite project in slag")
+(ingot :id "i3" :status molten :solo t :grade 1 :heat 1 :max 5 :proof "test -f slag/wrangler.toml && grep -q slag-dev slag/wrangler.toml" :work "Configure wrangler for slag.dev deployment")
+(ingot :id "i4" :status ore :solo nil :grade 1 :heat 0 :max 5 :proof "test -f slag/index.html && grep -q viewport slag/index.html" :work "Cast mobile-first HTML foundation")
+(ingot :id "i5" :status ore :solo nil :grade 2 :heat 0 :max 5 :proof "test -f slag/src/main.css && grep -q '@media' slag/src/main.css" :work "Forge terminal-ui styles with mobile breakpoints")
+(ingot :id "i6" :status ore :solo nil :grade 2 :heat 0 :max 5 :proof "test -f slag/src/main.js && node --check slag/src/main.js" :work "Build interactive terminal display logic")
+(ingot :id "i7" :status ore :solo nil :grade 1 :heat 0 :max 5 :proof "grep -q 'Usage:' slag/index.html || grep -q 'Usage:' slag/src/content.js" :work "Craft usage section at top with examples")
+(ingot :id "i8" :status ore :solo nil :grade 2 :heat 0 :max 5 :proof "test -f slag/src/content.js && grep -q 'ingot.*:status.*ore' slag/src/content.js" :work "Temper content with s-expression ingot examples")
+(ingot :id "i9" :status ore :solo nil :grade 1 :heat 0 :max 5 :proof "grep -q ':proof.*:work' slag/src/content.js || grep -q 'proof.*work' slag/index.html" :work "Document ingot field semantics below usage")
+(ingot :id "i10" :status ore :solo nil :grade 1 :heat 0 :max 5 :proof "test -f slag/src/palette.css && grep -q '#' slag/src/palette.css" :work "Apply color palette from reference image")
+(ingot :id "i11" :status ore :solo nil :grade 1 :heat 0 :max 5 :proof "npm --prefix slag run build" :work "Test production build compiles")
+(ingot :id "i12" :status ore :solo nil :grade 1 :heat 0 :max 5 :proof "grep -q 'slag bash orchestrator' slag/index.html" :work "Polish copy describing slag orchestrator purpose")
+
+=== SMITHY LEDGER (last 20) ===
+Furnace fired: Tue Jan 27 09:46:02 CET 2026
+
+=== RECENT WORKINGS ===
+No history
+
+=== SMITH INSTRUCTIONS ===
+1. Forge the ingot
+2. Create/modify files as needed
+3. Add useful techniques to ALLOY RECIPES (AGENTS.md)
+4. MUST end with: CMD: <shell command to proof the work>
+
+NO EXPLANATION. Forge and CMD only.

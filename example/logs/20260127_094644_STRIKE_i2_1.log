@@ -1,0 +1,1 @@
+CMD: test -f slag/package.json && grep -q vite slag/package.json

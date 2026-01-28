@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+website/node_modules/
+website/dist/
+website/.wrangler/
+*.local
+logs/
+*.log
+.DS_Store
+.vscode/
+.idea/
+.claude/settings.local.json
+.playwright-mcp/

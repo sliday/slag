@@ -1,0 +1,19 @@
+Looking at the context, I can see:
+- The HTML already has the terminal-ui content structure but is still using Vite's default JS
+- There's a color palette in the bash script: GRAY, RED, ORANGE, YELLOW, WHITE for terminal states
+- The ingot system uses s-expressions with specific fields (:id, :status, :solo, :grade, :heat, :max, :proof, :work)
+- Visual states: ore (cold/gray), molten (hot/orange), forged (pure/white)
+
+Let me ask one clarifying question to refine the design:
+
+**What level of interactivity do you want for the website?**
+
+A) **Static display** - Just showcase the system with example ingots (lighter weight, faster load, easier to maintain)
+
+B) **Live demo** - Interactive terminal that lets visitors try commands and see state changes (more engaging, shows the tool in action)
+
+C) **Documentation-focused** - Heavy on explanation with static examples and code snippets (best for learning)
+
+I'm leaning toward **A) Static display** because it matches the task description "cast mobile-first HTML foundation" and keeps scope minimal. The existing HTML structure already has examples and docs - we'd just need to wire up the styling and perhaps add animated examples of the ingot states.
+
+What do you think?

@@ -1,0 +1,1 @@
+CMD: test -d slag && test -f slag/package.json && grep -q vite slag/package.json && test -f slag/wrangler.toml && grep -q slag-dev slag/wrangler.toml

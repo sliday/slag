@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en" data-webtui-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2692;</text></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>slag - bash orchestrator</title>
+    <meta name="description" content="slag: Smelt ideas, skim the bugs, forge the product. A bash-based task orchestrator using metallurgical metaphors and AI-powered development workflows." />
+  </head>
+  <body>
+    <div id="app">
+
+      <!-- S1: HERO -->
+      <header box="double" style="padding: 2ch;">
+        <h1>slag</h1>
+        <p style="color: var(--foreground1); margin-top: 0.5lh;">Smelt ideas, skim the bugs, forge the product.</p>
+        <p style="margin-top: 0.5lh;">Bash orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them via Claude agents with automatic retry and proof-based verification.</p>
+        <div class="temp-bar">
+          <span style="color: var(--slag-cold);">&#x25B1;&#x25B1;&#x25B1;</span><span style="color: var(--slag-warm);">&#x25B0;</span><span style="color: var(--slag-hot);">&#x25B0;</span><span style="color: var(--slag-bright);">&#x25B0;</span><span style="color: var(--slag-pure);">&#x25B0;</span>
+          <span style="color: var(--foreground2); font-size: 0.75rem; letter-spacing: 0;">cold &rarr; hot &rarr; pure</span>
+        </div>
+      </header>
+
+      <div is="separator"></div>
+
+      <!-- S2: QUICK START -->
+      <section>
+        <h2>Quick Start</h2>
+        <div class="quickstart-box" box="square">
+          <div class="cmd-line">
+            <span class="cmd-comment"># download</span>
+            <code data-copy>curl -fsSL https://slag.dev/slag.sh -o slag && chmod +x slag</code>
+          </div>
+          <div class="cmd-line">
+            <span class="cmd-comment"># forge</span>
+            <code data-copy>./slag "Build a REST API with auth and rate limiting"</code>
+          </div>
+        </div>
+        <p class="disclaimer"><span style="color: var(--slag-warm);">&#x26A0;</span> Runs Claude with <code>--dangerously-skip-permissions</code>. Use at your own discretion.</p>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S3: PIPELINE DIAGRAM -->
+      <section class="diagram">
+        <h2>Pipeline</h2>
+<pre box="square">
+  PRD.md                                          PROGRESS.md
+  <span style="color:var(--slag-warm);">(ore)</span>                                             <span style="color:var(--slag-pure);">(ledger)</span>
+    |                                                 ^
+    v                                                 |
+ <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+--------------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+-------+</span>
+ <span style="color:var(--slag-cold);">|</span> <span style="color:var(--slag-bright);">SURVEYOR</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FOUNDER</span>      <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FORGE</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">ASSAY</span> <span style="color:var(--slag-cold);">|</span>
+ <span style="color:var(--slag-cold);">|</span> analyze   <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> cast ingots  <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> strike <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> report<span style="color:var(--slag-cold);">|</span>
+ <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+--------------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+-------+</span>
+    |                    |                    |
+    v                    v                    v
+ BLUEPRINT.md        PLAN.md             git commits
+ <span style="color:var(--foreground1);">(analysis)</span>        <span style="color:var(--foreground1);">(s-expr ingots)</span>      <span style="color:var(--foreground1);">(per ingot)</span>
+</pre>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S4: FORGE LOOP DETAIL -->
+      <section class="diagram">
+        <h2>Forge Loop</h2>
+<pre box="square">
+ <span style="color:var(--slag-bright);">PICK ORE</span>                       <span style="color:var(--slag-bright);">PARALLEL ANVILS</span>
+    |                           +---------+---------+
+    v                           |         |         |
+ :solo t? ----yes-----> <span style="color:var(--slag-hot);">ANVIL 1</span>   <span style="color:var(--slag-hot);">ANVIL 2</span>   <span style="color:var(--slag-hot);">ANVIL 3</span>
+    |                      |         |         |
+    no                     v         v         v
+    |                   (each anvil is independent subshell)
+    v
+ <span style="color:var(--slag-bright);">SELECT SMITH</span> by :skill + :grade
+    |
+    |  web/frontend --> +Playwright
+    |  grade >= 3   --> plan mode
+    |  default      --> base tools
+    v
+ <span style="color:var(--slag-hot);">STRIKE</span> (claude invocation)
+    |
+    v
+ <span style="color:var(--slag-cold);">CMD</span> (extract & run shell command)
+    |
+    v
+ <span style="color:var(--slag-bright);">PROOF</span> (run :proof shell command)
+    |
+    +----- pass ----> <span style="color:var(--slag-pure);">:forged</span>  + git commit
+    |
+    +----- fail ----> :heat++ retry with slag feedback
+    |
+    +----- max -----> <span style="color:var(--slag-warm);">:cracked</span> + halt
+</pre>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S5: FOUR PHASES -->
+      <section>
+        <h2>Four Phases</h2>
+        <div class="phase-grid">
+          <div class="phase-card" box="square">
+            <div>
+              <span is="badge" class="ore phase-num">1</span>
+              <span class="phase-name">SURVEYOR</span>
+            </div>
+            <p class="phase-desc">Deep analysis with plan mode. Reads PRD.md (ore), produces BLUEPRINT.md with architecture, dependency graph, risk assessment, and forging sequence. Self-iterates to resolve any ambiguity.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div>
+              <span is="badge" class="molten phase-num">2</span>
+              <span class="phase-name">FOUNDER</span>
+            </div>
+            <p class="phase-desc">Casts S-expression ingots from the blueprint. Each ingot has an ID, complexity grade, skill tag, proof command, and work description. Outputs PLAN.md as the crucible.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div>
+              <span is="badge" class="forged phase-num">3</span>
+              <span class="phase-name">FORGE</span>
+            </div>
+            <p class="phase-desc">Strikes each ingot via Claude. Solo ingots run on parallel anvils (up to 3). Selects smith by skill and grade. Retries with slag feedback on failure. Commits on success.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div>
+              <span is="badge" class="forged phase-num">4</span>
+              <span class="phase-name">ASSAY</span>
+            </div>
+            <p class="phase-desc">Final quality report. Shows forged/cracked counts, temperature bar, and identifies any cracked ingots. Exits 0 on full forge, 1 if any ingot cracked.</p>
+          </div>
+        </div>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S6: DESIGN DECISIONS -->
+      <section class="decisions">
+        <h2>Design Decisions</h2>
+
+        <details box="square">
+          <summary>Why S-Expressions?</summary>
+          <p>S-expressions are single-line, grep/sed parseable, require zero dependencies, and survive bash string handling. Every ingot is one line in PLAN.md. The entire orchestrator can manipulate state with sed_i without any JSON/YAML parser. Fields are keyword-prefixed (:id, :status) making them unambiguous to extract with pattern matching.</p>
+        </details>
+
+        <details box="square">
+          <summary>Why Parallel Anvils?</summary>
+          <p>Independent ingots (:solo t) run concurrently in background subshells, up to MAX_ANVILS=3. This gives 3x throughput for foundation tasks that have no dependencies. Each anvil gets its own smith process. Sequential ingots (:solo nil) run one at a time after parallel work completes.</p>
+        </details>
+
+        <details box="square">
+          <summary>Why Proof-Based Verification?</summary>
+          <p>Every ingot carries a :proof field containing a shell command. Exit code 0 means pass, anything else means fail. No human review needed. Proofs are concrete: "test -f file", "npm test", "grep -q pattern file". This enables fully autonomous forging with machine-verifiable quality gates.</p>
+        </details>
+
+        <details box="square">
+          <summary>Why Self-Iteration?</summary>
+          <p>When a surveyor or founder output contains questions, slag detects them and feeds the output back with instructions to resolve autonomously. Up to 3 rounds. This prevents the forge from stalling on ambiguity. The AI is instructed to make expert decisions rather than ask for clarification.</p>
+        </details>
+
+        <details box="square">
+          <summary>Why Metallurgical Metaphor?</summary>
+          <p>Unambiguous vocabulary that maps naturally to the pipeline. Ore (raw input) is surveyed, cast into ingots, heated in a forge, and either becomes forged steel or cracked waste. Every term has exactly one meaning. The temperature gradient (cold &rarr; hot &rarr; pure) maps to progress from unstarted to complete.</p>
+        </details>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S7: INGOT EXAMPLES (JS-rendered) -->
+      <section>
+        <h2>Ingot Examples</h2>
+        <div id="ingot-display" class="ingot-list"></div>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S8: FIELD REFERENCE -->
+      <section>
+        <h2>Field Reference</h2>
+        <table class="field-table">
+          <thead>
+            <tr>
+              <th>Field</th>
+              <th>Values</th>
+              <th>Meaning</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>:id</code></td>
+              <td>"i1", "i2", ...</td>
+              <td>Unique ingot identifier</td>
+            </tr>
+            <tr>
+              <td><code>:status</code></td>
+              <td>ore | molten | forged | cracked</td>
+              <td>Lifecycle state</td>
+            </tr>
+            <tr>
+              <td><code>:solo</code></td>
+              <td>t | nil</td>
+              <td>Can run in parallel (t) or must be sequential (nil)</td>
+            </tr>
+            <tr>
+              <td><code>:grade</code></td>
+              <td>1-5</td>
+              <td>Complexity level; grade &ge; 3 uses plan mode</td>
+            </tr>
+            <tr>
+              <td><code>:skill</code></td>
+              <td>web | api | cli | default</td>
+              <td>Selects smith tools/plugins</td>
+            </tr>
+            <tr>
+              <td><code>:heat</code></td>
+              <td>0-N</td>
+              <td>Current retry attempt</td>
+            </tr>
+            <tr>
+              <td><code>:max</code></td>
+              <td>5-8+</td>
+              <td>Max retries before cracking</td>
+            </tr>
+            <tr>
+              <td><code>:proof</code></td>
+              <td>shell command</td>
+              <td>Acceptance test (exit 0 = pass)</td>
+            </tr>
+            <tr>
+              <td><code>:work</code></td>
+              <td>string</td>
+              <td>Task description for the smith</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S9: FOOTER -->
+      <footer class="footer" box="square">
+        <div class="temp-bar" style="margin-top:0; margin-bottom: 0.5lh;">
+          <span style="color: var(--slag-cold);">&#x25B1;&#x25B1;&#x25B1;</span><span style="color: var(--slag-warm);">&#x25B0;</span><span style="color: var(--slag-hot);">&#x25B0;</span><span style="color: var(--slag-bright);">&#x25B0;</span><span style="color: var(--slag-pure);">&#x25B0;</span>
+        </div>
+        <p style="color: var(--foreground2);">
+          <a href="https://github.com/AestheticVoyager/slag">GitHub</a>
+          &middot;
+          <a href="/slag.sh" download="slag">Download</a>
+          &middot;
+          MIT License
+        </p>
+      </footer>
+
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

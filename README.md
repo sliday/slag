@@ -1,55 +1,89 @@
-# [slag](https://slag.dev)
-### Smelt ideas, skim the bugs, forge the product.**
+# slag
 
+[slag.dev](https://slag.dev)
+
+**Smelt ideas, skim the bugs, forge the product.**
+
+A task orchestrator for AI-powered development. Give it a product requirement, and it breaks it into verifiable tasks, executes them via Claude, and proves each one passed before moving on.
+
+![slag-promo](https://github.com/user-attachments/assets/d12def06-6eab-4236-9634-bbbd09be6683)
+
+## Install
+
+**Binary** (recommended):
+```bash
+curl -sSf https://raw.githubusercontent.com/sliday/slag/main/install.sh | sh
+```
+
+**Bash version** (no build required):
 ```bash
 curl -fsSL https://slag.dev/slag -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
 ```
 
+**From source**:
+```bash
+cargo install --git https://github.com/sliday/slag
 ```
-slag "Forge me an app"
-```
-
-![slag-promo](https://github.com/user-attachments/assets/d12def06-6eab-4236-9634-bbbd09be6683)
 
 ## Quick start
 
 ```bash
-# write your requirements
+# Write your requirements
 cat > PRD.md << 'EOF'
 Build a REST API with user authentication, rate limiting,
 and PostgreSQL storage. Include health check endpoint.
 EOF
 
-# forge
-slag
+# Forge it
+slag "Build the REST API from PRD.md"
 ```
 
-Or pass the commission directly:
+slag reads `PRD.md`, analyzes it, designs tasks, executes them, and proves each one works.
 
-```bash
-slag "Build a CLI tool that converts CSV to JSON"
+## Language
+
+slag uses metallurgical vocabulary. Here's the dictionary.
+
+### Nouns
+
+| Term | What it is | File/location |
+|------|-----------|---------------|
+| **Ore** | Raw requirements; the starting material | `PRD.md` |
+| **Ingot** | A single task encoded as an S-expression | One line in `PLAN.md` |
+| **Crucible** | The file holding all ingots | `PLAN.md` |
+| **Blueprint** | Architecture analysis and forging plan | `BLUEPRINT.md` |
+| **Anvil** | A parallel execution slot (background process) | In-memory |
+| **Smith** | The AI agent that does the work (Claude) | Claude CLI invocation |
+| **Slag heap** | Debug logs dumped during forging | `logs/` directory |
+| **Heat** | One attempt at forging an ingot (retry count) | `:heat` field |
+| **Grade** | Complexity rating (1-5); high grade = plan mode | `:grade` field |
+| **Proof** | Shell command that verifies the work (exit 0 = pass) | `:proof` field |
+| **Skill** | Tool configuration for the smith (web, default) | `:skill` field |
+| **Temper bar** | Progress visualization in the terminal | TUI output |
+| **Sparks** | Animated spinner shown during work | TUI output |
+
+### Verbs
+
+| Term | What it does | Phase |
+|------|-------------|-------|
+| **Survey** | Analyze requirements, produce blueprint | Phase 1 |
+| **Found** | Design and cast ingots from blueprint | Phase 2 |
+| **Forge** | Execute an ingot: strike, run commands, verify | Phase 3 |
+| **Strike** | Send work to the smith (Claude) and get output | Phase 3 |
+| **Smelt** | Process raw ore into workable material | Phase 3 |
+| **Re-smelt** | Analyze a cracked ingot and rewrite/split it | Phase 3 (recovery) |
+| **Temper** | Track and display forging progress | Phase 3 |
+| **Assay** | Final quality check, produce report | Phase 4 |
+| **Crack** | Fail permanently after exhausting all heats | Terminal state |
+
+### Ingot lifecycle
+
 ```
-
-This writes `PRD.md` for you and runs the full pipeline.
-
-> **WARNING:** slag runs Claude with `--dangerously-skip-permissions`. This means Claude will execute shell commands, write files, and make changes to your system **without asking for confirmation**. Run it in a clean directory or container. Review the generated `PRD.md` before forging. You accept all risk.
-
----
-
-A bash orchestrator for AI-powered development. Give it a product requirement, and it breaks it into verifiable tasks, executes them via Claude, and proves each one passed before moving on. No human review needed -- every task carries its own machine-verifiable acceptance test.
-
-## Why
-
-AI coding agents are powerful but chaotic. They lose context on long tasks, hallucinate completeness, and can't tell you whether their output actually works. Existing orchestrators add layers of abstraction (YAML configs, plugin systems, Docker containers) that fight the simplicity of just running shell commands.
-
-slag takes a different approach:
-
-- **One file.** A single bash script. No runtime, no dependencies beyond bash and `claude`.
-- **S-expressions for state.** Each task is one line in a text file, parseable with `grep` and `sed`. No JSON/YAML parser needed.
-- **Proof over trust.** Every task has a `:proof` field -- a shell command whose exit code determines pass/fail. `test -f file`, `npm test`, `curl -s url | grep -q pattern`. If it exits 0, the task is forged.
-- **Automatic retry with feedback.** Failed tasks get retried with the error output fed back to the AI. Up to N attempts before giving up.
-- **Parallel execution.** Independent tasks run on concurrent "anvils" (background subshells). Dependent tasks run sequentially.
-- **No questions asked.** The AI is instructed to make expert decisions autonomously. If the surveyor's analysis contains questions, slag feeds it back with instructions to resolve them. Up to 3 self-iteration rounds.
+ore --> molten --> forged
+                   \--> cracked --> [re-smelt] --> ore (rewritten)
+                                               --> ore + ore (split)
+                                               --> cracked (impossible)
+```
 
 ## How it works
 
@@ -57,69 +91,110 @@ slag runs a 4-phase pipeline:
 
 ```
 PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGRESS.md
- (ore)    (analyze)    (analysis)      (design)   (ingots)   (strike)    (ledger)
+ (ore)    (analyze)    (blueprint)     (design)   (crucible)  (strike)    (ledger)
 ```
 
-### Phase 1: SURVEYOR
+### Phase 1: Surveyor
 
-Reads your `PRD.md` (the ore) and produces `BLUEPRINT.md` -- a deep analysis with architecture decisions, dependency graph, risk assessment, and forging sequence. Uses Claude's plan mode for thorough reasoning.
+Reads `PRD.md` and produces `BLUEPRINT.md` -- architecture decisions, dependency graph, risk assessment, and forging sequence. Uses Claude's plan mode.
 
-### Phase 2: FOUNDER
+### Phase 2: Founder
 
-Reads the blueprint and casts S-expression ingots into `PLAN.md`. Each ingot is a single task:
+Reads the blueprint and casts S-expression ingots into `PLAN.md`:
 
 ```
 (ingot :id "i1" :status ore :solo t :grade 1 :skill default :heat 0 :max 5
        :proof "test -f package.json" :work "Initialize project with package.json")
 ```
 
-### Phase 3: FORGE
+### Phase 3: Forge
 
 The main loop. For each ingot:
 
 1. **Pick** the next ore-status ingot
-2. **Select smith** -- choose tools based on `:skill` tag (web gets Playwright, etc.) and `:grade` (high complexity gets plan mode)
-3. **Strike** -- invoke Claude with the task description
-4. **CMD** -- extract and run the shell commands from Claude's output
-5. **Proof** -- run the `:proof` command
-6. Pass: mark `:forged`, git commit. Fail: increment `:heat`, retry with error feedback. Max retries: mark `:cracked`, halt.
+2. **Strike** -- invoke Claude with the task, context, and skill tools
+3. **Run** -- extract and execute shell commands from Claude's output
+4. **Proof** -- run the `:proof` command; exit 0 = forged, non-zero = retry
 
-Independent ingots (`:solo t`) run on up to 3 parallel anvils. Dependent ingots (`:solo nil`) run sequentially after.
+Independent ingots (`:solo t`) run on parallel anvils. Sequential ingots (`:solo nil`) run one at a time.
 
-### Phase 4: ASSAY
+### Phase 4: Assay
 
-Final report. Counts forged vs cracked ingots, shows a temperature bar, and exits 0 on full forge or 1 if anything cracked.
+Final report. Counts forged vs cracked, writes results to `PROGRESS.md`.
 
 ## Ingot fields
 
+```
+(ingot :id "i3" :status ore :solo t :grade 2 :skill web :heat 0 :max 5
+       :proof "curl -s localhost:3000/health | grep -q ok"
+       :work "Add health check endpoint returning JSON {status: ok}")
+```
+
 | Field | Values | Meaning |
 |-------|--------|---------|
-| `:id` | `"i1"`, `"i2"`, ... | Unique identifier |
-| `:status` | `ore` / `molten` / `forged` / `cracked` | Lifecycle state |
-| `:solo` | `t` / `nil` | Can run in parallel or must be sequential |
+| `:id` | string | Unique identifier |
+| `:status` | ore / molten / forged / cracked | Lifecycle state |
+| `:solo` | t / nil | Can run in parallel (t) or must be sequential (nil) |
 | `:grade` | 1-5 | Complexity; grade >= 3 uses plan mode |
-| `:skill` | `web` / `api` / `cli` / `default` | Selects smith tools |
+| `:skill` | default / web / ... | Tool configuration for the smith |
 | `:heat` | 0-N | Current retry attempt |
 | `:max` | 5-8+ | Max retries before cracking |
 | `:proof` | shell command | Acceptance test (exit 0 = pass) |
-| `:work` | string | Task description for the smith |
+| `:work` | string | Task description for the AI |
 
-## Files
+## Project files
 
 | File | Role |
 |------|------|
 | `PRD.md` | Requirements input (ore) |
-| `BLUEPRINT.md` | Surveyor analysis output |
+| `BLUEPRINT.md` | Surveyor analysis |
 | `PLAN.md` | Ingot crucible (task list) |
-| `AGENTS.md` | Learned recipes |
 | `PROGRESS.md` | Work history ledger |
+| `AGENTS.md` | Agent recipe docs |
 | `logs/` | Debug logs (slag heap) |
+
+## Development
+
+```bash
+# Rust binary
+cargo test --all
+cargo clippy -- -D warnings
+cargo run -- "Your commission"
+
+# Website (slag.dev)
+cd website
+npm install
+npm run dev       # Dev server at localhost:5173
+npm run build     # Production build
+npx wrangler pages deploy dist --project-name=slag-dev
+
+# Bash tests
+bash tests/test_slag.sh
+```
+
+### Repository structure
+
+```
+Cargo.toml              # Rust project
+src/                    # Rust source (24 files)
+slag.sh                 # Bash orchestrator (legacy)
+install.sh              # curl | sh installer
+website/                # slag.dev (Vite + Cloudflare Pages)
+tests/                  # Bash test suite
+example/                # Real slag run outputs
+.github/workflows/      # CI + release automation
+```
 
 ## Requirements
 
-- bash 4+
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` command)
+- **Rust binary**: Claude CLI (`claude` in PATH)
+- **Bash version**: bash 4+, Claude CLI, curl, sed, awk
+- **Optional**: Playwright (for `:skill web` ingots)
 
 ## License
 
 MIT
+
+## Warning
+
+slag gives Claude autonomous shell access. It will create files, install packages, and run commands without asking. Use in a dedicated directory or container.

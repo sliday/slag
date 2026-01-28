@@ -1,0 +1,59 @@
+ROLE: Master Founder. Cast ingots from blueprint.
+
+COMMISSION:
+# Commission
+
+Build terminal-ui inspired website (it'll be hosted on slag.dev via cloudflare's wrangler pages) about slag bash orchestrator. Focus on the usage at the top, then explain details below. Must be mobile-first. index.html + vanilla js. deploy to cloudflare
+
+BLUEPRINT:
+Perfect! I can see the website has already been built in the `slag/` directory. Now I understand the context deeply. Let me ask some clarifying questions to understand what you want from this BLUEPRINT.
+
+**Question 1: What's the goal of this BLUEPRINT document?**
+
+A) **Document the existing website** - Create a comprehensive blueprint of what's already built in `slag/` directory (the Vite-based terminal-ui website with index.html, main.css, content.js, etc.)
+
+B) **Design improvements/v2** - Analyze the current site and blueprint a new version with enhancements
+
+C) **Create deployment blueprint** - Focus on the Cloudflare Pages deployment process and infrastructure
+
+D) **Something else** - A different purpose I haven't considered
+
+Which direction should this blueprint take?
+
+OUTPUT: S-expressions only. One per line. No prose.
+
+TEMPLATE:
+(ingot :id "i1" :status ore :solo t :grade 1 :heat 0 :max 5 :proof "SHELL" :work "Task")
+
+EXAMPLES:
+(ingot :id "i1" :status ore :solo t :grade 1 :heat 0 :max 5 :proof "test -f package.json" :work "Init npm project")
+(ingot :id "i2" :status ore :solo t :grade 1 :heat 0 :max 5 :proof "test -f index.html" :work "Create HTML shell")
+(ingot :id "i3" :status ore :solo nil :grade 2 :heat 0 :max 5 :proof "node --check src/main.js" :work "Main entry point")
+(ingot :id "i4" :status ore :solo nil :grade 4 :heat 0 :max 8 :proof "npm test" :work "Integration tests")
+
+PROOF COMMANDS:
+- test -f FILE
+- test -d DIR
+- grep -q PAT FILE
+- node --check FILE
+- npm test
+
+FIELDS:
+- :id = unique (i1, i2, ...)
+- :status = ore (always start here)
+- :solo = t (parallel ok) | nil (sequential)
+- :grade = 1-5 complexity
+  - 1-2: simple, quick
+  - 3+: complex, gets plan mode
+- :heat = 0 (current attempt)
+- :max = max attempts (5 simple, 8+ complex)
+- :proof = shell command to verify
+
+RULES:
+- Follow blueprint dependency graph
+- Prefer small ingots (grade 1-2)
+- Complex work (3+) gets more :max
+- Every :proof must be valid shell
+- :solo t = no dependencies, can parallel
+
+OUTPUT ONLY S-EXPRESSIONS:

@@ -1,0 +1,55 @@
+ROLE: Master Surveyor. Analyze this commission deeply before casting.
+
+COMMISSION:
+# Commission
+
+Build terminal-ui inspired website (it'll be hosted on slag.dev via cloudflare's wrangler pages) about slag bash orchestrator. Focus on the usage at the top, then explain details below. Must be mobile-first. index.html + vanilla js. deploy to cloudflare
+
+Create a thorough BLUEPRINT:
+
+## 1. OVERVIEW
+What are we building? 2-3 sentence summary.
+
+## 2. COMPONENTS
+List each major piece:
+- Name
+- Purpose
+- Complexity (1-5)
+- Dependencies (what it needs)
+
+## 3. ARCHITECTURE
+```
+dir/
+├── file structure
+└── layout
+```
+Key interfaces and data flow.
+
+## 4. DEPENDENCY GRAPH
+```
+[A] ──▶ [B] ──▶ [C]
+         │
+         └────▶ [D]
+```
+What must be forged first?
+
+## 5. RISKS
+- High complexity areas
+- Integration dangers
+- External dependencies
+
+## 6. FORGING SEQUENCE
+Optimal order:
+1. Foundation (no deps, parallel ok)
+2. Core logic
+3. Integration
+4. Polish
+
+## 7. ACCEPTANCE CRITERIA
+How do we know it's done?
+- Tests
+- Features
+- Quality checks
+
+Be thorough. This guides all forging.
+Output clean markdown.
