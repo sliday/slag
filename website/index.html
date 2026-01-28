@@ -168,11 +168,19 @@ EOF</code>
     |
     +----- fail ----> :heat++ retry with slag feedback
     |
-    +----- max -----> <span style="color:var(--slag-warm);">RE-SMELT</span> (analyze failure)
+    +----- max -----> <span style="color:var(--slag-warm);">RE-SMELT</span> (analyze failure, :smelt 0→1)
                          |
                          +----- rewrite --> new ore (retry)
                          +----- split ----> sub-ingots (2-4)
-                         +----- impossible -> <span style="color:var(--slag-warm);">:cracked</span>
+                         |
+                         +----- crack again?
+                                   |
+                                   v
+                              <span style="color:var(--slag-bright);">RECONSIDER</span> (rethink approach, :smelt 1→2)
+                                   |
+                                   +----- rethought --> new ore
+                                   +----- decomposed -> sub-ingots
+                                   +----- impossible -> <span style="color:var(--slag-warm);">:cracked</span>
 </pre>
       </section>
 
@@ -240,8 +248,8 @@ EOF</code>
         </details>
 
         <details box="square">
-          <summary>Why Re-Smelt?</summary>
-          <p>When an ingot cracks after exhausting all heats, re-smelting analyzes the failure logs, blueprint, and git history to diagnose the root cause. It can rewrite the ingot with corrected work/proof, split it into 2-4 focused sub-ingots, or declare it impossible. Each ingot gets one re-smelt attempt &mdash; learning from failure instead of brute-forcing retries.</p>
+          <summary>Why Re-Smelt + Reconsider?</summary>
+          <p>When an ingot cracks after exhausting all heats, re-smelting analyzes failure logs, blueprint, and git history to diagnose the root cause. It can rewrite the work/proof, split into sub-ingots, or declare impossible. If a re-smelted ingot cracks again, a <strong>reconsider</strong> step triggers &mdash; a surveyor-level re-analysis that questions the fundamental approach rather than tweaking details. This gives each ingot two chances to self-correct before permanently cracking: re-smelt (fix) then reconsider (rethink). Only the specific ingot is affected; other anvils continue undisturbed.</p>
         </details>
 
         <details box="square">

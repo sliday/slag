@@ -111,6 +111,7 @@ slag uses metallurgical vocabulary. Here's the dictionary.
 | **Strike** | Send work to the smith (Claude) and get output | Phase 3 |
 | **Smelt** | Process raw ore into workable material | Phase 3 |
 | **Re-smelt** | Analyze a cracked ingot and rewrite/split it | Phase 3 (recovery) |
+| **Reconsider** | Rethink a twice-cracked ingot's fundamental approach | Phase 3 (recovery) |
 | **Temper** | Track and display forging progress | Phase 3 |
 | **Assay** | Final quality check, produce report | Phase 4 |
 | **Crack** | Fail permanently after exhausting all heats | Terminal state |
@@ -119,9 +120,10 @@ slag uses metallurgical vocabulary. Here's the dictionary.
 
 ```
 ore --> molten --> forged
-                   \--> cracked --> [re-smelt] --> ore (rewritten)
-                                               --> ore + ore (split)
-                                               --> cracked (impossible)
+                   \--> cracked --> [re-smelt] --> ore (retry)
+                                                    \--> cracked --> [reconsider] --> ore (rethought)
+                                                                                  --> ore + ore (decomposed)
+                                                                                  --> cracked (truly impossible)
 ```
 
 ## How it works
