@@ -41,7 +41,7 @@ body {
 }
 
 #app {
-  max-width: 80ch;
+  max-width: 100ch;
   margin: 0 auto;
 }
 
@@ -98,6 +98,7 @@ a:hover {
 .cmd-line {
   position: relative;
   padding: 0.25lh 1ch;
+  padding-right: 8ch;
   margin-bottom: 0.5lh;
 }
 
@@ -108,10 +109,13 @@ a:hover {
 .cmd-comment {
   display: block;
   color: var(--slag-cold);
+  font-size: 0.8125rem;
 }
 
 .cmd-line code {
   display: block;
+  font-size: 0.8125rem;
+  word-break: break-all;
 }
 
 .download-btn {

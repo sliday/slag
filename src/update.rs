@@ -69,27 +69,60 @@ pub async fn self_update() -> Result<(), SlagError> {
         .await
         .map_err(|e| SlagError::UpdateFailed(format!("read failed: {e}")))?;
 
-    // Write to temp file and replace current binary
+    // Extract binary from tar.gz archive
     let current_exe = std::env::current_exe()
         .map_err(|e| SlagError::UpdateFailed(format!("cannot find current exe: {e}")))?;
 
-    let tmp_path = current_exe.with_extension("tmp");
-    tokio::fs::write(&tmp_path, &bytes)
+    let tmp_dir = current_exe
+        .parent()
+        .unwrap_or(std::path::Path::new("/tmp"))
+        .join(".slag-update-tmp");
+
+    // Use tar to extract — the archive contains a single "slag" binary
+    tokio::fs::create_dir_all(&tmp_dir)
         .await
-        .map_err(|e| SlagError::UpdateFailed(format!("write tmp failed: {e}")))?;
+        .map_err(|e| SlagError::UpdateFailed(format!("mkdir failed: {e}")))?;
+
+    let archive_path = tmp_dir.join("slag.tar.gz");
+    tokio::fs::write(&archive_path, &bytes)
+        .await
+        .map_err(|e| SlagError::UpdateFailed(format!("write archive failed: {e}")))?;
+
+    let extract = tokio::process::Command::new("tar")
+        .args(["xzf", "slag.tar.gz"])
+        .current_dir(&tmp_dir)
+        .output()
+        .await
+        .map_err(|e| SlagError::UpdateFailed(format!("tar extract failed: {e}")))?;
+
+    if !extract.status.success() {
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        return Err(SlagError::UpdateFailed("tar extract failed".into()));
+    }
+
+    let extracted_binary = tmp_dir.join("slag");
+    if !extracted_binary.exists() {
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        return Err(SlagError::UpdateFailed(
+            "extracted binary not found in archive".into(),
+        ));
+    }
 
     // Make executable on unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&tmp_path, perms)
+        std::fs::set_permissions(&extracted_binary, perms)
             .map_err(|e| SlagError::UpdateFailed(format!("chmod failed: {e}")))?;
     }
 
     // Replace current binary
-    std::fs::rename(&tmp_path, &current_exe)
+    std::fs::rename(&extracted_binary, &current_exe)
         .map_err(|e| SlagError::UpdateFailed(format!("replace failed: {e}")))?;
+
+    // Cleanup
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 
     println!("  Updated to v{latest}");
     Ok(())

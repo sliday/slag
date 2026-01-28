@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2692;</text></svg>" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>slag - bash orchestrator</title>
-    <meta name="description" content="slag: Smelt ideas, skim the bugs, forge the product. A bash-based task orchestrator using metallurgical metaphors and AI-powered development workflows." />
+    <title>slag - AI task orchestrator</title>
+    <meta name="description" content="slag: Smelt ideas, skim the bugs, forge the product. Task orchestrator for AI-powered development using metallurgical metaphors, S-expression ingots, and proof-based verification." />
   </head>
   <body>
     <div id="app">
@@ -14,7 +14,7 @@
       <header box="double" style="padding: 2ch;">
         <h1>slag</h1>
         <p style="color: var(--foreground1); margin-top: 0.5lh;">Smelt ideas, skim the bugs, forge the product.</p>
-        <p style="margin-top: 0.5lh;">Bash orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them via Claude agents with automatic retry and proof-based verification.</p>
+        <p style="margin-top: 0.5lh;">Task orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them via Claude agents with automatic retry, re-smelt recovery, and proof-based verification.</p>
         <div class="temp-bar">
           <span style="color: var(--slag-cold);">&#x25B1;&#x25B1;&#x25B1;</span><span style="color: var(--slag-warm);">&#x25B0;</span><span style="color: var(--slag-hot);">&#x25B0;</span><span style="color: var(--slag-bright);">&#x25B0;</span><span style="color: var(--slag-pure);">&#x25B0;</span>
           <span style="color: var(--foreground2); font-size: 0.75rem; letter-spacing: 0;">cold &rarr; hot &rarr; pure</span>
@@ -23,25 +23,48 @@
 
       <div is="separator"></div>
 
-      <!-- S2: QUICK START -->
+      <!-- S2: INSTALL -->
       <section>
-        <h2>Quick Start</h2>
+        <h2>Install</h2>
         <div class="quickstart-box" box="square">
           <div class="cmd-line">
-            <span class="cmd-comment"># download</span>
-            <code data-copy>curl -fsSL https://slag.dev/slag.sh -o slag && chmod +x slag</code>
+            <span class="cmd-comment"># binary (recommended)</span>
+            <code data-copy>curl -sSf https://raw.githubusercontent.com/sliday/slag/main/install.sh | sh</code>
           </div>
           <div class="cmd-line">
-            <span class="cmd-comment"># forge</span>
-            <code data-copy>./slag "Build a REST API with auth and rate limiting"</code>
+            <span class="cmd-comment"># bash version (no build required)</span>
+            <code data-copy>curl -fsSL https://slag.dev/slag.sh -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag</code>
+          </div>
+          <div class="cmd-line">
+            <span class="cmd-comment"># from source</span>
+            <code data-copy>cargo install --git https://github.com/sliday/slag</code>
           </div>
         </div>
-        <p class="disclaimer"><span style="color: var(--slag-warm);">&#x26A0;</span> Runs Claude with <code>--dangerously-skip-permissions</code>. Use at your own discretion.</p>
       </section>
 
       <div is="separator"></div>
 
-      <!-- S3: PIPELINE DIAGRAM -->
+      <!-- S3: QUICK START -->
+      <section>
+        <h2>Quick Start</h2>
+        <div class="quickstart-box" box="square">
+          <div class="cmd-line">
+            <span class="cmd-comment"># write your requirements</span>
+            <code data-copy>cat > PRD.md &lt;&lt; 'EOF'
+Build a REST API with auth and rate limiting
+EOF</code>
+          </div>
+          <div class="cmd-line">
+            <span class="cmd-comment"># forge</span>
+            <code data-copy>slag "Build the REST API from PRD.md"</code>
+          </div>
+        </div>
+        <p class="disclaimer"><span style="color: var(--slag-warm);">&#x26A0;</span> slag gives Claude autonomous shell access. Use in a dedicated directory or container.</p>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S4: PIPELINE DIAGRAM -->
       <section class="diagram">
         <h2>Pipeline</h2>
 <pre box="square">
@@ -62,7 +85,7 @@
 
       <div is="separator"></div>
 
-      <!-- S4: FORGE LOOP DETAIL -->
+      <!-- S5: FORGE LOOP DETAIL -->
       <section class="diagram">
         <h2>Forge Loop</h2>
 <pre box="square">
@@ -92,13 +115,17 @@
     |
     +----- fail ----> :heat++ retry with slag feedback
     |
-    +----- max -----> <span style="color:var(--slag-warm);">:cracked</span> + halt
+    +----- max -----> <span style="color:var(--slag-warm);">RE-SMELT</span> (analyze failure)
+                         |
+                         +----- rewrite --> new ore (retry)
+                         +----- split ----> sub-ingots (2-4)
+                         +----- impossible -> <span style="color:var(--slag-warm);">:cracked</span>
 </pre>
       </section>
 
       <div is="separator"></div>
 
-      <!-- S5: FOUR PHASES -->
+      <!-- S6: FOUR PHASES -->
       <section>
         <h2>Four Phases</h2>
         <div class="phase-grid">
@@ -135,7 +162,7 @@
 
       <div is="separator"></div>
 
-      <!-- S6: DESIGN DECISIONS -->
+      <!-- S7: DESIGN DECISIONS -->
       <section class="decisions">
         <h2>Design Decisions</h2>
 
@@ -160,6 +187,11 @@
         </details>
 
         <details box="square">
+          <summary>Why Re-Smelt?</summary>
+          <p>When an ingot cracks after exhausting all heats, re-smelting analyzes the failure logs, blueprint, and git history to diagnose the root cause. It can rewrite the ingot with corrected work/proof, split it into 2-4 focused sub-ingots, or declare it impossible. Each ingot gets one re-smelt attempt &mdash; learning from failure instead of brute-forcing retries.</p>
+        </details>
+
+        <details box="square">
           <summary>Why Metallurgical Metaphor?</summary>
           <p>Unambiguous vocabulary that maps naturally to the pipeline. Ore (raw input) is surveyed, cast into ingots, heated in a forge, and either becomes forged steel or cracked waste. Every term has exactly one meaning. The temperature gradient (cold &rarr; hot &rarr; pure) maps to progress from unstarted to complete.</p>
         </details>
@@ -167,7 +199,7 @@
 
       <div is="separator"></div>
 
-      <!-- S7: INGOT EXAMPLES (JS-rendered) -->
+      <!-- S8: INGOT EXAMPLES (JS-rendered) -->
       <section>
         <h2>Ingot Examples</h2>
         <div id="ingot-display" class="ingot-list"></div>
@@ -175,7 +207,7 @@
 
       <div is="separator"></div>
 
-      <!-- S8: FIELD REFERENCE -->
+      <!-- S9: FIELD REFERENCE -->
       <section>
         <h2>Field Reference</h2>
         <table class="field-table">
@@ -238,15 +270,17 @@
 
       <div is="separator"></div>
 
-      <!-- S9: FOOTER -->
+      <!-- S10: FOOTER -->
       <footer class="footer" box="square">
         <div class="temp-bar" style="margin-top:0; margin-bottom: 0.5lh;">
           <span style="color: var(--slag-cold);">&#x25B1;&#x25B1;&#x25B1;</span><span style="color: var(--slag-warm);">&#x25B0;</span><span style="color: var(--slag-hot);">&#x25B0;</span><span style="color: var(--slag-bright);">&#x25B0;</span><span style="color: var(--slag-pure);">&#x25B0;</span>
         </div>
         <p style="color: var(--foreground2);">
-          <a href="https://github.com/AestheticVoyager/slag">GitHub</a>
+          <a href="https://github.com/sliday/slag">GitHub</a>
           &middot;
-          <a href="/slag.sh" download="slag">Download</a>
+          <a href="/slag.sh" download="slag.sh">Download (bash)</a>
+          &middot;
+          <a href="https://github.com/sliday/slag/releases">Releases (binary)</a>
           &middot;
           MIT License
         </p>
