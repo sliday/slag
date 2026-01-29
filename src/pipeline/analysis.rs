@@ -128,7 +128,10 @@ pub async fn analyze_and_prepare(
                     );
                 }
                 AnalysisAction::Skip => {
-                    println!("    \x1b[31m✗\x1b[0m [{}] skipped (truly impossible)", analysis.id);
+                    println!(
+                        "    \x1b[31m✗\x1b[0m [{}] skipped (truly impossible)",
+                        analysis.id
+                    );
                 }
                 AnalysisAction::Regenerate => {
                     // Already handled above
