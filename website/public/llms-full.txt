@@ -1,0 +1,350 @@
+# slag - Complete Documentation for LLMs
+
+> Smelt ideas, skim the bugs, forge the product.
+
+A task orchestrator for AI-powered development. Give it a product requirement, and it breaks it into verifiable tasks, executes them via Claude, and proves each one passed before moving on.
+
+---
+
+## Table of Contents
+
+1. Installation
+2. Quick Start
+3. CLI Reference
+4. Pipeline Phases
+5. Ingot Format
+6. Vocabulary
+7. Project Files
+8. Configuration
+9. Recovery Mechanisms
+10. Design Decisions
+
+---
+
+## 1. Installation
+
+### Binary (recommended)
+```bash
+curl -sSf https://slag.dev/install.sh | sh
+```
+
+### Bash version (no build required)
+```bash
+curl -fsSL https://slag.dev/slag.sh -o /usr/local/bin/slag && chmod +x /usr/local/bin/slag
+```
+
+### From source
+```bash
+cargo install --git https://github.com/sliday/slag
+```
+
+### Requirements
+- Claude CLI (`claude` command in PATH)
+- Optional: Playwright (for `:skill web` ingots)
+
+---
+
+## 2. Quick Start
+
+```bash
+# Write your requirements
+cat > PRD.md << 'EOF'
+Build a REST API with user authentication, rate limiting,
+and PostgreSQL storage. Include health check endpoint.
+EOF
+
+# Forge it
+slag "Build the REST API from PRD.md"
+```
+
+slag reads `PRD.md`, analyzes it, designs tasks, executes them, and proves each one works.
+
+---
+
+## 3. CLI Reference
+
+### Usage
+```
+slag [OPTIONS] [COMMISSION]... [COMMAND]
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `slag "Build X from PRD.md"` | Start a new forge from a commission |
+| `slag status` | Show crucible state (ingot counts and progress) |
+| `slag resume` | Resume an existing forge |
+| `slag update` | Self-update to latest release |
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--worktree` | off | Enable branch-per-ingot worktree isolation with master review |
+| `--anvils N` | 3 | Max parallel anvil workers |
+| `--skip-review` | off | Skip the master review phase (legacy behavior) |
+| `--keep-branches` | off | Don't delete branches after review |
+| `--ci-only` | off | Run CI checks but skip AI review |
+| `--review-all` | off | Review even if CI fails |
+
+### Progress Display
+
+slag shows emoji progress in the terminal:
+
+```
+[ ✅3  🔥1  🧱5 ] 37%
+```
+
+| Emoji | Status | Meaning |
+|-------|--------|---------|
+| 🧱 | queued | Ingot is ore, waiting to be forged |
+| 🔥 | forging | Ingot is molten, currently being worked |
+| ✅ | done | Ingot is forged, proof passed |
+| ❌ | failed | Ingot cracked after exhausting all heats |
+
+---
+
+## 4. Pipeline Phases
+
+slag runs a 4-phase pipeline (5 phases with `--worktree`):
+
+```
+PRD.md → SURVEYOR → BLUEPRINT.md → FOUNDER → PLAN.md → FORGE → PROGRESS.md
+
+With --worktree:
+PRD.md → SURVEYOR → FOUNDER → FORGE (branches) → REVIEW → ASSAY
+```
+
+### Phase 1: Surveyor
+
+Reads `PRD.md` and produces `BLUEPRINT.md` -- architecture decisions, dependency graph, risk assessment, and forging sequence. Uses Claude's plan mode.
+
+**Input:** PRD.md (ore)
+**Output:** BLUEPRINT.md (analysis)
+
+### Phase 2: Founder
+
+Reads the blueprint and casts S-expression ingots into `PLAN.md`:
+
+```
+(ingot :id "i1" :status ore :solo t :grade 1 :skill default :heat 0 :max 5
+       :proof "test -f package.json" :work "Initialize project with package.json")
+```
+
+**Input:** BLUEPRINT.md
+**Output:** PLAN.md (crucible with ingots)
+
+### Phase 3: Forge
+
+The main loop. For each ingot:
+
+1. **Pick** the next ore-status ingot
+2. **Strike** -- invoke Claude with the task, context, and skill tools
+3. **Run** -- extract and execute shell commands from Claude's output
+4. **Proof** -- run the `:proof` command; exit 0 = forged, non-zero = retry
+
+Independent ingots (`:solo t`) run on parallel anvils. Sequential ingots (`:solo nil`) run one at a time.
+
+### Phase 3.5: Review (with `--worktree`)
+
+When `--worktree` is enabled, each ingot is forged in an isolated git worktree branch (`forge/iN`). After forging completes, the Review phase:
+
+1. **CI Checks** -- runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --all` on each branch
+2. **Master Review** -- AI agent reviews the diff, code quality, and integration safety
+3. **Merge Decision** -- approved branches merge to main; rejected branches are flagged
+
+Use `--ci-only` to skip AI review and auto-merge on CI pass. Use `--keep-branches` to preserve branches for debugging.
+
+### Phase 4: Assay
+
+Final report. Counts forged vs cracked, writes results to `PROGRESS.md`.
+
+---
+
+## 5. Ingot Format
+
+### S-Expression Structure
+
+```
+(ingot :id "i3" :status ore :solo t :grade 2 :skill web :heat 0 :max 5
+       :proof "curl -s localhost:3000/health | grep -q ok"
+       :work "Add health check endpoint returning JSON {status: ok}")
+```
+
+### Fields
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `:id` | string | Unique identifier (i1, i2, i3...) |
+| `:status` | ore / molten / forged / cracked | Lifecycle state |
+| `:solo` | t / nil | Can run in parallel (t) or must be sequential (nil) |
+| `:grade` | 1-5 | Complexity; grade >= 3 uses plan mode |
+| `:skill` | default / web / api / cli | Tool configuration for the smith |
+| `:heat` | 0-N | Current retry attempt |
+| `:max` | 5-8+ | Max retries before cracking |
+| `:smelt` | 0-2 | Re-smelt count (0=never, 1=re-smelted, 2=reconsidered) |
+| `:proof` | shell command | Acceptance test (exit 0 = pass) |
+| `:work` | string | Task description for the AI |
+
+### Proof Command Examples
+
+```bash
+test -f FILE              # File exists
+test -d DIR               # Directory exists
+grep -q PATTERN FILE      # Pattern in file
+node --check FILE         # JS syntax valid
+npm test                  # Tests pass
+npx playwright test       # E2E tests pass
+curl -s URL | grep -q X   # HTTP response contains X
+```
+
+### Ingot Lifecycle
+
+```
+ore --> molten --> forged
+                   \--> cracked --> [re-smelt] --> ore (retry)
+                                                    \--> cracked --> [reconsider] --> ore (rethought)
+                                                                                  --> ore + ore (decomposed)
+                                                                                  --> cracked (truly impossible)
+```
+
+---
+
+## 6. Vocabulary
+
+slag uses metallurgical vocabulary.
+
+### Nouns
+
+| Term | What it is | File/location |
+|------|-----------|---------------|
+| **Ore** | Raw requirements; the starting material | `PRD.md` |
+| **Ingot** | A single task encoded as an S-expression | One line in `PLAN.md` |
+| **Crucible** | The file holding all ingots | `PLAN.md` |
+| **Blueprint** | Architecture analysis and forging plan | `BLUEPRINT.md` |
+| **Anvil** | A parallel execution slot (background process) | In-memory |
+| **Smith** | The AI agent that does the work (Claude) | Claude CLI invocation |
+| **Slag heap** | Debug logs dumped during forging | `logs/` directory |
+| **Heat** | One attempt at forging an ingot (retry count) | `:heat` field |
+| **Grade** | Complexity rating (1-5); high grade = plan mode | `:grade` field |
+| **Proof** | Shell command that verifies the work (exit 0 = pass) | `:proof` field |
+| **Skill** | Tool configuration for the smith (web, default) | `:skill` field |
+| **Temper bar** | Progress visualization in the terminal | TUI output |
+
+### Verbs
+
+| Term | What it does | Phase |
+|------|-------------|-------|
+| **Survey** | Analyze requirements, produce blueprint | Phase 1 |
+| **Found** | Design and cast ingots from blueprint | Phase 2 |
+| **Forge** | Execute an ingot: strike, run commands, verify | Phase 3 |
+| **Strike** | Send work to the smith (Claude) and get output | Phase 3 |
+| **Smelt** | Process raw ore into workable material | Phase 3 |
+| **Re-smelt** | Analyze a cracked ingot and rewrite/split it | Phase 3 (recovery) |
+| **Reconsider** | Rethink a twice-cracked ingot's fundamental approach | Phase 3 (recovery) |
+| **Review** | Master agent CI checks and code review before merge | Phase 3.5 (--worktree) |
+| **Temper** | Track and display forging progress | Phase 3 |
+| **Assay** | Final quality check, produce report | Phase 4 |
+| **Crack** | Fail permanently after exhausting all heats | Terminal state |
+
+---
+
+## 7. Project Files
+
+| File | Role |
+|------|------|
+| `PRD.md` | Requirements input (ore) |
+| `BLUEPRINT.md` | Surveyor analysis |
+| `PLAN.md` | Ingot crucible (task list) |
+| `PROGRESS.md` | Work history ledger |
+| `AGENTS.md` | Agent recipe docs |
+| `logs/` | Debug logs (slag heap) |
+
+---
+
+## 8. Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SLAG_SMITH` | `claude --dangerously-skip-permissions -p` | Base smith command |
+
+### Smith Selection
+
+The smith command is selected based on `:skill` and `:grade`:
+
+| Skill | Grade < 3 | Grade >= 3 |
+|-------|-----------|------------|
+| default | base | base + plan mode |
+| web | base + Playwright | base + Playwright + plan mode |
+
+---
+
+## 9. Recovery Mechanisms
+
+### Re-smelt (first failure)
+
+When an ingot cracks after exhausting all heats, re-smelting:
+
+1. Analyzes failure logs, blueprint, and git history
+2. Diagnoses the root cause
+3. Takes one of three actions:
+   - **REWRITE**: Corrected work description and/or proof command
+   - **SPLIT**: Decompose into 2-4 smaller sub-ingots
+   - **IMPOSSIBLE**: Declare the task cannot be done
+
+Re-smelted ingots get `:smelt 1` marker.
+
+### Reconsider (second failure)
+
+If a re-smelted ingot cracks again, reconsideration:
+
+1. Questions the fundamental approach (not just tweaks)
+2. Performs surveyor-level re-analysis
+3. Takes the same actions but with deeper rethinking
+
+Reconsidered ingots get `:smelt 2` marker. If they crack again, they're permanently cracked.
+
+---
+
+## 10. Design Decisions
+
+### Why S-Expressions?
+
+S-expressions are single-line, grep/sed parseable, require zero dependencies, and survive bash string handling. Every ingot is one line in PLAN.md. Fields are keyword-prefixed (`:id`, `:status`) making them unambiguous to extract with pattern matching.
+
+### Why Parallel Anvils?
+
+Independent ingots (`:solo t`) run concurrently in background processes, up to MAX_ANVILS=3. This gives 3x throughput for foundation tasks that have no dependencies. Sequential ingots (`:solo nil`) run one at a time after parallel work completes.
+
+### Why Proof-Based Verification?
+
+Every ingot carries a `:proof` field containing a shell command. Exit code 0 means pass, anything else means fail. No human review needed. Proofs are concrete: "test -f file", "npm test", "grep -q pattern file". This enables fully autonomous forging with machine-verifiable quality gates.
+
+### Why Self-Iteration?
+
+When a surveyor or founder output contains questions, slag detects them and feeds the output back with instructions to resolve autonomously. Up to 3 rounds. This prevents the forge from stalling on ambiguity. The AI is instructed to make expert decisions rather than ask for clarification.
+
+### Why Re-Smelt + Reconsider?
+
+Two-tier recovery gives each ingot two chances to self-correct:
+1. **Re-smelt**: Fix the immediate problem (proof, work description)
+2. **Reconsider**: Rethink the fundamental approach
+
+Only the specific ingot is affected; other anvils continue undisturbed.
+
+---
+
+## Links
+
+- Website: https://slag.dev
+- GitHub: https://github.com/sliday/slag
+- Concise LLM docs: https://slag.dev/llms.txt
+
+---
+
+## Warning
+
+slag gives Claude autonomous shell access. It will create files, install packages, and run commands without asking. Use in a dedicated directory or container.

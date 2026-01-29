@@ -1,0 +1,81 @@
+# slag
+
+> Smelt ideas, skim the bugs, forge the product.
+
+Task orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them via Claude with automatic retry, re-smelt recovery, and proof-based verification.
+
+## Links
+
+- Docs: https://slag.dev
+- GitHub: https://github.com/sliday/slag
+- Full LLM docs: https://slag.dev/llms-full.txt
+
+## Install
+
+```bash
+curl -sSf https://slag.dev/install.sh | sh
+```
+
+## Quick Start
+
+```bash
+# Write requirements
+cat > PRD.md << 'EOF'
+Build a REST API with auth and rate limiting
+EOF
+
+# Forge it
+slag "Build the REST API from PRD.md"
+```
+
+## CLI
+
+```
+slag [OPTIONS] [COMMISSION]
+slag status    # Show progress
+slag resume    # Continue existing forge
+slag update    # Self-update
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| --worktree | Branch-per-ingot isolation with master review |
+| --anvils N | Max parallel workers (default: 3) |
+| --skip-review | Skip review phase |
+| --keep-branches | Preserve branches after review |
+| --ci-only | CI checks only, no AI review |
+| --review-all | Review even if CI fails |
+
+## Pipeline
+
+```
+PRD.md → SURVEYOR → FOUNDER → FORGE → [REVIEW] → ASSAY → PROGRESS.md
+```
+
+1. **Surveyor**: Analyze requirements → BLUEPRINT.md
+2. **Founder**: Cast S-expression ingots → PLAN.md
+3. **Forge**: Execute ingots via Claude, verify with proof commands
+4. **Review**: (--worktree) CI checks + AI review before merge
+5. **Assay**: Final report
+
+## Ingot Format
+
+```
+(ingot :id "i1" :status ore :solo t :grade 1 :skill default
+       :heat 0 :max 5 :proof "test -f file" :work "Task description")
+```
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| :status | ore/molten/forged/cracked | Lifecycle state |
+| :solo | t/nil | Can run parallel (t) or sequential (nil) |
+| :grade | 1-5 | Complexity; >=3 uses plan mode |
+| :skill | default/web | Tool configuration |
+| :proof | shell command | Exit 0 = pass |
+
+## Requirements
+
+- Claude CLI (`claude` in PATH)
+- Optional: Playwright for :skill web
