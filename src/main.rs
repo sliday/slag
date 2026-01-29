@@ -35,6 +35,7 @@ async fn main() {
         cli.keep_branches,
         cli.ci_only,
         cli.review_all,
+        cli.retry,
     );
 
     let result = match cli.command {

@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod assay;
 pub mod forge;
 pub mod founder;
@@ -39,27 +40,83 @@ pub async fn run(
         founder::run(&smith).await?;
     }
 
-    // Phase 3: Forge
+    // Phase 3: Forge (with retry loop)
     let forge_start = std::time::Instant::now();
-    tui::header("FORGE");
-    tui::show_legend();
-    let crucible = Crucible::load(crucible_path)?;
-    let counts = crucible.counts();
-    print!("  ");
-    tui::ingot_status_line(&counts);
-    println!();
+    let mut cycle = 0;
+    let max_cycles = pipeline_config.max_retry + 1; // +1 for initial attempt
 
-    let forged_branches = forge::run(smith_config, pipeline_config).await?;
+    loop {
+        cycle += 1;
 
-    // Phase 3.5: Review (if worktree mode enabled)
-    if pipeline_config.should_review() && !forged_branches.is_empty() {
+        if cycle > 1 {
+            tui::header(&format!("FORGE · retry {}/{}", cycle - 1, max_cycles - 1));
+        } else {
+            tui::header("FORGE");
+        }
+        tui::show_legend();
+
+        let crucible = Crucible::load(crucible_path)?;
+        let counts = crucible.counts();
+        print!("  ");
+        tui::ingot_status_line(&counts);
+        println!();
+
+        // Run forge (ignore ForgeFailed error - we handle it with analysis)
+        let forge_result = forge::run(smith_config, pipeline_config).await;
+
+        let forged_branches = match forge_result {
+            Ok(branches) => branches,
+            Err(SlagError::ForgeFailed(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+
+        // Phase 3.5: Review (if worktree mode enabled)
+        if pipeline_config.should_review() && !forged_branches.is_empty() {
+            let smith = ClaudeSmith::base(smith_config);
+            review::run(&smith, pipeline_config, &forged_branches).await?;
+        }
+
+        // Check if we're done (all forged, none cracked)
+        let crucible = Crucible::load(crucible_path)?;
+        let counts = crucible.counts();
+
+        if counts.cracked == 0 {
+            // Success!
+            break;
+        }
+
+        // Check if we've exhausted retries
+        if cycle >= max_cycles {
+            println!(
+                "\n  \x1b[31m✗\x1b[0m Max retries ({}) exhausted, {} ingots still cracked",
+                max_cycles - 1,
+                counts.cracked
+            );
+            break;
+        }
+
+        // Analyze failures and prepare for retry
         let smith = ClaudeSmith::base(smith_config);
-        review::run(&smith, pipeline_config, &forged_branches).await?;
+        let can_retry = analysis::analyze_and_prepare(&smith, smith_config, cycle).await?;
+
+        if !can_retry {
+            println!("\n  \x1b[31m✗\x1b[0m No recoverable ingots, stopping");
+            break;
+        }
+
+        println!("\n  \x1b[38;5;220m↺\x1b[0m Retrying forge...\n");
     }
 
     // Phase 4: Assay
     let elapsed_secs = forge_start.elapsed().as_secs();
     assay::show(Some(elapsed_secs))?;
+
+    // Final check - if any cracked, return error
+    let crucible = Crucible::load(crucible_path)?;
+    let counts = crucible.counts();
+    if counts.cracked > 0 {
+        return Err(SlagError::ForgeFailed(counts.cracked));
+    }
 
     Ok(())
 }

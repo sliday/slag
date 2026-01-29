@@ -38,6 +38,10 @@ pub struct Cli {
     /// Review even if CI fails
     #[arg(long)]
     pub review_all: bool,
+
+    /// Max retry cycles when ingots crack (0 = no retry)
+    #[arg(long, default_value_t = 3)]
+    pub retry: usize,
 }
 
 #[derive(Subcommand)]

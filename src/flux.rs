@@ -238,6 +238,42 @@ pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
     )
 }
 
+/// Build the regenerate prompt for failed ingots
+pub fn regenerate_prompt(cracked_descriptions: &str) -> String {
+    let blueprint = std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "None".into());
+    let crucible = std::fs::read_to_string(CRUCIBLE).unwrap_or_else(|_| "Empty".into());
+
+    format!(
+        "=== REGENERATE CRACKED INGOTS ===\n\
+        The following ingots cracked and need to be regenerated with a better approach.\n\n\
+        CRACKED INGOTS:\n\
+        {cracked_descriptions}\n\n\
+        BLUEPRINT:\n\
+        {blueprint}\n\n\
+        CURRENT CRUCIBLE:\n\
+        {crucible}\n\n\
+        === YOUR TASK ===\n\
+        Regenerate these ingots with fixes:\n\
+        1. If they failed due to missing files, ensure proper sequencing (:solo nil)\n\
+        2. If they failed due to complex tasks, split into smaller pieces\n\
+        3. Make proof commands more robust\n\
+        4. Ensure each ingot is independently verifiable\n\n\
+        OUTPUT FORMAT:\n\
+        Output ONLY S-expression ingots, one per line.\n\
+        Use new IDs (r1, r2, r3...) to avoid conflicts.\n\
+        Mark dependencies as :solo nil (sequential).\n\
+        Keep grade low (1-2) unless truly complex.\n\n\
+        TEMPLATE:\n\
+        (ingot :id \"r1\" :status ore :solo nil :grade 1 :skill default :heat 0 :max 5 :smelt 0 :proof \"SHELL\" :work \"Task\")\n\n\
+        RULES:\n\
+        - Foundation tasks (creating files/dirs) MUST be :solo nil\n\
+        - Tasks that modify existing files MUST be :solo nil\n\
+        - Use mkdir -p to create directories\n\
+        - Use simple proof commands: test -f FILE, test -d DIR\n\
+        - Output ONLY S-expressions, no prose\n"
+    )
+}
+
 /// Build the master review prompt for the review phase
 pub fn prepare_review_flux(
     ingot_id: &str,

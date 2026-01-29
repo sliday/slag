@@ -65,6 +65,7 @@ slag [OPTIONS] [COMMISSION]... [COMMAND]
 | `--keep-branches` | off | Don't delete branches after review |
 | `--ci-only` | off | Run CI checks but skip AI review |
 | `--review-all` | off | Review even if CI fails |
+| `--retry N` | 3 | Max retry cycles when ingots crack (0 = no retry) |
 
 ## Progress display
 
@@ -179,6 +180,17 @@ When `--worktree` is enabled, each ingot is forged in an isolated git worktree b
 3. **Merge Decision** -- approved branches merge to main; rejected branches are flagged
 
 Use `--ci-only` to skip AI review and auto-merge on CI pass. Use `--keep-branches` to preserve branches for debugging.
+
+### Phase 3.6: Analysis & Retry
+
+When ingots crack, slag analyzes failures and can retry automatically (up to `--retry N` cycles):
+
+1. **Failure detection** -- identifies patterns: missing dependencies, protocol failures, proof mismatches
+2. **Fix application** -- converts parallel ingots to sequential if they have dependencies
+3. **Regeneration** -- uses founder to regenerate ingots that can't be fixed simply
+4. **Retry** -- re-runs forge with fixed/regenerated ingots
+
+This loop continues until all ingots forge or max retries exhausted.
 
 ### Phase 4: Assay
 

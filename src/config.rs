@@ -77,9 +77,12 @@ pub struct PipelineConfig {
     pub ci_only: bool,
     /// Review even if CI fails
     pub review_all: bool,
+    /// Max retry cycles when ingots crack
+    pub max_retry: usize,
 }
 
 impl PipelineConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         worktree: bool,
         max_anvils: usize,
@@ -87,6 +90,7 @@ impl PipelineConfig {
         keep_branches: bool,
         ci_only: bool,
         review_all: bool,
+        max_retry: usize,
     ) -> Self {
         Self {
             worktree,
@@ -95,6 +99,7 @@ impl PipelineConfig {
             keep_branches,
             ci_only,
             review_all,
+            max_retry,
         }
     }
 
