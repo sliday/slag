@@ -47,6 +47,7 @@ slag update    # Self-update
 | --keep-branches | Preserve branches after review |
 | --ci-only | CI checks only, no AI review |
 | --review-all | Review even if CI fails |
+| --retry N | Max retry cycles when ingots crack (default: 3) |
 
 ## Pipeline
 
