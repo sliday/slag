@@ -185,12 +185,13 @@ Use `--ci-only` to skip AI review and auto-merge on CI pass. Use `--keep-branche
 
 When ingots crack, slag analyzes failures and can retry automatically (up to `--retry N` cycles):
 
-1. **Failure detection** -- identifies patterns: missing dependencies, protocol failures, proof mismatches
+1. **Failure detection** -- identifies patterns: missing dependencies, protocol failures, proof mismatches, JSON errors
 2. **Fix application** -- converts parallel ingots to sequential if they have dependencies
 3. **Regeneration** -- uses founder to regenerate ingots that can't be fixed simply
 4. **Retry** -- re-runs forge with fixed/regenerated ingots
+5. **Force retry prompt** -- when no recoverable ingots found, asks user to confirm force retry
 
-This loop continues until all ingots forge or max retries exhausted.
+This loop continues until all ingots forge, max retries exhausted, or user declines force retry.
 
 ### Phase 4: Assay
 

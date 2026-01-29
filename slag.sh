@@ -159,6 +159,24 @@ sparks_stop() {
 
 trap 'sparks_stop; exit' INT TERM
 
+# Ask user if they want to force retry cracked ingots
+ask_force_retry() {
+    local count=$1
+    printf "\n  ${FIRE}?${NC} Force retry %d cracked ingots? [y/N] " "$count"
+    read -r answer
+    [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
+}
+
+# Reset all cracked ingots to ore for retry
+force_retry_cracked() {
+    local ids
+    ids=$(grep ":status cracked" "$CRUCIBLE" | while read -r line; do sexp_get_quoted "$line" "id"; done)
+    for id in $ids; do
+        sed_i "s/:id \"$id\" :status cracked/:id \"$id\" :status ore/" "$CRUCIBLE"
+        sed_i "s/:id \"$id\" \(.*\):heat [0-9]*/:id \"$id\" \1:heat 0/" "$CRUCIBLE"
+    done
+}
+
 hr() { printf "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"; }
 
 header() {
@@ -999,7 +1017,17 @@ printf "  "; ingot_status; echo ""
 while true; do
     if ! grep -q ":status ore\|:status molten" "$CRUCIBLE"; then
         if grep -q ":status cracked" "$CRUCIBLE"; then
+            local cracked_count
+            cracked_count=$(grep -c ":status cracked" "$CRUCIBLE" 2>/dev/null) || cracked_count=0
+            cracked_count=${cracked_count//[^0-9]/}
             show_assay
+            # Ask user if they want to force retry
+            if ask_force_retry "$cracked_count"; then
+                force_retry_cracked
+                printf "\n  ${FIRE}⚒${NC} Force retry: %d ingots reset to ore\n" "$cracked_count"
+                printf "\n  "; ingot_status; echo ""
+                continue
+            fi
             printf "\n  ${RED}${BOLD}✗ CRACKED${NC}\n\n"
             exit 1
         fi
