@@ -15,13 +15,29 @@ pub struct Cli {
     #[arg(trailing_var_arg = true)]
     pub commission: Vec<String>,
 
-    /// Enable branch-per-ingot worktree isolation
+    /// Enable branch-per-ingot worktree isolation with master review
     #[arg(long)]
     pub worktree: bool,
 
     /// Max parallel anvil workers
     #[arg(long, default_value_t = crate::config::MAX_ANVILS)]
     pub anvils: usize,
+
+    /// Skip the master review phase (legacy behavior)
+    #[arg(long)]
+    pub skip_review: bool,
+
+    /// Don't delete branches after review
+    #[arg(long)]
+    pub keep_branches: bool,
+
+    /// Run CI checks but skip AI review
+    #[arg(long)]
+    pub ci_only: bool,
+
+    /// Review even if CI fails
+    #[arg(long)]
+    pub review_all: bool,
 }
 
 #[derive(Subcommand)]

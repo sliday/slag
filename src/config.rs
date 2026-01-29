@@ -61,3 +61,45 @@ impl SmithConfig {
 pub fn project_path(filename: &str) -> PathBuf {
     PathBuf::from(filename)
 }
+
+/// Pipeline execution configuration (from CLI flags)
+#[derive(Debug, Clone, Default)]
+pub struct PipelineConfig {
+    /// Enable worktree isolation per ingot
+    pub worktree: bool,
+    /// Max parallel anvils
+    pub max_anvils: usize,
+    /// Skip the review phase
+    pub skip_review: bool,
+    /// Keep branches after review
+    pub keep_branches: bool,
+    /// CI checks only, no AI review
+    pub ci_only: bool,
+    /// Review even if CI fails
+    pub review_all: bool,
+}
+
+impl PipelineConfig {
+    pub fn new(
+        worktree: bool,
+        max_anvils: usize,
+        skip_review: bool,
+        keep_branches: bool,
+        ci_only: bool,
+        review_all: bool,
+    ) -> Self {
+        Self {
+            worktree,
+            max_anvils,
+            skip_review,
+            keep_branches,
+            ci_only,
+            review_all,
+        }
+    }
+
+    /// Check if review phase should run
+    pub fn should_review(&self) -> bool {
+        self.worktree && !self.skip_review
+    }
+}

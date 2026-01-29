@@ -238,6 +238,91 @@ pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
     )
 }
 
+/// Build the master review prompt for the review phase
+pub fn prepare_review_flux(
+    ingot_id: &str,
+    branch: &str,
+    diff: &str,
+    ci_result: &crate::pipeline::review::CiResult,
+) -> String {
+    let fmt_status = if ci_result.fmt_passed {
+        "PASSED"
+    } else {
+        "FAILED"
+    };
+    let clippy_status = if ci_result.clippy_passed {
+        "PASSED"
+    } else {
+        "FAILED"
+    };
+    let test_status = if ci_result.test_passed {
+        "PASSED"
+    } else {
+        "FAILED"
+    };
+
+    format!(
+        "=== MASTER CODE REVIEW ===\n\
+        You are the master code reviewer for the slag forge system.\n\
+        Review this branch before it can be merged to main.\n\n\
+        INGOT: {ingot_id}\n\
+        BRANCH: {branch}\n\n\
+        === CI RESULTS ===\n\
+        - Format check (cargo fmt --check): {fmt_status}\n\
+        - Clippy (cargo clippy -- -D warnings): {clippy_status}\n\
+        - Tests (cargo test --all): {test_status}\n\n\
+        {ci_details}\n\
+        === DIFF ===\n\
+        {diff}\n\n\
+        === YOUR TASK ===\n\
+        Review the code changes and evaluate:\n\
+        1. Code correctness - does the implementation match the intent?\n\
+        2. Code quality - is it clean, idiomatic, maintainable?\n\
+        3. Integration safety - will this merge cleanly with main?\n\
+        4. Potential issues - bugs, edge cases, security concerns?\n\n\
+        OUTPUT FORMAT (exactly this):\n\
+        STATUS: APPROVED|REJECTED\n\
+        COMMENTS:\n\
+        <your detailed review comments, 1-3 sentences>\n\n\
+        RULES:\n\
+        - If CI passed and code looks reasonable, APPROVE\n\
+        - Only REJECT for serious issues\n\
+        - Be concise in comments\n\
+        - Focus on what matters\n",
+        ci_details = if !ci_result.passed() {
+            format!(
+                "CI FAILURE DETAILS:\n{}\n{}\n{}",
+                if !ci_result.fmt_passed {
+                    format!(
+                        "- fmt: {}",
+                        &ci_result.fmt_output[..ci_result.fmt_output.len().min(200)]
+                    )
+                } else {
+                    String::new()
+                },
+                if !ci_result.clippy_passed {
+                    format!(
+                        "- clippy: {}",
+                        &ci_result.clippy_output[..ci_result.clippy_output.len().min(500)]
+                    )
+                } else {
+                    String::new()
+                },
+                if !ci_result.test_passed {
+                    format!(
+                        "- test: {}",
+                        &ci_result.test_output[..ci_result.test_output.len().min(500)]
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            String::new()
+        }
+    )
+}
+
 fn read_tail(path: &str, lines: usize) -> String {
     match std::fs::read_to_string(path) {
         Ok(content) => {

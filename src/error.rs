@@ -35,6 +35,12 @@ pub enum SlagError {
     #[error("worktree error: {0}")]
     WorktreeError(String),
 
+    #[error("review failed: {0} branches rejected")]
+    ReviewFailed(usize),
+
+    #[error("CI check failed for branch {branch}: {reason}")]
+    CiFailed { branch: String, reason: String },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

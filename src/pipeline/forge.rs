@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use crate::config::{SmithConfig, CRUCIBLE, LEDGER};
+use crate::anvil::worktree;
+use crate::config::{PipelineConfig, SmithConfig, CRUCIBLE, LEDGER};
 use crate::crucible::Crucible;
 use crate::error::SlagError;
 use crate::flux;
@@ -12,8 +13,24 @@ use crate::tui;
 
 use super::resmelt;
 
+/// Result of forging an ingot, including branch name if worktree mode
+#[derive(Debug, Clone)]
+pub struct ForgeResult {
+    pub id: String,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+}
+
 /// Phase 3: Forge loop — parallel anvils then sequential
-pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagError> {
+/// Returns list of forged branches (empty if not using worktree mode)
+pub async fn run(
+    config: &SmithConfig,
+    pipeline_config: &PipelineConfig,
+) -> Result<Vec<ForgeResult>, SlagError> {
+    let mut forged_results: Vec<ForgeResult> = Vec::new();
+    let use_worktree = pipeline_config.worktree;
+    let max_anvils = pipeline_config.max_anvils;
+
     loop {
         let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
 
@@ -23,7 +40,7 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
             if counts.cracked > 0 {
                 return Err(SlagError::ForgeFailed(counts.cracked));
             }
-            return Ok(());
+            return Ok(forged_results);
         }
 
         // --- Parallel anvils for :solo t ---
@@ -63,9 +80,10 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
             let mut set = tokio::task::JoinSet::new();
             for ingot in ingot_snapshots {
                 let smith_cmd = config.select(ingot.skill.as_str(), ingot.grade).to_string();
+                let worktree_mode = use_worktree;
                 set.spawn(async move {
                     let smith = ClaudeSmith::new(smith_cmd);
-                    let result = strike_ingot(&ingot, &smith).await;
+                    let result = strike_ingot(&ingot, &smith, worktree_mode).await;
                     (ingot.id.clone(), result)
                 });
             }
@@ -74,9 +92,10 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
             while let Some(result) = set.join_next().await {
                 let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
                 match result {
-                    Ok((id, Ok(()))) => {
+                    Ok((id, Ok(forge_result))) => {
                         crucible.set_status(&id, Status::Forged);
                         crucible.save()?;
+                        forged_results.push(forge_result);
                     }
                     Ok((id, Err(_))) => {
                         // Try resmelt
@@ -119,22 +138,26 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
         let smith_cmd = config.select(ingot.skill.as_str(), ingot.grade).to_string();
         let smith = ClaudeSmith::new(smith_cmd);
 
-        if strike_ingot(&ingot, &smith).await.is_ok() {
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
-            crucible.set_status(&ingot.id, Status::Forged);
-            crucible.save()?;
-        } else {
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
-            let base_smith = ClaudeSmith::base(config);
-            if resmelt::resmelt_ingot(&mut crucible, &ingot, &base_smith)
-                .await
-                .is_ok()
-            {
-                // Re-smelted: status already updated by resmelt
+        match strike_ingot(&ingot, &smith, use_worktree).await {
+            Ok(forge_result) => {
+                let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                crucible.set_status(&ingot.id, Status::Forged);
                 crucible.save()?;
-            } else {
-                crucible.set_status(&ingot.id, Status::Cracked);
-                crucible.save()?;
+                forged_results.push(forge_result);
+            }
+            Err(_) => {
+                let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                let base_smith = ClaudeSmith::base(config);
+                if resmelt::resmelt_ingot(&mut crucible, &ingot, &base_smith)
+                    .await
+                    .is_ok()
+                {
+                    // Re-smelted: status already updated by resmelt
+                    crucible.save()?;
+                } else {
+                    crucible.set_status(&ingot.id, Status::Cracked);
+                    crucible.save()?;
+                }
             }
         }
 
@@ -146,8 +169,32 @@ pub async fn run(config: &SmithConfig, max_anvils: usize) -> Result<(), SlagErro
 }
 
 /// Strike a single ingot: retry with heat, extract CMD, verify proof.
-async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError> {
+/// If worktree_mode is true, creates an isolated worktree branch for the work.
+async fn strike_ingot(
+    ingot: &Ingot,
+    smith: &dyn Smith,
+    worktree_mode: bool,
+) -> Result<ForgeResult, SlagError> {
     let mut slag: Option<String> = None;
+    let mut worktree_path: Option<String> = None;
+    let branch_name = format!("forge/{}", ingot.id);
+
+    // Create worktree if in worktree mode
+    if worktree_mode {
+        match worktree::create(&ingot.id).await {
+            Ok(path) => {
+                worktree_path = Some(path.clone());
+                println!(
+                    "    \x1b[90m↳ worktree: {}\x1b[0m",
+                    tui::truncate(&path, 40)
+                );
+            }
+            Err(e) => {
+                eprintln!("    \x1b[31m✗\x1b[0m worktree create failed: {e}");
+                return Err(e);
+            }
+        }
+    }
 
     println!(
         "\n  \x1b[38;5;208m▣\x1b[0m \x1b[1;37m[{}]\x1b[0m {}{}{}",
@@ -203,7 +250,14 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
         };
         let spinner = tui::spinner(spinner_msg);
 
-        let response = match smith.invoke(&flux_text).await {
+        // In worktree mode, invoke smith in the worktree directory
+        let response = if let Some(ref wt_path) = worktree_path {
+            invoke_smith_in_worktree(smith, &flux_text, wt_path).await
+        } else {
+            smith.invoke(&flux_text).await
+        };
+
+        let response = match response {
             Ok(r) => {
                 spinner.finish_and_clear();
                 r
@@ -231,8 +285,12 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
         print!("\x1b[90m{}\x1b[0m ", tui::truncate(&cmd, 32));
         tui::flush();
 
-        // Run CMD
-        let (ok, output) = proof::run_shell(&cmd).await;
+        // Run CMD (in worktree if applicable)
+        let (ok, output) = if let Some(ref wt_path) = worktree_path {
+            run_shell_in_dir(&cmd, wt_path).await
+        } else {
+            proof::run_shell(&cmd).await
+        };
         log_to_file(
             &format!("ASSAY_{}_{heat}", ingot.id),
             &format!("exit={}\n{output}", if ok { 0 } else { 1 }),
@@ -241,7 +299,11 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
         if ok {
             // Verify proof if different from cmd
             if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
-                let (proof_ok, proof_output) = proof::run_shell(&ingot.proof).await;
+                let (proof_ok, proof_output) = if let Some(ref wt_path) = worktree_path {
+                    run_shell_in_dir(&ingot.proof, wt_path).await
+                } else {
+                    proof::run_shell(&ingot.proof).await
+                };
                 if !proof_ok {
                     slag = Some(format!("Proof failed [{}]: {proof_output}", ingot.proof));
                     println!(
@@ -253,16 +315,85 @@ async fn strike_ingot(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError>
             }
 
             println!("\x1b[1;37m█\x1b[0m");
-            proof::git_commit(&ingot.id, &ingot.work).await;
+
+            // Commit in worktree or main repo
+            if let Some(ref wt_path) = worktree_path {
+                git_commit_in_dir(&ingot.id, &ingot.work, wt_path).await;
+            } else {
+                proof::git_commit(&ingot.id, &ingot.work).await;
+            }
+
             append_ledger(ingot, heat);
-            return Ok(());
+            return Ok(ForgeResult {
+                id: ingot.id.clone(),
+                branch: if worktree_mode {
+                    Some(branch_name)
+                } else {
+                    None
+                },
+                worktree_path,
+            });
         } else {
             slag = Some(format!("CMD failed (exit 1): {output}"));
             println!("\x1b[31m✗\x1b[0m");
         }
     }
 
+    // Clean up worktree on failure (preserve branch for debugging)
+    if worktree_path.is_some() {
+        worktree::cleanup_without_merge(&ingot.id).await;
+    }
+
     Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max))
+}
+
+/// Invoke smith in a specific directory (worktree)
+async fn invoke_smith_in_worktree(
+    smith: &dyn Smith,
+    prompt: &str,
+    worktree_path: &str,
+) -> Result<String, SlagError> {
+    // The smith will work in the current directory, so we need to
+    // modify the prompt to include worktree context
+    let enhanced_prompt = format!(
+        "WORKTREE: You are working in an isolated git worktree at: {worktree_path}\n\
+        All file operations should be relative to this directory.\n\n\
+        {prompt}"
+    );
+    smith.invoke(&enhanced_prompt).await
+}
+
+/// Run a shell command in a specific directory
+async fn run_shell_in_dir(cmd: &str, dir: &str) -> (bool, String) {
+    match tokio::process::Command::new("bash")
+        .args(["-c", cmd])
+        .current_dir(dir)
+        .output()
+        .await
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{stdout}{stderr}");
+            (output.status.success(), combined)
+        }
+        Err(e) => (false, format!("spawn error: {e}")),
+    }
+}
+
+/// Git commit in a specific directory (worktree)
+async fn git_commit_in_dir(id: &str, work: &str, dir: &str) {
+    let msg = format!("forge({id}): {work}");
+    let _ = tokio::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(dir)
+        .output()
+        .await;
+    let _ = tokio::process::Command::new("git")
+        .args(["commit", "-m", &msg, "--quiet"])
+        .current_dir(dir)
+        .output()
+        .await;
 }
 
 fn append_ledger(ingot: &Ingot, heat: u8) {

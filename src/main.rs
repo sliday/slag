@@ -19,7 +19,7 @@ use std::path::Path;
 use clap::Parser;
 
 use cli::{Cli, Command};
-use config::SmithConfig;
+use config::{PipelineConfig, SmithConfig};
 
 #[tokio::main]
 async fn main() {
@@ -28,17 +28,26 @@ async fn main() {
     // Ensure logs directory exists
     let _ = std::fs::create_dir_all(config::LOG_DIR);
 
+    let pipeline_config = PipelineConfig::new(
+        cli.worktree,
+        cli.anvils,
+        cli.skip_review,
+        cli.keep_branches,
+        cli.ci_only,
+        cli.review_all,
+    );
+
     let result = match cli.command {
         Some(Command::Status) => show_status(),
         Some(Command::Update) => update::self_update().await,
         Some(Command::Resume) => {
-            let config = SmithConfig::from_env();
-            pipeline::run(None, &config, cli.anvils).await
+            let smith_config = SmithConfig::from_env();
+            pipeline::run(None, &smith_config, &pipeline_config).await
         }
         None => {
-            let config = SmithConfig::from_env();
+            let smith_config = SmithConfig::from_env();
             let commission = cli.commission_text();
-            pipeline::run(commission.as_deref(), &config, cli.anvils).await
+            pipeline::run(commission.as_deref(), &smith_config, &pipeline_config).await
         }
     };
 

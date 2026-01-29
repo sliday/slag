@@ -2,19 +2,20 @@ pub mod assay;
 pub mod forge;
 pub mod founder;
 pub mod resmelt;
+pub mod review;
 pub mod surveyor;
 
-use crate::config::SmithConfig;
+use crate::config::{PipelineConfig, SmithConfig};
 use crate::crucible::Crucible;
 use crate::error::SlagError;
 use crate::smith::claude::ClaudeSmith;
 use crate::tui;
 
-/// Run the full 4-phase pipeline.
+/// Run the full pipeline (4 or 5 phases depending on review mode).
 pub async fn run(
     commission: Option<&str>,
-    config: &SmithConfig,
-    max_anvils: usize,
+    smith_config: &SmithConfig,
+    pipeline_config: &PipelineConfig,
 ) -> Result<(), SlagError> {
     tui::show_banner();
 
@@ -23,7 +24,7 @@ pub async fn run(
 
     // Phase 1: Survey
     if !std::path::Path::new(crate::config::BLUEPRINT).exists() {
-        let smith = ClaudeSmith::plan(config);
+        let smith = ClaudeSmith::plan(smith_config);
         surveyor::run(&smith).await?;
     }
 
@@ -34,7 +35,7 @@ pub async fn run(
         !content.contains("(ingot ")
     };
     if needs_founder {
-        let smith = ClaudeSmith::plan(config);
+        let smith = ClaudeSmith::plan(smith_config);
         founder::run(&smith).await?;
     }
 
@@ -48,7 +49,13 @@ pub async fn run(
     tui::ingot_status_line(&counts);
     println!();
 
-    forge::run(config, max_anvils).await?;
+    let forged_branches = forge::run(smith_config, pipeline_config).await?;
+
+    // Phase 3.5: Review (if worktree mode enabled)
+    if pipeline_config.should_review() && !forged_branches.is_empty() {
+        let smith = ClaudeSmith::base(smith_config);
+        review::run(&smith, pipeline_config, &forged_branches).await?;
+    }
 
     // Phase 4: Assay
     let elapsed_secs = forge_start.elapsed().as_secs();
