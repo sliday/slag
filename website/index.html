@@ -121,18 +121,18 @@ EOF</code>
       <section class="diagram">
         <h2>Pipeline</h2>
 <pre box="square">
-  PRD.md                                          PROGRESS.md
-  <span style="color:var(--slag-warm);">(ore)</span>                                             <span style="color:var(--slag-pure);">(ledger)</span>
-    |                                                 ^
-    v                                                 |
- <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+--------------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+-------+</span>
- <span style="color:var(--slag-cold);">|</span> <span style="color:var(--slag-bright);">SURVEYOR</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FOUNDER</span>      <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FORGE</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">ASSAY</span> <span style="color:var(--slag-cold);">|</span>
- <span style="color:var(--slag-cold);">|</span> analyze   <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> cast ingots  <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> strike <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> report<span style="color:var(--slag-cold);">|</span>
- <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+--------------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+-------+</span>
-    |                    |                    |
-    v                    v                    v
- BLUEPRINT.md        PLAN.md             git commits
- <span style="color:var(--foreground1);">(analysis)</span>        <span style="color:var(--foreground1);">(s-expr ingots)</span>      <span style="color:var(--foreground1);">(per ingot)</span>
+  PRD.md                                                              PROGRESS.md
+  <span style="color:var(--slag-warm);">(ore)</span>                                                                 <span style="color:var(--slag-pure);">(ledger)</span>
+    |                                                                     ^
+    v                                                                     |
+ <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+-------+</span>
+ <span style="color:var(--slag-cold);">|</span> <span style="color:var(--slag-bright);">SURVEYOR</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FOUNDER</span>   <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FORGE</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-hot);">REVIEW</span> <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">ASSAY</span> <span style="color:var(--slag-cold);">|</span>
+ <span style="color:var(--slag-cold);">|</span> analyze   <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> cast      <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> strike <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> CI+AI  <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> report<span style="color:var(--slag-cold);">|</span>
+ <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+-------+</span>
+    |                  |                |              |
+    v                  v                v              v
+ BLUEPRINT.md      PLAN.md         branches      merge to main
+ <span style="color:var(--foreground1);">(analysis)</span>      <span style="color:var(--foreground1);">(s-expr)</span>       <span style="color:var(--foreground1);">(worktree)</span>   <span style="color:var(--foreground1);">(--worktree)</span>
 </pre>
       </section>
 
@@ -186,9 +186,9 @@ EOF</code>
 
       <div is="separator"></div>
 
-      <!-- S6: FOUR PHASES -->
+      <!-- S6: PHASES -->
       <section>
-        <h2>Four Phases</h2>
+        <h2>Phases</h2>
         <div class="phase-grid">
           <div class="phase-card" box="square">
             <div>
@@ -210,6 +210,14 @@ EOF</code>
               <span class="phase-name">FORGE</span>
             </div>
             <p class="phase-desc">Strikes each ingot via Claude. Solo ingots run on parallel anvils (up to 3). Selects smith by skill and grade. Retries with slag feedback on failure. Commits on success.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div>
+              <span is="badge" class="molten phase-num">3.5</span>
+              <span class="phase-name">REVIEW</span>
+              <span style="color: var(--foreground2); font-size: 0.8rem;">(--worktree)</span>
+            </div>
+            <p class="phase-desc">Master agent quality gate. With --worktree, each ingot forges in an isolated branch. Review runs CI checks (fmt, clippy, test), then AI reviews the diff. Approved branches merge; rejected ones are flagged.</p>
           </div>
           <div class="phase-card" box="square">
             <div>

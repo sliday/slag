@@ -59,8 +59,12 @@ slag [OPTIONS] [COMMISSION]... [COMMAND]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--worktree` | off | Enable branch-per-ingot worktree isolation |
+| `--worktree` | off | Enable branch-per-ingot worktree isolation with master review |
 | `--anvils N` | 3 | Max parallel anvil workers |
+| `--skip-review` | off | Skip the master review phase (legacy behavior) |
+| `--keep-branches` | off | Don't delete branches after review |
+| `--ci-only` | off | Run CI checks but skip AI review |
+| `--review-all` | off | Review even if CI fails |
 
 ## Progress display
 
@@ -113,6 +117,7 @@ slag uses metallurgical vocabulary. Here's the dictionary.
 | **Re-smelt** | Analyze a cracked ingot and rewrite/split it | Phase 3 (recovery) |
 | **Reconsider** | Rethink a twice-cracked ingot's fundamental approach | Phase 3 (recovery) |
 | **Temper** | Track and display forging progress | Phase 3 |
+| **Review** | Master agent CI checks and code review before merge | Phase 3.5 (--worktree) |
 | **Assay** | Final quality check, produce report | Phase 4 |
 | **Crack** | Fail permanently after exhausting all heats | Terminal state |
 
@@ -128,11 +133,17 @@ ore --> molten --> forged
 
 ## How it works
 
-slag runs a 4-phase pipeline:
+slag runs a 4-phase pipeline (5 phases with `--worktree`):
 
 ```
 PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGRESS.md
  (ore)    (analyze)    (blueprint)     (design)   (crucible)  (strike)    (ledger)
+
+With --worktree (master review enabled):
+PRD.md --> SURVEYOR --> FOUNDER --> FORGE (branches) --> REVIEW --> ASSAY
+                                         |                  |
+                                    git worktrees      CI + AI review
+                                    per ingot          before merge
 ```
 
 ### Phase 1: Surveyor
@@ -158,6 +169,16 @@ The main loop. For each ingot:
 4. **Proof** -- run the `:proof` command; exit 0 = forged, non-zero = retry
 
 Independent ingots (`:solo t`) run on parallel anvils. Sequential ingots (`:solo nil`) run one at a time.
+
+### Phase 3.5: Review (with `--worktree`)
+
+When `--worktree` is enabled, each ingot is forged in an isolated git worktree branch (`forge/iN`). After forging completes, the Review phase:
+
+1. **CI Checks** -- runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --all` on each branch
+2. **Master Review** -- AI agent reviews the diff, code quality, and integration safety
+3. **Merge Decision** -- approved branches merge to main; rejected branches are flagged
+
+Use `--ci-only` to skip AI review and auto-merge on CI pass. Use `--keep-branches` to preserve branches for debugging.
 
 ### Phase 4: Assay
 
