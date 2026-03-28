@@ -568,6 +568,11 @@ mod tests {
     }
 
     #[test]
+    fn extract_number_before_empty_string_returns_none() {
+        assert_eq!(extract_number_before("", "passed"), None);
+    }
+
+    #[test]
     fn commission_shortcuts_include_baseline() {
         let baseline = Metrics {
             test_pass: 134,
