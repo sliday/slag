@@ -1,9 +1,21 @@
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor, ResetColor};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::crucible::CrucibleCounts;
+
+/// Stream-mode silencer: the Ratatui dashboard owns the screen while set.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, Ordering::Relaxed);
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
 
 // Palette (cold ore → hot metal → pure steel)
 pub const COLD: Color = Color::DarkGrey;
@@ -13,6 +25,9 @@ pub const BRIGHT: Color = Color::AnsiValue(220); // yellow
 pub const PURE: Color = Color::White;
 
 pub fn hr() {
+    if is_quiet() {
+        return;
+    }
     println!(
         "{}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{}",
         fg(COLD),
@@ -21,6 +36,9 @@ pub fn hr() {
 }
 
 pub fn header(title: &str) {
+    if is_quiet() {
+        return;
+    }
     println!();
     hr();
     println!(
@@ -35,10 +53,16 @@ pub fn header(title: &str) {
 }
 
 pub fn status_line(icon: &str, color: Color, msg: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("  {}{}{} {}", fg(color), icon, reset(), msg);
 }
 
 pub fn show_banner() {
+    if is_quiet() {
+        return;
+    }
     println!();
     print!("  {}░░░", fg(COLD));
     print!("{}▒", fg(WARM));
@@ -66,6 +90,9 @@ pub fn show_banner() {
 }
 
 pub fn ingot_status_line(counts: &CrucibleCounts) {
+    if is_quiet() {
+        return;
+    }
     print!("[ ✅{} done | 🔥{} forging | 🧱{} queued", counts.forged, counts.molten, counts.ore);
     if counts.cracked > 0 {
         print!(" | ❌{} failed", counts.cracked);
@@ -74,6 +101,9 @@ pub fn ingot_status_line(counts: &CrucibleCounts) {
 }
 
 pub fn temper_bar(counts: &CrucibleCounts) {
+    if is_quiet() {
+        return;
+    }
     let total = counts.total.max(1);
     let pct = counts.forged * 100 / total;
     let filled = counts.forged * 20 / total;
@@ -104,6 +134,9 @@ pub fn temper_bar(counts: &CrucibleCounts) {
 
 /// Create a spinner for long operations
 pub fn spinner(msg: &str) -> ProgressBar {
+    if is_quiet() {
+        return ProgressBar::hidden();
+    }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -117,6 +150,9 @@ pub fn spinner(msg: &str) -> ProgressBar {
 
 /// Create a spark-style spinner
 pub fn spark_spinner(msg: &str) -> ProgressBar {
+    if is_quiet() {
+        return ProgressBar::hidden();
+    }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
