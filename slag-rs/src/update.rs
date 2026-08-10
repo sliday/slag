@@ -41,8 +41,8 @@ pub async fn self_update() -> Result<(), SlagError> {
         .map_err(|e| SlagError::UpdateFailed(format!("parse failed: {e}")))?;
 
     let latest = release.tag_name.trim_start_matches('v');
-    if latest == current_version {
-        println!("  Already up to date (v{current_version})");
+    if !is_newer(latest, current_version) {
+        println!("  Already up to date (v{current_version}, latest release v{latest})");
         return Ok(());
     }
 
@@ -95,6 +95,20 @@ pub async fn self_update() -> Result<(), SlagError> {
 
     println!("  Updated to v{latest}");
     Ok(())
+}
+
+/// True only when `latest` is a strictly newer x.y.z than `current`.
+/// Refuses downgrades: a stale remote release must never replace a
+/// newer local build. Unparseable versions compare as not-newer.
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parse(v: &str) -> Option<[u64; 3]> {
+        let mut parts = v.split('.').map(|p| p.trim().parse::<u64>().ok());
+        Some([parts.next()??, parts.next()??, parts.next()??])
+    }
+    match (parse(latest), parse(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
 }
 
 fn platform_asset_name() -> Option<String> {
