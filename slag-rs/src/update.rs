@@ -52,10 +52,12 @@ pub async fn self_update() -> Result<(), SlagError> {
     let asset_name = platform_asset_name()
         .ok_or_else(|| SlagError::UpdateFailed("unsupported platform".into()))?;
 
+    // Prefer an exact raw-binary asset; fall back to a tarball match.
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name.contains(&asset_name))
+        .find(|a| a.name == asset_name)
+        .or_else(|| release.assets.iter().find(|a| a.name.contains(&asset_name)))
         .ok_or_else(|| {
             SlagError::UpdateFailed(format!("no asset matching {asset_name} in release"))
         })?;
@@ -76,9 +78,15 @@ pub async fn self_update() -> Result<(), SlagError> {
         .map_err(|e| SlagError::UpdateFailed(format!("cannot find current exe: {e}")))?;
 
     let tmp_path = current_exe.with_extension("tmp");
-    tokio::fs::write(&tmp_path, &bytes)
-        .await
-        .map_err(|e| SlagError::UpdateFailed(format!("write tmp failed: {e}")))?;
+    if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".tgz") {
+        // cargo-dist ships tarballs; installing raw bytes as the
+        // executable yields "exec format error". Extract first.
+        extract_binary_from_targz(&bytes, &tmp_path).await?;
+    } else {
+        tokio::fs::write(&tmp_path, &bytes)
+            .await
+            .map_err(|e| SlagError::UpdateFailed(format!("write tmp failed: {e}")))?;
+    }
 
     // Make executable on unix
     #[cfg(unix)]
@@ -95,6 +103,74 @@ pub async fn self_update() -> Result<(), SlagError> {
 
     println!("  Updated to v{latest}");
     Ok(())
+}
+
+/// Extract the `slag` binary from a .tar.gz release asset into `dest`.
+/// Uses the system tar; the archive may nest the binary one directory deep.
+async fn extract_binary_from_targz(
+    bytes: &[u8],
+    dest: &std::path::Path,
+) -> Result<(), SlagError> {
+    let work = tempdir_path()?;
+    tokio::fs::create_dir_all(&work)
+        .await
+        .map_err(|e| SlagError::UpdateFailed(format!("mkdir failed: {e}")))?;
+    let archive = work.join("asset.tar.gz");
+    tokio::fs::write(&archive, bytes)
+        .await
+        .map_err(|e| SlagError::UpdateFailed(format!("write archive failed: {e}")))?;
+
+    let out = tokio::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&work)
+        .output()
+        .await
+        .map_err(|e| SlagError::UpdateFailed(format!("tar spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(SlagError::UpdateFailed(format!(
+            "tar extract failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+
+    let binary = find_slag_binary(&work).ok_or_else(|| {
+        SlagError::UpdateFailed("no `slag` binary inside release archive".into())
+    })?;
+    tokio::fs::copy(&binary, dest)
+        .await
+        .map_err(|e| SlagError::UpdateFailed(format!("copy binary failed: {e}")))?;
+    let _ = tokio::fs::remove_dir_all(&work).await;
+    Ok(())
+}
+
+/// Find a file named `slag` up to two levels deep.
+fn find_slag_binary(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn scan(dir: &std::path::Path, depth: u8) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().is_some_and(|n| n == "slag") {
+                return Some(path);
+            }
+            if path.is_dir() && depth > 0 {
+                if let Some(found) = scan(&path, depth - 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    scan(dir, 2)
+}
+
+fn tempdir_path() -> Result<std::path::PathBuf, SlagError> {
+    let base = std::env::temp_dir();
+    let unique = format!(
+        "slag-update-{}",
+        std::process::id()
+    );
+    Ok(base.join(unique))
 }
 
 /// True only when `latest` is a strictly newer x.y.z than `current`.
