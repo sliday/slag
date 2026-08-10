@@ -27,6 +27,17 @@ use smith::EngineHooks;
 async fn main() {
     let cli = Cli::parse();
 
+    // Model flags override env; EngineConfig::load reads env downstream.
+    if let Some(m) = &cli.model {
+        std::env::set_var("SLAG_MODEL_BASE", m);
+    }
+    if let Some(m) = &cli.plan_model {
+        std::env::set_var("SLAG_MODEL_PLAN", m);
+    }
+    if let Some(m) = &cli.judge_model {
+        std::env::set_var("SLAG_MODEL_JUDGE", m);
+    }
+
     // Ensure logs directory exists
     let _ = std::fs::create_dir_all(config::LOG_DIR);
 

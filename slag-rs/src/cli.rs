@@ -26,6 +26,18 @@ pub struct Cli {
     /// Max parallel anvil workers
     #[arg(long, default_value_t = crate::config::MAX_ANVILS)]
     pub anvils: usize,
+
+    /// Worker model, any OpenRouter id (overrides SLAG_MODEL_BASE)
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Planner model for grade>=3 ingots (overrides SLAG_MODEL_PLAN)
+    #[arg(long, value_name = "MODEL")]
+    pub plan_model: Option<String>,
+
+    /// Duel judge model (overrides SLAG_MODEL_JUDGE)
+    #[arg(long, value_name = "MODEL")]
+    pub judge_model: Option<String>,
 }
 
 #[derive(Subcommand)]
