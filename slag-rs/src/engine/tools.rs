@@ -17,9 +17,11 @@ pub mod recipes;
 #[path = "judge.rs"]
 pub mod judge;
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -33,18 +35,36 @@ const BASH_TIMEOUT_MAX: u64 = 600;
 const BASH_OUTPUT_CAP: usize = 30_000;
 const GREP_LINE_CAP: usize = 100;
 const DIFF_LINE_CAP: usize = 12;
+/// Files modified within this window never enter the read cache: a
+/// same-size rewrite landing in the same mtime tick would make the stamp
+/// lie (git's "racy clean" rule).
+const READ_CACHE_SETTLE: Duration = Duration::from_secs(2);
+
+/// Stamp of a file fully read this session: repeat full reads of a file
+/// whose mtime+size are unchanged return a short stub instead of the body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReadStamp {
+    mtime: SystemTime,
+    size: u64,
+    lines: usize,
+}
 
 /// Native toolbox rooted at an anvil worktree.
 #[derive(Clone)]
 pub struct ToolBox {
     root: PathBuf,
+    /// Session read cache (shared across clones of this ToolBox).
+    read_cache: Arc<Mutex<HashMap<PathBuf, ReadStamp>>>,
 }
 
 impl ToolBox {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = root.into();
         let root = root.canonicalize().unwrap_or(root);
-        Self { root }
+        Self {
+            root,
+            read_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Tool schemas advertised to the model.
@@ -58,7 +78,8 @@ impl ToolBox {
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to workspace root"},
                         "offset": {"type": "integer", "description": "1-based line to start from (default 1)"},
-                        "limit": {"type": "integer", "description": "Max lines to return (default 2000)"}
+                        "limit": {"type": "integer", "description": "Max lines to return (default 2000)"},
+                        "force": {"type": "boolean", "description": "Re-read even if the file is unchanged since your earlier read this session (default false)"}
                     },
                     "required": ["path"]
                 }),
@@ -234,17 +255,39 @@ impl ToolBox {
     async fn read_file(&self, args: &Value) -> Result<String, SlagError> {
         let raw = req_str(args, "read_file", "path")?;
         let path = self.resolve(raw)?;
-        let offset = args
-            .get("offset")
-            .and_then(Value::as_u64)
-            .map(|v| v.max(1) as usize)
-            .unwrap_or(1);
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
+        let offset_arg = args.get("offset").and_then(Value::as_u64);
+        let limit_arg = args.get("limit").and_then(Value::as_u64);
+        // Partial reads bypass the session read cache entirely: they always
+        // read fresh and never populate the cache.
+        let partial = offset_arg.is_some() || limit_arg.is_some();
+        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+        let offset = offset_arg.map(|v| v.max(1) as usize).unwrap_or(1);
+        let limit = limit_arg
             .map(|v| v as usize)
             .unwrap_or(READ_LIMIT_DEFAULT)
             .max(1);
+
+        let meta = tokio::fs::metadata(&path).await.ok();
+
+        // Repeat-read stub: a second full read of a file whose mtime+size
+        // are unchanged returns a stub instead of the body. force bypasses.
+        if !partial && !force {
+            if let Some(meta) = &meta {
+                if let Ok(mtime) = meta.modified() {
+                    let cache = self.read_cache.lock().unwrap();
+                    if let Some(prev) = cache.get(&path) {
+                        if prev.mtime == mtime && prev.size == meta.len() {
+                            return Ok(format!(
+                                "[unchanged since your earlier read this session: {raw} ({} lines)]. \
+                                 Content is already in your context. If it was compacted away, \
+                                 call read_file again with force: true.",
+                                prev.lines
+                            ));
+                        }
+                    }
+                }
+            }
+        }
 
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -274,13 +317,42 @@ impl ToolBox {
         } else {
             out.pop();
         }
+
+        // Only a complete, untruncated read of a settled file counts as
+        // "fully read" and enters the cache. force refreshes the entry.
+        if !partial && end == lines.len() {
+            if let Some(meta) = &meta {
+                if let Ok(mtime) = meta.modified() {
+                    let settled = SystemTime::now()
+                        .duration_since(mtime)
+                        .is_ok_and(|age| age >= READ_CACHE_SETTLE);
+                    if settled {
+                        self.read_cache.lock().unwrap().insert(
+                            path.clone(),
+                            ReadStamp {
+                                mtime,
+                                size: meta.len(),
+                                lines: lines.len(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
         Ok(out)
+    }
+
+    /// Drop a path from the session read cache; writers call this so a
+    /// post-write read never hits a stale stub.
+    fn invalidate_read_cache(&self, path: &Path) {
+        self.read_cache.lock().unwrap().remove(path);
     }
 
     async fn write_file(&self, args: &Value) -> Result<String, SlagError> {
         let raw = req_str(args, "write_file", "path")?;
         let content = req_str(args, "write_file", "content")?;
         let path = self.resolve(raw)?;
+        self.invalidate_read_cache(&path);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -313,6 +385,7 @@ impl ToolBox {
             return Err(SlagError::Tool("old_string must not be empty".into()));
         }
         let path = self.resolve(raw)?;
+        self.invalidate_read_cache(&path);
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| SlagError::Tool(format!("cannot read {raw}: {e}")))?;
@@ -434,7 +507,11 @@ impl ToolBox {
             .and_then(Value::as_u64)
             .unwrap_or(BASH_TIMEOUT_DEFAULT)
             .clamp(1, BASH_TIMEOUT_MAX);
-        self.run_shell(command, timeout).await
+        // Lossless-in-spirit noise reduction on successful bash output only:
+        // errors (Err path) and other tools (grep calls run_shell directly)
+        // are untouched.
+        let out = self.run_shell(command, timeout).await?;
+        Ok(reduce_bash_output(&out))
     }
 
     async fn run_shell(&self, command: &str, timeout_secs: u64) -> Result<String, SlagError> {
@@ -855,6 +932,213 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+// ---------------------------------------------------------------------------
+// cmd-strip: deterministic, idempotent noise reduction for bash tool output.
+// Patterns ported conservatively from tamp's command rewriters
+// (cargo/npm/pip/wget-curl): when unsure a line is progress noise, keep it.
+// ---------------------------------------------------------------------------
+
+const SPINNER_CHARS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const BLOCK_BAR_CHARS: [char; 14] = [
+    '█', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '▐', '░', '▒', '▓', '━', '╸',
+];
+const PROGRESS_VERBS: [&str; 6] = [
+    "Compiling",
+    "Downloading",
+    "Downloaded",
+    "Checking",
+    "Collecting",
+    "Fresh",
+];
+/// Runs of more than this many consecutive same-verb progress lines collapse
+/// to first + marker + last.
+const PROGRESS_RUN_KEEP: usize = 5;
+
+/// Reduce bash stdout/stderr text: carriage-return overwrite resolution,
+/// pure-progress-line removal, repeated-progress-run collapse, and 3+ blank
+/// line collapse. Idempotent: reduce(reduce(x)) == reduce(x).
+fn reduce_bash_output(s: &str) -> String {
+    let had_trailing_newline = s.ends_with('\n');
+    let mut lines: Vec<String> = s.split('\n').map(resolve_carriage_returns).collect();
+    if had_trailing_newline {
+        lines.pop(); // drop the empty element after the final '\n'
+    }
+
+    // Drop pure progress decorations.
+    lines.retain(|l| !is_progress_decoration(l));
+
+    // Collapse runs of >PROGRESS_RUN_KEEP consecutive similar progress lines
+    // (same leading verb, e.g. cargo's "Compiling foo v1.2.3" wall): keep
+    // first and last with a marker in between.
+    let mut collapsed: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        match progress_verb(&lines[i]) {
+            Some(verb) => {
+                let mut j = i + 1;
+                while j < lines.len() && progress_verb(&lines[j]) == Some(verb) {
+                    j += 1;
+                }
+                let run = j - i;
+                if run > PROGRESS_RUN_KEEP {
+                    collapsed.push(lines[i].clone());
+                    collapsed.push(format!("[… {} similar progress lines removed]", run - 2));
+                    collapsed.push(lines[j - 1].clone());
+                } else {
+                    collapsed.extend(lines[i..j].iter().cloned());
+                }
+                i = j;
+            }
+            None => {
+                collapsed.push(lines[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    // Blank-line collapse: runs of 3+ blank lines become a single blank.
+    let mut out: Vec<&str> = Vec::with_capacity(collapsed.len());
+    let mut blanks = 0usize;
+    for line in &collapsed {
+        if line.trim().is_empty() {
+            blanks += 1;
+            continue;
+        }
+        push_blanks(&mut out, blanks);
+        blanks = 0;
+        out.push(line);
+    }
+    push_blanks(&mut out, blanks);
+
+    let mut joined = out.join("\n");
+    if had_trailing_newline && !joined.is_empty() {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn push_blanks<'a>(out: &mut Vec<&'a str>, blanks: usize) {
+    let emit = if blanks >= 3 { 1 } else { blanks };
+    for _ in 0..emit {
+        out.push("");
+    }
+}
+
+/// A line overwritten in place with carriage returns keeps only the text
+/// after the last '\r'. A single trailing '\r' (CRLF artifact) is stripped
+/// first so CRLF content is not emptied.
+fn resolve_carriage_returns(line: &str) -> String {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    match line.rfind('\r') {
+        Some(pos) => line[pos + 1..].to_string(),
+        None => line.to_string(),
+    }
+}
+
+/// True when a line is purely a progress decoration. Conservative: only
+/// shapes that never carry unique information.
+fn is_progress_decoration(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.is_empty() {
+        return false;
+    }
+    // Anchored spinner glyph + whitespace (tamp/npm: unanchored matching
+    // deleted real output that merely contained a braille char).
+    let mut chars = t.chars();
+    if let Some(first) = chars.next() {
+        if SPINNER_CHARS.contains(&first) && matches!(chars.next(), Some(' ' | '\t') | None) {
+            return true;
+        }
+    }
+    // cargo: "   Building [=======>  ] 45/123: foo, bar"
+    if let Some(rest) = t.strip_prefix("Building") {
+        if starts_with_bracket_bar(rest.trim_start()) {
+            return true;
+        }
+    }
+    // wget-style: "45% [=====>     ]" — percent first, then a bar.
+    if let Some(after_pct) = leading_percent(t) {
+        if starts_with_bracket_bar(after_pct.trim_start()) {
+            return true;
+        }
+    }
+    // generic: "[=====>  ] 45%" — a bar first, then a percentage anywhere.
+    if t.starts_with('[') && starts_with_bracket_bar(t) && contains_percent(t) {
+        return true;
+    }
+    // pip-style block art: 4+ consecutive bar glyphs plus a digit
+    // ("━━━━━━━━ 1.2/1.2 MB 5.4 MB/s eta 0:00:00").
+    if has_block_bar_run(t) && t.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    false
+}
+
+/// `[=====>  ]`-shaped prefix: '[' then only fill chars (= > # - . space)
+/// with at least one of = # >, closed by ']'.
+fn starts_with_bracket_bar(s: &str) -> bool {
+    let Some(inner) = s.strip_prefix('[') else {
+        return false;
+    };
+    let Some(end) = inner.find(']') else {
+        return false;
+    };
+    let bar = &inner[..end];
+    !bar.is_empty()
+        && bar.chars().all(|c| matches!(c, '=' | '>' | '#' | '-' | '.' | ' '))
+        && bar.chars().any(|c| matches!(c, '=' | '#' | '>'))
+}
+
+/// If the line starts with "NN%" or "NN.N%", return the rest after the '%'.
+fn leading_percent(s: &str) -> Option<&str> {
+    let digits = s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').count();
+    if digits == 0 {
+        return None;
+    }
+    s[digits..].strip_prefix('%')
+}
+
+/// A digit immediately followed by '%' anywhere in the line.
+fn contains_percent(s: &str) -> bool {
+    let mut prev_digit = false;
+    for c in s.chars() {
+        if c == '%' && prev_digit {
+            return true;
+        }
+        prev_digit = c.is_ascii_digit();
+    }
+    false
+}
+
+fn has_block_bar_run(s: &str) -> bool {
+    let mut run = 0usize;
+    for c in s.chars() {
+        if BLOCK_BAR_CHARS.contains(&c) {
+            run += 1;
+            if run >= 4 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// The leading verb of a package-manager progress line
+/// ("   Compiling serde v1.0.190", "Collecting requests"), or None.
+fn progress_verb(line: &str) -> Option<&'static str> {
+    let t = line.trim_start();
+    for verb in PROGRESS_VERBS {
+        if let Some(rest) = t.strip_prefix(verb) {
+            if rest.starts_with(' ') && !rest.trim_start().is_empty() {
+                return Some(verb);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,6 +1161,17 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, content).expect("write fixture");
         path
+    }
+
+    /// Push a fixture's mtime into the past so it clears the racy-clean
+    /// settle window and is eligible for the read cache.
+    fn backdate(path: &Path) {
+        let status = std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(path)
+            .status()
+            .expect("touch fixture");
+        assert!(status.success(), "backdate failed");
     }
 
     #[tokio::test]
@@ -1369,6 +1664,278 @@ mod tests {
         assert!(out.is_error);
         assert!(out.output.contains("unknown recipe 'ghost'"), "{}", out.output);
         assert!(out.output.contains("ship"), "{}", out.output);
+    }
+
+    // -- cmd-strip / blank collapse -------------------------------------
+
+    /// Synthetic cargo-build transcript: 8 Compiling lines, spinner frames,
+    /// progress bars, block art, CR-overwritten download line, blank runs,
+    /// plus real content (warning, error, Finished, test results).
+    /// (Backslash continuations strip next-line leading whitespace; the
+    /// reducer trims leading whitespace before matching, so that's fine.)
+    const CARGO_TRANSCRIPT: &str = "\
+    Updating crates.io index\n\
+  Downloading serde v1.0.190 (10%)\r  Downloading serde v1.0.190 (55%)\r  Downloaded serde v1.0.190\n\
+   Compiling proc-macro2 v1.0.69\n\
+   Compiling quote v1.0.33\n\
+   Compiling syn v2.0.38\n\
+   Compiling serde v1.0.190\n\
+   Compiling serde_json v1.0.107\n\
+   Compiling tokio v1.33.0\n\
+   Compiling thiserror v2.0.3\n\
+   Compiling slag v1.1.0 (/work/slag)\n\
+   Building [=======>                  ] 45/123: syn, tokio\n\
+⠋ building\n\
+⠙ building\n\
+[=====>  ] 45%\n\
+━━━━━━━━━━━━ 1.2/1.2 MB 5.4 MB/s eta 0:00:00\n\
+warning: unused variable: `x`\n\
+ --> src/main.rs:4:9\n\
+\n\
+\n\
+\n\
+\n\
+error[E0308]: mismatched types\n\
+ --> src/lib.rs:10:5\n\
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.34s\n\
+     Running unittests src/lib.rs\n\
+test result: ok. 207 passed; 0 failed\n";
+
+    #[test]
+    fn cmd_strip_cargo_transcript() {
+        let out = reduce_bash_output(CARGO_TRANSCRIPT);
+
+        // Real content survives.
+        for kept in [
+            "Updating crates.io index",
+            "warning: unused variable: `x`",
+            "--> src/main.rs:4:9",
+            "error[E0308]: mismatched types",
+            "Finished `dev` profile",
+            "Running unittests src/lib.rs",
+            "test result: ok. 207 passed; 0 failed",
+        ] {
+            assert!(out.contains(kept), "lost real content {kept:?}:\n{out}");
+        }
+
+        // Progress decorations are gone.
+        assert!(!out.contains("Building ["), "{out}");
+        assert!(!out.contains('⠋'), "{out}");
+        assert!(!out.contains("[=====>"), "{out}");
+        assert!(!out.contains('━'), "{out}");
+
+        // CR-overwritten line keeps only the final segment.
+        assert!(out.contains("Downloaded serde v1.0.190"), "{out}");
+        assert!(!out.contains("(10%)"), "{out}");
+        assert!(!out.contains("(55%)"), "{out}");
+
+        // 8 consecutive Compiling lines collapse to first + marker + last.
+        assert!(out.contains("Compiling proc-macro2 v1.0.69"), "{out}");
+        assert!(out.contains("[… 6 similar progress lines removed]"), "{out}");
+        assert!(out.contains("Compiling slag v1.1.0"), "{out}");
+        assert!(!out.contains("Compiling quote"), "{out}");
+        assert!(!out.contains("Compiling tokio"), "{out}");
+
+        assert!(
+            out.len() < CARGO_TRANSCRIPT.len(),
+            "no reduction: {} -> {}",
+            CARGO_TRANSCRIPT.len(),
+            out.len()
+        );
+        println!(
+            "cmd-strip reduction: {} -> {} bytes ({:.1}%)",
+            CARGO_TRANSCRIPT.len(),
+            out.len(),
+            100.0 * (CARGO_TRANSCRIPT.len() - out.len()) as f64 / CARGO_TRANSCRIPT.len() as f64
+        );
+    }
+
+    #[test]
+    fn cmd_strip_carriage_returns() {
+        // Overwritten segments: keep only text after the last \r per line.
+        assert_eq!(reduce_bash_output("a 10%\ra 50%\ra done\nnext"), "a done\nnext");
+        // CRLF line endings must not empty the content.
+        assert_eq!(reduce_bash_output("hello\r\nworld\r\n"), "hello\nworld\n");
+        // Bare \r at start keeps the tail.
+        assert_eq!(reduce_bash_output("\rfinal"), "final");
+    }
+
+    #[test]
+    fn cmd_strip_blank_collapse() {
+        // 3+ blank lines -> 1 blank line; 1-2 blanks stay as-is.
+        assert_eq!(reduce_bash_output("a\n\n\n\n\nb"), "a\n\nb");
+        assert_eq!(reduce_bash_output("a\n\n\n\nb\n"), "a\n\nb\n");
+        assert_eq!(reduce_bash_output("a\n\n\nb"), "a\n\n\nb");
+        assert_eq!(reduce_bash_output("a\n\nb"), "a\n\nb");
+        assert_eq!(reduce_bash_output("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn cmd_strip_keeps_ambiguous_lines() {
+        // Not obviously progress noise -> kept verbatim.
+        let keep = "\
+error: expected `]`, found `%`\n\
+let v = [1, 2, 3]; // 45% of cases\n\
+Compiling is slow today\n\
+Building [production] artifacts\n\
+Collecting\n\
+100% test coverage reached\n";
+        assert_eq!(reduce_bash_output(keep), keep);
+    }
+
+    #[test]
+    fn cmd_strip_is_idempotent() {
+        for input in [
+            CARGO_TRANSCRIPT,
+            "a 10%\ra done\n\n\n\n\nend\n",
+            "plain output\nno noise at all\n",
+        ] {
+            let once = reduce_bash_output(input);
+            let twice = reduce_bash_output(&once);
+            assert_eq!(once, twice, "not idempotent for {input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_output_is_reduced_but_errors_untouched() {
+        let (_dir, tb) = setup();
+        // Progress-ish noise through the real bash tool is stripped.
+        let out = tb
+            .dispatch(&call(
+                "bash",
+                json!({"command": "printf 'x 1%%\\rx 2%%\\rx done\\nreal line\\n'"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("x done"), "{}", out.output);
+        assert!(!out.output.contains("x 1%"), "{}", out.output);
+        assert!(out.output.contains("real line"), "{}", out.output);
+
+        // is_error outputs come back untouched by reductions.
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "sleep 5", "timeout": 1})))
+            .await;
+        assert!(out.is_error);
+        assert!(out.output.contains("timed out"), "{}", out.output);
+    }
+
+    // -- repeat-read stub ------------------------------------------------
+
+    #[tokio::test]
+    async fn repeat_read_returns_stub_and_force_bypasses() {
+        let (dir, tb) = setup();
+        let p = write(&dir, "a.txt", "alpha\nbeta\ngamma\n");
+        backdate(&p);
+
+        let first = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert!(!first.is_error);
+        assert_eq!(first.output, "1|alpha\n2|beta\n3|gamma");
+
+        // Unchanged repeat read -> stub with path and line count.
+        let second = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert!(!second.is_error);
+        assert!(
+            second.output.starts_with("[unchanged since your earlier read this session: a.txt (3 lines)]"),
+            "{}",
+            second.output
+        );
+        assert!(second.output.contains("force: true"), "{}", second.output);
+
+        // force: true reads fresh.
+        let forced = tb
+            .dispatch(&call("read_file", json!({"path": "a.txt", "force": true})))
+            .await;
+        assert!(!forced.is_error);
+        assert_eq!(forced.output, "1|alpha\n2|beta\n3|gamma");
+
+        // ... and refreshes the cache: the next plain read stubs again.
+        let after = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert!(after.output.starts_with("[unchanged"), "{}", after.output);
+    }
+
+    #[tokio::test]
+    async fn repeat_read_stub_invalidated_by_edit_and_write() {
+        let (dir, tb) = setup();
+        let p = write(&dir, "a.txt", "alpha\nbeta\n");
+        backdate(&p);
+        tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+
+        // edit_file invalidates: the next read returns fresh content.
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "beta", "new_string": "BETA"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        let read = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert_eq!(read.output, "1|alpha\n2|BETA");
+
+        // write_file invalidates too.
+        backdate(&p);
+        tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await; // re-arm cache
+        let out = tb
+            .dispatch(&call(
+                "write_file",
+                json!({"path": "a.txt", "content": "rewritten\n"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        let read = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert_eq!(read.output, "1|rewritten");
+    }
+
+    #[tokio::test]
+    async fn repeat_read_stub_skipped_when_file_changes_on_disk() {
+        let (dir, tb) = setup();
+        let p = write(&dir, "a.txt", "one\n");
+        backdate(&p);
+        tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+
+        // External change (different mtime+size) -> cache check misses.
+        write(&dir, "a.txt", "one\ntwo\n");
+        let read = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert_eq!(read.output, "1|one\n2|two");
+    }
+
+    #[tokio::test]
+    async fn freshly_modified_files_are_never_stubbed() {
+        let (dir, tb) = setup();
+        // No backdate: mtime is now, inside the racy-clean settle window,
+        // so repeat reads keep returning the full body.
+        write(&dir, "a.txt", "hot\n");
+        for _ in 0..3 {
+            let out = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+            assert_eq!(out.output, "1|hot");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_reads_bypass_the_cache() {
+        let (dir, tb) = setup();
+        let p = write(&dir, "a.txt", "l1\nl2\nl3\n");
+        backdate(&p);
+
+        // Partial reads never stub and never populate the cache.
+        for _ in 0..2 {
+            let out = tb
+                .dispatch(&call("read_file", json!({"path": "a.txt", "limit": 2})))
+                .await;
+            assert!(out.output.contains("1|l1"), "{}", out.output);
+            assert!(!out.output.starts_with("[unchanged"), "{}", out.output);
+        }
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": "a.txt", "offset": 2})))
+            .await;
+        assert!(out.output.contains("2|l2"), "{}", out.output);
+
+        // A full read after partial reads still returns content (cache was
+        // never populated by the partial reads).
+        let full = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert_eq!(full.output, "1|l1\n2|l2\n3|l3");
+        // Only now does the stub arm.
+        let again = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
+        assert!(again.output.starts_with("[unchanged"), "{}", again.output);
     }
 
     #[tokio::test]

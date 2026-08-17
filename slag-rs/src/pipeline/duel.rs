@@ -85,7 +85,9 @@ where
 
     if !tui::is_quiet() {
         println!(
-            "    \x1b[38;5;220m⚔\x1b[0m duel: {} vs {} — {} round{}",
+            "    {}⚔{} duel: {} vs {} — {} round{}",
+            super::fg(tui::BRIGHT),
+            super::reset(),
             cfg.model_base,
             cfg.model_alt,
             rounds,
@@ -132,7 +134,11 @@ where
                 worktree::discard_in(repo, &id_a).await;
                 worktree::discard_in(repo, &id_b).await;
                 if !tui::is_quiet() {
-                    println!("    \x1b[31m⚔✗\x1b[0m both casts failed proof — single-smith fallback");
+                    println!(
+                        "    {}⚔✗{} both casts failed proof — single-smith fallback",
+                        super::fg(tui::WARM),
+                        super::reset()
+                    );
                 }
                 return Ok(DuelOutcome::FellThrough);
             }

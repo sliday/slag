@@ -110,6 +110,8 @@ impl EngineConfig {
         let screenshot_cmd =
             env_nonempty("SLAG_SCREENSHOT_CMD").or_else(|| file_value(&entries, "screenshot_cmd"));
 
+
+
         let effort =
             env_nonempty("SLAG_REASONING_EFFORT").and_then(|v| match v.to_lowercase().as_str() {
                 "low" => Some(Effort::Low),
@@ -601,6 +603,7 @@ mod tests {
         clear_engine_env();
     }
 
+
     #[test]
     fn duel_qualifies_by_mode_and_grade() {
         let mut config = test_config();
@@ -669,6 +672,195 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
 
         clear_engine_env();
+    }
+
+    /// The whole point of the OpenRouter-only rewrite: a bare key is the
+    /// only setup step. Every role must fall back to the auto router, and
+    /// the literal id is pinned so a rename cannot slip through silently.
+    #[test]
+    fn every_model_role_defaults_to_auto_router() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or-only-a-key");
+
+        assert_eq!(AUTO_MODEL, "openrouter/auto");
+        let config = EngineConfig::load().expect("key in env is enough");
+        for (role, model) in [
+            ("base", &config.model_base),
+            ("plan", &config.model_plan),
+            ("alt", &config.model_alt),
+            ("judge", &config.model_judge),
+        ] {
+            assert_eq!(model, AUTO_MODEL, "role {role} should default to auto");
+        }
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn mask_key_never_returns_the_raw_key() {
+        let key = "sk-or-v1-0123456789abcdef0123456789";
+        let masked = mask_key(key);
+        assert_ne!(masked, key);
+        assert!(masked.starts_with("sk-or-v"), "masked: {masked}");
+        assert!(masked.ends_with("6789"), "masked: {masked}");
+        assert!(masked.contains('…'), "masked: {masked}");
+        // The middle is what a screenshot must not leak.
+        assert!(!masked.contains(&key[7..key.len() - 4]), "masked: {masked}");
+        assert!(masked.chars().count() < key.chars().count());
+
+        // Short keys have no safe middle to show, so nothing is shown.
+        for short in ["sk-or", "sk-or-v1-abcd", "sk-or-v1-abcde"] {
+            let masked = mask_key(short);
+            assert_ne!(masked, short);
+            assert!(
+                masked.chars().all(|c| c == '•'),
+                "short key leaked: {masked}"
+            );
+            assert_eq!(masked.chars().count(), short.chars().count());
+        }
+
+        // Never returns an empty string, which would render as a blank panel.
+        assert_eq!(mask_key(""), "•");
+    }
+
+    #[test]
+    fn key_status_prefers_env_then_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+
+        // Nothing anywhere.
+        assert!(key_status().is_none());
+
+        // File only.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "openrouter_api_key = \"sk-or-from-file\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            key_status(),
+            Some((KeySource::File, "sk-or-from-file".to_string()))
+        );
+
+        // Env wins, so CI can override a stored key.
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or-from-env");
+        assert_eq!(
+            key_status(),
+            Some((KeySource::Env, "sk-or-from-env".to_string()))
+        );
+
+        // A blank export is not a key: fall through to the file rather than
+        // reporting an unusable empty one.
+        std::env::set_var("OPENROUTER_API_KEY", "   ");
+        assert_eq!(
+            key_status(),
+            Some((KeySource::File, "sk-or-from-file".to_string()))
+        );
+
+        assert_eq!(KeySource::Env.label(), "OPENROUTER_API_KEY");
+        assert_eq!(KeySource::File.label(), "config file");
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn clear_key_removes_only_the_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+
+        // No config file yet: forgetting nothing is not an error.
+        assert_eq!(clear_key().unwrap(), None);
+
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "openrouter_api_key = \"sk-or-old\"\nmodel_base = \"kept/model\"\nduel = \"off\"\n",
+        )
+        .unwrap();
+
+        let path = clear_key().unwrap().expect("config file existed");
+        let parsed = parse_config_lines(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(file_value(&parsed, "openrouter_api_key"), None);
+        assert_eq!(file_value(&parsed, "model_base").as_deref(), Some("kept/model"));
+        assert_eq!(file_value(&parsed, "duel").as_deref(), Some("off"));
+        assert!(EngineConfig::load().is_none(), "key should be gone");
+
+        clear_engine_env();
+    }
+
+    #[tokio::test]
+    async fn verify_and_store_saves_only_a_key_openrouter_accepts() {
+        use wiremock::matchers::{method, path as req_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(req_path("/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": []
+            })))
+            .mount(&server)
+            .await;
+        std::env::set_var("SLAG_OPENROUTER_BASE", server.uri());
+        assert_eq!(base_url(), server.uri());
+
+        let stored = verify_and_store("sk-or-good").await.unwrap();
+        assert_eq!(stored, dir.path().join("config.toml"));
+        assert_eq!(
+            key_status(),
+            Some((KeySource::File, "sk-or-good".to_string()))
+        );
+
+        // A refused key must never reach disk: the old one stays, and a
+        // fresh config dir stays empty.
+        let refuser = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(req_path("/key"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&refuser)
+            .await;
+        std::env::set_var("SLAG_OPENROUTER_BASE", refuser.uri());
+
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", empty.path());
+        let err = verify_and_store("sk-or-bad").await.unwrap_err();
+        assert!(err.to_string().contains("401"), "error: {err}");
+        assert!(!empty.path().join("config.toml").exists());
+        assert!(key_status().is_none());
+
+        clear_engine_env();
+    }
+
+    /// Two casts of `openrouter/auto` are one model rolled twice: the duel
+    /// costs triple the tokens and buys no diversity, so Auto skips it.
+    #[test]
+    fn auto_duel_needs_two_different_models() {
+        let mut config = test_config();
+        config.model_alt = config.model_base.clone();
+        assert!(!config.duel_qualifies(5));
+        assert!(!config.duel_qualifies(HIGH_GRADE));
+
+        config.model_alt = "other/model".into();
+        assert!(config.duel_qualifies(5));
+        assert!(config.duel_qualifies(HIGH_GRADE));
+        assert!(!config.duel_qualifies(HIGH_GRADE - 1));
+
+        // Explicit opt-in still forces the duel, matched models or not.
+        config.model_alt = config.model_base.clone();
+        config.duel = DuelMode::On;
+        assert!(config.duel_qualifies(5));
+        assert!(config.duel_qualifies(1));
     }
 
     #[test]

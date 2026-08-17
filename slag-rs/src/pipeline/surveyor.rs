@@ -34,10 +34,15 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
         println!();
         let lines: Vec<&str> = raw.lines().collect();
         for line in lines.iter().take(20) {
-            println!("  \x1b[90m{line}\x1b[0m");
+            println!("  {}{line}{}", super::fg(tui::COLD), super::reset());
         }
         if lines.len() > 20 {
-            println!("\n  \x1b[90m... +{} lines\x1b[0m", lines.len() - 20);
+            println!(
+                "\n  {}... +{} lines{}",
+                super::fg(tui::COLD),
+                lines.len() - 20,
+                super::reset()
+            );
         }
     }
 

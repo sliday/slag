@@ -54,15 +54,26 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     // Show table
     if !tui::is_quiet() {
         println!();
-        println!("  \x1b[90m{:<5} {:<3} {:<4} {:<7} {}\x1b[0m", "ID", "GR", "SOLO", "SKILL", "WORK");
+        println!(
+            "  {}{:<5} {:<3} {:<4} {:<7} {}{}",
+            super::fg(tui::COLD),
+            "ID",
+            "GR",
+            "SOLO",
+            "SKILL",
+            "WORK",
+            super::reset()
+        );
         for (i, ingot) in ingots.iter().enumerate() {
             if i >= 10 {
                 break;
             }
             let solo_sym = if ingot.solo { "∥" } else { "→" };
             println!(
-                "  \x1b[38;5;208m{:<5}\x1b[0m {:<3} {:<4} {:<7} {}",
+                "  {}{:<5}{} {:<3} {:<4} {:<7} {}",
+                super::fg(tui::HOT),
                 ingot.id,
+                super::reset(),
                 ingot.grade,
                 solo_sym,
                 ingot.skill,
@@ -70,7 +81,7 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
             );
         }
         if count > 10 {
-            println!("  \x1b[90m+{} more\x1b[0m", count - 10);
+            println!("  {}+{} more{}", super::fg(tui::COLD), count - 10, super::reset());
         }
     }
 

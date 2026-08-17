@@ -5,11 +5,41 @@ pub mod duel;
 pub mod resmelt;
 pub mod assay;
 
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
+
 use crate::config::EngineConfig;
 use crate::crucible::Crucible;
 use crate::error::SlagError;
 use crate::smith::EngineHooks;
 use crate::tui;
+
+/// Paint a palette color for the stream-mode `print!` lines in this crate.
+/// `tui::fg` is private, so callers route through `tui::downgrade` here
+/// rather than hardcoding escape sequences that drift from the palette.
+/// Returns an empty string when color is off, so redirected output and
+/// `NO_COLOR` runs carry no escape bytes at all.
+pub(crate) fn fg(color: Color) -> String {
+    if !tui::colored() {
+        return String::new();
+    }
+    SetForegroundColor(tui::downgrade(color)).to_string()
+}
+
+/// Clears color and attributes, matching what `\x1b[0m` used to do.
+pub(crate) fn reset() -> String {
+    if !tui::colored() {
+        return String::new();
+    }
+    ResetColor.to_string()
+}
+
+/// Bold, or nothing when color is off. Pairs with `reset`.
+pub(crate) fn bold() -> String {
+    if !tui::colored() {
+        return String::new();
+    }
+    SetAttribute(Attribute::Bold).to_string()
+}
 
 /// Run the full 4-phase pipeline.
 pub async fn run(
@@ -50,12 +80,15 @@ pub async fn run(
         println!();
     }
 
-    forge::run(config, max_anvils, &hooks).await?;
+    let forged = forge::run(config, max_anvils, &hooks).await;
 
-    // Phase 4: Assay
-    assay::show()?;
-
-    Ok(())
+    // Phase 4: Assay. It runs on failure too — a run that cracked an ingot
+    // is exactly when the user needs the counts and the cracked list, and
+    // returning early left them with one line of "forge failed".
+    if !matches!(forged, Err(SlagError::Cancelled)) {
+        let _ = assay::show();
+    }
+    forged
 }
 
 /// Initialize project structure (fire the furnace)
@@ -114,9 +147,18 @@ fn fire_furnace(commission: Option<&str>) -> Result<(), SlagError> {
     // Create logs dir
     std::fs::create_dir_all(crate::config::LOG_DIR)?;
 
-    // Initial commit
+    // Initial commit, scoped to the files slag just wrote. `git add -A`
+    // here swept whatever the user had lying around — including .env —
+    // into a commit they never asked for.
     let _ = std::process::Command::new("git")
-        .args(["add", "-A"])
+        .args([
+            "add",
+            "--",
+            ".gitignore",
+            crate::config::ORE_FILE,
+            crate::config::ALLOY_FILE,
+            crate::config::LEDGER,
+        ])
         .output();
     let _ = std::process::Command::new("git")
         .args(["commit", "-m", "fire: furnace lit", "--quiet"])

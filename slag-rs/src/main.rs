@@ -21,6 +21,7 @@ use clap::Parser;
 
 use cli::{Cli, Command};
 use config::EngineConfig;
+use pipeline::{fg, reset};
 use smith::EngineHooks;
 
 #[tokio::main]
@@ -31,17 +32,19 @@ async fn main() {
     // repos): until wired, say so loudly instead of ignoring the flag.
     if cli.worktree {
         eprintln!(
-            "  \x1b[38;5;220m⚠\x1b[0m --worktree is not implemented yet; \
-             all ingots run in the shared checkout"
+            "  {}⚠{} --worktree is not implemented yet; \
+             all ingots run in the shared checkout",
+            fg(tui::BRIGHT),
+            reset()
         );
     }
 
     // Model flags override env; EngineConfig::load reads env downstream.
     // --auto first, so explicit model flags win over it.
     if cli.auto {
-        std::env::set_var("SLAG_MODEL_BASE", "openrouter/auto");
-        std::env::set_var("SLAG_MODEL_PLAN", "openrouter/auto");
-        std::env::set_var("SLAG_MODEL_JUDGE", "openrouter/auto");
+        for var in ["SLAG_MODEL_BASE", "SLAG_MODEL_PLAN", "SLAG_MODEL_ALT", "SLAG_MODEL_JUDGE"] {
+            std::env::set_var(var, config::AUTO_MODEL);
+        }
     }
     if let Some(m) = &cli.model {
         std::env::set_var("SLAG_MODEL_BASE", m);
@@ -52,9 +55,6 @@ async fn main() {
     if let Some(m) = &cli.judge_model {
         std::env::set_var("SLAG_MODEL_JUDGE", m);
     }
-
-    // Ensure logs directory exists
-    let _ = std::fs::create_dir_all(config::LOG_DIR);
 
     // `status`, `update` and `key` inspect or repair a broken setup, so
     // none of them may demand the very key the user came here to fix.
@@ -70,7 +70,7 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("\n  \x1b[31m✗\x1b[0m {e}\n");
+        eprintln!("\n  {}✗{} {e}\n", fg(tui::WARM), reset());
         std::process::exit(1);
     }
 }
@@ -84,6 +84,9 @@ async fn forge(
     tui_flag: bool,
 ) -> Result<(), error::SlagError> {
     let config = EngineConfig::resolve().await?;
+    // Only a forge writes logs. `slag key` run from $HOME should not leave
+    // an empty ~/logs behind.
+    let _ = std::fs::create_dir_all(config::LOG_DIR);
     run_pipeline(commission, &config, anvils, tui_flag).await
 }
 
@@ -94,6 +97,11 @@ async fn forge(
 async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
     if let Some(key) = key {
         config::verify_and_store(key.trim()).await?;
+        // Saving into a shell that exports its own key stores something
+        // slag will never read. Warn instead of letting the next run 401.
+        if matches!(config::key_status(), Some((config::KeySource::Env, _))) {
+            tui::key_shadowed();
+        }
         return Ok(());
     }
 
@@ -108,19 +116,30 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
 
     // Models only resolve once a key exists; without one, show the defaults
     // the user will get rather than an empty panel.
-    let models = match EngineConfig::load() {
-        Some(cfg) => vec![
-            ("work", cfg.model_base),
-            ("plan", cfg.model_plan),
-            ("duel", cfg.model_alt),
-            ("judge", cfg.model_judge),
-        ],
-        None => ["work", "plan", "duel", "judge"]
-            .iter()
-            .map(|role| (*role, config::AUTO_MODEL.to_string()))
-            .collect(),
+    let cfg = EngineConfig::load();
+    let (base, plan, alt, judge) = match &cfg {
+        Some(cfg) => (
+            cfg.model_base.clone(),
+            cfg.model_plan.clone(),
+            cfg.model_alt.clone(),
+            cfg.model_judge.clone(),
+        ),
+        None => {
+            let auto = config::AUTO_MODEL.to_string();
+            (auto.clone(), auto.clone(), auto.clone(), auto)
+        }
     };
-    let models: Vec<(&str, &str)> = models.iter().map(|(r, m)| (*r, m.as_str())).collect();
+
+    // The duel and judge roles only run when a duel does. Listing a model
+    // slag will never call reads as a promise it does not keep.
+    let duels = cfg.as_ref().is_some_and(|c| c.duel_qualifies(5));
+    let idle = (!duels).then_some("idle — set SLAG_MODEL_ALT to duel");
+    let models = [
+        ("work", base.as_str(), None),
+        ("plan", plan.as_str(), None),
+        ("duel", alt.as_str(), idle),
+        ("judge", judge.as_str(), idle),
+    ];
 
     tui::key_panel(source, &models);
     Ok(())
@@ -171,8 +190,9 @@ async fn run_pipeline(
     tui::set_quiet(false);
 
     // The alternate screen took the in-dashboard ASSAY output with it;
-    // reprint the final report on the real terminal.
-    if result.is_ok() {
+    // reprint the final report on the real terminal. A cracked run needs
+    // it most, so only a cancel (nothing to report) skips it.
+    if !matches!(result, Err(error::SlagError::Cancelled)) {
         let _ = pipeline::assay::show();
     }
 
@@ -196,13 +216,20 @@ fn show_status() -> Result<(), error::SlagError> {
         let ore = std::fs::read_to_string(ore_path)?;
         let commission = ore.lines().last().unwrap_or("(unknown)");
         println!(
-            "\n  \x1b[38;5;208mCommission:\x1b[0m {}",
+            "\n  {}Commission:{} {}",
+            fg(tui::HOT),
+            reset(),
             tui::truncate(commission, 50)
         );
     }
 
     let has_bp = Path::new(config::BLUEPRINT).exists();
-    println!("  \x1b[90mBlueprint: {}\x1b[0m", if has_bp { "yes" } else { "no" });
+    println!(
+        "  {}Blueprint: {}{}",
+        fg(tui::COLD),
+        if has_bp { "yes" } else { "no" },
+        reset()
+    );
 
     print!("  ");
     tui::ingot_status_line(&counts);
@@ -210,10 +237,10 @@ fn show_status() -> Result<(), error::SlagError> {
     tui::temper_bar(&counts);
 
     if counts.cracked > 0 {
-        println!("\n  \x1b[31mCracked:\x1b[0m");
+        println!("\n  {}Cracked:{}", fg(tui::WARM), reset());
         for ingot in &crucible.ingots {
             if ingot.status == sexp::Status::Cracked {
-                println!("    \x1b[31m✗\x1b[0m [{}] {}", ingot.id, ingot.work);
+                println!("    {}✗{} [{}] {}", fg(tui::WARM), reset(), ingot.id, ingot.work);
             }
         }
     }

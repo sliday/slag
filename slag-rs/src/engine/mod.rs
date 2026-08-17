@@ -193,6 +193,11 @@ pub enum EngineEvent {
     Steer { text: String },
     Finish { summary: String },
     Error { message: String },
+    /// Plain-language interpretation of the current activity, produced by
+    /// the narrator model. Display-only; never enters the smith's context.
+    Narrate { text: String },
+    /// Soft alert (e.g. spend at 80% of budget). Display + JSONL only.
+    Warning { message: String },
     // Pipeline-level events (emitted by forge, consumed by the dashboard).
     IngotStart { id: String, work: String },
     HeatTick { id: String, heat: u8 },

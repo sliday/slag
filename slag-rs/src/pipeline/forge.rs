@@ -70,9 +70,19 @@ pub async fn run(
 
             if !tui::is_quiet() {
                 println!(
-                    "\n  \x1b[38;5;208m⚒\x1b[38;5;220m⚒\x1b[1;37m⚒\x1b[0m \x1b[90m{} anvils:\x1b[0m \x1b[1;37m{}\x1b[0m",
+                    "\n  {}⚒{}⚒{}{}⚒{} {}{} anvils:{} {}{}{}{}",
+                    super::fg(tui::HOT),
+                    super::fg(tui::BRIGHT),
+                    super::bold(),
+                    super::fg(tui::PURE),
+                    super::reset(),
+                    super::fg(tui::COLD),
                     solo_ids.len(),
+                    super::reset(),
+                    super::bold(),
+                    super::fg(tui::PURE),
                     solo_ids.join(" "),
+                    super::reset(),
                 );
             }
 
@@ -134,7 +144,11 @@ pub async fn run(
                         // Ingot stays Molten here; the loop-top stale-molten
                         // reset reschedules it on the next iteration.
                         if !tui::is_quiet() {
-                            eprintln!("  \x1b[31m✗\x1b[0m anvil panicked: {e}");
+                            eprintln!(
+                                "  {}✗{} anvil panicked: {e}",
+                                super::fg(tui::WARM),
+                                super::reset()
+                            );
                         }
                     }
                 }
@@ -239,7 +253,10 @@ async fn forge_ingot(
             Ok(duel::DuelOutcome::Merged { winner, rounds }) => {
                 if !tui::is_quiet() {
                     println!(
-                        "    \x1b[1;37m⚔█\x1b[0m cast {winner} merged after {rounds} round(s)"
+                        "    {}{}⚔█{} cast {winner} merged after {rounds} round(s)",
+                        super::bold(),
+                        super::fg(tui::PURE),
+                        super::reset()
                     );
                 }
                 return Ok(());
@@ -251,7 +268,11 @@ async fn forge_ingot(
             Err(SlagError::Cancelled) => return Err(SlagError::Cancelled),
             Err(e) => {
                 if !tui::is_quiet() {
-                    println!("    \x1b[31m⚔✗\x1b[0m duel failed ({e}) — single-smith fallback");
+                    println!(
+                        "    {}⚔✗{} duel failed ({e}) — single-smith fallback",
+                        super::fg(tui::WARM),
+                        super::reset()
+                    );
                 }
             }
         }
@@ -291,17 +312,32 @@ async fn strike_ingot(
 
     if !quiet {
         println!(
-            "\n  \x1b[38;5;208m▣\x1b[0m \x1b[1;37m[{}]\x1b[0m {}{}{}",
+            "\n  {}▣{} {}{}[{}]{} {}{}{}",
+            super::fg(tui::HOT),
+            super::reset(),
+            super::bold(),
+            super::fg(tui::PURE),
             ingot.id,
+            super::reset(),
             tui::truncate(&ingot.work, 42),
-            if ingot.is_complex() { " \x1b[38;5;220m◉\x1b[0m" } else { "" },
-            if ingot.is_web() { " \x1b[38;5;208m⚡\x1b[0m" } else { "" },
+            if ingot.is_complex() {
+                format!(" {}◉{}", super::fg(tui::BRIGHT), super::reset())
+            } else {
+                String::new()
+            },
+            if ingot.is_web() {
+                format!(" {}⚡{}", super::fg(tui::HOT), super::reset())
+            } else {
+                String::new()
+            },
         );
         println!(
-            "    \x1b[90mgr:{} skill:{} proof:{}\x1b[0m",
+            "    {}gr:{} skill:{} proof:{}{}",
+            super::fg(tui::COLD),
             ingot.grade,
             ingot.skill,
             tui::truncate(&ingot.proof, 30),
+            super::reset(),
         );
     }
 
@@ -318,12 +354,19 @@ async fn strike_ingot(
 
         if !quiet {
             let hc = match heat {
-                1..=2 => "\x1b[31m",
-                3 => "\x1b[38;5;208m",
-                4 => "\x1b[38;5;220m",
-                _ => "\x1b[1;37m",
+                1..=2 => tui::WARM,
+                3 => tui::HOT,
+                4 => tui::BRIGHT,
+                _ => tui::PURE,
             };
-            print!("    {hc}⚒ {heat}/{}\x1b[0m ", ingot.max);
+            let hb = if heat > 4 { super::bold() } else { String::new() };
+            print!(
+                "    {}{}⚒ {heat}/{}{} ",
+                hb,
+                super::fg(hc),
+                ingot.max,
+                super::reset()
+            );
         }
 
         let flux_text = flux::prepare_flux(ingot, slag.as_deref());
@@ -353,7 +396,7 @@ async fn strike_ingot(
                 }
                 slag = Some(format!("Smith error: {e}"));
                 if !quiet {
-                    println!("\x1b[31m✗\x1b[0m");
+                    println!("{}✗{}", super::fg(tui::WARM), super::reset());
                 }
                 continue;
             }
@@ -367,14 +410,14 @@ async fn strike_ingot(
             None => {
                 slag = Some("NO CMD: line in response".into());
                 if !quiet {
-                    println!("\x1b[31m✗\x1b[0m no CMD");
+                    println!("{}✗{} no CMD", super::fg(tui::WARM), super::reset());
                 }
                 continue;
             }
         };
 
         if !quiet {
-            print!("\x1b[90m{}\x1b[0m ", tui::truncate(&cmd, 32));
+            print!("{}{}{} ", super::fg(tui::COLD), tui::truncate(&cmd, 32), super::reset());
             tui::flush();
         }
 
@@ -392,14 +435,14 @@ async fn strike_ingot(
                 if !proof_ok {
                     slag = Some(format!("Proof failed [{}]: {proof_output}", ingot.proof));
                     if !quiet {
-                        println!("\x1b[31m✗\x1b[0m impure");
+                        println!("{}✗{} impure", super::fg(tui::WARM), super::reset());
                     }
                     continue;
                 }
             }
 
             if !quiet {
-                println!("\x1b[1;37m█\x1b[0m");
+                println!("{}{}█{}", super::bold(), super::fg(tui::PURE), super::reset());
             }
             proof::git_commit(&ingot.id, &ingot.work).await;
             append_ledger(ingot, heat);
@@ -407,7 +450,7 @@ async fn strike_ingot(
         } else {
             slag = Some(format!("CMD failed (exit 1): {output}"));
             if !quiet {
-                println!("\x1b[31m✗\x1b[0m");
+                println!("{}✗{}", super::fg(tui::WARM), super::reset());
             }
         }
     }

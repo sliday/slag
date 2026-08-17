@@ -20,33 +20,71 @@ pub fn show() -> Result<(), SlagError> {
     tui::header("ASSAY");
 
     print!(
-        "  \x1b[1;37m{}\x1b[0m ingots  \x1b[1;37m{}\x1b[0m forged",
-        counts.total, counts.forged,
+        "  {}{}{}{} ingots  {}{}{}{} forged",
+        super::bold(),
+        super::fg(tui::PURE),
+        counts.total,
+        super::reset(),
+        super::bold(),
+        super::fg(tui::PURE),
+        counts.forged,
+        super::reset(),
     );
     if counts.cracked > 0 {
-        print!("  \x1b[31m{}\x1b[0m cracked", counts.cracked);
+        print!("  {}{}{} cracked", super::fg(tui::WARM), counts.cracked, super::reset());
     }
     println!();
 
     tui::temper_bar(&counts);
 
     if counts.cracked > 0 {
-        println!("\n  \x1b[31mCracked:\x1b[0m");
+        println!("\n  {}Cracked:{}", super::fg(tui::WARM), super::reset());
         for ingot in &crucible.ingots {
             if ingot.status == Status::Cracked {
-                println!("    \x1b[31m✗\x1b[0m [{}] {}", ingot.id, ingot.work);
+                println!(
+                    "    {}✗{} [{}] {}",
+                    super::fg(tui::WARM),
+                    super::reset(),
+                    ingot.id,
+                    ingot.work
+                );
             }
         }
     }
 
-    println!("\n  \x1b[90mblueprint: {}\x1b[0m", crate::config::BLUEPRINT);
-    println!("  \x1b[90mcrucible:  {}\x1b[0m", crate::config::CRUCIBLE);
-    println!("  \x1b[90mslag heap: {}\x1b[0m", crate::config::LOG_DIR);
+    println!(
+        "\n  {}blueprint: {}{}",
+        super::fg(tui::COLD),
+        crate::config::BLUEPRINT,
+        super::reset()
+    );
+    println!(
+        "  {}crucible:  {}{}",
+        super::fg(tui::COLD),
+        crate::config::CRUCIBLE,
+        super::reset()
+    );
+    println!(
+        "  {}slag heap: {}{}",
+        super::fg(tui::COLD),
+        crate::config::LOG_DIR,
+        super::reset()
+    );
 
     if counts.cracked > 0 {
-        println!("\n  \x1b[31m\x1b[1m✗ CRACKED\x1b[0m\n");
+        println!(
+            "\n  {}{}✗ CRACKED{}\n",
+            super::fg(tui::WARM),
+            super::bold(),
+            super::reset()
+        );
     } else {
-        println!("\n  \x1b[1;37m\x1b[1m█ FORGED\x1b[0m\n");
+        println!(
+            "\n  {}{}█ FORGED{}\n",
+            super::bold(),
+            super::fg(tui::PURE),
+            super::reset()
+        );
     }
 
     Ok(())

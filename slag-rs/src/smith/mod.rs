@@ -117,6 +117,72 @@ mod tests {
         assert!(clone.events.is_none());
     }
 
+    fn openrouter_only_config(base_url: String) -> EngineConfig {
+        EngineConfig {
+            api_key: "sk-or-test".into(),
+            model_base: "test/base".into(),
+            model_plan: "test/plan".into(),
+            model_alt: "test/alt".into(),
+            model_judge: "test/judge".into(),
+            effort: None,
+            base_url,
+            duel: crate::config::DuelMode::Auto,
+            duel_rounds_override: None,
+            screenshot_cmd: None,
+        }
+    }
+
+    /// slag has one provider. All three factories take the config by
+    /// reference (one config serves the whole run) and every smith they
+    /// build talks OpenRouter over HTTP — there is no Claude CLI branch
+    /// left to fall back to, so the mock server sees every call.
+    #[tokio::test]
+    async fn factories_build_openrouter_smiths_from_one_borrowed_config() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": { "content": "forged" },
+                        "finish_reason": "stop",
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = openrouter_only_config(server.uri());
+        let hooks = EngineHooks::default();
+
+        // One borrow feeds all three: no factory may consume the config.
+        let forge = make_smith(&cfg, "rust", 1, &hooks);
+        let plan = make_plan_smith(&cfg, &hooks);
+        let base = make_base_smith(&cfg, &hooks);
+        assert_eq!(cfg.model_base, "test/base", "config survives the factories");
+
+        for smith in [&forge, &plan, &base] {
+            assert_eq!(smith.invoke("do the thing").await.unwrap(), "forged");
+        }
+
+        // Model per role: forge at grade 1 works on base, both plan-mode
+        // factories reason on the plan model.
+        let models: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|req| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                body["model"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(models, ["test/base", "test/plan", "test/plan"]);
+    }
+
     #[test]
     fn detect_questions() {
         assert!(has_questions("What framework should we use?"));

@@ -19,15 +19,24 @@ pub async fn resmelt_ingot(
     let quiet = tui::is_quiet();
     if ingot.smelt >= 1 {
         if !quiet {
-            println!("    \x1b[31m⚠\x1b[0m already re-smelted, truly cracked");
+            println!(
+                "    {}⚠{} already re-smelted, truly cracked",
+                super::fg(tui::WARM),
+                super::reset()
+            );
         }
         return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
     }
 
     if !quiet {
         println!(
-            "\n  \x1b[38;5;208m♻\x1b[0m \x1b[1;37mRE-SMELTING [{}]\x1b[0m — analyzing failure...",
-            ingot.id
+            "\n  {}♻{} {}{}RE-SMELTING [{}]{} — analyzing failure...",
+            super::fg(tui::HOT),
+            super::reset(),
+            super::bold(),
+            super::fg(tui::PURE),
+            ingot.id,
+            super::reset()
         );
     }
 
@@ -41,7 +50,7 @@ pub async fn resmelt_ingot(
     let response = smith.invoke(&prompt).await.map_err(|e| {
         spinner.finish_and_clear();
         if !quiet {
-            println!("    \x1b[31m✗\x1b[0m smelter failed");
+            println!("    {}✗{} smelter failed", super::fg(tui::WARM), super::reset());
         }
         SlagError::SmithFailed(e.to_string())
     })?;
@@ -58,7 +67,9 @@ pub async fn resmelt_ingot(
             .unwrap_or("unknown");
         if !quiet {
             println!(
-                "    \x1b[31m✗\x1b[0m impossible: {}",
+                "    {}✗{} impossible: {}",
+                super::fg(tui::WARM),
+                super::reset(),
                 &reason[..reason.len().min(60)]
             );
         }
@@ -69,7 +80,11 @@ pub async fn resmelt_ingot(
     let new_ingots = parse_crucible(&response);
     if new_ingots.is_empty() {
         if !quiet {
-            println!("    \x1b[31m✗\x1b[0m could not parse smelter output");
+            println!(
+                "    {}✗{} could not parse smelter output",
+                super::fg(tui::WARM),
+                super::reset()
+            );
         }
         return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
     }
@@ -78,13 +93,17 @@ pub async fn resmelt_ingot(
         if new_ingots.len() == 1 {
             // Rewrite
             println!(
-                "    \x1b[38;5;220m♻\x1b[0m rewritten: {}",
+                "    {}♻{} rewritten: {}",
+                super::fg(tui::BRIGHT),
+                super::reset(),
                 tui::truncate(&new_ingots[0].work, 50)
             );
         } else {
             // Split
             println!(
-                "    \x1b[38;5;220m♻\x1b[0m split into {} sub-ingots",
+                "    {}♻{} split into {} sub-ingots",
+                super::fg(tui::BRIGHT),
+                super::reset(),
                 new_ingots.len()
             );
         }

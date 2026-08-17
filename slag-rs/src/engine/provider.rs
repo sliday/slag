@@ -67,6 +67,12 @@ impl OpenRouter {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = json!("auto");
         }
+        // Sent unconditionally on purpose. OpenRouter drops parameters the
+        // chosen model does not support (that is the default; only
+        // `provider.require_parameters` makes them routing constraints), so
+        // asking a non-reasoning model for effort costs nothing. Setting
+        // require_parameters here would instead shrink the auto router's
+        // pool to reasoning models only.
         if let Some(effort) = req.effort {
             body["reasoning"] = json!({ "effort": effort.as_str() });
         }
@@ -119,7 +125,20 @@ impl OpenRouter {
                 last_err = format!("{status}: {excerpt}");
                 continue;
             }
-            return Err(SlagError::Provider(format!("{status}: {excerpt}")));
+            // Auth and billing failures have a fix; a bare status line does
+            // not tell the user what it is.
+            let remedy = match status.as_u16() {
+                401 | 403 => Some(
+                    "OpenRouter rejected the key. Run `slag key` to set a new one \
+                     (a shell OPENROUTER_API_KEY overrides the saved key)",
+                ),
+                402 => Some("OpenRouter is out of credit. Top up at https://openrouter.ai/credits"),
+                _ => None,
+            };
+            return Err(SlagError::Provider(match remedy {
+                Some(remedy) => format!("{remedy} [{status}: {excerpt}]"),
+                None => format!("{status}: {excerpt}"),
+            }));
         }
 
         Err(SlagError::Provider(format!(
@@ -145,9 +164,11 @@ pub enum KeyCheck {
     Unreachable(String),
 }
 
-/// Cheap key check: GET {base}/models with the bearer key, 200 = valid.
+/// Cheap key check: GET {base}/key, which reports the bearer token's own
+/// limits and so requires auth. `/models` is public — it answers 200 for a
+/// bogus key and even for no key at all, which made checking it worthless.
 pub async fn check_key(api_key: &str, base_url: &str) -> KeyCheck {
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let url = format!("{}/key", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -725,7 +746,7 @@ mod tests {
     async fn validate_key_accepts_200_rejects_401() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/models"))
+            .and(path("/key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
             .mount(&server)
             .await;
@@ -736,7 +757,7 @@ mod tests {
 
         let bad = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/models"))
+            .and(path("/key"))
             .respond_with(ResponseTemplate::new(401))
             .mount(&bad)
             .await;
@@ -745,5 +766,56 @@ mod tests {
             .await
             .expect_err("bad key");
         assert!(err.to_string().contains("401"));
+    }
+
+    /// A bare "401 Unauthorized" reads like a slag bug. Auth and billing
+    /// failures are the two the user can actually fix, so they carry the fix.
+    #[tokio::test]
+    async fn auth_and_billing_failures_carry_a_remedy() {
+        for (status, needle) in [(401, "slag key"), (403, "slag key"), (402, "credits")] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let err = OpenRouter::with_base_url("sk-bad", &server.uri())
+                .chat(request(vec![], None))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{status} said: {err}");
+            // The raw status stays, so bug reports keep the detail.
+            assert!(err.contains(&status.to_string()), "{status} said: {err}");
+        }
+    }
+
+    /// `/models` answers 200 for any bearer token, so checking it would
+    /// wave every typo through. `/key` is the endpoint that needs auth.
+    #[tokio::test]
+    async fn check_key_asks_the_authenticated_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            check_key("sk-bad", &server.uri()).await,
+            KeyCheck::Rejected(_)
+        ));
+        // A 5xx is OpenRouter's problem, not the key's.
+        let flaky = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/key"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&flaky)
+            .await;
+        assert!(matches!(
+            check_key("sk-fine", &flaky.uri()).await,
+            KeyCheck::Unreachable(_)
+        ));
     }
 }

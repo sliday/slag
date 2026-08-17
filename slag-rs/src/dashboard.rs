@@ -167,6 +167,10 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
         }
         EngineEvent::Finish { summary } => (palette(tui::PURE), format!("■ {}", preview(summary, 120))),
         EngineEvent::Error { message } => (palette(tui::WARM), format!("✗ {}", preview(message, 120))),
+        EngineEvent::Narrate { text } => (palette(tui::COLD), format!("◈ {}", preview(text, 110))),
+        EngineEvent::Warning { message } => {
+            (palette(tui::BRIGHT), format!("⚠ {}", preview(message, 110)))
+        }
         EngineEvent::IngotStart { id, work } => {
             (palette(tui::HOT), format!("🧱 [{id}] {}", preview(work, 60)))
         }
@@ -626,6 +630,17 @@ mod tests {
         assert!(content.contains("steer queued"));
         // Hint line clips at 80 cols; assert on its head.
         assert!(content.contains("steer the smith"));
+    }
+
+    /// Every tui palette color must survive the crossterm → ratatui hop.
+    /// `Color::Reset` is the match arm's give-up value: it paints the
+    /// terminal default, so a feed line that hit it would lose its meaning.
+    #[test]
+    fn palette_maps_every_tui_color() {
+        for color in [tui::COLD, tui::WARM, tui::HOT, tui::BRIGHT, tui::PURE] {
+            let mapped = palette(color);
+            assert_ne!(mapped, Color::Reset, "{color:?} fell through to Reset");
+        }
     }
 
     #[test]

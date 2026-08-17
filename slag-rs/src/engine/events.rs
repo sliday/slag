@@ -170,6 +170,12 @@ impl StderrNarrator {
             EngineEvent::Error { message } => {
                 Self::line(WARM, "✗", &preview(message, 120));
             }
+            EngineEvent::Narrate { text } => {
+                Self::line(COLD, "◈", &preview(text, 110));
+            }
+            EngineEvent::Warning { message } => {
+                Self::line(BRIGHT, "⚠", &preview(message, 110));
+            }
             EngineEvent::IngotStart { id, work } => {
                 Self::line(HOT, "🧱", &format!("[{id}] {}", preview(work, 60)));
             }

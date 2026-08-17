@@ -28,9 +28,9 @@ pub struct Cli {
     #[arg(long, default_value_t = crate::config::MAX_ANVILS)]
     pub anvils: usize,
 
-    /// Let OpenRouter pick the model per call: openrouter/auto for
-    /// worker, planner, and judge (duel cast B keeps its own model
-    /// for diversity). Explicit model flags override.
+    /// Route every role through openrouter/auto, ignoring models pinned in
+    /// the environment or config file. This is already the default; the
+    /// flag exists to override those pins. Explicit model flags still win.
     #[arg(long)]
     pub auto: bool,
 

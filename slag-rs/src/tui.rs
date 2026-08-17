@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor, ResetColor};
@@ -41,6 +41,16 @@ pub fn truecolor() -> bool {
     })
 }
 
+/// Whether to emit color at all. Redirected output and NO_COLOR both mean
+/// no: escape bytes in a log file or a pasted bug report help nobody, and
+/// they break `grep` on a colored word.
+pub fn colored() -> bool {
+    static YES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *YES.get_or_init(|| {
+        std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+    })
+}
+
 /// Map a palette color to what the terminal can actually render. Sending
 /// 24-bit escapes to a 256-color terminal paints unreadable approximations.
 pub fn downgrade(color: Color) -> Color {
@@ -76,11 +86,11 @@ pub fn header(title: &str) {
     hr();
     println!(
         "{}{}  \u{2692} {}{}{}",
-        SetAttribute(Attribute::Bold),
+        bold(),
         fg(PURE),
         title,
         reset(),
-        SetAttribute(Attribute::Reset),
+        unbold(),
     );
     hr();
 }
@@ -104,9 +114,9 @@ pub fn show_banner() {
     print!("{}█", fg(PURE));
     print!(
         "  {}{}SLAG{}",
-        SetAttribute(Attribute::Bold),
+        bold(),
         fg(PURE),
-        SetAttribute(Attribute::Reset),
+        unbold(),
     );
     print!("  {}█", fg(PURE));
     print!("{}▓", fg(BRIGHT));
@@ -169,7 +179,8 @@ pub fn key_saved(path: &std::path::Path) {
 }
 
 /// `slag key` with no argument: state of the one setting slag has.
-pub fn key_panel(source: Option<(&str, String)>, models: &[(&str, &str)]) {
+/// Each model row may carry a note explaining when that role is inactive.
+pub fn key_panel(source: Option<(&str, String)>, models: &[(&str, &str, Option<&str>)]) {
     show_banner();
     println!();
     match source {
@@ -188,7 +199,7 @@ pub fn key_panel(source: Option<(&str, String)>, models: &[(&str, &str)]) {
         }
         None => {
             println!(
-                "  {}key{}    {}none{}  {}run `slag key <KEY>` or set OPENROUTER_API_KEY{}",
+                "  {}key{}    {}none{}  {}run `slag key` or set OPENROUTER_API_KEY{}",
                 fg(COLD),
                 reset(),
                 fg(WARM),
@@ -198,18 +209,33 @@ pub fn key_panel(source: Option<(&str, String)>, models: &[(&str, &str)]) {
             );
         }
     }
-    for (role, model) in models {
+    for (role, model, note) in models {
         println!(
-            "  {}{:<6}{} {}{}{}",
+            "  {}{:<6}{} {}{}{}{}",
             fg(COLD),
             role,
             reset(),
             fg(BRIGHT),
             model,
-            reset()
+            reset(),
+            match note {
+                Some(note) => format!("  {}{note}{}", fg(COLD), reset()),
+                None => String::new(),
+            }
         );
     }
     println!();
+}
+
+/// A file key that the environment overrides is a key that does nothing.
+/// Say so at the moment of saving, not three 401s later.
+pub fn key_shadowed() {
+    println!(
+        "  {}▒{} OPENROUTER_API_KEY is set and wins over the saved key — \
+         unset it to use this one",
+        fg(WARM),
+        reset()
+    );
 }
 
 pub fn ingot_status_line(counts: &CrucibleCounts) {
@@ -287,9 +313,12 @@ pub fn spark_spinner(msg: &str) -> ProgressBar {
     pb
 }
 
+/// Shorten to `max` characters. Counts characters, not bytes: a commission
+/// written in Cyrillic or Japanese used to slice mid-codepoint and panic
+/// the whole binary on `slag status`.
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}...", &s[..max])
+    if s.chars().count() > max {
+        format!("{}...", s.chars().take(max).collect::<String>())
     } else {
         s.to_string()
     }
@@ -320,11 +349,109 @@ pub fn flush() {
     let _ = std::io::stdout().flush();
 }
 
-// Helper to create crossterm foreground color string
-fn fg(color: Color) -> SetForegroundColor {
-    SetForegroundColor(downgrade(color))
+// Helper to create crossterm foreground color string. Empty when color is
+// off, so nothing writes escape bytes into a redirected stream.
+fn fg(color: Color) -> String {
+    if !colored() {
+        return String::new();
+    }
+    SetForegroundColor(downgrade(color)).to_string()
 }
 
-fn reset() -> ResetColor {
-    ResetColor
+fn bold() -> String {
+    if !colored() {
+        return String::new();
+    }
+    SetAttribute(Attribute::Bold).to_string()
+}
+
+fn unbold() -> String {
+    if !colored() {
+        return String::new();
+    }
+    SetAttribute(Attribute::Reset).to_string()
+}
+
+fn reset() -> String {
+    if !colored() {
+        return String::new();
+    }
+    ResetColor.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The terminal and the site are one product: these are the same five
+    /// hexes as `--slag-*` in website/src/main.css. Changing the site
+    /// palette without mirroring it here should fail the build, not ship a
+    /// terminal that quietly disagrees with slag.dev.
+    #[test]
+    fn palette_matches_the_slag_dev_hexes() {
+        assert_eq!(COLD, Color::Rgb { r: 0x6b, g: 0x73, b: 0x85 });
+        assert_eq!(WARM, Color::Rgb { r: 0xe0, g: 0x6c, b: 0x75 });
+        assert_eq!(HOT, Color::Rgb { r: 0xff, g: 0x99, b: 0x40 });
+        assert_eq!(BRIGHT, Color::Rgb { r: 0xff, g: 0xd8, b: 0x66 });
+        assert_eq!(PURE, Color::Rgb { r: 0xff, g: 0xff, b: 0xff });
+    }
+
+    /// `truecolor()` memoizes in a OnceLock, so one process only ever sees
+    /// one branch. Assert the branch this process is actually in: both
+    /// mappings stay covered across a truecolor and a plain terminal, and
+    /// neither can regress unnoticed.
+    #[test]
+    fn downgrade_follows_terminal_capability() {
+        let legacy = [
+            (COLD, Color::DarkGrey),
+            (WARM, Color::Red),
+            (HOT, Color::AnsiValue(208)),
+            (BRIGHT, Color::AnsiValue(220)),
+            (PURE, Color::White),
+        ];
+
+        if truecolor() {
+            for (rgb, _) in legacy {
+                assert_eq!(downgrade(rgb), rgb, "24-bit terminals get the exact hex");
+            }
+        } else {
+            for (rgb, ansi) in legacy {
+                assert_eq!(downgrade(rgb), ansi, "no truecolor: {rgb:?} must degrade");
+            }
+        }
+    }
+
+    /// Colors outside the palette pass through untouched either way.
+    #[test]
+    fn downgrade_passes_through_unknown_colors() {
+        assert_eq!(downgrade(Color::Green), Color::Green);
+        assert_eq!(downgrade(Color::AnsiValue(42)), Color::AnsiValue(42));
+    }
+
+    #[test]
+    fn heat_and_grade_colors_stay_in_the_palette() {
+        let palette = [COLD, WARM, HOT, BRIGHT, PURE];
+        for heat in 0u8..=8 {
+            assert!(palette.contains(&heat_color(heat)), "heat {heat}");
+        }
+        for grade in 0u8..=6 {
+            assert!(palette.contains(&grade_color(grade)), "grade {grade}");
+        }
+    }
+
+    /// A Cyrillic or CJK commission used to slice mid-codepoint and abort
+    /// the process on `slag status`.
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        let cyrillic = "сделать очень длинное описание проекта на русском";
+        let cut = truncate(cyrillic, 10);
+        assert_eq!(cut, "сделать оч...");
+        assert_eq!(cut.chars().count(), 13);
+
+        // Short strings pass through untouched, multibyte or not.
+        assert_eq!(truncate("日本語", 10), "日本語");
+        assert_eq!(truncate("ascii", 10), "ascii");
+        // Exactly at the limit is not truncated.
+        assert_eq!(truncate("абвгд", 5), "абвгд");
+    }
 }
