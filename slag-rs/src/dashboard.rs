@@ -41,9 +41,12 @@ const FLASH: Duration = Duration::from_millis(1500);
 const HINT: &str =
     "type+Enter: steer the smith · Esc/q (empty input): quit view · Ctrl-C: cancel forge";
 
-/// tui.rs palette (crossterm) → ratatui, same values.
+/// tui.rs palette (crossterm) → ratatui, same values. Runs through the
+/// same truecolor downgrade so the dashboard and the stream view never
+/// disagree about what "hot" looks like.
 fn palette(c: crossterm::style::Color) -> Color {
-    match c {
+    match crate::tui::downgrade(c) {
+        crossterm::style::Color::Rgb { r, g, b } => Color::Rgb(r, g, b),
         crossterm::style::Color::DarkGrey => Color::DarkGray,
         crossterm::style::Color::Red => Color::Red,
         crossterm::style::Color::White => Color::White,
@@ -140,6 +143,9 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
     match event {
         EngineEvent::TurnStart { turn } => (palette(tui::HOT), format!("⚒ turn {turn}")),
         EngineEvent::ModelCall { model } => (palette(tui::COLD), format!("⚙ {model}")),
+        EngineEvent::ModelRouted { routed, .. } => {
+            (palette(tui::COLD), format!("⚙ routed to {routed}"))
+        }
         EngineEvent::ToolCallStart { name, preview: p } => {
             (palette(tui::BRIGHT), format!("→ {name}: {}", preview(p, 80)))
         }

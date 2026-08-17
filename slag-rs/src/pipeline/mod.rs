@@ -5,7 +5,7 @@ pub mod duel;
 pub mod resmelt;
 pub mod assay;
 
-use crate::config::SmithConfig;
+use crate::config::EngineConfig;
 use crate::crucible::Crucible;
 use crate::error::SlagError;
 use crate::smith::EngineHooks;
@@ -14,7 +14,7 @@ use crate::tui;
 /// Run the full 4-phase pipeline.
 pub async fn run(
     commission: Option<&str>,
-    config: &SmithConfig,
+    config: &EngineConfig,
     max_anvils: usize,
     hooks: EngineHooks,
 ) -> Result<(), SlagError> {

@@ -17,12 +17,45 @@ pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
 }
 
-// Palette (cold ore → hot metal → pure steel)
-pub const COLD: Color = Color::DarkGrey;
-pub const WARM: Color = Color::Red;
-pub const HOT: Color = Color::AnsiValue(208); // orange
-pub const BRIGHT: Color = Color::AnsiValue(220); // yellow
-pub const PURE: Color = Color::White;
+// Palette (cold ore → hot metal → pure steel).
+// Same five hexes the slag.dev site uses (website/src/main.css `--slag-*`),
+// so terminal and web read as one product. Terminals without truecolor get
+// the nearest ANSI value via `downgrade`.
+pub const COLD: Color = Color::Rgb { r: 0x6b, g: 0x73, b: 0x85 };
+pub const WARM: Color = Color::Rgb { r: 0xe0, g: 0x6c, b: 0x75 };
+pub const HOT: Color = Color::Rgb { r: 0xff, g: 0x99, b: 0x40 };
+pub const BRIGHT: Color = Color::Rgb { r: 0xff, g: 0xd8, b: 0x66 };
+pub const PURE: Color = Color::Rgb { r: 0xff, g: 0xff, b: 0xff };
+
+/// True when the terminal advertises 24-bit color. Checked once: the
+/// answer cannot change mid-run, and every printed line asks.
+pub fn truecolor() -> bool {
+    static YES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *YES.get_or_init(|| {
+        std::env::var("COLORTERM")
+            .map(|v| {
+                let v = v.to_lowercase();
+                v.contains("truecolor") || v.contains("24bit")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Map a palette color to what the terminal can actually render. Sending
+/// 24-bit escapes to a 256-color terminal paints unreadable approximations.
+pub fn downgrade(color: Color) -> Color {
+    if truecolor() {
+        return color;
+    }
+    match color {
+        COLD => Color::DarkGrey,
+        WARM => Color::Red,
+        HOT => Color::AnsiValue(208),
+        BRIGHT => Color::AnsiValue(220),
+        PURE => Color::White,
+        other => other,
+    }
+}
 
 pub fn hr() {
     if is_quiet() {
@@ -87,6 +120,96 @@ pub fn show_banner() {
         fg(COLD),
         reset()
     );
+}
+
+/// First-run key prompt. Two lines of why, one line to act on, then the
+/// cursor. Everything slag needs to run fits on this screen.
+pub fn key_intro() {
+    show_banner();
+    println!();
+    println!(
+        "  {}slag forges through OpenRouter. One key, every model.{}",
+        fg(PURE),
+        reset()
+    );
+    println!(
+        "  {}get one at{} {}https://openrouter.ai/keys{}",
+        fg(COLD),
+        reset(),
+        fg(BRIGHT),
+        reset()
+    );
+    println!();
+    print!("  {}key{} {}› {}", fg(HOT), reset(), fg(COLD), reset());
+    flush();
+}
+
+/// Saved a key slag could not reach OpenRouter to check. Say so, so a
+/// later 401 does not read like a mystery.
+pub fn key_unverified(why: &str) {
+    println!(
+        "  {}▒{} could not reach OpenRouter ({}) — saving unverified",
+        fg(WARM),
+        reset(),
+        why
+    );
+}
+
+/// Confirm where the key landed, so the user can find or delete it later.
+pub fn key_saved(path: &std::path::Path) {
+    println!(
+        "  {}█{} saved to {}{}{}",
+        fg(PURE),
+        reset(),
+        fg(COLD),
+        path.display(),
+        reset()
+    );
+    println!();
+}
+
+/// `slag key` with no argument: state of the one setting slag has.
+pub fn key_panel(source: Option<(&str, String)>, models: &[(&str, &str)]) {
+    show_banner();
+    println!();
+    match source {
+        Some((from, masked)) => {
+            println!(
+                "  {}key{}    {}{}{}  {}from {}{}",
+                fg(COLD),
+                reset(),
+                fg(PURE),
+                masked,
+                reset(),
+                fg(COLD),
+                from,
+                reset()
+            );
+        }
+        None => {
+            println!(
+                "  {}key{}    {}none{}  {}run `slag key <KEY>` or set OPENROUTER_API_KEY{}",
+                fg(COLD),
+                reset(),
+                fg(WARM),
+                reset(),
+                fg(COLD),
+                reset()
+            );
+        }
+    }
+    for (role, model) in models {
+        println!(
+            "  {}{:<6}{} {}{}{}",
+            fg(COLD),
+            role,
+            reset(),
+            fg(BRIGHT),
+            model,
+            reset()
+        );
+    }
+    println!();
 }
 
 pub fn ingot_status_line(counts: &CrucibleCounts) {
@@ -199,7 +322,7 @@ pub fn flush() {
 
 // Helper to create crossterm foreground color string
 fn fg(color: Color) -> SetForegroundColor {
-    SetForegroundColor(color)
+    SetForegroundColor(downgrade(color))
 }
 
 fn reset() -> ResetColor {

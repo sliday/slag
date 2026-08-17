@@ -610,6 +610,7 @@ mod tests {
                 .expect("scripted judge ran out of replies");
             Box::pin(async move {
                 Ok(NormalizedResponse {
+                    model: None,
                     content,
                     tool_calls: vec![],
                     finish_reason: crate::engine::FinishReason::Stop,

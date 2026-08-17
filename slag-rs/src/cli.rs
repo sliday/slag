@@ -28,6 +28,12 @@ pub struct Cli {
     #[arg(long, default_value_t = crate::config::MAX_ANVILS)]
     pub anvils: usize,
 
+    /// Let OpenRouter pick the model per call: openrouter/auto for
+    /// worker, planner, and judge (duel cast B keeps its own model
+    /// for diversity). Explicit model flags override.
+    #[arg(long)]
+    pub auto: bool,
+
     /// Worker model, any OpenRouter id (overrides SLAG_MODEL_BASE)
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
@@ -43,6 +49,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Show or set the OpenRouter key (the only setup slag needs)
+    Key {
+        /// Key to verify and save; omit to show the current setup
+        #[arg(value_name = "KEY")]
+        key: Option<String>,
+    },
+
     /// Show crucible state
     Status,
 

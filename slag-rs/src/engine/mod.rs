@@ -146,6 +146,9 @@ impl Usage {
 /// Provider-agnostic model response (hermes `NormalizedResponse` pattern).
 #[derive(Debug, Clone)]
 pub struct NormalizedResponse {
+    /// Model the provider actually ran, when it says. Differs from the
+    /// requested id whenever a router like `openrouter/auto` is in play.
+    pub model: Option<String>,
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
@@ -180,6 +183,10 @@ pub trait Provider: Send + Sync {
 pub enum EngineEvent {
     TurnStart { turn: usize },
     ModelCall { model: String },
+    /// A router answered with a different model than the one requested.
+    /// Only `openrouter/auto` and friends emit this; a pinned model never
+    /// does, so this line always carries news.
+    ModelRouted { requested: String, routed: String },
     ToolCallStart { name: String, preview: String },
     ToolResult { name: String, ok: bool, preview: String },
     Tokens { usage: Usage },

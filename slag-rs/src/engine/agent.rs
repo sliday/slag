@@ -154,6 +154,17 @@ impl ForgeAgent {
                     return Err(e);
                 }
             };
+            // With a router in front, the requested id says nothing about
+            // what actually did the work. Report the swap when it happens.
+            if let Some(routed) = resp.model.as_deref().filter(|m| *m != self.model) {
+                emit(
+                    &self.events,
+                    EngineEvent::ModelRouted {
+                        requested: self.model.clone(),
+                        routed: routed.to_string(),
+                    },
+                );
+            }
             emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
 
             if resp.tool_calls.is_empty() {
@@ -462,6 +473,7 @@ mod tests {
 
     fn resp_tools(calls: Vec<ToolCall>) -> NormalizedResponse {
         NormalizedResponse {
+            model: None,
             content: String::new(),
             tool_calls: calls,
             finish_reason: FinishReason::ToolCalls,
@@ -473,6 +485,7 @@ mod tests {
 
     fn resp_text(text: &str, finish_reason: FinishReason) -> NormalizedResponse {
         NormalizedResponse {
+            model: None,
             content: text.into(),
             tool_calls: vec![],
             finish_reason,

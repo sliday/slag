@@ -1,4 +1,3 @@
-pub mod claude;
 pub mod mock;
 pub mod native;
 
@@ -6,7 +5,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use crate::config::{EngineConfig, SmithConfig};
+use crate::config::EngineConfig;
 use crate::error::SlagError;
 
 /// Async trait for invoking an AI smith (Claude or mock).
@@ -20,7 +19,6 @@ pub trait Smith: Send + Sync {
 /// `events` fans the engine event stream out to the dashboard (the
 /// per-invocation JSONL sink keeps running regardless); `steer` and
 /// `cancel` wire the dashboard's input line and Ctrl-C into the agent.
-/// `ClaudeSmith` ignores all three.
 #[derive(Clone, Default)]
 pub struct EngineHooks {
     pub events: Option<crate::engine::EventTx>,
@@ -34,32 +32,28 @@ fn workspace_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Forge smith factory: native engine when an OpenRouter key is configured,
-/// else the Claude CLI (current behavior).
-pub fn make_smith(config: &SmithConfig, skill: &str, grade: u8, hooks: &EngineHooks) -> Box<dyn Smith> {
-    match EngineConfig::load() {
-        Some(cfg) => Box::new(native::NativeSmith::forge(cfg, skill, grade, workspace_root(), hooks)),
-        None => Box::new(claude::ClaudeSmith::from_config(config, skill, grade)),
-    }
+/// Forge smith factory. One engine, one provider: OpenRouter.
+pub fn make_smith(cfg: &EngineConfig, skill: &str, grade: u8, hooks: &EngineHooks) -> Box<dyn Smith> {
+    Box::new(native::NativeSmith::forge(
+        cfg.clone(),
+        skill,
+        grade,
+        workspace_root(),
+        hooks,
+    ))
 }
 
 /// Plan smith factory (surveyor/founder passes).
-pub fn make_plan_smith(config: &SmithConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
-    match EngineConfig::load() {
-        Some(cfg) => Box::new(native::NativeSmith::plan(cfg, workspace_root(), hooks)),
-        None => Box::new(claude::ClaudeSmith::plan(config)),
-    }
+pub fn make_plan_smith(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
+    Box::new(native::NativeSmith::plan(cfg.clone(), workspace_root(), hooks))
 }
 
 /// Base smith factory (resmelt analysis — low grade, no skill).
-/// Native engine runs this in plan mode: resmelt is an analysis-only pass
-/// whose text output is parsed as REWRITE/SPLIT/IMPOSSIBLE s-expressions,
-/// so it must not get forge-mode write access or finish-summary-only output.
-pub fn make_base_smith(config: &SmithConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
-    match EngineConfig::load() {
-        Some(cfg) => Box::new(native::NativeSmith::plan(cfg, workspace_root(), hooks)),
-        None => Box::new(claude::ClaudeSmith::base(config)),
-    }
+/// Runs in plan mode: resmelt is an analysis-only pass whose text output is
+/// parsed as REWRITE/SPLIT/IMPOSSIBLE s-expressions, so it must not get
+/// forge-mode write access or finish-summary-only output.
+pub fn make_base_smith(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
+    Box::new(native::NativeSmith::plan(cfg.clone(), workspace_root(), hooks))
 }
 
 /// Check if response text contains unresolved questions
@@ -121,10 +115,6 @@ mod tests {
         // Clones stay cheap and independent.
         let clone = hooks.clone();
         assert!(clone.events.is_none());
-        // ClaudeSmith ignores hooks entirely: the CLI path still builds
-        // from SmithConfig alone.
-        let config = SmithConfig::from_env();
-        let _cli: Box<dyn Smith> = Box::new(claude::ClaudeSmith::from_config(&config, "web", 1));
     }
 
     #[test]

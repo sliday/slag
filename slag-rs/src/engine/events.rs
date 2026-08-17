@@ -142,6 +142,9 @@ impl StderrNarrator {
             EngineEvent::ModelCall { model } => {
                 Self::line(COLD, "⚙", model);
             }
+            EngineEvent::ModelRouted { routed, .. } => {
+                Self::line(COLD, "⚙", &format!("routed to {routed}"));
+            }
             EngineEvent::ToolCallStart { name, preview: p } => {
                 Self::line(BRIGHT, "→", &format!("{name}: {}", preview(p, 80)));
             }

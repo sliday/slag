@@ -137,28 +137,50 @@ impl Provider for OpenRouter {
     }
 }
 
+/// Outcome of a key check. Onboarding treats these differently: a key
+/// OpenRouter refused is worth retyping, an unreachable OpenRouter is not.
+pub enum KeyCheck {
+    Valid,
+    Rejected(String),
+    Unreachable(String),
+}
+
 /// Cheap key check: GET {base}/models with the bearer key, 200 = valid.
-pub async fn validate_key(api_key: &str, base_url: &str) -> Result<(), SlagError> {
+pub async fn check_key(api_key: &str, base_url: &str) -> KeyCheck {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| SlagError::Provider(format!("client build failed: {e}")))?;
+    {
+        Ok(client) => client,
+        Err(e) => return KeyCheck::Unreachable(format!("client build failed: {e}")),
+    };
     let resp = client
         .get(&url)
         .bearer_auth(api_key)
         .header("HTTP-Referer", "https://slag.dev")
         .header("X-Title", "slag")
         .send()
-        .await
-        .map_err(|e| SlagError::Provider(format!("key validation request failed: {e}")))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(SlagError::Provider(format!(
-            "key validation failed: {}",
-            resp.status()
-        )))
+        .await;
+
+    match resp {
+        Ok(resp) if resp.status().is_success() => KeyCheck::Valid,
+        // 4xx is a verdict on the key; 5xx is OpenRouter having a bad day.
+        Ok(resp) if resp.status().is_client_error() => {
+            KeyCheck::Rejected(resp.status().to_string())
+        }
+        Ok(resp) => KeyCheck::Unreachable(resp.status().to_string()),
+        Err(e) => KeyCheck::Unreachable(format!("{e}")),
+    }
+}
+
+/// Boolean form of `check_key` for callers that treat every failure alike.
+pub async fn validate_key(api_key: &str, base_url: &str) -> Result<(), SlagError> {
+    match check_key(api_key, base_url).await {
+        KeyCheck::Valid => Ok(()),
+        KeyCheck::Rejected(why) | KeyCheck::Unreachable(why) => {
+            Err(SlagError::Provider(format!("key validation failed: {why}")))
+        }
     }
 }
 
@@ -247,6 +269,7 @@ fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
         .or_else(|| reasoning_from_details(msg.reasoning_details.as_ref()));
 
     Ok(NormalizedResponse {
+        model: api.model.filter(|m| !m.is_empty()),
         content: msg.content.unwrap_or_default(),
         tool_calls,
         finish_reason,
@@ -294,6 +317,10 @@ struct ApiResponse {
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// Which model actually answered. With `openrouter/auto` this is the
+    /// only place the routed id appears.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]

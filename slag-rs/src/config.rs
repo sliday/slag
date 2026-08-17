@@ -17,60 +17,15 @@ pub const MAX_ANVILS: usize = 3;
 pub const HIGH_GRADE: u8 = 3;
 pub const MAX_ITERATE: usize = 3;
 
-/// Smith configuration resolved from environment
-pub struct SmithConfig {
-    pub base: String,
-    pub plan: String,
-    pub web: String,
-    pub web_plan: String,
-}
-
-impl SmithConfig {
-    pub fn from_env() -> Self {
-        let base = std::env::var("SLAG_SMITH")
-            .unwrap_or_else(|_| "claude --dangerously-skip-permissions -p".to_string());
-        let plan = format!("{base} --permission-mode plan");
-        let web = format!("{base} --allowedTools 'Bash Edit Read Write Playwright'");
-        let web_plan = format!("{web} --permission-mode plan");
-        Self {
-            base,
-            plan,
-            web,
-            web_plan,
-        }
-    }
-
-    /// Select smith command based on skill and grade
-    pub fn select(&self, skill: &str, grade: u8) -> &str {
-        match skill {
-            "web" | "frontend" | "ui" | "css" | "html" => {
-                if grade >= HIGH_GRADE {
-                    &self.web_plan
-                } else {
-                    &self.web
-                }
-            }
-            _ => {
-                if grade >= HIGH_GRADE {
-                    &self.plan
-                } else {
-                    &self.base
-                }
-            }
-        }
-    }
-}
-
 /// Resolve a project-relative path
 pub fn project_path(filename: &str) -> PathBuf {
     PathBuf::from(filename)
 }
 
-/// Default models for the native engine
-const DEFAULT_MODEL_BASE: &str = "qwen/qwen3-coder";
-const DEFAULT_MODEL_PLAN: &str = "openai/gpt-5";
-const DEFAULT_MODEL_ALT: &str = "moonshotai/kimi-k2";
-const DEFAULT_MODEL_JUDGE: &str = "openai/gpt-5";
+/// Default model for every role: OpenRouter's automatic router picks a
+/// live model per request, so a fresh key works with zero model config.
+/// Each role still takes an env/file/flag override.
+pub const AUTO_MODEL: &str = "openrouter/auto";
 
 /// Twin-cast duel gate. Auto duels only high grades; On/Off force it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,9 +43,10 @@ pub struct EngineConfig {
     pub api_key: String,
     pub model_base: String,
     pub model_plan: String,
-    /// Cast B model — different family than base, forced diversity.
+    /// Cast B model. Set it to a different family than `model_base` to
+    /// make a duel worth its cost; left at the default it matches base.
     pub model_alt: String,
-    /// Assayer model — different family than both smiths.
+    /// Assayer model. Same story: a distinct family judges more usefully.
     pub model_judge: String,
     pub effort: Option<Effort>,
     pub base_url: String,
@@ -101,8 +57,18 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// Resolve config, onboarding the user when no key exists yet.
+    /// The one prerequisite slag has: an OpenRouter key.
+    pub async fn resolve() -> Result<Self, SlagError> {
+        if let Some(cfg) = Self::load() {
+            return Ok(cfg);
+        }
+        onboard().await?;
+        Self::load().ok_or_else(|| SlagError::Config("key stored but config still unreadable".into()))
+    }
+
     /// Resolve engine config. Returns None when no API key is available
-    /// anywhere (caller falls back to the CLI smith or onboarding).
+    /// anywhere (caller onboards instead).
     pub fn load() -> Option<Self> {
         let entries = config_file_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -114,19 +80,19 @@ impl EngineConfig {
 
         let model_base = env_nonempty("SLAG_MODEL_BASE")
             .or_else(|| file_value(&entries, "model_base"))
-            .unwrap_or_else(|| DEFAULT_MODEL_BASE.to_string());
+            .unwrap_or_else(|| AUTO_MODEL.to_string());
 
         let model_plan = env_nonempty("SLAG_MODEL_PLAN")
             .or_else(|| file_value(&entries, "model_plan"))
-            .unwrap_or_else(|| DEFAULT_MODEL_PLAN.to_string());
+            .unwrap_or_else(|| AUTO_MODEL.to_string());
 
         let model_alt = env_nonempty("SLAG_MODEL_ALT")
             .or_else(|| file_value(&entries, "model_alt"))
-            .unwrap_or_else(|| DEFAULT_MODEL_ALT.to_string());
+            .unwrap_or_else(|| AUTO_MODEL.to_string());
 
         let model_judge = env_nonempty("SLAG_MODEL_JUDGE")
             .or_else(|| file_value(&entries, "model_judge"))
-            .unwrap_or_else(|| DEFAULT_MODEL_JUDGE.to_string());
+            .unwrap_or_else(|| AUTO_MODEL.to_string());
 
         let duel = env_nonempty("SLAG_DUEL")
             .or_else(|| file_value(&entries, "duel"))
@@ -179,12 +145,16 @@ impl EngineConfig {
     }
 
     /// Grade-gated duel qualification (plan section 9 rule 1): Auto duels
-    /// grade 3 and above.
+    /// grade 3 and above, and only when the two casts run different models.
+    /// A duel buys diversity; two casts of the same model id cost triple
+    /// the tokens and buy nothing, which is what the default
+    /// `openrouter/auto` everywhere would otherwise do. `SLAG_DUEL=on`
+    /// still forces it for anyone who wants two rolls of the same dice.
     pub fn duel_qualifies(&self, grade: u8) -> bool {
         match self.duel {
             DuelMode::On => true,
             DuelMode::Off => false,
-            DuelMode::Auto => grade >= HIGH_GRADE,
+            DuelMode::Auto => grade >= HIGH_GRADE && self.model_alt != self.model_base,
         }
     }
 
@@ -218,45 +188,152 @@ pub fn store_key(key: &str) -> Result<PathBuf, SlagError> {
         None => entries.push(("openrouter_api_key".to_string(), key.to_string())),
     }
 
+    write_entries(&path, &entries)?;
+    Ok(path)
+}
+
+/// Rewrite the config file from `key = "value"` pairs, owner-only on unix.
+fn write_entries(path: &std::path::Path, entries: &[(String, String)]) -> Result<(), SlagError> {
     let mut out = String::new();
-    for (k, v) in &entries {
+    for (k, v) in entries {
         out.push_str(k);
         out.push_str(" = \"");
         out.push_str(v);
         out.push_str("\"\n");
     }
-    std::fs::write(&path, out)?;
+    std::fs::write(path, out)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
 
+    Ok(())
+}
+
+/// Forget the stored key. Leaves every other config entry in place.
+pub fn clear_key() -> Result<Option<PathBuf>, SlagError> {
+    let Some(path) = config_file_path() else {
+        return Ok(None);
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let entries: Vec<_> = parse_config_lines(&contents)
+        .into_iter()
+        .filter(|(k, _)| k != "openrouter_api_key")
+        .collect();
+    write_entries(&path, &entries)?;
+    Ok(Some(path))
+}
+
+/// Where the active key comes from. Env wins so CI can override a stored key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Env,
+    File,
+}
+
+impl KeySource {
+    pub fn label(self) -> &'static str {
+        match self {
+            KeySource::Env => "OPENROUTER_API_KEY",
+            KeySource::File => "config file",
+        }
+    }
+}
+
+/// Current key and where it came from, without onboarding.
+pub fn key_status() -> Option<(KeySource, String)> {
+    if let Some(key) = env_nonempty("OPENROUTER_API_KEY") {
+        return Some((KeySource::Env, key));
+    }
+    let entries = config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_config_lines(&c))
+        .unwrap_or_default();
+    file_value(&entries, "openrouter_api_key").map(|key| (KeySource::File, key))
+}
+
+/// Show a key without leaking it: first 7 and last 4 characters.
+pub fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 14 {
+        return "•".repeat(chars.len().max(1));
+    }
+    let head: String = chars[..7].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// The base URL a key is checked against; honours the test/proxy override.
+pub fn base_url() -> String {
+    env_nonempty("SLAG_OPENROUTER_BASE").unwrap_or_else(|| crate::engine::OPENROUTER_BASE.to_string())
+}
+
+/// Interactive key onboarding: read, verify against OpenRouter, then store.
+/// A key that never gets verified fails later inside a forge, where the
+/// error reads like a model problem instead of a setup problem.
+/// Headless runs get an actionable error rather than a blocked stdin read.
+pub async fn onboard() -> Result<String, SlagError> {
+    if !std::io::stdin().is_terminal() {
+        return Err(SlagError::Config(
+            "no OpenRouter key. Set OPENROUTER_API_KEY, or run `slag key` on a terminal \
+             to save one. Get a key at https://openrouter.ai/keys"
+                .into(),
+        ));
+    }
+
+    crate::tui::key_intro();
+    let key = read_key_line()?;
+    verify_and_store(&key).await?;
+    Ok(key)
+}
+
+/// Verify a key over the wire, then persist it. Shared by onboarding and
+/// `slag key`, so neither saves a key OpenRouter refuses.
+///
+/// Only a refusal blocks. A key typed on a plane is still probably the
+/// right key: slag saves it with a warning rather than making the user
+/// find it again once the network comes back.
+pub async fn verify_and_store(key: &str) -> Result<PathBuf, SlagError> {
+    use crate::engine::provider::KeyCheck;
+
+    if key.is_empty() {
+        return Err(SlagError::Config("no key entered".into()));
+    }
+
+    let spinner = crate::tui::spinner("checking key with OpenRouter");
+    let check = crate::engine::provider::check_key(key, &base_url()).await;
+    spinner.finish_and_clear();
+
+    match check {
+        KeyCheck::Valid => {}
+        KeyCheck::Rejected(why) => {
+            return Err(SlagError::Config(format!(
+                "OpenRouter rejected that key ({why}). \
+                 Copy it again from https://openrouter.ai/keys"
+            )))
+        }
+        KeyCheck::Unreachable(why) => crate::tui::key_unverified(&why),
+    }
+
+    let path = store_key(key)?;
+    crate::tui::key_saved(&path);
     Ok(path)
 }
 
-/// Interactive key onboarding. Only prompts on a real terminal;
-/// headless runs get a hard config error instead of hanging on stdin.
-pub fn prompt_for_key() -> Result<String, SlagError> {
-    use std::io::{BufRead, Write};
-
-    if !std::io::stdin().is_terminal() {
-        return Err(SlagError::Config("OPENROUTER_API_KEY not set".into()));
-    }
-
-    println!("slag needs an OpenRouter key — get one at openrouter.ai/keys");
-    print!("key: ");
-    std::io::stdout().flush()?;
+/// Read one key from stdin, rejecting blanks before any network call.
+fn read_key_line() -> Result<String, SlagError> {
+    use std::io::BufRead;
 
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     let key = line.trim().to_string();
     if key.is_empty() {
-        return Err(SlagError::Config("empty OpenRouter key".into()));
+        return Err(SlagError::Config("no key entered".into()));
     }
-
-    store_key(&key)?;
     Ok(key)
 }
 
@@ -374,10 +451,10 @@ mod tests {
 
         let config = EngineConfig::load().expect("key stored in file");
         assert_eq!(config.api_key, "sk-or-file-key");
-        assert_eq!(config.model_base, DEFAULT_MODEL_BASE);
-        assert_eq!(config.model_plan, DEFAULT_MODEL_PLAN);
-        assert_eq!(config.model_alt, DEFAULT_MODEL_ALT);
-        assert_eq!(config.model_judge, DEFAULT_MODEL_JUDGE);
+        assert_eq!(config.model_base, AUTO_MODEL);
+        assert_eq!(config.model_plan, AUTO_MODEL);
+        assert_eq!(config.model_alt, AUTO_MODEL);
+        assert_eq!(config.model_judge, AUTO_MODEL);
         assert_eq!(config.effort, None);
         assert_eq!(config.base_url, crate::engine::OPENROUTER_BASE);
         assert_eq!(config.duel, DuelMode::Auto);
@@ -407,7 +484,7 @@ mod tests {
         let config = EngineConfig::load().unwrap();
         assert_eq!(config.api_key, "sk-or-from-env");
         assert_eq!(config.model_base, "env/base-model");
-        assert_eq!(config.model_plan, DEFAULT_MODEL_PLAN);
+        assert_eq!(config.model_plan, AUTO_MODEL);
         assert_eq!(config.effort, Some(Effort::High));
         assert_eq!(config.base_url, "http://localhost:9999/v1");
 
@@ -446,8 +523,8 @@ mod tests {
             api_key: "sk-or-x".into(),
             model_base: "base-model".into(),
             model_plan: "plan-model".into(),
-            model_alt: DEFAULT_MODEL_ALT.into(),
-            model_judge: DEFAULT_MODEL_JUDGE.into(),
+            model_alt: AUTO_MODEL.into(),
+            model_judge: AUTO_MODEL.into(),
             effort: None,
             base_url: crate::engine::OPENROUTER_BASE.into(),
             duel: DuelMode::Auto,

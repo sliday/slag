@@ -249,6 +249,7 @@ mod tests {
                 .expect("mock judge ran out of replies");
             Box::pin(async move {
                 Ok(NormalizedResponse {
+                    model: None,
                     content,
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,

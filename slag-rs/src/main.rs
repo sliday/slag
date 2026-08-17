@@ -20,7 +20,7 @@ use std::path::Path;
 use clap::Parser;
 
 use cli::{Cli, Command};
-use config::SmithConfig;
+use config::EngineConfig;
 use smith::EngineHooks;
 
 #[tokio::main]
@@ -37,6 +37,12 @@ async fn main() {
     }
 
     // Model flags override env; EngineConfig::load reads env downstream.
+    // --auto first, so explicit model flags win over it.
+    if cli.auto {
+        std::env::set_var("SLAG_MODEL_BASE", "openrouter/auto");
+        std::env::set_var("SLAG_MODEL_PLAN", "openrouter/auto");
+        std::env::set_var("SLAG_MODEL_JUDGE", "openrouter/auto");
+    }
     if let Some(m) = &cli.model {
         std::env::set_var("SLAG_MODEL_BASE", m);
     }
@@ -50,25 +56,16 @@ async fn main() {
     // Ensure logs directory exists
     let _ = std::fs::create_dir_all(config::LOG_DIR);
 
+    // `status`, `update` and `key` inspect or repair a broken setup, so
+    // none of them may demand the very key the user came here to fix.
     let result = match cli.command {
         Some(Command::Status) => show_status(),
         Some(Command::Update) => update::self_update().await,
-        Some(Command::Resume) => {
-            let config = SmithConfig::from_env();
-            match ensure_engine_key() {
-                Ok(()) => run_pipeline(None, &config, cli.anvils, cli.tui).await,
-                Err(e) => Err(e),
-            }
-        }
+        Some(Command::Key { key }) => run_key(key).await,
+        Some(Command::Resume) => forge(None, cli.anvils, cli.tui).await,
         None => {
-            let config = SmithConfig::from_env();
-            match ensure_engine_key() {
-                Ok(()) => {
-                    let commission = cli.commission_text();
-                    run_pipeline(commission.as_deref(), &config, cli.anvils, cli.tui).await
-                }
-                Err(e) => Err(e),
-            }
+            let commission = cli.commission_text();
+            forge(commission.as_deref(), cli.anvils, cli.tui).await
         }
     };
 
@@ -78,12 +75,63 @@ async fn main() {
     }
 }
 
+/// Resolve the key (onboarding on first run) and forge. The key gate
+/// runs before any project file is touched: a run that cannot call a
+/// model should not leave a half-lit furnace behind.
+async fn forge(
+    commission: Option<&str>,
+    anvils: usize,
+    tui_flag: bool,
+) -> Result<(), error::SlagError> {
+    let config = EngineConfig::resolve().await?;
+    run_pipeline(commission, &config, anvils, tui_flag).await
+}
+
+/// `slag key [KEY]` — the whole configuration surface. With a key it
+/// verifies and saves; without one it reports what slag would use, or
+/// onboards when there is nothing to report. Passing the key as an
+/// argument leaks it into shell history, so the bare form prompts.
+async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
+    if let Some(key) = key {
+        config::verify_and_store(key.trim()).await?;
+        return Ok(());
+    }
+
+    let status = config::key_status();
+    if status.is_none() && std::io::stdin().is_terminal() {
+        config::onboard().await?;
+        return Ok(());
+    }
+    let source = status
+        .as_ref()
+        .map(|(src, key)| (src.label(), config::mask_key(key)));
+
+    // Models only resolve once a key exists; without one, show the defaults
+    // the user will get rather than an empty panel.
+    let models = match EngineConfig::load() {
+        Some(cfg) => vec![
+            ("work", cfg.model_base),
+            ("plan", cfg.model_plan),
+            ("duel", cfg.model_alt),
+            ("judge", cfg.model_judge),
+        ],
+        None => ["work", "plan", "duel", "judge"]
+            .iter()
+            .map(|role| (*role, config::AUTO_MODEL.to_string()))
+            .collect(),
+    };
+    let models: Vec<(&str, &str)> = models.iter().map(|(r, m)| (*r, m.as_str())).collect();
+
+    tui::key_panel(source, &models);
+    Ok(())
+}
+
 /// Run the pipeline, optionally under the full-screen dashboard.
 /// `--tui` needs a real terminal on stdin for the key reader; headless
 /// runs (CI, pipes) silently keep the stream-mode display.
 async fn run_pipeline(
     commission: Option<&str>,
-    config: &SmithConfig,
+    config: &EngineConfig,
     anvils: usize,
     tui_flag: bool,
 ) -> Result<(), error::SlagError> {
@@ -129,15 +177,6 @@ async fn run_pipeline(
     }
 
     result
-}
-
-/// OpenRouter key is a prerequisite: prompt on first run.
-/// `SLAG_SMITH` env stays as the legacy CLI-smith escape hatch.
-fn ensure_engine_key() -> Result<(), error::SlagError> {
-    if config::EngineConfig::load().is_some() || std::env::var_os("SLAG_SMITH").is_some() {
-        return Ok(());
-    }
-    config::prompt_for_key().map(|_| ())
 }
 
 fn show_status() -> Result<(), error::SlagError> {

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::config::{EngineConfig, SmithConfig, CRUCIBLE, LEDGER};
+use crate::config::{EngineConfig, CRUCIBLE, LEDGER};
 use crate::crucible::{Crucible, CRUCIBLE_LOCK};
 use crate::engine::provider::OpenRouter;
 use crate::engine::{emit, EngineEvent};
@@ -15,7 +15,7 @@ use super::{duel, resmelt};
 
 /// Phase 3: Forge loop — parallel anvils then sequential
 pub async fn run(
-    config: &SmithConfig,
+    config: &EngineConfig,
     max_anvils: usize,
     hooks: &EngineHooks,
 ) -> Result<(), SlagError> {
@@ -76,18 +76,12 @@ pub async fn run(
                 );
             }
 
-            // Engine config decides duel eligibility; resolved once per wave.
-            let engine_cfg = EngineConfig::load();
-
             // Spawn parallel tasks
             let mut set = tokio::task::JoinSet::new();
             for ingot in ingot_snapshots {
                 let smith = crate::smith::make_smith(config, ingot.skill.as_str(), ingot.grade, hooks);
                 let task_hooks = hooks.clone();
-                let duel_cfg = engine_cfg
-                    .as_ref()
-                    .filter(|cfg| duel::should_duel(cfg, &ingot))
-                    .cloned();
+                let duel_cfg = duel::should_duel(config, &ingot).then(|| config.clone());
                 set.spawn(async move {
                     emit(
                         &task_hooks.events,
