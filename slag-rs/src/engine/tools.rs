@@ -1,4 +1,4 @@
-//! tools — the seven native tools the smith works with.
+//! tools — the eight native tools the smith works with.
 //!
 //! Sandbox: every path resolves inside the anvil root. Edit uses the
 //! hermes fuzzy ladder (exact → line-trimmed → whitespace-normalized →
@@ -30,10 +30,16 @@ use super::{ToolCall, ToolOutcome, ToolSpec};
 use crate::error::SlagError;
 
 const READ_LIMIT_DEFAULT: usize = 2000;
+/// Full reads of files over this size are refused pre-read (stat only);
+/// the caller is told to use offset/limit instead.
+const READ_SIZE_MAX: u64 = 256 * 1024;
 const BASH_TIMEOUT_DEFAULT: u64 = 120;
 const BASH_TIMEOUT_MAX: u64 = 600;
-const BASH_OUTPUT_CAP: usize = 30_000;
+const BASH_OUTPUT_CAP_DEFAULT: usize = 30_000;
+/// Hard ceiling for SLAG_BASH_OUTPUT_CAP.
+const BASH_OUTPUT_CAP_MAX: usize = 200 * 1024;
 const GREP_LINE_CAP: usize = 100;
+const GLOB_FILE_CAP: usize = 100;
 const DIFF_LINE_CAP: usize = 12;
 /// Files modified within this window never enter the read cache: a
 /// same-size rewrite landing in the same mtime tick would make the stamp
@@ -100,7 +106,9 @@ impl ToolBox {
                 "edit_file",
                 "Replace old_string with new_string in a file. old_string must match exactly once; \
                  fuzzy whitespace/indentation fallbacks apply when exact match fails. \
-                 Set replace_all to replace every exact occurrence.",
+                 Set replace_all to replace every exact occurrence. \
+                 read_file output is LINENUM|CONTENT — never include that line-number prefix \
+                 in old_string or new_string.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -132,6 +140,19 @@ impl ToolBox {
                     "properties": {
                         "pattern": {"type": "string", "description": "Regex pattern"},
                         "path": {"type": "string", "description": "Directory or file to search (default workspace root)"}
+                    },
+                    "required": ["pattern"]
+                }),
+            ),
+            spec(
+                "glob",
+                "Find files by glob pattern (e.g. '*.rs', 'src/**/*.ts'). \
+                 Returns workspace-relative paths, capped at 100 files.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Glob pattern to match file paths"},
+                        "path": {"type": "string", "description": "Directory to search (default workspace root)"}
                     },
                     "required": ["pattern"]
                 }),
@@ -192,6 +213,7 @@ impl ToolBox {
             "edit_file" => self.edit_file(&args).await,
             "bash" => self.bash(&args).await,
             "grep" => self.grep(&args).await,
+            "glob" => self.glob(&args).await,
             "recipe_view" => self.recipe_view(&args).await,
             "finish" => Ok(req_str(&args, "finish", "summary")?.to_string()),
             other => Err(SlagError::Tool(format!("unknown tool: {other}"))),
@@ -255,12 +277,12 @@ impl ToolBox {
     async fn read_file(&self, args: &Value) -> Result<String, SlagError> {
         let raw = req_str(args, "read_file", "path")?;
         let path = self.resolve(raw)?;
-        let offset_arg = args.get("offset").and_then(Value::as_u64);
-        let limit_arg = args.get("limit").and_then(Value::as_u64);
+        let offset_arg = arg_u64(args, "offset");
+        let limit_arg = arg_u64(args, "limit");
         // Partial reads bypass the session read cache entirely: they always
         // read fresh and never populate the cache.
         let partial = offset_arg.is_some() || limit_arg.is_some();
-        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+        let force = arg_bool(args, "force").unwrap_or(false);
         let offset = offset_arg.map(|v| v.max(1) as usize).unwrap_or(1);
         let limit = limit_arg
             .map(|v| v as usize)
@@ -268,6 +290,22 @@ impl ToolBox {
             .max(1);
 
         let meta = tokio::fs::metadata(&path).await.ok();
+
+        // Size gate (stat only, before any read): a full read of an
+        // oversized file is refused with instructions to chunk it.
+        if !partial {
+            if let Some(meta) = &meta {
+                if meta.len() > READ_SIZE_MAX {
+                    return Err(SlagError::Tool(format!(
+                        "read_file: {raw} is {:.1}KB ({} bytes), over the {}KB full-read limit; \
+                         pass offset and limit to read it in chunks",
+                        meta.len() as f64 / 1024.0,
+                        meta.len(),
+                        READ_SIZE_MAX / 1024
+                    )));
+                }
+            }
+        }
 
         // Repeat-read stub: a second full read of a file whose mtime+size
         // are unchanged returns a stub instead of the body. force bypasses.
@@ -377,10 +415,7 @@ impl ToolBox {
         let raw = req_str(args, "edit_file", "path")?;
         let old = req_str(args, "edit_file", "old_string")?;
         let new = req_str(args, "edit_file", "new_string")?;
-        let replace_all = args
-            .get("replace_all")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let replace_all = arg_bool(args, "replace_all").unwrap_or(false);
         if old.is_empty() {
             return Err(SlagError::Tool("old_string must not be empty".into()));
         }
@@ -502,16 +537,36 @@ impl ToolBox {
 
     async fn bash(&self, args: &Value) -> Result<String, SlagError> {
         let command = req_str(args, "bash", "command")?;
-        let timeout = args
-            .get("timeout")
-            .and_then(Value::as_u64)
+        let timeout = arg_u64(args, "timeout")
             .unwrap_or(BASH_TIMEOUT_DEFAULT)
             .clamp(1, BASH_TIMEOUT_MAX);
+        // Destructive-command gate: refuse with the reason unless
+        // SLAG_ALLOW_DESTRUCTIVE=1; even then the reason is emitted.
+        let allow_note = match destructive_warning(command) {
+            Some(warning) => {
+                let allowed =
+                    std::env::var("SLAG_ALLOW_DESTRUCTIVE").is_ok_and(|v| v == "1");
+                if !allowed {
+                    return Err(SlagError::Tool(format!(
+                        "refused destructive command ({warning}); \
+                         set SLAG_ALLOW_DESTRUCTIVE=1 to allow"
+                    )));
+                }
+                Some(format!(
+                    "[destructive command allowed by SLAG_ALLOW_DESTRUCTIVE=1: {warning}]\n"
+                ))
+            }
+            None => None,
+        };
         // Lossless-in-spirit noise reduction on successful bash output only:
         // errors (Err path) and other tools (grep calls run_shell directly)
         // are untouched.
         let out = self.run_shell(command, timeout).await?;
-        Ok(reduce_bash_output(&out))
+        let reduced = reduce_bash_output(&out);
+        Ok(match allow_note {
+            Some(note) => format!("{note}{reduced}"),
+            None => reduced,
+        })
     }
 
     async fn run_shell(&self, command: &str, timeout_secs: u64) -> Result<String, SlagError> {
@@ -545,12 +600,12 @@ impl ToolBox {
                     }
                     merged.push_str(&stderr);
                 }
-                let mut out = truncate_tail(&merged, BASH_OUTPUT_CAP);
+                let mut out = truncate_middle(&merged, bash_output_cap());
                 if !output.status.success() {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                    out.push_str(&format!("(exit {})", output.status.code().unwrap_or(-1)));
+                    out.push_str(&exit_note(command, output.status.code().unwrap_or(-1)));
                 }
                 Ok(out)
             }
@@ -598,6 +653,59 @@ impl ToolBox {
             result.push_str(&format!(
                 "\n(truncated: {} more lines)",
                 lines.len() - GREP_LINE_CAP
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Find files via `rg --files -g` with a `find -name` fallback (the
+    /// fallback matches basenames only). Sandbox-rooted; output is
+    /// workspace-relative and capped at GLOB_FILE_CAP entries.
+    ///
+    /// Runs from inside the search dir: rg matches `-g` globs against the
+    /// paths it prints, so passing the dir as an absolute argument would
+    /// keep any pattern with a directory component (`src/**/*.ts`) from
+    /// ever matching — the printed path starts with the absolute prefix.
+    async fn glob(&self, args: &Value) -> Result<String, SlagError> {
+        let pattern = req_str(args, "glob", "pattern")?;
+        let raw_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let dir = self.resolve(raw_path)?;
+        let base = pattern.rsplit('/').next().unwrap_or(pattern);
+        let cmd = format!(
+            "cd {d} && if command -v rg >/dev/null 2>&1; then rg --files -g {p}; else find . -type f -name {b}; fi",
+            p = sh_quote(pattern),
+            d = sh_quote(&dir.display().to_string()),
+            b = sh_quote(base),
+        );
+        let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT).await?;
+        // Results are dir-relative; re-anchor them workspace-relative.
+        let rel_dir = dir
+            .strip_prefix(&self.root)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string());
+        let files: Vec<String> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with("(exit "))
+            .map(|l| l.strip_prefix("./").unwrap_or(l))
+            .map(|l| match &rel_dir {
+                Some(rd) => format!("{rd}/{l}"),
+                None => l.to_string(),
+            })
+            .collect();
+        if files.is_empty() {
+            return Ok("no files found".into());
+        }
+        let mut result = files
+            .iter()
+            .take(GLOB_FILE_CAP)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if files.len() > GLOB_FILE_CAP {
+            result.push_str(&format!(
+                "\n(truncated: {} more files)",
+                files.len() - GLOB_FILE_CAP
             ));
         }
         Ok(result)
@@ -917,15 +1025,334 @@ fn diff_summary(
     out
 }
 
-fn truncate_tail(s: &str, max: usize) -> String {
+/// Argument coercion: models sometimes send numbers as strings.
+fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    match args.get(key)? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Argument coercion: "true"/"false" strings become bools. Naive truthiness
+/// would be wrong here — the string "false" must coerce to false.
+fn arg_bool(args: &Value, key: &str) -> Option<bool> {
+    match args.get(key)? {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Bash output cap: SLAG_BASH_OUTPUT_CAP overrides the default, hard
+/// ceiling 200KB.
+fn bash_output_cap() -> usize {
+    cap_from(std::env::var("SLAG_BASH_OUTPUT_CAP").ok().as_deref())
+}
+
+fn cap_from(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, BASH_OUTPUT_CAP_MAX))
+        .unwrap_or(BASH_OUTPUT_CAP_DEFAULT)
+}
+
+/// Head 20% + tail 80% truncation with an elided-line count. The head keeps
+/// error context that often appears first (command echo, first failure);
+/// the tail keeps the usually-decisive final output. Cut points align to
+/// line boundaries where possible.
+fn truncate_middle(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let mut cut = s.len() - max;
-    while cut < s.len() && !s.is_char_boundary(cut) {
-        cut += 1;
+    let head_budget = max / 5;
+    let tail_budget = max - head_budget;
+
+    let mut head_end = head_budget.min(s.len());
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    format!("[truncated]\n{}", &s[cut..])
+    let head = match s[..head_end].rfind('\n') {
+        Some(pos) => &s[..pos],
+        None => &s[..head_end],
+    };
+
+    let mut tail_start = s.len() - tail_budget.min(s.len());
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let tail = match s[tail_start..].find('\n') {
+        Some(pos) => &s[tail_start + pos + 1..],
+        None => &s[tail_start..],
+    };
+
+    let total_lines = s.lines().count();
+    let kept = head.lines().count() + tail.lines().count();
+    let elided = total_lines.saturating_sub(kept).max(1);
+    format!("{head}\n[{elided} lines truncated]\n{tail}")
+}
+
+// ---------------------------------------------------------------------------
+// Exit-code semantics: some tools use exit 1 to convey information, not
+// failure. Keyed on the last pipeline/statement segment's argv[0] (that's
+// what determines the exit code), ported from Claude Code's
+// commandSemantics.ts. Exit >= 2 stays a plain error annotation.
+// ---------------------------------------------------------------------------
+
+const EXIT_ONE_MEANINGS: [(&str, &str); 6] = [
+    ("grep", "no matches found"),
+    ("rg", "no matches found"),
+    ("diff", "files differ"),
+    ("cmp", "files differ"),
+    ("test", "condition false"),
+    ("[", "condition false"),
+];
+
+fn exit_note(command: &str, code: i32) -> String {
+    if code == 1 {
+        let argv0 = last_segment_argv0(command);
+        if let Some((_, meaning)) = EXIT_ONE_MEANINGS.iter().find(|(name, _)| *name == argv0) {
+            return format!("(exit 1: {meaning})");
+        }
+    }
+    format!("(exit {code})")
+}
+
+/// Heuristic: split on statement/pipe separators, take the last non-empty
+/// segment's first word, basename'd. Quotes are not parsed — same
+/// "may get it super wrong" tradeoff as upstream; never used for security.
+fn last_segment_argv0(command: &str) -> &str {
+    let last = split_segments(command)
+        .into_iter()
+        .rev()
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or("");
+    let argv0 = last.split_whitespace().next().unwrap_or("");
+    argv0.rsplit('/').next().unwrap_or(argv0)
+}
+
+/// Split a command line on `;`, `|`, `&`, newlines, parens, and backticks
+/// (runs of separators yield empty segments, which callers skip). Parens
+/// and backticks count so subshells `(rm …)` and substitutions `$(rm …)`
+/// surface their inner command as its own segment.
+fn split_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (i, b) in command.bytes().enumerate() {
+        if matches!(b, b';' | b'\n' | b'|' | b'&' | b'(' | b')' | b'`') {
+            segments.push(&command[start..i]);
+            start = i + 1;
+        }
+    }
+    segments.push(&command[start..]);
+    segments
+}
+
+// ---------------------------------------------------------------------------
+// Destructive-command deny table, ported (hand-rolled, no regex dep) from
+// Claude Code's BashTool/destructiveCommandWarning.ts. Slag refuses these
+// outright instead of warning; SLAG_ALLOW_DESTRUCTIVE=1 relaxes the gate
+// but the reason is still emitted.
+// ---------------------------------------------------------------------------
+
+fn destructive_warning(command: &str) -> Option<&'static str> {
+    // SQL scan over the whole command (statements usually live in quotes):
+    // DROP/TRUNCATE followed by TABLE/DATABASE/SCHEMA as adjacent words.
+    // Read-only commands that merely mention the words (`grep -r "DROP
+    // TABLE" migrations/`) are exempt.
+    if sql_drop(command) && !sql_scan_exempt(command) {
+        return Some("may drop or truncate database objects");
+    }
+    for seg in split_segments(command) {
+        if let Some(hit) = destructive_segment(seg) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// One segment through the deny table, with wrapper stripping so `sudo`,
+/// `env FOO=1`, `VAR=x cmd`, `nohup`, `xargs`, `\rm`, and `sh -c '…'`
+/// cannot smuggle a denied command past the first-token match.
+fn destructive_segment(seg: &str) -> Option<&'static str> {
+    let toks: Vec<&str> = seg.split_whitespace().collect();
+    let mut tokens: &[&str] = &toks;
+    loop {
+        match tokens.first() {
+            Some(t) if is_env_assignment(t) => tokens = &tokens[1..],
+            Some(&"sudo") | Some(&"env") | Some(&"command") | Some(&"builtin")
+            | Some(&"nohup") | Some(&"time") | Some(&"xargs") => tokens = &tokens[1..],
+            // Leftover wrapper flags (`sudo -E`, `xargs -0`): skip. Their
+            // values may be skipped imperfectly; that errs toward checking
+            // a non-command token, which simply matches nothing.
+            Some(t) if t.starts_with('-') => tokens = &tokens[1..],
+            _ => break,
+        }
+    }
+    let (first, rest) = tokens.split_first()?;
+    let first = first.trim_start_matches('\\');
+    let first = first.rsplit('/').next().unwrap_or(first);
+    match first {
+        "git" => git_destructive(rest),
+        "rm" => rm_destructive(rest),
+        "terraform" if rest.first() == Some(&"destroy") => {
+            Some("may destroy Terraform infrastructure")
+        }
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => shell_c_payload(rest),
+        _ => None,
+    }
+}
+
+/// `VAR=value` prefix assignment.
+fn is_env_assignment(t: &str) -> bool {
+    t.split_once('=').is_some_and(|(k, _)| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// `sh -c '<payload>'`: check the payload itself. The payload is rejoined
+/// from whitespace-split tokens and quote-trimmed — good enough to catch
+/// the leading command, which is all the deny table matches anyway.
+fn shell_c_payload(rest: &[&str]) -> Option<&'static str> {
+    let at = rest
+        .iter()
+        .position(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('c'))?;
+    let payload = rest.get(at + 1..)?.join(" ");
+    let payload = payload.trim_matches(|c| c == '"' || c == '\'');
+    destructive_warning(payload)
+}
+
+/// Every segment's command is a read-only tool that cannot execute SQL:
+/// searching or logging SQL text must not trip the deny table.
+fn sql_scan_exempt(command: &str) -> bool {
+    const READ_ONLY: [&str; 8] = ["grep", "rg", "ag", "git", "cat", "less", "head", "tail"];
+    let mut any = false;
+    for seg in split_segments(command) {
+        let Some(argv0) = seg.split_whitespace().next() else {
+            continue;
+        };
+        let base = argv0.rsplit('/').next().unwrap_or(argv0);
+        if !READ_ONLY.contains(&base) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+fn git_destructive(rest: &[&str]) -> Option<&'static str> {
+    // Find the subcommand, skipping global options. `-C <dir>` and
+    // `-c <k=v>` (and long forms without `=`) take their value in the
+    // next token — that value must not be mistaken for the subcommand
+    // (`git -C /repo push --force` is still a force-push).
+    let mut i = 0;
+    let sub = loop {
+        let t = *rest.get(i)?;
+        if t.starts_with('-') {
+            let takes_value = matches!(
+                t,
+                "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+            );
+            i += if takes_value { 2 } else { 1 };
+        } else {
+            break t;
+        }
+    };
+    let has = |flag: &str| rest.iter().any(|t| *t == flag);
+    match sub {
+        "reset" if has("--hard") => Some("may discard uncommitted changes"),
+        // --force-with-lease is a distinct token and intentionally allowed.
+        "push" if has("--force") || has("-f") => Some("may overwrite remote history"),
+        "clean" => {
+            let dry = has("--dry-run") || rest.iter().any(|t| short_flags(t).contains('n'));
+            let force = rest.iter().any(|t| short_flags(t).contains('f'));
+            (force && !dry).then_some("may permanently delete untracked files")
+        }
+        "checkout" | "restore" if has(".") => Some("may discard all working tree changes"),
+        "commit" | "push" | "merge" if has("--no-verify") => Some("may skip safety hooks"),
+        _ => None,
+    }
+}
+
+/// rm with both recursive and force flags: tmp-family paths and plain
+/// relative paths (contained by the workspace sandbox) are allowed;
+/// absolute non-tmp, `~`, `$var`, and `..`-bearing targets are refused.
+fn rm_destructive(rest: &[&str]) -> Option<&'static str> {
+    let mut recursive = false;
+    let mut force = false;
+    let mut targets: Vec<&str> = Vec::new();
+    for t in rest {
+        if t.starts_with("--") {
+            match *t {
+                "--recursive" => recursive = true,
+                "--force" => force = true,
+                _ => {}
+            }
+        } else if let Some(flags) = t.strip_prefix('-') {
+            if flags.contains('r') || flags.contains('R') {
+                recursive = true;
+            }
+            if flags.contains('f') {
+                force = true;
+            }
+        } else {
+            targets.push(t);
+        }
+    }
+    if !(recursive && force) {
+        return None;
+    }
+    if targets.is_empty() {
+        // `xargs rm -rf` and friends: targets arrive from elsewhere
+        // (stdin), so nothing can be allowlisted — refuse.
+        return Some("may recursively force-remove files outside tmp");
+    }
+    let risky = targets.iter().any(|t| {
+        let t = t.trim_matches(|c| c == '"' || c == '\'');
+        if t.contains("..") || t.starts_with('~') || t.starts_with('$') {
+            return true;
+        }
+        if t.starts_with('/') {
+            return !is_tmp_path(t);
+        }
+        false
+    });
+    risky.then_some("may recursively force-remove files outside tmp")
+}
+
+/// Strict subpaths of the tmp family only; the tmp roots themselves are
+/// not fair game.
+fn is_tmp_path(t: &str) -> bool {
+    ["/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/"]
+        .iter()
+        .any(|p| t.len() > p.len() && t.starts_with(p))
+}
+
+fn short_flags(t: &str) -> &str {
+    if t.starts_with("--") {
+        ""
+    } else {
+        t.strip_prefix('-').unwrap_or("")
+    }
+}
+
+/// DROP or TRUNCATE immediately followed by TABLE/DATABASE/SCHEMA,
+/// case-insensitive, with punctuation/quotes treated as word breaks.
+fn sql_drop(command: &str) -> bool {
+    let words: Vec<String> = command
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
+    words.windows(2).any(|w| {
+        matches!(w[0].as_str(), "DROP" | "TRUNCATE")
+            && matches!(w[1].as_str(), "TABLE" | "DATABASE" | "SCHEMA")
+    })
 }
 
 fn sh_quote(s: &str) -> String {
@@ -1615,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn specs_cover_seven_tools() {
+    fn specs_cover_eight_tools() {
         let names: Vec<String> = ToolBox::specs().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
@@ -1625,9 +2052,24 @@ mod tests {
                 "edit_file",
                 "bash",
                 "grep",
+                "glob",
                 "recipe_view",
                 "finish"
             ]
+        );
+    }
+
+    #[test]
+    fn edit_file_spec_warns_about_line_number_prefix() {
+        let spec = ToolBox::specs()
+            .into_iter()
+            .find(|s| s.name == "edit_file")
+            .unwrap();
+        assert!(spec.description.contains("LINENUM|CONTENT"), "{}", spec.description);
+        assert!(
+            spec.description.contains("never include that line-number prefix"),
+            "{}",
+            spec.description
         );
     }
 
@@ -1936,6 +2378,380 @@ Collecting\n\
         // Only now does the stub arm.
         let again = tb.dispatch(&call("read_file", json!({"path": "a.txt"}))).await;
         assert!(again.output.starts_with("[unchanged"), "{}", again.output);
+    }
+
+    // -- read_file size gate ---------------------------------------------
+
+    #[tokio::test]
+    async fn read_size_gate_refuses_full_read_of_big_file() {
+        let (dir, tb) = setup();
+        let big = "x".repeat(80) + "\n";
+        write(&dir, "big.txt", &big.repeat(4000)); // ~324KB
+        let out = tb.dispatch(&call("read_file", json!({"path": "big.txt"}))).await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("256KB"), "{}", out.output);
+        assert!(out.output.contains("KB ("), "size not named: {}", out.output);
+        assert!(out.output.contains("offset and limit"), "{}", out.output);
+
+        // offset/limit reads pass the gate.
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": "big.txt", "offset": 1, "limit": 2})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("1|"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn read_size_gate_allows_files_under_limit() {
+        let (dir, tb) = setup();
+        write(&dir, "ok.txt", &"y\n".repeat(1000)); // 2KB
+        let out = tb.dispatch(&call("read_file", json!({"path": "ok.txt"}))).await;
+        assert!(!out.is_error, "{}", out.output);
+    }
+
+    // -- arg coercion ------------------------------------------------------
+
+    #[test]
+    fn arg_coercion_units() {
+        let a = json!({"n": 7, "s": "42", "pad": " 3 ", "bad": "x", "f": 1.5});
+        assert_eq!(arg_u64(&a, "n"), Some(7));
+        assert_eq!(arg_u64(&a, "s"), Some(42));
+        assert_eq!(arg_u64(&a, "pad"), Some(3));
+        assert_eq!(arg_u64(&a, "bad"), None);
+        assert_eq!(arg_u64(&a, "f"), None);
+        assert_eq!(arg_u64(&a, "missing"), None);
+
+        let b = json!({"t": true, "st": "true", "sf": "false", "up": "False", "junk": "yes"});
+        assert_eq!(arg_bool(&b, "t"), Some(true));
+        assert_eq!(arg_bool(&b, "st"), Some(true));
+        // Naive truthiness trap: the string "false" must be false.
+        assert_eq!(arg_bool(&b, "sf"), Some(false));
+        assert_eq!(arg_bool(&b, "up"), Some(false));
+        assert_eq!(arg_bool(&b, "junk"), None);
+        assert_eq!(arg_bool(&b, "missing"), None);
+    }
+
+    #[tokio::test]
+    async fn stringly_typed_args_work_end_to_end() {
+        let (dir, tb) = setup();
+        write(&dir, "f.txt", "foo\nbar\nfoo\n");
+        // replace_all as the string "true" replaces both occurrences.
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "f.txt", "old_string": "foo", "new_string": "baz",
+                       "replace_all": "true"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("replaced 2"), "{}", out.output);
+
+        // replace_all as the string "false" behaves as false: multi-match error.
+        write(&dir, "g.txt", "foo\nfoo\n");
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "g.txt", "old_string": "foo", "new_string": "baz",
+                       "replace_all": "false"}),
+            ))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("matches 2 times"), "{}", out.output);
+
+        // read_file limit as a string.
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": "g.txt", "limit": "1"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("1|foo"), "{}", out.output);
+        assert!(out.output.contains("truncated"), "{}", out.output);
+    }
+
+    // -- exit-code semantics ----------------------------------------------
+
+    #[test]
+    fn exit_note_units() {
+        assert_eq!(exit_note("grep foo file.txt", 1), "(exit 1: no matches found)");
+        assert_eq!(exit_note("rg foo", 1), "(exit 1: no matches found)");
+        assert_eq!(exit_note("diff a b", 1), "(exit 1: files differ)");
+        assert_eq!(exit_note("cmp a b", 1), "(exit 1: files differ)");
+        assert_eq!(exit_note("test -f missing", 1), "(exit 1: condition false)");
+        assert_eq!(exit_note("[ -f missing ]", 1), "(exit 1: condition false)");
+        // Last pipeline segment decides; basenames match too.
+        assert_eq!(exit_note("cat f | /usr/bin/grep foo", 1), "(exit 1: no matches found)");
+        assert_eq!(exit_note("grep foo f | wc -l", 1), "(exit 1)");
+        // >= 2 stays a plain error annotation.
+        assert_eq!(exit_note("grep foo f", 2), "(exit 2)");
+        assert_eq!(exit_note("false", 1), "(exit 1)");
+    }
+
+    #[tokio::test]
+    async fn bash_annotates_semantic_exit_codes() {
+        let (_dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "test -f /nonexistent-slag"})))
+            .await;
+        assert!(!out.is_error);
+        assert!(out.output.contains("(exit 1: condition false)"), "{}", out.output);
+
+        let out = tb.dispatch(&call("bash", json!({"command": "false"}))).await;
+        assert!(!out.is_error);
+        assert_eq!(out.output.trim(), "(exit 1)");
+    }
+
+    // -- destructive-command deny -----------------------------------------
+
+    #[test]
+    fn destructive_table_true_positives() {
+        for cmd in [
+            "git reset --hard HEAD~1",
+            "git push --force origin main",
+            "git push -f",
+            "git push origin main --no-verify",
+            "git clean -fd",
+            "git clean -f",
+            "git checkout -- .",
+            "git checkout .",
+            "git restore .",
+            "git restore -- .",
+            "git commit --no-verify -m x",
+            "git merge --no-verify feature",
+            "sudo rm -rf /opt/data",
+            "rm -rf /Users/someone/project",
+            "rm -rf /",
+            "rm -rf ~/stuff",
+            "rm -rf ../up-and-out",
+            "rm -rf \"$HOME/dir\"",
+            "rm -fr /etc/nginx",
+            "rm --recursive --force /srv/app",
+            "psql -c 'DROP TABLE users;'",
+            "mysql -e \"drop database prod\"",
+            "echo ok && terraform destroy",
+        ] {
+            assert!(destructive_warning(cmd).is_some(), "should refuse: {cmd}");
+        }
+    }
+
+    #[test]
+    fn destructive_table_catches_shell_wrappers_and_prefixes() {
+        for cmd in [
+            // sh -c payloads
+            "sh -c 'rm -rf /'",
+            "bash -c \"rm -rf /etc\"",
+            "bash -lc 'git push --force origin main'",
+            // env-assignment and env/wrapper prefixes
+            "FOO=1 rm -rf /etc",
+            "env FOO=1 rm -rf /etc",
+            "nohup rm -rf /srv/app",
+            "sudo -E rm -rf /opt/data",
+            // subshells and command substitution
+            "(rm -rf /etc)",
+            "echo $(rm -rf /etc)",
+            "echo `rm -rf /etc`",
+            // backslash escape and absolute binary path
+            "\\rm -rf /etc",
+            "/bin/rm -rf /etc",
+            // targets arriving via xargs
+            "find . -name '*.bak' | xargs rm -rf",
+            "find . -print0 | xargs -0 rm -rf",
+            // value-taking git globals before the subcommand
+            "git -C /repo push --force origin main",
+            "git -c core.hooksPath=/dev/null reset --hard",
+        ] {
+            assert!(destructive_warning(cmd).is_some(), "should refuse: {cmd}");
+        }
+    }
+
+    #[test]
+    fn sql_scan_exempts_read_only_mentions_but_not_clients() {
+        // Searching or logging SQL text is not executing it.
+        for cmd in [
+            "grep -r \"DROP TABLE\" migrations/",
+            "rg 'drop table users' src/",
+            "git log --grep 'drop table users'",
+            "cat migrations/002_drop_table.sql",
+        ] {
+            assert_eq!(destructive_warning(cmd), None, "should allow: {cmd}");
+        }
+        // A pipeline that reaches a client still refuses.
+        assert!(
+            destructive_warning("echo 'DROP TABLE x;' | psql").is_some(),
+            "echo into a client must stay refused"
+        );
+    }
+
+    #[test]
+    fn destructive_table_false_positives_stay_allowed() {
+        for cmd in [
+            "git status",
+            "git push origin main",
+            "git push --force-with-lease origin main",
+            "git reset HEAD~1",
+            "git clean -n",
+            "git clean -fn",
+            "git clean --dry-run -f",
+            "git checkout main",
+            "git checkout -b feature",
+            "git restore file.txt",
+            "git commit -m 'no-verify mentioned in message'",
+            "rm -rf /tmp/x",
+            "rm -rf /private/tmp/build",
+            "rm -rf /var/tmp/cache",
+            "rm -rf build",
+            "rm -rf target/debug",
+            "rm foo.txt",
+            "rm -r somedir",
+            "rm -f stale.lock",
+            "terraform plan",
+            "cat dropdown_table.txt",
+            "echo 'the tablespace dropped'",
+        ] {
+            assert_eq!(destructive_warning(cmd), None, "should allow: {cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_refuses_destructive_then_env_relaxes_with_reason() {
+        let (_dir, tb) = setup();
+        std::env::remove_var("SLAG_ALLOW_DESTRUCTIVE");
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "git reset --hard"})))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("refused destructive command"), "{}", out.output);
+        assert!(out.output.contains("SLAG_ALLOW_DESTRUCTIVE"), "{}", out.output);
+        assert!(out.output.contains("discard uncommitted changes"), "{}", out.output);
+
+        // Relaxed: the command runs but the reason is still emitted.
+        std::env::set_var("SLAG_ALLOW_DESTRUCTIVE", "1");
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "rm -rf /nonexistent-slag-dir"})))
+            .await;
+        std::env::remove_var("SLAG_ALLOW_DESTRUCTIVE");
+        assert!(!out.is_error, "{}", out.output);
+        assert!(
+            out.output.contains("[destructive command allowed by SLAG_ALLOW_DESTRUCTIVE=1"),
+            "{}",
+            out.output
+        );
+    }
+
+    // -- glob --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn glob_finds_files_with_relative_paths() {
+        let (dir, tb) = setup();
+        write(&dir, "a.rs", "fn a() {}\n");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        write(&dir, "sub/b.rs", "fn b() {}\n");
+        write(&dir, "c.txt", "not rust\n");
+        let out = tb.dispatch(&call("glob", json!({"pattern": "*.rs"}))).await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("a.rs"), "{}", out.output);
+        assert!(out.output.contains("sub/b.rs"), "{}", out.output);
+        assert!(!out.output.contains("c.txt"), "{}", out.output);
+        for line in out.output.lines() {
+            assert!(!line.starts_with('/'), "path not relative: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_matches_patterns_with_directory_components() {
+        // The tool spec's own example: 'src/**/*.ts'. rg matches -g globs
+        // against printed paths, so this only works run from the dir.
+        let (dir, tb) = setup();
+        std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+        write(&dir, "src/b.ts", "let b\n");
+        write(&dir, "src/deep/c.ts", "let c\n");
+        write(&dir, "top.ts", "let t\n");
+
+        let out = tb
+            .dispatch(&call("glob", json!({"pattern": "src/**/*.ts"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("src/b.ts"), "{}", out.output);
+        assert!(out.output.contains("src/deep/c.ts"), "{}", out.output);
+        assert!(!out.output.contains("top.ts"), "{}", out.output);
+
+        // Explicit subdir path arg still yields workspace-relative paths.
+        let out = tb
+            .dispatch(&call("glob", json!({"pattern": "*.ts", "path": "src"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("src/b.ts"), "{}", out.output);
+        for line in out.output.lines() {
+            assert!(!line.starts_with('/'), "path not relative: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_no_match_and_sandbox() {
+        let (_dir, tb) = setup();
+        let out = tb.dispatch(&call("glob", json!({"pattern": "*.nope"}))).await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(out.output, "no files found");
+
+        let out = tb
+            .dispatch(&call("glob", json!({"pattern": "*", "path": "../.."})))
+            .await;
+        assert!(out.is_error);
+        assert!(out.output.contains("escapes workspace"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn glob_caps_at_100_files_with_notice() {
+        let (dir, tb) = setup();
+        for i in 0..120 {
+            write(&dir, &format!("f{i:03}.log"), "x\n");
+        }
+        let out = tb.dispatch(&call("glob", json!({"pattern": "*.log"}))).await;
+        assert!(!out.is_error, "{}", out.output);
+        let listed = out
+            .output
+            .lines()
+            .filter(|l| l.ends_with(".log"))
+            .count();
+        assert_eq!(listed, 100, "{}", out.output);
+        assert!(out.output.contains("(truncated: 20 more files)"), "{}", out.output);
+    }
+
+    // -- bash truncation ---------------------------------------------------
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail_with_count() {
+        let lines: Vec<String> = (1..=1000).map(|i| format!("line-{i:04}")).collect();
+        let s = lines.join("\n");
+        let out = truncate_middle(&s, 1000);
+        assert!(out.len() <= 1100, "way over budget: {}", out.len());
+        // Head (20%) keeps the start, tail (80%) keeps the end.
+        assert!(out.starts_with("line-0001"), "{out}");
+        assert!(out.ends_with("line-1000"), "{out}");
+        // Count marker names how many lines were elided.
+        let head_kept = out.lines().take_while(|l| l.starts_with("line-")).count();
+        let tail_kept = out
+            .lines()
+            .rev()
+            .take_while(|l| l.starts_with("line-"))
+            .count();
+        assert!(
+            out.contains(&format!("[{} lines truncated]", 1000 - head_kept - tail_kept)),
+            "{out}"
+        );
+        // Tail budget is ~4x the head budget.
+        assert!(tail_kept > head_kept * 2, "head {head_kept} tail {tail_kept}");
+        // Short input passes through untouched.
+        assert_eq!(truncate_middle("small\n", 1000), "small\n");
+    }
+
+    #[test]
+    fn bash_output_cap_env_parsing() {
+        assert_eq!(cap_from(None), BASH_OUTPUT_CAP_DEFAULT);
+        assert_eq!(cap_from(Some("50000")), 50_000);
+        assert_eq!(cap_from(Some(" 1234 ")), 1234);
+        // Hard ceiling 200KB.
+        assert_eq!(cap_from(Some("999999999")), BASH_OUTPUT_CAP_MAX);
+        assert_eq!(cap_from(Some("garbage")), BASH_OUTPUT_CAP_DEFAULT);
+        assert_eq!(cap_from(Some("")), BASH_OUTPUT_CAP_DEFAULT);
     }
 
     #[tokio::test]

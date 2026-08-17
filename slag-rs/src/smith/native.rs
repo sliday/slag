@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::{EngineHooks, Smith};
 use crate::config::EngineConfig;
-use crate::engine::agent::ForgeAgent;
+use crate::engine::agent::{ForgeAgent, SpendAccum};
 use crate::engine::events::{self, StderrNarrator};
 use crate::engine::prompt::{self, PromptMode};
 use crate::engine::provider::OpenRouter;
@@ -28,6 +28,10 @@ pub struct NativeSmith {
     /// Explicit model pin for duel casts; None follows grade selection.
     model_override: Option<String>,
     hooks: EngineHooks,
+    /// One accumulator per smith: every invoke (heat, transient retry) of
+    /// this smith shares it, so `SLAG_MAX_COST_INGOT` caps the whole
+    /// ingot's spend rather than each session starting from $0.
+    ingot_spend: SpendAccum,
 }
 
 impl NativeSmith {
@@ -41,6 +45,7 @@ impl NativeSmith {
             mode: PromptMode::Forge,
             model_override: None,
             hooks: hooks.clone(),
+            ingot_spend: SpendAccum::default(),
         }
     }
 
@@ -54,6 +59,7 @@ impl NativeSmith {
             mode: PromptMode::Plan,
             model_override: None,
             hooks: hooks.clone(),
+            ingot_spend: SpendAccum::default(),
         }
     }
 
@@ -81,7 +87,15 @@ impl NativeSmith {
                 steer: None,
                 cancel: hooks.cancel.clone(),
             },
+            ingot_spend: SpendAccum::default(),
         }
+    }
+
+    /// Share a spend accumulator with other smiths of the same ingot
+    /// (duel casts are rebuilt every round; the accumulator persists).
+    pub fn with_ingot_spend(mut self, acc: SpendAccum) -> Self {
+        self.ingot_spend = acc;
+        self
     }
 
     fn model(&self) -> &str {
@@ -134,6 +148,7 @@ impl NativeSmith {
         ));
         let mut agent = ForgeAgent::new(provider, ToolBox::new(&self.root), &model)
             .with_effort(effort)
+            .with_ingot_spend(self.ingot_spend.clone())
             .with_events(tx);
         if let Some(steer) = &self.hooks.steer {
             agent = agent.with_steer(steer.clone());

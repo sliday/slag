@@ -47,8 +47,20 @@ pub fn truecolor() -> bool {
 pub fn colored() -> bool {
     static YES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *YES.get_or_init(|| {
-        std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        colored_from(
+            std::env::var_os("NO_COLOR").is_some(),
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        )
     })
+}
+
+/// Pure color policy: painted text lands on BOTH streams (stdout status
+/// lines, stderr narrator), so either stream being redirected turns color
+/// off everywhere — `slag forge 2> err.log` must not fill err.log with
+/// escape bytes just because stdout is still a terminal.
+fn colored_from(no_color: bool, stdout_tty: bool, stderr_tty: bool) -> bool {
+    !no_color && stdout_tty && stderr_tty
 }
 
 /// Map a palette color to what the terminal can actually render. Sending
@@ -313,6 +325,26 @@ pub fn spark_spinner(msg: &str) -> ProgressBar {
     pb
 }
 
+/// Spinner frames for the stream-mode live line (see `engine::events`).
+pub const SPINNER_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+/// Frame for tick `i`; wraps forever, so callers just count up.
+pub fn spinner_frame(i: usize) -> &'static str {
+    SPINNER_FRAMES[i % SPINNER_FRAMES.len()]
+}
+
+/// Paint `s` in `color` when color is on; plain text otherwise. String
+/// form (not a Display adapter) so render state machines can build lines
+/// without touching a terminal.
+pub fn paint(color: Color, s: &str) -> String {
+    format!("{}{}{}", fg(color), s, reset())
+}
+
+/// Dim secondary text — tree connectors, routed-model suffixes, metadata.
+pub fn dim(s: &str) -> String {
+    paint(COLD, s)
+}
+
 /// Shorten to `max` characters. Counts characters, not bytes: a commission
 /// written in Cyrillic or Japanese used to slice mid-codepoint and panic
 /// the whole binary on `slag status`.
@@ -436,6 +468,39 @@ mod tests {
         }
         for grade in 0u8..=6 {
             assert!(palette.contains(&grade_color(grade)), "grade {grade}");
+        }
+    }
+
+    /// Spinner frames wrap forever; render loops just count ticks up.
+    #[test]
+    fn spinner_frame_wraps() {
+        assert_eq!(spinner_frame(0), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(SPINNER_FRAMES.len()), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(SPINNER_FRAMES.len() + 2), SPINNER_FRAMES[2]);
+    }
+
+    /// A single redirected stream disables color on both: paint/dim feed
+    /// stdout status lines AND the stderr narrator, so `2> err.log` with a
+    /// TTY stdout must not leak ANSI bytes into the log (and vice versa).
+    #[test]
+    fn color_needs_both_streams_on_a_terminal_and_no_color_wins() {
+        assert!(colored_from(false, true, true));
+        assert!(!colored_from(false, true, false), "stderr redirected");
+        assert!(!colored_from(false, false, true), "stdout redirected");
+        assert!(!colored_from(false, false, false));
+        assert!(!colored_from(true, true, true), "NO_COLOR wins");
+    }
+
+    /// With color off (redirected test output), paint/dim pass text through
+    /// untouched — no escape bytes in logs or assertions.
+    #[test]
+    fn paint_and_dim_are_plain_when_color_is_off() {
+        if !colored() {
+            assert_eq!(paint(HOT, "x"), "x");
+            assert_eq!(dim("meta"), "meta");
+        } else {
+            assert!(paint(HOT, "x").contains('x'));
+            assert!(dim("meta").contains("meta"));
         }
     }
 

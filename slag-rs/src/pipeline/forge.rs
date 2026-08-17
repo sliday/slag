@@ -13,6 +13,10 @@ use crate::tui;
 
 use super::{duel, resmelt};
 
+/// Transient provider errors (429/5xx/timeouts) absorbed per heat before
+/// one surfaces and burns the heat like a real failure.
+pub(crate) const MAX_TRANSIENT_PER_HEAT: u8 = 5;
+
 /// Phase 3: Forge loop — parallel anvils then sequential
 pub async fn run(
     config: &EngineConfig,
@@ -44,6 +48,27 @@ pub async fn run(
                 return Err(SlagError::ForgeFailed(counts.cracked));
             }
             return Ok(());
+        }
+
+        // Run-wide spend cap: stop scheduling new ingots once the run
+        // total (accumulated by every agent session) crosses the cap.
+        // Pending ore stays ore — `slag resume` picks it back up.
+        if let Some(cap) = crate::config::run_cost_cap() {
+            let spent = crate::config::run_spend_dollars();
+            if spent >= cap {
+                let note = run_budget_note(spent, cap, crucible.counts().ore);
+                drop(guard);
+                emit(&hooks.events, EngineEvent::Warning { message: note.clone() });
+                if !tui::is_quiet() {
+                    println!(
+                        "\n  {}⚠{} {note}",
+                        super::fg(tui::BRIGHT),
+                        super::reset()
+                    );
+                }
+                append_assay_note(&note);
+                return Ok(());
+            }
         }
 
         // --- Parallel anvils for :solo t ---
@@ -105,6 +130,7 @@ pub async fn run(
 
             // Collect results and update crucible on main thread
             let mut cancelled = false;
+            let mut budget_stop: Option<(f64, f64)> = None;
             while let Some(result) = set.join_next().await {
                 match result {
                     Ok((id, Ok(()))) => {
@@ -122,6 +148,16 @@ pub async fn run(
                         crucible.set_status(&id, Status::Ore);
                         crucible.save()?;
                         cancelled = true;
+                    }
+                    Ok((id, Err(SlagError::RunBudgetExhausted { spent, cap }))) => {
+                        // Not a smith failure: the run cap tripped mid-
+                        // flight. Back to ore for `slag resume`, and stop
+                        // scheduling once this batch drains.
+                        let _guard = CRUCIBLE_LOCK.lock().await;
+                        let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                        crucible.set_status(&id, Status::Ore);
+                        crucible.save()?;
+                        budget_stop = Some((spent, cap));
                     }
                     Ok((id, Err(_))) => {
                         // Try resmelt. Holding the lock across the smith call
@@ -158,6 +194,10 @@ pub async fn run(
                 return Err(SlagError::Cancelled);
             }
 
+            if let Some((spent, cap)) = budget_stop {
+                return finish_run_over_budget(spent, cap, hooks).await;
+            }
+
             // Show status
             let crucible = Crucible::load(Path::new(CRUCIBLE))?;
             if !tui::is_quiet() {
@@ -192,6 +232,14 @@ pub async fn run(
             crucible.set_status(&ingot.id, Status::Ore);
             crucible.save()?;
             return Err(SlagError::Cancelled);
+        }
+        if let Err(SlagError::RunBudgetExhausted { spent, cap }) = struck {
+            let _guard = CRUCIBLE_LOCK.lock().await;
+            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            crucible.set_status(&ingot.id, Status::Ore);
+            crucible.save()?;
+            drop(_guard);
+            return finish_run_over_budget(spent, cap, hooks).await;
         }
         if struck.is_ok() {
             let _guard = CRUCIBLE_LOCK.lock().await;
@@ -231,20 +279,26 @@ async fn forge_ingot(
     hooks: &EngineHooks,
 ) -> Result<(), SlagError> {
     if let Some(cfg) = duel_cfg {
+        // Casts are rebuilt every round; one shared accumulator keeps the
+        // ingot cost cap cumulative across all of an ingot's duel sessions.
+        let cast_spend = crate::engine::agent::SpendAccum::default();
         let casts = |cast: char, root: &Path| -> Box<dyn Smith> {
             let (model, cfg) = if cast == 'a' {
                 (cfg.model_base.clone(), cfg.clone())
             } else {
                 (cfg.model_alt.clone(), cfg.clone())
             };
-            Box::new(crate::smith::native::NativeSmith::cast(
-                cfg,
-                ingot.skill.as_str(),
-                ingot.grade,
-                root.to_path_buf(),
-                &model,
-                hooks,
-            ))
+            Box::new(
+                crate::smith::native::NativeSmith::cast(
+                    cfg,
+                    ingot.skill.as_str(),
+                    ingot.grade,
+                    root.to_path_buf(),
+                    &model,
+                    hooks,
+                )
+                .with_ingot_spend(cast_spend.clone()),
+            )
         };
         let judge_provider =
             OpenRouter::with_base_url(cfg.api_key.clone(), cfg.base_url.clone());
@@ -265,7 +319,9 @@ async fn forge_ingot(
                 // Both casts failed a round: duel is off for this ingot,
                 // fall through to the single-smith strike below.
             }
-            Err(SlagError::Cancelled) => return Err(SlagError::Cancelled),
+            Err(e @ (SlagError::Cancelled | SlagError::RunBudgetExhausted { .. })) => {
+                return Err(e)
+            }
             Err(e) => {
                 if !tui::is_quiet() {
                     println!(
@@ -299,6 +355,90 @@ async fn forge_ingot(
 /// Heats left after `spent` of a `max` budget.
 fn remaining_budget(max: u8, spent: u8) -> u8 {
     max.saturating_sub(spent)
+}
+
+/// True when the smith's own stderr narrator will drive the display: no
+/// dashboard hook consumes events, so `NativeSmith` spawns a narrator per
+/// invoke (see `smith::native`) and any other stderr writer would corrupt
+/// its live line.
+fn narrator_owns_stderr(hooks: &EngineHooks) -> bool {
+    hooks.events.is_none()
+}
+
+/// The run cap tripped mid-flight: emit the same note the scheduler's
+/// between-batches gate produces and end the run cleanly (interrupted
+/// ingots are already back to ore).
+async fn finish_run_over_budget(
+    spent: f64,
+    cap: f64,
+    hooks: &EngineHooks,
+) -> Result<(), SlagError> {
+    let ore_left = {
+        let _guard = CRUCIBLE_LOCK.lock().await;
+        Crucible::load(Path::new(CRUCIBLE)).map(|c| c.counts().ore).unwrap_or(0)
+    };
+    let note = run_budget_note(spent, cap, ore_left);
+    emit(&hooks.events, EngineEvent::Warning { message: note.clone() });
+    if !tui::is_quiet() {
+        println!("\n  {}⚠{} {note}", super::fg(tui::BRIGHT), super::reset());
+    }
+    append_assay_note(&note);
+    Ok(())
+}
+
+/// Assay-ready line for a run stopped by the spend cap.
+fn run_budget_note(spent: f64, cap: f64, ore_left: usize) -> String {
+    format!(
+        "run budget exhausted (${spent:.2} of ${cap:.2} cap) — {ore_left} ingot(s) left as ore; \
+         raise SLAG_MAX_COST_RUN and `slag resume` to continue"
+    )
+}
+
+/// Ledger note the assay phase surfaces alongside the final counts.
+fn append_assay_note(note: &str) {
+    let entry = format!(
+        "\n## {} assay note\n- {note}\n",
+        chrono::Local::now().format("%m-%d %H:%M"),
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(LEDGER)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(entry.as_bytes())
+        });
+}
+
+/// Invoke the smith, absorbing transient provider errors: up to
+/// `max_transient` immediate retries that burn no heat and run no proof.
+/// The retry past the limit surfaces the error, and the heat loop then
+/// treats it like any smith failure — that attempt counts as a real heat.
+pub(crate) async fn invoke_absorbing_transients(
+    smith: &dyn Smith,
+    flux: &str,
+    id: &str,
+    max_transient: u8,
+    hooks: &EngineHooks,
+) -> Result<String, SlagError> {
+    let mut transients = 0u8;
+    loop {
+        match smith.invoke(flux).await {
+            Err(SlagError::ProviderTransient(why)) if transients < max_transient => {
+                transients += 1;
+                emit(
+                    &hooks.events,
+                    EngineEvent::Warning {
+                        message: format!(
+                            "[{id}] transient provider error ({transients}/{max_transient}, \
+                             heat not burned): {why}"
+                        ),
+                    },
+                );
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Strike a single ingot: retry with heat, extract CMD, verify proof.
@@ -379,9 +519,24 @@ async fn strike_ingot(
         } else {
             "forging..."
         };
-        let spinner = tui::spinner(spinner_msg);
+        // In stream mode the smith's stderr narrator owns the terminal
+        // line; a steady-tick indicatif spinner on the same stderr would
+        // fight its `\r` rewrites, so it stays hidden there.
+        let spinner = if narrator_owns_stderr(hooks) {
+            indicatif::ProgressBar::hidden()
+        } else {
+            tui::spinner(spinner_msg)
+        };
 
-        let response = match smith.invoke(&flux_text).await {
+        let response = match invoke_absorbing_transients(
+            smith,
+            &flux_text,
+            &ingot.id,
+            MAX_TRANSIENT_PER_HEAT,
+            hooks,
+        )
+        .await
+        {
             Ok(r) => {
                 spinner.finish_and_clear();
                 r
@@ -391,7 +546,10 @@ async fn strike_ingot(
                 // Ctrl-C cancellation is not a retryable smith failure:
                 // retrying burns the whole heat budget on instant errors
                 // and cracks the ingot. Propagate so the run stops.
-                if matches!(e, SlagError::Cancelled) {
+                if matches!(
+                    e,
+                    SlagError::Cancelled | SlagError::RunBudgetExhausted { .. }
+                ) {
                     return Err(e);
                 }
                 slag = Some(format!("Smith error: {e}"));
@@ -486,7 +644,12 @@ fn log_to_file(label: &str, content: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::remaining_budget;
+    use super::*;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[test]
     fn remaining_budget_never_exceeds_max_or_underflows() {
@@ -495,5 +658,140 @@ mod tests {
         assert_eq!(remaining_budget(5, 5), 0);
         // Duel rounds may overshoot the budget; no wrap-around.
         assert_eq!(remaining_budget(5, 7), 0);
+    }
+
+    /// Scripted smith: pops one Result per invoke, counts invocations.
+    struct ScriptSmith {
+        script: Mutex<VecDeque<Result<String, SlagError>>>,
+        invokes: AtomicUsize,
+    }
+
+    impl ScriptSmith {
+        fn new(script: Vec<Result<String, SlagError>>) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                invokes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Smith for ScriptSmith {
+        fn invoke(
+            &self,
+            _prompt: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
+            self.invokes.fetch_add(1, Ordering::SeqCst);
+            let next = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script exhausted");
+            Box::pin(async move { next })
+        }
+    }
+
+    fn transient() -> Result<String, SlagError> {
+        Err(SlagError::ProviderTransient("503: overloaded".into()))
+    }
+
+    #[tokio::test]
+    async fn transients_are_absorbed_without_surfacing() {
+        let smith = ScriptSmith::new(vec![
+            transient(),
+            transient(),
+            Ok("CMD: true".into()),
+        ]);
+        let hooks = EngineHooks::default();
+
+        let out = invoke_absorbing_transients(&smith, "flux", "i1", 5, &hooks)
+            .await
+            .expect("transients absorbed");
+        assert_eq!(out, "CMD: true");
+        assert_eq!(smith.invokes.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn transient_past_the_limit_surfaces_and_counts_as_a_heat() {
+        // 5 absorbed retries, the 6th surfaces to the heat loop.
+        let smith = ScriptSmith::new((0..6).map(|_| transient()).collect());
+        let hooks = EngineHooks::default();
+
+        let err = invoke_absorbing_transients(&smith, "flux", "i1", 5, &hooks)
+            .await
+            .expect_err("sixth transient must surface");
+        assert!(matches!(err, SlagError::ProviderTransient(_)), "got: {err}");
+        assert_eq!(smith.invokes.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_surface_immediately() {
+        for e in [
+            SlagError::SmithFailed("bad output".into()),
+            SlagError::Cancelled,
+            SlagError::Provider("401: bad key".into()),
+        ] {
+            let smith = ScriptSmith::new(vec![Err(e)]);
+            let hooks = EngineHooks::default();
+            invoke_absorbing_transients(&smith, "flux", "i1", 5, &hooks)
+                .await
+                .expect_err("permanent error surfaces");
+            assert_eq!(smith.invokes.load(Ordering::SeqCst), 1, "no retry burned");
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_retries_emit_warnings_with_the_ingot_id() {
+        let smith = ScriptSmith::new(vec![transient(), Ok("CMD: true".into())]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hooks = EngineHooks { events: Some(tx), ..Default::default() };
+
+        invoke_absorbing_transients(&smith, "flux", "i7", 5, &hooks)
+            .await
+            .expect("absorbed");
+
+        let mut warned = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Warning { message } = ev {
+                assert!(message.contains("[i7]"), "message: {message}");
+                assert!(message.contains("heat not burned"), "message: {message}");
+                warned = true;
+            }
+        }
+        assert!(warned, "transient retry must warn");
+    }
+
+    #[tokio::test]
+    async fn run_budget_exhaustion_surfaces_without_burning_retries() {
+        // The error must propagate out of the transient absorber (it is
+        // not transient) so the heat loop can stop instead of retrying.
+        let smith = ScriptSmith::new(vec![Err(SlagError::RunBudgetExhausted {
+            spent: 5.02,
+            cap: 5.0,
+        })]);
+        let hooks = EngineHooks::default();
+        let err = invoke_absorbing_transients(&smith, "flux", "i1", 5, &hooks)
+            .await
+            .expect_err("budget exhaustion surfaces");
+        assert!(matches!(err, SlagError::RunBudgetExhausted { .. }), "got: {err}");
+        assert_eq!(smith.invokes.load(Ordering::SeqCst), 1, "no retry burned");
+    }
+
+    #[test]
+    fn stream_mode_hides_the_indicatif_spinner_for_the_narrator() {
+        // No dashboard hook → the per-invoke stderr narrator drives the
+        // display, so strike_ingot must not start a competing spinner.
+        assert!(narrator_owns_stderr(&EngineHooks::default()));
+        let (tx, _rx) = crate::engine::events::channel();
+        let hooks = EngineHooks { events: Some(tx), ..Default::default() };
+        assert!(!narrator_owns_stderr(&hooks));
+    }
+
+    #[test]
+    fn run_budget_note_reads_like_an_assay_line() {
+        let note = run_budget_note(5.021, 5.0, 3);
+        assert!(note.contains("$5.02 of $5.00"), "note: {note}");
+        assert!(note.contains("3 ingot(s) left as ore"), "note: {note}");
+        assert!(note.contains("slag resume"), "note: {note}");
     }
 }

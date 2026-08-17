@@ -17,6 +17,12 @@ pub enum SlagError {
     #[error("interrupted by user")]
     Cancelled,
 
+    /// Run-wide spend cap (`SLAG_MAX_COST_RUN`) tripped mid-flight. Not a
+    /// smith failure: the ingot goes back to ore and the run stops cleanly
+    /// so `slag resume` can pick it up under a raised cap.
+    #[error("run budget exhausted (${spent:.2} of ${cap:.2} cap)")]
+    RunBudgetExhausted { spent: f64, cap: f64 },
+
     #[error("no ingots produced by founder")]
     NoIngots,
 
@@ -41,6 +47,11 @@ pub enum SlagError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    /// Transient provider failure (rate limit, 5xx, dropped connection,
+    /// empty completion). Worth retrying; `Provider` is permanent.
+    #[error("provider error (transient): {0}")]
+    ProviderTransient(String),
+
     #[error("tool error: {0}")]
     Tool(String),
 
@@ -52,4 +63,24 @@ pub enum SlagError {
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl SlagError {
+    /// True when retrying the same call may succeed. Permanent failures
+    /// (auth, billing, malformed requests) return false.
+    pub fn retryable(&self) -> bool {
+        matches!(self, SlagError::ProviderTransient(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_is_retryable_permanent_is_not() {
+        assert!(SlagError::ProviderTransient("429: slow down".into()).retryable());
+        assert!(!SlagError::Provider("401: bad key".into()).retryable());
+        assert!(!SlagError::Cancelled.retryable());
+    }
 }

@@ -16,7 +16,9 @@ use crate::error::SlagError;
 
 const REQUEST_TIMEOUT_SECS: u64 = 600;
 const MAX_ATTEMPTS: usize = 3;
-const BACKOFF_MS: [u64; 2] = [250, 1000];
+const BACKOFF_BASE_MS: u64 = 500;
+const BACKOFF_CAP_MS: u64 = 32_000;
+const RETRY_AFTER_CAP_SECS: u64 = 60;
 const BODY_EXCERPT_LEN: usize = 300;
 
 /// OpenRouter chat-completions client.
@@ -86,10 +88,13 @@ impl OpenRouter {
         let body = Self::build_body(&req);
         let url = format!("{}/chat/completions", self.base_url);
         let mut last_err = String::new();
+        let mut retry_after: Option<Duration> = None;
 
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(BACKOFF_MS[attempt - 1])).await;
+                // A server-sent Retry-After beats the computed backoff.
+                let delay = retry_after.take().unwrap_or_else(|| backoff_delay(attempt));
+                tokio::time::sleep(delay).await;
             }
 
             let sent = self
@@ -104,6 +109,9 @@ impl OpenRouter {
 
             let resp = match sent {
                 Ok(resp) => resp,
+                // Connect and timeout failures are transient by definition;
+                // the remaining send errors rarely heal but a bounded retry
+                // costs little.
                 Err(e) => {
                     last_err = format!("request failed: {e}");
                     continue;
@@ -111,17 +119,31 @@ impl OpenRouter {
             };
 
             let status = resp.status();
+            let retry_hint = should_retry_override(resp.headers());
             if status.is_success() {
                 let api: ApiResponse = resp
                     .json()
                     .await
                     .map_err(|e| SlagError::Provider(format!("malformed response: {e}")))?;
-                return normalize(api);
+                match normalize(api) {
+                    // Empty 200s (no choices, no message, no finish_reason)
+                    // are upstream hiccups; burn a retry instead of handing
+                    // the agent an empty turn.
+                    Err(SlagError::ProviderTransient(why)) => {
+                        last_err = format!("empty 200: {why}");
+                        continue;
+                    }
+                    other => return other,
+                }
             }
 
+            let retry_after_header = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
             let excerpt = excerpt(&text);
-            if status.as_u16() == 429 || status.is_server_error() {
+            if retry_hint.unwrap_or_else(|| transient_status(status)) {
+                if status.as_u16() == 429 {
+                    retry_after = retry_after_header;
+                }
                 last_err = format!("{status}: {excerpt}");
                 continue;
             }
@@ -141,10 +163,68 @@ impl OpenRouter {
             }));
         }
 
-        Err(SlagError::Provider(format!(
+        Err(SlagError::ProviderTransient(format!(
             "gave up after {MAX_ATTEMPTS} attempts: {last_err}"
         )))
     }
+}
+
+/// Statuses worth another attempt: timeouts (408), races (409), rate
+/// limits (429), and anything 5xx.
+fn transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
+}
+
+/// `x-should-retry: true|false` lets the server override the status-based
+/// classification (the contract the Anthropic SDK honors).
+fn should_retry_override(headers: &reqwest::header::HeaderMap) -> Option<bool> {
+    match headers.get("x-should-retry")?.to_str().ok()?.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Retry-After in delta-seconds, capped at 60s. The HTTP-date form is rare
+/// enough upstream that the seconds form suffices; unparseable values fall
+/// back to the computed backoff.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs.min(RETRY_AFTER_CAP_SECS)))
+}
+
+/// Process-wide LCG state for retry jitter — enough randomness to spread
+/// parallel anvils without pulling in a rand dependency.
+static JITTER_STATE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
+
+/// 0..=25, a fresh percentage per call (Knuth MMIX LCG constants).
+fn next_jitter_percent() -> u64 {
+    use std::sync::atomic::Ordering;
+    let step = |s: u64| {
+        s.wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407)
+    };
+    let prev = JITTER_STATE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| Some(step(s)))
+        .expect("closure always returns Some");
+    // High bits of the advanced state; low LCG bits cycle too predictably.
+    (step(prev) >> 33) % 26
+}
+
+/// Delay before retry `retry` (1-based): 500ms doubling capped at 32s,
+/// plus 0-25% jitter so parallel anvils do not stampede in lockstep.
+fn backoff_delay(retry: usize) -> Duration {
+    // 500 << 6 hits the 32s cap exactly; larger shifts would drop bits.
+    let shift = retry.saturating_sub(1).min(6) as u32;
+    let base = (BACKOFF_BASE_MS << shift).min(BACKOFF_CAP_MS);
+    Duration::from_millis(base + base * next_jitter_percent() / 100)
 }
 
 impl Provider for OpenRouter {
@@ -256,12 +336,19 @@ fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
 static FALLBACK_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
+    // A 200 with no choices, no message, or no finish_reason is an upstream
+    // hiccup, not a completion — classify transient so the caller retries.
     let choice = api
         .choices
         .into_iter()
         .next()
-        .ok_or_else(|| SlagError::Provider("no choices in response".into()))?;
-    let msg = choice.message;
+        .ok_or_else(|| SlagError::ProviderTransient("no choices in response".into()))?;
+    let msg = choice
+        .message
+        .ok_or_else(|| SlagError::ProviderTransient("choice missing message".into()))?;
+    let finish = choice
+        .finish_reason
+        .ok_or_else(|| SlagError::ProviderTransient("choice missing finish_reason".into()))?;
 
     let seq = FALLBACK_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tool_calls: Vec<ToolCall> = msg
@@ -277,10 +364,10 @@ fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
         })
         .collect();
 
-    let finish_reason = match choice.finish_reason.as_deref() {
-        Some("stop") => FinishReason::Stop,
-        Some("tool_calls") => FinishReason::ToolCalls,
-        Some("length") => FinishReason::Length,
+    let finish_reason = match finish.as_str() {
+        "stop" => FinishReason::Stop,
+        "tool_calls" => FinishReason::ToolCalls,
+        "length" => FinishReason::Length,
         _ => FinishReason::Other,
     };
 
@@ -346,7 +433,8 @@ struct ApiResponse {
 
 #[derive(Deserialize)]
 struct ApiChoice {
-    message: ApiMessage,
+    #[serde(default)]
+    message: Option<ApiMessage>,
     #[serde(default)]
     finish_reason: Option<String>,
 }
@@ -419,7 +507,8 @@ mod tests {
                             { "id": "", "function": { "name": "bash", "arguments": "{}" } },
                             { "id": "", "function": { "name": "grep", "arguments": "{}" } },
                         ]
-                    }
+                    },
+                    "finish_reason": "tool_calls"
                 }]
             }))
             .unwrap()
@@ -817,5 +906,248 @@ mod tests {
             check_key("sk-fine", &flaky.uri()).await,
             KeyCheck::Unreachable(_)
         ));
+    }
+
+    fn ok_body() -> Value {
+        json!({
+            "choices": [{
+                "message": { "content": "forged" },
+                "finish_reason": "stop",
+            }],
+        })
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_jitters_within_bounds() {
+        for retry in 1..=10usize {
+            let base = (BACKOFF_BASE_MS << (retry - 1).min(63)).min(BACKOFF_CAP_MS);
+            let ms = backoff_delay(retry).as_millis() as u64;
+            assert!(ms >= base, "retry {retry}: {ms} below base {base}");
+            assert!(ms <= base + base / 4, "retry {retry}: {ms} above base+25%");
+        }
+        // Doubling stops at the cap.
+        assert!(backoff_delay(7).as_millis() as u64 <= BACKOFF_CAP_MS + BACKOFF_CAP_MS / 4);
+        assert!(backoff_delay(63).as_millis() as u64 >= BACKOFF_CAP_MS);
+    }
+
+    #[test]
+    fn jitter_stays_in_percent_range_and_varies() {
+        let draws: Vec<u64> = (0..100).map(|_| next_jitter_percent()).collect();
+        assert!(draws.iter().all(|&p| p <= 25));
+        // An LCG that returns one constant would defeat the point.
+        assert!(draws.iter().collect::<std::collections::HashSet<_>>().len() > 1);
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_caps_at_60() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert("retry-after", "3".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(3)));
+        headers.insert("retry-after", "120".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(60)));
+        // HTTP-date (unsupported form) falls back to computed backoff.
+        headers.insert("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn should_retry_header_parses_true_false_only() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(should_retry_override(&headers), None);
+        headers.insert("x-should-retry", "true".parse().unwrap());
+        assert_eq!(should_retry_override(&headers), Some(true));
+        headers.insert("x-should-retry", "false".parse().unwrap());
+        assert_eq!(should_retry_override(&headers), Some(false));
+        headers.insert("x-should-retry", "maybe".parse().unwrap());
+        assert_eq!(should_retry_override(&headers), None);
+    }
+
+    #[test]
+    fn transient_statuses_cover_408_409_429_and_5xx() {
+        for code in [408u16, 409, 429, 500, 502, 503, 529] {
+            assert!(transient_status(reqwest::StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+        for code in [400u16, 401, 402, 403, 404, 422] {
+            assert!(!transient_status(reqwest::StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+    }
+
+    #[test]
+    fn normalize_classifies_incomplete_200s_as_transient() {
+        let cases = [
+            json!({ "choices": [] }),
+            json!({ "choices": [{ "finish_reason": "stop" }] }),
+            json!({ "choices": [{ "message": { "content": "hi" } }] }),
+        ];
+        for body in cases {
+            let api: ApiResponse = serde_json::from_value(body.clone()).unwrap();
+            let err = normalize(api).expect_err("incomplete 200 must err");
+            assert!(err.retryable(), "{body} gave permanent: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_overrides_computed_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_string("slow down"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let started = std::time::Instant::now();
+        let resp = provider.chat(request(vec![], None)).await.expect("retry ok");
+        assert_eq!(resp.content, "forged");
+        // Computed first-retry backoff tops out at 625ms; only the header
+        // explains a full second of waiting.
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "waited only {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_408_and_409_then_succeeds() {
+        for status in [408u16, 409] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("try again"))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let provider = OpenRouter::with_base_url("sk-test", server.uri());
+            let resp = provider.chat(request(vec![], None)).await.expect("retry ok");
+            assert_eq!(resp.content, "forged", "status {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_fast_on_400_without_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = OpenRouter::with_base_url("sk-test", server.uri())
+            .chat(request(vec![], None))
+            .await
+            .expect_err("400 must fail");
+        assert!(!err.retryable(), "400 must be permanent: {err}");
+        assert!(err.to_string().contains("400"), "message was: {err}");
+    }
+
+    #[tokio::test]
+    async fn x_should_retry_true_retries_a_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("x-should-retry", "true")
+                    .set_body_string("flaky 400"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let resp = provider.chat(request(vec![], None)).await.expect("header-driven retry");
+        assert_eq!(resp.content, "forged");
+    }
+
+    #[tokio::test]
+    async fn x_should_retry_false_stops_a_503() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("x-should-retry", "false")
+                    .set_body_string("do not bother"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = OpenRouter::with_base_url("sk-test", server.uri())
+            .chat(request(vec![], None))
+            .await
+            .expect_err("header forbids retry");
+        assert!(!err.retryable(), "must be permanent: {err}");
+        assert!(err.to_string().contains("503"), "message was: {err}");
+    }
+
+    #[tokio::test]
+    async fn empty_200_retries_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "choices": [] })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let resp = provider.chat(request(vec![], None)).await.expect("empty 200 retried");
+        assert_eq!(resp.content, "forged");
+    }
+
+    #[tokio::test]
+    async fn persistent_empty_200_gives_up_transient() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "choices": [] })))
+            .expect(MAX_ATTEMPTS as u64)
+            .mount(&server)
+            .await;
+
+        let err = OpenRouter::with_base_url("sk-test", server.uri())
+            .chat(request(vec![], None))
+            .await
+            .expect_err("all empty");
+        assert!(err.retryable(), "exhausted retries stay transient: {err}");
+        assert!(err.to_string().contains("gave up"), "message was: {err}");
     }
 }

@@ -17,6 +17,64 @@ pub const MAX_ANVILS: usize = 3;
 pub const HIGH_GRADE: u8 = 3;
 pub const MAX_ITERATE: usize = 3;
 
+// --- Spend caps ---------------------------------------------------------
+//
+// Free functions rather than `EngineConfig` fields: the struct is built as
+// a full literal in the duel/smith test constructors, so new fields would
+// break files outside this change's blast radius. Default None = uncapped.
+
+/// Dollar ceiling for a single ingot session (`SLAG_MAX_COST_INGOT` env,
+/// `max_cost_per_ingot` file key). Enforced by the agent loop.
+pub fn ingot_cost_cap() -> Option<f64> {
+    cost_cap("SLAG_MAX_COST_INGOT", "max_cost_per_ingot")
+}
+
+/// Dollar ceiling for the whole run (`SLAG_MAX_COST_RUN` env,
+/// `max_cost_per_run` file key). Enforced by the forge scheduler.
+pub fn run_cost_cap() -> Option<f64> {
+    cost_cap("SLAG_MAX_COST_RUN", "max_cost_per_run")
+}
+
+fn cost_cap(env_var: &str, file_key: &str) -> Option<f64> {
+    env_nonempty(env_var)
+        .or_else(|| {
+            let entries = config_file_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|c| parse_config_lines(&c))
+                .unwrap_or_default();
+            file_value(&entries, file_key)
+        })
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// Run-wide spend accumulator, shared by every anvil in the process.
+/// Millicents (1/1000 of a cent) in a u64: f64 has no atomic add, and at
+/// this resolution u64 never saturates on real spend.
+static RUN_SPEND_MILLICENTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn dollars_to_millicents(dollars: f64) -> u64 {
+    (dollars.max(0.0) * 100_000.0).round() as u64
+}
+
+fn millicents_to_dollars(millicents: u64) -> f64 {
+    millicents as f64 / 100_000.0
+}
+
+/// Fold one response's cost into the run total (agent loop calls this).
+pub fn add_run_spend(dollars: f64) {
+    let mc = dollars_to_millicents(dollars);
+    if mc > 0 {
+        RUN_SPEND_MILLICENTS.fetch_add(mc, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Total dollars spent by this run so far.
+pub fn run_spend_dollars() -> f64 {
+    millicents_to_dollars(RUN_SPEND_MILLICENTS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Resolve a project-relative path
 pub fn project_path(filename: &str) -> PathBuf {
     PathBuf::from(filename)
@@ -413,6 +471,8 @@ mod tests {
         "SLAG_REASONING_EFFORT",
         "SLAG_OPENROUTER_BASE",
         "SLAG_CONFIG_DIR",
+        "SLAG_MAX_COST_INGOT",
+        "SLAG_MAX_COST_RUN",
     ];
 
     fn clear_engine_env() {
@@ -861,6 +921,73 @@ mod tests {
         config.duel = DuelMode::On;
         assert!(config.duel_qualifies(5));
         assert!(config.duel_qualifies(1));
+    }
+
+    #[test]
+    fn cost_caps_default_to_uncapped() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+
+        assert_eq!(ingot_cost_cap(), None);
+        assert_eq!(run_cost_cap(), None);
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn cost_caps_env_overrides_file_and_rejects_garbage() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "max_cost_per_ingot = \"1.50\"\nmax_cost_per_run = \"20\"\n",
+        )
+        .unwrap();
+
+        // File keys load.
+        assert_eq!(ingot_cost_cap(), Some(1.50));
+        assert_eq!(run_cost_cap(), Some(20.0));
+
+        // Env wins over file.
+        std::env::set_var("SLAG_MAX_COST_INGOT", "0.75");
+        std::env::set_var("SLAG_MAX_COST_RUN", "5.5");
+        assert_eq!(ingot_cost_cap(), Some(0.75));
+        assert_eq!(run_cost_cap(), Some(5.5));
+
+        // Garbage, zero, and negative values mean uncapped, not a crash.
+        for bad in ["lots", "0", "-3", "NaN"] {
+            std::env::set_var("SLAG_MAX_COST_INGOT", bad);
+            assert_eq!(ingot_cost_cap(), None, "value {bad:?} must not cap");
+        }
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn millicent_conversion_round_trips_and_clamps() {
+        assert_eq!(dollars_to_millicents(0.0), 0);
+        assert_eq!(dollars_to_millicents(1.0), 100_000);
+        assert_eq!(dollars_to_millicents(0.00001), 1);
+        // Negative cost (bad provider data) never underflows.
+        assert_eq!(dollars_to_millicents(-2.0), 0);
+        let d = millicents_to_dollars(dollars_to_millicents(12.34567));
+        assert!((d - 12.34567).abs() < 1e-5, "round trip drifted: {d}");
+    }
+
+    #[test]
+    fn run_spend_accumulates_monotonically() {
+        // The accumulator is process-global and other tests may add to it
+        // concurrently, so assert on the delta, not the absolute value.
+        let before = run_spend_dollars();
+        add_run_spend(1.25);
+        add_run_spend(-5.0); // ignored, never subtracts
+        add_run_spend(0.75);
+        let after = run_spend_dollars();
+        assert!(after - before >= 2.0 - 1e-9, "before {before}, after {after}");
     }
 
     #[test]

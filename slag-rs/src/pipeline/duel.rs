@@ -116,8 +116,8 @@ where
         let smith_b = casts('b', &dir_b);
 
         let (cast_a, cast_b) = tokio::join!(
-            run_cast(smith_a.as_ref(), &prompt_a, &dir_a, ingot),
-            run_cast(smith_b.as_ref(), &prompt_b, &dir_b, ingot),
+            run_cast(smith_a.as_ref(), &prompt_a, &dir_a, ingot, hooks),
+            run_cast(smith_b.as_ref(), &prompt_b, &dir_b, ingot, hooks),
         );
         let (cast_a, cast_b) = match (cast_a, cast_b) {
             (Ok(a), Ok(b)) => (a, b),
@@ -255,18 +255,30 @@ fn cast_prompt(ingot: &Ingot, direction: &str, critique: Option<&str>) -> String
 
 /// Run one cast to a proof-checked `CastResult`, or `Ok(None)` on any
 /// cast failure (smith error, missing CMD, CMD failure, proof failure).
-/// `SlagError::Cancelled` propagates so Ctrl-C aborts the duel instead of
-/// reading as a failed cast. Mirrors `strike_ingot`'s CMD-then-proof
-/// sequence, rooted in the worktree.
+/// Transient provider errors (429/5xx blips) are absorbed exactly like
+/// `strike_ingot`'s heats — a rate-limit burst must not burn a duel round
+/// or end the duel via a phantom double-failure. `SlagError::Cancelled`
+/// and run-budget exhaustion propagate so Ctrl-C / the spend cap abort
+/// the duel instead of reading as a failed cast. Mirrors `strike_ingot`'s
+/// CMD-then-proof sequence, rooted in the worktree.
 async fn run_cast(
     smith: &dyn Smith,
     prompt: &str,
     dir: &Path,
     ingot: &Ingot,
+    hooks: &EngineHooks,
 ) -> Result<Option<CastResult>, SlagError> {
-    let response = match smith.invoke(prompt).await {
+    let invoked = super::forge::invoke_absorbing_transients(
+        smith,
+        prompt,
+        &ingot.id,
+        super::forge::MAX_TRANSIENT_PER_HEAT,
+        hooks,
+    )
+    .await;
+    let response = match invoked {
         Ok(response) => response,
-        Err(SlagError::Cancelled) => return Err(SlagError::Cancelled),
+        Err(e @ (SlagError::Cancelled | SlagError::RunBudgetExhausted { .. })) => return Err(e),
         Err(_) => return Ok(None),
     };
     let Some(cmd) = proof::extract_cmd(&response) else {
@@ -845,6 +857,67 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
             Box::pin(async { Err(SlagError::Cancelled) })
         }
+    }
+
+    /// Smith that pops one scripted result per invoke; shareable across
+    /// the per-round cast rebuilds via the Arc wrapper below.
+    struct ScriptedCast(std::sync::Mutex<std::collections::VecDeque<Result<String, SlagError>>>);
+
+    struct SharedSmith(std::sync::Arc<ScriptedCast>);
+
+    impl Smith for SharedSmith {
+        fn invoke(
+            &self,
+            _prompt: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
+            let next = self.0 .0.lock().unwrap().pop_front().expect("cast script exhausted");
+            Box::pin(async move { next })
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_provider_blips_do_not_fail_a_cast() {
+        let (_tmp, repo) = test_repo();
+        let ingot = ingot("it", true, 4, None, "test -f out.txt");
+
+        // Cast A hits a 429 blip, then succeeds on the absorbed retry;
+        // cast B genuinely fails its proof. Without transient absorption
+        // the blip would read as a failed cast and (None, None) would end
+        // the duel via FellThrough.
+        let a = std::sync::Arc::new(ScriptedCast(std::sync::Mutex::new(
+            [
+                Err(SlagError::ProviderTransient("429: slow down".into())),
+                Ok("CMD: echo forged-by-a > out.txt".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )));
+        let b = std::sync::Arc::new(ScriptedCast(std::sync::Mutex::new(
+            [Ok("CMD: false".to_string())].into_iter().collect(),
+        )));
+        let casts = move |cast: char, _dir: &Path| -> Box<dyn Smith> {
+            Box::new(SharedSmith(if cast == 'a' { a.clone() } else { b.clone() }))
+        };
+
+        let outcome = duel_ingot(
+            &repo,
+            &ingot,
+            &cfg(DuelMode::On),
+            &EngineHooks::default(),
+            &casts,
+            &NoJudge,
+        )
+        .await
+        .expect("duel runs");
+
+        match outcome {
+            DuelOutcome::Merged { winner, rounds } => {
+                assert_eq!(winner, 'a', "the blipped cast must still win");
+                assert_eq!(rounds, 1);
+            }
+            other => panic!("transient blip must not end the duel: {other:?}"),
+        }
+        assert!(repo.join("out.txt").exists());
     }
 
     #[tokio::test]

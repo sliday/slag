@@ -96,7 +96,11 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
          - Satisfy the :proof command. It is the acceptance gate — exit 0 or the ingot cracks.\n\
          - Minimal diffs. Change only what the ingot requires; no drive-by fixes, no \
            reformatting, no stray comments.\n\
-         - Never touch .env files. Never commit unless the ingot explicitly asks.\n\n",
+         - Never touch .env files. Never commit unless the ingot explicitly asks.\n\
+         - ≤25 words of commentary between tool calls; finish summary ≤120 words.\n\
+         - Report outcomes faithfully. Never claim checks pass when output shows failures. \
+           Never weaken a test or the proof command to manufacture a pass. Never modify \
+           the :proof command unless the ingot explicitly asks.\n\n",
     );
 
     s.push_str("## Edit style for this model\n\n");
@@ -292,6 +296,32 @@ mod tests {
         assert!(s.contains("Do NOT edit files"));
         let f = stable_band("qwen/qwen3-coder", PromptMode::Forge);
         assert!(!f.contains("Do NOT edit files"));
+    }
+
+    #[test]
+    fn stable_band_carries_numeric_length_anchors() {
+        for mode in [PromptMode::Forge, PromptMode::Plan] {
+            let s = stable_band("qwen/qwen3-coder", mode);
+            assert!(s.contains("≤25 words of commentary between tool calls"), "{s}");
+            assert!(s.contains("finish summary ≤120 words"), "{s}");
+        }
+    }
+
+    #[test]
+    fn stable_band_carries_faithful_reporting_rule() {
+        let s = stable_band("qwen/qwen3-coder", PromptMode::Forge);
+        let rules = &s[s.find("## Rules").unwrap()..];
+        assert!(rules.contains("Report outcomes faithfully."));
+        assert!(rules.contains("Never claim checks pass when output shows failures."));
+        assert!(rules.contains("Never weaken a test or the proof command to manufacture a pass."));
+        assert!(rules.contains("Never modify the :proof command unless the ingot explicitly asks."));
+    }
+
+    #[test]
+    fn stable_band_is_byte_stable_across_runs() {
+        let a = stable_band("openai/gpt-5", PromptMode::Forge);
+        let b = stable_band("openai/gpt-5", PromptMode::Forge);
+        assert_eq!(a, b, "stable band must be byte-identical across builds");
     }
 
     #[test]
