@@ -145,9 +145,17 @@ fn parse_frontmatter(content: &str) -> Frontmatter {
     fm
 }
 
+/// Prompt-band budget: the index never grows past these caps, however
+/// many (or however verbose) the installed recipes are.
+const INDEX_MAX_RECIPES: usize = 50;
+const INDEX_MAX_DESC_CHARS: usize = 200;
+
 fn render_index(recipes: &[Recipe], available_tools: &[String]) -> String {
     let mut lines = Vec::new();
     for r in recipes {
+        if lines.len() >= INDEX_MAX_RECIPES {
+            break;
+        }
         if !r
             .requires_tools
             .iter()
@@ -157,7 +165,13 @@ fn render_index(recipes: &[Recipe], available_tools: &[String]) -> String {
         }
         let collides = recipes.iter().filter(|o| o.name == r.name).count() > 1;
         let marker = if collides { " [name collision]" } else { "" };
-        lines.push(format!("- {}: {}{}", r.name, r.description, marker));
+        let desc = if r.description.chars().count() > INDEX_MAX_DESC_CHARS {
+            let cut: String = r.description.chars().take(INDEX_MAX_DESC_CHARS).collect();
+            format!("{cut}…")
+        } else {
+            r.description.clone()
+        };
+        lines.push(format!("- {}: {}{}", r.name, desc, marker));
     }
     if lines.is_empty() {
         return "## Recipes\n(none installed)".to_string();
@@ -371,6 +385,25 @@ mod tests {
 
         let idx = render_index(&found, &tools(&["bash", "browser"]));
         assert!(idx.contains("- web: needs browser"), "{idx}");
+    }
+
+    #[test]
+    fn index_caps_recipe_count_and_description_length() {
+        let recipes: Vec<Recipe> = (0..60)
+            .map(|i| Recipe {
+                name: format!("r{i:02}"),
+                description: "d".repeat(300),
+                path: PathBuf::from("RECIPE.md"),
+                requires_tools: vec![],
+            })
+            .collect();
+        let idx = render_index(&recipes, &tools(&[]));
+        let entries: Vec<&str> = idx.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(entries.len(), INDEX_MAX_RECIPES);
+        for e in entries {
+            assert!(e.ends_with('…'), "long description must be truncated: {e}");
+            assert!(e.chars().count() < 300, "got {} chars", e.chars().count());
+        }
     }
 
     #[test]

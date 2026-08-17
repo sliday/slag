@@ -39,6 +39,9 @@ pub fn preview(s: &str, max: usize) -> String {
                 line.push(' ');
                 last_space = true;
             }
+        } else if ch.is_control() {
+            // Drop ESC and every other control char so tool output can
+            // never inject ANSI sequences into the terminal or dashboard.
         } else {
             line.push(ch);
             last_space = false;
@@ -291,6 +294,15 @@ mod tests {
         assert_eq!(preview("anything", 0), "");
         // Exactly at the limit: no ellipsis.
         assert_eq!(preview("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn preview_strips_control_chars() {
+        // ANSI color/clear sequences lose their ESC and cannot re-arm.
+        assert_eq!(preview("a\x1b[31mred\x1b[0m b", 80), "a[31mred[0m b");
+        assert_eq!(preview("bell\x07 and \x08backspace", 80), "bell and backspace");
+        // Whitespace controls (\n, \t) still collapse to single spaces.
+        assert_eq!(preview("x\n\ty", 80), "x y");
     }
 
     #[test]

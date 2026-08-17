@@ -208,6 +208,10 @@ fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
         .collect()
 }
 
+/// Distinguishes synthesized fallback tool-call ids across responses so a
+/// multi-turn history never replays duplicate ids to strict backends.
+static FALLBACK_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
     let choice = api
         .choices
@@ -216,6 +220,7 @@ fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
         .ok_or_else(|| SlagError::Provider("no choices in response".into()))?;
     let msg = choice.message;
 
+    let seq = FALLBACK_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tool_calls: Vec<ToolCall> = msg
         .tool_calls
         .unwrap_or_default()
@@ -223,7 +228,7 @@ fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
         .enumerate()
         .map(|(i, tc)| ToolCall {
             // Some upstreams omit ids; strict backends reject "" on replay.
-            id: if tc.id.is_empty() { format!("call_{i}") } else { tc.id },
+            id: if tc.id.is_empty() { format!("call_{seq}_{i}") } else { tc.id },
             name: tc.function.name,
             arguments: tc.function.arguments,
         })
@@ -354,6 +359,30 @@ mod tests {
             effort,
             max_tokens: None,
         }
+    }
+
+    #[test]
+    fn fallback_tool_call_ids_stay_unique_across_responses() {
+        let api = || -> ApiResponse {
+            serde_json::from_value(json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [
+                            { "id": "", "function": { "name": "bash", "arguments": "{}" } },
+                            { "id": "", "function": { "name": "grep", "arguments": "{}" } },
+                        ]
+                    }
+                }]
+            }))
+            .unwrap()
+        };
+        let first = normalize(api()).unwrap();
+        let second = normalize(api()).unwrap();
+        // Within one response the ids differ by index; across responses the
+        // sequence counter keeps them from colliding in the replayed history.
+        assert_ne!(first.tool_calls[0].id, first.tool_calls[1].id);
+        assert_ne!(first.tool_calls[0].id, second.tool_calls[0].id);
+        assert_ne!(first.tool_calls[1].id, second.tool_calls[1].id);
     }
 
     #[test]

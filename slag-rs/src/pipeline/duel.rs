@@ -76,7 +76,10 @@ where
     F: Fn(char, &Path) -> Box<dyn Smith> + Send + Sync,
 {
     let _slot = DUEL_SLOT.lock().await;
-    let rounds = cfg.duel_rounds(ingot.grade).max(1);
+    // Each round burns one heat; never schedule more rounds than the
+    // ingot's remaining heat budget (:max - :heat) allows.
+    let remaining = ingot.max.saturating_sub(ingot.heat).max(1);
+    let rounds = cfg.duel_rounds(ingot.grade).clamp(1, remaining);
     let mut critique: Option<String> = None;
     let mut prev_winner_score: Option<u8> = None;
 
@@ -114,6 +117,15 @@ where
             run_cast(smith_a.as_ref(), &prompt_a, &dir_a, ingot),
             run_cast(smith_b.as_ref(), &prompt_b, &dir_b, ingot),
         );
+        let (cast_a, cast_b) = match (cast_a, cast_b) {
+            (Ok(a), Ok(b)) => (a, b),
+            // Cancelled (Ctrl-C): abort the duel, don't treat as failed casts.
+            (Err(e), _) | (_, Err(e)) => {
+                worktree::discard_in(repo, &id_a).await;
+                worktree::discard_in(repo, &id_b).await;
+                return Err(e);
+            }
+        };
 
         match (cast_a, cast_b) {
             (None, None) => {
@@ -174,10 +186,10 @@ where
                     let merged = merge_winner(repo, ingot, verdict.winner, win_id, win_dir).await;
                     worktree::discard_in(repo, lose_id).await;
                     if let Err(e) = merged {
-                        // Merge failure must not leak the winner's
-                        // worktree/branch; deterministic names would break
-                        // every future duel of this ingot.
-                        worktree::discard_in(repo, win_id).await;
+                        // Keep the proven winner's worktree and branch — its
+                        // commit is the only copy of the work. The stale
+                        // deterministic names are reclaimed by
+                        // `worktree::create_in` on the next duel attempt.
                         return Err(e);
                     }
                     append_ledger(repo, ingot, verdict.winner, round);
@@ -211,7 +223,8 @@ async fn crown(
     let merged = merge_winner(repo, ingot, winner, win_id, win_dir).await;
     worktree::discard_in(repo, lose_id).await;
     if let Err(e) = merged {
-        worktree::discard_in(repo, win_id).await;
+        // Keep the proven winner's worktree/branch (only copy of the work);
+        // `worktree::create_in` reclaims the stale names on the next duel.
         return Err(e);
     }
     emit(
@@ -234,27 +247,35 @@ fn cast_prompt(ingot: &Ingot, direction: &str, critique: Option<&str>) -> String
     prompt
 }
 
-/// Run one cast to a proof-checked `CastResult`, or None on any failure
-/// (smith error, missing CMD, CMD failure, proof failure). Mirrors
-/// `strike_ingot`'s CMD-then-proof sequence, rooted in the worktree.
+/// Run one cast to a proof-checked `CastResult`, or `Ok(None)` on any
+/// cast failure (smith error, missing CMD, CMD failure, proof failure).
+/// `SlagError::Cancelled` propagates so Ctrl-C aborts the duel instead of
+/// reading as a failed cast. Mirrors `strike_ingot`'s CMD-then-proof
+/// sequence, rooted in the worktree.
 async fn run_cast(
     smith: &dyn Smith,
     prompt: &str,
     dir: &Path,
     ingot: &Ingot,
-) -> Option<CastResult> {
-    let response = smith.invoke(prompt).await.ok()?;
-    let cmd = proof::extract_cmd(&response)?;
+) -> Result<Option<CastResult>, SlagError> {
+    let response = match smith.invoke(prompt).await {
+        Ok(response) => response,
+        Err(SlagError::Cancelled) => return Err(SlagError::Cancelled),
+        Err(_) => return Ok(None),
+    };
+    let Some(cmd) = proof::extract_cmd(&response) else {
+        return Ok(None);
+    };
 
     let (ok, output) = run_shell_in(&cmd, dir).await;
     if !ok {
-        return None;
+        return Ok(None);
     }
 
     let proof_output = if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
         let (proof_ok, proof_out) = run_shell_in(&ingot.proof, dir).await;
         if !proof_ok {
-            return None;
+            return Ok(None);
         }
         proof_out
     } else {
@@ -266,8 +287,13 @@ async fn run_cast(
     let _ = git_in(dir, &["add", "-A"]).await;
     let diff = git_in(dir, &["diff", "--cached"]).await.unwrap_or_default();
 
-    Some(CastResult { diff, proof_output })
+    Ok(Some(CastResult { diff, proof_output }))
 }
+
+/// How long merge_winner waits for another anvil's uncommitted overlap in
+/// the main checkout to clear before letting git report the failure itself.
+const MERGE_DIRTY_TRIES: u32 = 20;
+const MERGE_DIRTY_WAIT_MS: u64 = 500;
 
 /// Commit the winner's staged work on its cast branch, then merge and
 /// clean up through the same path solo ingots use.
@@ -280,11 +306,52 @@ async fn merge_winner(
 ) -> Result<(), SlagError> {
     let msg = format!("forge({}): cast {winner} wins duel — {}", ingot.id, ingot.work);
     let _ = git_in(cast_dir, &["add", "-A"]).await;
-    let _ = git_in(cast_dir, &["commit", "-m", &msg, "--quiet"]).await;
-    // Serialize against other anvils' `git add -A; git commit` on the
-    // shared main checkout (see proof::REPO_GIT_LOCK).
+    // `diff --cached --quiet` exits non-zero when work is staged. A
+    // swallowed commit failure (hook, gpgsign, identity) would leave the
+    // cast branch at base: the merge then reports "Already up to date"
+    // and the winner's work silently never lands on main.
+    let staged = git_in(cast_dir, &["diff", "--cached", "--quiet"]).await.is_none();
+    let committed = git_in(cast_dir, &["commit", "-m", &msg, "--quiet"]).await.is_some();
+    if staged && !committed {
+        return Err(SlagError::WorktreeError(format!(
+            "cast {winner} commit failed in {}; the work stays in that worktree",
+            cast_dir.display()
+        )));
+    }
+
+    let branch = format!("forge/{cast_id}");
+    for _ in 0..MERGE_DIRTY_TRIES {
+        {
+            // Serialize against other anvils' `git add -A; git commit` on
+            // the shared main checkout (see proof::REPO_GIT_LOCK).
+            let _guard = crate::proof::REPO_GIT_LOCK.lock().await;
+            if !dirty_overlap(repo, &branch).await {
+                return worktree::merge_and_cleanup_in(repo, cast_id).await;
+            }
+        }
+        // Another anvil's smith has uncommitted edits to files this merge
+        // touches; wait for its commit instead of aborting immediately and
+        // burning the proven winner.
+        tokio::time::sleep(std::time::Duration::from_millis(MERGE_DIRTY_WAIT_MS)).await;
+    }
     let _guard = crate::proof::REPO_GIT_LOCK.lock().await;
     worktree::merge_and_cleanup_in(repo, cast_id).await
+}
+
+/// True when the main checkout has uncommitted (or untracked) changes to
+/// any file the branch's merge would touch — the case where `git merge`
+/// refuses with "local changes would be overwritten".
+async fn dirty_overlap(repo: &Path, branch: &str) -> bool {
+    let changed = git_in(repo, &["diff", "--name-only", &format!("HEAD...{branch}")])
+        .await
+        .unwrap_or_default();
+    if changed.trim().is_empty() {
+        return false;
+    }
+    let status = git_in(repo, &["status", "--porcelain"]).await.unwrap_or_default();
+    let dirty: std::collections::HashSet<&str> =
+        status.lines().filter_map(|l| l.get(3..)).collect();
+    changed.lines().any(|f| dirty.contains(f))
 }
 
 /// Visual assay inputs: only for web ingots with a configured screenshot
@@ -661,7 +728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_merge_aborts_and_discards_both_worktrees() {
+    async fn failed_merge_aborts_and_preserves_the_winner() {
         let (_tmp, repo) = test_repo();
         // Base file both sides will touch.
         std::fs::write(repo.join("x.txt"), "base\n").unwrap();
@@ -696,13 +763,134 @@ mod tests {
         assert!(!repo.join(".git/MERGE_HEAD").exists(), "merge must be aborted");
         assert!(!std::fs::read_to_string(repo.join("x.txt")).unwrap().contains("<<<<<<<"));
 
-        // Both worktrees and forge/* branches are gone, so a redo can
-        // recreate them under the same deterministic names.
-        assert!(!repo.parent().unwrap().join("slag-anvil-i5-r1a").exists());
+        // The loser is gone; the proven winner's worktree and branch stay
+        // (only copy of the work). The stale names must still be reusable:
+        // create_in reclaims them on the next duel attempt.
         assert!(!repo.parent().unwrap().join("slag-anvil-i5-r1b").exists());
-        let branches = git(&repo, &["branch", "--list", "forge/*"]);
-        assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
+        assert!(repo.parent().unwrap().join("slag-anvil-i5-r1a").exists(), "winner preserved");
+        let branches = git(&repo, &["branch", "--list", "forge/i5-r1a"]);
+        assert!(!String::from_utf8_lossy(&branches.stdout).trim().is_empty(), "winner branch kept");
         assert!(worktree::create_in(&repo, "i5-r1a").await.is_ok(), "names must be reusable");
+        worktree::discard_in(&repo, "i5-r1a").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_commit_surfaces_instead_of_false_merge() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, repo) = test_repo();
+        // Failing pre-commit hook: worktrees share the main repo's hooks.
+        // Stand-in for gpgsign failures / missing identity in real repos.
+        let hooks_dir = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let win_dir = worktree::create_in(&repo, "i6-r1a").await.unwrap();
+        worktree::create_in(&repo, "i6-r1b").await.unwrap();
+        std::fs::write(win_dir.join("won.txt"), "winner\n").unwrap();
+
+        let ingot = ingot("i6", true, 4, None, "true");
+        let err = crown(
+            &repo,
+            &ingot,
+            &EngineHooks::default(),
+            'a',
+            "i6-r1a",
+            &win_dir,
+            "i6-r1b",
+            1,
+        )
+        .await
+        .expect_err("commit failure must not be reported as a merged win");
+        assert!(err.to_string().contains("commit failed"), "got {err}");
+        assert!(!repo.join("won.txt").exists(), "nothing must land on main");
+        worktree::discard_in(&repo, "i6-r1a").await;
+    }
+
+    #[tokio::test]
+    async fn dirty_overlap_detects_only_overlapping_files() {
+        let (_tmp, repo) = test_repo();
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-m", "add shared", "--quiet"]);
+
+        let dir = worktree::create_in(&repo, "ov-r1a").await.unwrap();
+        std::fs::write(dir.join("shared.txt"), "cast\n").unwrap();
+        assert!(git_in(&dir, &["commit", "-am", "cast edit"]).await.is_some());
+
+        assert!(!dirty_overlap(&repo, "forge/ov-r1a").await, "clean main: no overlap");
+        std::fs::write(repo.join("unrelated.txt"), "dirt\n").unwrap();
+        assert!(!dirty_overlap(&repo, "forge/ov-r1a").await, "disjoint dirt: no overlap");
+        std::fs::write(repo.join("shared.txt"), "main-dirt\n").unwrap();
+        assert!(dirty_overlap(&repo, "forge/ov-r1a").await, "overlapping dirt detected");
+        worktree::discard_in(&repo, "ov-r1a").await;
+    }
+
+    /// Smith that reports cancellation (Ctrl-C mid-cast).
+    struct CancelledSmith;
+
+    impl Smith for CancelledSmith {
+        fn invoke(
+            &self,
+            _prompt: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
+            Box::pin(async { Err(SlagError::Cancelled) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_cast_aborts_the_duel_and_cleans_up() {
+        let (_tmp, repo) = test_repo();
+        let ingot = ingot("ic", true, 4, None, "true");
+        let casts = |_cast: char, _dir: &Path| Box::new(CancelledSmith) as Box<dyn Smith>;
+
+        let err = duel_ingot(
+            &repo,
+            &ingot,
+            &cfg(DuelMode::On),
+            &EngineHooks::default(),
+            &casts,
+            &NoJudge,
+        )
+        .await
+        .expect_err("cancellation must abort the duel, not read as a failed cast");
+        assert!(matches!(err, SlagError::Cancelled), "got {err}");
+        assert!(!repo.parent().unwrap().join("slag-anvil-ic-r1a").exists());
+        assert!(!repo.parent().unwrap().join("slag-anvil-ic-r1b").exists());
+    }
+
+    #[tokio::test]
+    async fn rounds_clamped_to_remaining_heat_budget() {
+        let (_tmp, repo) = test_repo();
+        // heat 4 of max 5 → one heat left; grade 5 would otherwise cap at 10.
+        let mut ing = ingot("ihb", true, 5, None, "true");
+        ing.heat = 4;
+        let casts = casts_returning("CMD: echo a > a.txt", "CMD: echo b > b.txt");
+        // Margin 10 (< MARGIN_STOP): only the round cap can end this duel,
+        // and the judge holds exactly one round's worth of replies.
+        let judge = ScriptedJudge::new(&[
+            r#"{"winner":"a","score_a":60,"score_b":50,"critique":"r1"}"#,
+            r#"{"winner":"b","score_a":50,"score_b":60,"critique":"r1s"}"#,
+        ]);
+
+        let outcome = duel_ingot(
+            &repo,
+            &ing,
+            &cfg(DuelMode::On),
+            &EngineHooks::default(),
+            &casts,
+            &judge,
+        )
+        .await
+        .expect("duel runs");
+        match outcome {
+            DuelOutcome::Merged { rounds, .. } => {
+                assert_eq!(rounds, 1, "must merge at the clamped single round");
+            }
+            other => panic!("expected merge, got {other:?}"),
+        }
     }
 
     #[tokio::test]

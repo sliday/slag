@@ -15,7 +15,8 @@ pub struct Cli {
     #[arg(trailing_var_arg = true)]
     pub commission: Vec<String>,
 
-    /// Enable branch-per-ingot worktree isolation
+    /// Branch-per-ingot worktree isolation (not implemented yet; ignored
+    /// with a warning — all ingots run in the shared checkout)
     #[arg(long)]
     pub worktree: bool,
 
@@ -59,5 +60,23 @@ impl Cli {
         } else {
             Some(self.commission.join(" "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worktree_flag_still_parses_and_help_says_it_is_ignored() {
+        let cli = Cli::parse_from(["slag", "--worktree", "build", "it"]);
+        assert!(cli.worktree);
+        assert_eq!(cli.commission_text().as_deref(), Some("build it"));
+
+        // The advertised behavior must match reality: the help text says
+        // the flag is ignored until the isolation is actually wired up.
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("not implemented yet"), "help: {help}");
     }
 }

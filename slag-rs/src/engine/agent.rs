@@ -17,14 +17,47 @@ use super::events::preview;
 use super::tools::ToolBox;
 use super::{
     emit, CancelFlag, ChatMessage, ChatRequest, Effort, EngineEvent, EventTx, FinishReason,
-    Provider, SteerQueue, ToolCall, ToolOutcome,
+    NormalizedResponse, Provider, SteerQueue, ToolCall, ToolOutcome,
 };
 use crate::error::SlagError;
 
 const DEFAULT_MAX_TURNS: usize = 40;
 const CHAR_BUDGET: usize = 600_000;
+/// Overflow-shrink floor: below this, compaction cannot help — the
+/// system prompt, task, and protected tail alone exceed the window.
+const CHAR_BUDGET_FLOOR: usize = 16_000;
 const PREVIEW_LEN: usize = 80;
 const STEER_TAG: &str = "[STEER — operator message, follow it]";
+
+/// Char budget for compaction. `SLAG_CHAR_BUDGET` overrides the default so
+/// smaller-context models compact before the provider rejects the request.
+fn char_budget_from_env() -> usize {
+    std::env::var("SLAG_CHAR_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(CHAR_BUDGET)
+}
+
+/// Provider rejection caused by the request exceeding the model's context
+/// window (OpenRouter surfaces these as 400s with varying phrasings).
+fn is_context_overflow(e: &SlagError) -> bool {
+    let s = e.to_string().to_lowercase();
+    [
+        "context length",
+        "context_length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "input is too long",
+    ]
+    .iter()
+    .any(|needle| s.contains(needle))
+}
+
+fn convo_chars(messages: &[ChatMessage]) -> usize {
+    messages.iter().map(|m| m.content.chars().count()).sum()
+}
 
 /// One smith session: a provider, a toolbox, a model, and a turn budget.
 pub struct ForgeAgent {
@@ -33,6 +66,7 @@ pub struct ForgeAgent {
     model: String,
     effort: Option<Effort>,
     max_turns: usize,
+    char_budget: usize,
     events: Option<EventTx>,
     steer: Option<SteerQueue>,
     cancel: Option<CancelFlag>,
@@ -46,10 +80,17 @@ impl ForgeAgent {
             model: model.into(),
             effort: None,
             max_turns: DEFAULT_MAX_TURNS,
+            char_budget: char_budget_from_env(),
             events: None,
             steer: None,
             cancel: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_char_budget(mut self, chars: usize) -> Self {
+        self.char_budget = chars.max(1);
+        self
     }
 
     pub fn with_effort(mut self, effort: Option<Effort>) -> Self {
@@ -79,17 +120,34 @@ impl ForgeAgent {
 
     /// Run the loop to completion. Returns the final summary text.
     pub async fn run(&self, system: String, task: String) -> Result<String, SlagError> {
+        // Steers drained into the conversation die with it if the provider
+        // errors: re-queue them so the ingot's next heat re-delivers them.
+        let mut applied_steers: Vec<String> = Vec::new();
+        let result = self.run_inner(system, task, &mut applied_steers).await;
+        if result.is_err() {
+            self.requeue_steers(&applied_steers);
+        }
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        system: String,
+        task: String,
+        applied_steers: &mut Vec<String>,
+    ) -> Result<String, SlagError> {
         let mut messages = vec![ChatMessage::system(system), ChatMessage::user(task)];
         let mut continued = false;
+        let mut char_budget = self.char_budget;
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
-            self.apply_steers(&mut messages);
-            compact(&mut messages, CHAR_BUDGET);
+            self.apply_steers(&mut messages, applied_steers);
+            compact(&mut messages, char_budget);
             emit(&self.events, EngineEvent::TurnStart { turn });
             emit(&self.events, EngineEvent::ModelCall { model: self.model.clone() });
 
-            let resp = match self.provider.chat(self.request(messages.clone(), true)).await {
+            let resp = match self.chat_shrinking(&mut messages, true, &mut char_budget).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     emit(&self.events, EngineEvent::Error { message: e.to_string() });
@@ -148,15 +206,15 @@ impl ForgeAgent {
 
             // Drain again right after tool execution: a steer typed during
             // a long bash lands before the next model call.
-            self.apply_steers(&mut messages);
+            self.apply_steers(&mut messages, applied_steers);
         }
 
         // Turn budget exhausted: one final no-tools call for a summary.
         messages.push(ChatMessage::user(
             "no more tool budget — summarize what was done",
         ));
-        compact(&mut messages, CHAR_BUDGET);
-        let resp = match self.provider.chat(self.request(messages, false)).await {
+        compact(&mut messages, char_budget);
+        let resp = match self.chat_shrinking(&mut messages, false, &mut char_budget).await {
             Ok(resp) => resp,
             Err(e) => {
                 emit(&self.events, EngineEvent::Error { message: e.to_string() });
@@ -179,11 +237,46 @@ impl ForgeAgent {
         Ok(())
     }
 
+    /// Chat with context-overflow recovery: on a context-window 400, halve
+    /// the budget, compact, and retry — until the floor is reached or
+    /// compaction stops making progress. Fixed budgets sized for large
+    /// windows never fire compaction on smaller-context models otherwise.
+    async fn chat_shrinking(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        with_tools: bool,
+        char_budget: &mut usize,
+    ) -> Result<NormalizedResponse, SlagError> {
+        loop {
+            match self.provider.chat(self.request(messages.clone(), with_tools)).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) if is_context_overflow(&e) && *char_budget > CHAR_BUDGET_FLOOR => {
+                    *char_budget = (*char_budget / 2).max(CHAR_BUDGET_FLOOR);
+                    let before = convo_chars(messages);
+                    compact(messages, *char_budget);
+                    if convo_chars(messages) == before {
+                        return Err(e); // nothing prunable — retrying is futile
+                    }
+                    emit(
+                        &self.events,
+                        EngineEvent::Error {
+                            message: format!(
+                                "context overflow — compacted to {char_budget} chars, retrying"
+                            ),
+                        },
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Inject queued steering messages (hermes steer-into-tool-result
     /// pattern): each steer appends to the last tool result so the model
     /// reads it with the tool output; before any tool result exists it
-    /// rides as a user message. Order is preserved.
-    fn apply_steers(&self, messages: &mut Vec<ChatMessage>) {
+    /// rides as a user message. Order is preserved. Every applied steer is
+    /// recorded so a failed run can put it back in the queue.
+    fn apply_steers(&self, messages: &mut Vec<ChatMessage>, applied: &mut Vec<String>) {
         for text in self.drain_steers() {
             emit(&self.events, EngineEvent::Steer { text: text.clone() });
             match messages.iter_mut().rev().find(|m| m.role == "tool") {
@@ -192,6 +285,21 @@ impl ForgeAgent {
                 }
                 None => messages.push(ChatMessage::user(format!("{STEER_TAG}\n{text}"))),
             }
+            applied.push(text);
+        }
+    }
+
+    /// Put steers consumed by a failed run back at the front of the queue,
+    /// ahead of anything queued since, so the retry heat re-delivers them.
+    fn requeue_steers(&self, applied: &[String]) {
+        if applied.is_empty() {
+            return;
+        }
+        if let Some(q) = &self.steer {
+            let mut q = q.lock().unwrap();
+            let mut restored: Vec<String> = applied.to_vec();
+            restored.append(&mut *q);
+            *q = restored;
         }
     }
 
@@ -748,6 +856,119 @@ mod tests {
             .iter()
             .filter(|m| m.role == "user")
             .all(|m| !m.content.contains(STEER_TAG)));
+    }
+
+    /// Scripted provider that can also fail: pops one Result per chat call.
+    struct FlakyProvider {
+        script: Mutex<VecDeque<Result<NormalizedResponse, String>>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl FlakyProvider {
+        fn new(script: Vec<Result<NormalizedResponse, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl Provider for FlakyProvider {
+        fn chat(
+            &self,
+            req: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>>
+        {
+            self.requests.lock().unwrap().push(req);
+            let next = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("flaky script exhausted");
+            Box::pin(async move { next.map_err(SlagError::Provider) })
+        }
+    }
+
+    #[test]
+    fn context_overflow_classifier_matches_provider_phrasings() {
+        for msg in [
+            "400 Bad Request: This endpoint's maximum context length is 131072 tokens",
+            "400: context_length_exceeded",
+            "400: input is too long for this model's context window",
+        ] {
+            assert!(is_context_overflow(&SlagError::Provider(msg.into())), "{msg}");
+        }
+        assert!(!is_context_overflow(&SlagError::Provider("429: rate limited".into())));
+        assert!(!is_context_overflow(&SlagError::Provider("500: internal".into())));
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_harder_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.txt"), format!("{}\n", "y".repeat(6000))).unwrap();
+
+        let read = || tc("c1", "read_file", serde_json::json!({"path": "big.txt"}));
+        // Six fat read turns build prunable history beyond the protected
+        // tail, then the provider rejects on context, then accepts the
+        // harder-compacted retry.
+        let provider = FlakyProvider::new(vec![
+            Ok(resp_tools(vec![read()])),
+            Ok(resp_tools(vec![read()])),
+            Ok(resp_tools(vec![read()])),
+            Ok(resp_tools(vec![read()])),
+            Ok(resp_tools(vec![read()])),
+            Ok(resp_tools(vec![read()])),
+            Err("400 Bad Request: maximum context length is 8192 tokens".into()),
+            Ok(resp_text("done", FinishReason::Stop)),
+        ]);
+
+        let result = ForgeAgent::new(provider.clone(), ToolBox::new(dir.path()), "test/model")
+            .with_char_budget(40_000)
+            .run("system".into(), "task".into())
+            .await
+            .expect("overflow must be recovered by compaction, not propagated");
+        assert_eq!(result, "done");
+
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 8, "exactly one retry after the overflow");
+        // The retry request carries a pruned (stubbed) old tool result.
+        let retry = &requests[7];
+        assert!(
+            retry.messages.iter().any(|m| m.content.starts_with("[pruned old tool result")),
+            "retry must be compacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_turn_overflow_with_nothing_prunable_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = FlakyProvider::new(vec![
+            Err("400: maximum context length exceeded".into()),
+        ]);
+        let err = ForgeAgent::new(provider, ToolBox::new(dir.path()), "test/model")
+            .with_char_budget(40_000)
+            .run("system".into(), "task".into())
+            .await
+            .expect_err("nothing prunable — must fail, not loop");
+        assert!(err.to_string().contains("context"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn steers_are_requeued_when_the_provider_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = FlakyProvider::new(vec![Err("500: boom".into())]);
+        let queue: SteerQueue = Arc::new(Mutex::new(vec!["do NOT touch migrations".into()]));
+
+        let err = ForgeAgent::new(provider, ToolBox::new(dir.path()), "test/model")
+            .with_steer(queue.clone())
+            .run("system".into(), "task".into())
+            .await
+            .expect_err("provider error propagates");
+        assert!(err.to_string().contains("boom"), "got: {err}");
+
+        // The drained steer is back in the queue for the retry heat.
+        assert_eq!(*queue.lock().unwrap(), vec!["do NOT touch migrations".to_string()]);
     }
 
     #[tokio::test]

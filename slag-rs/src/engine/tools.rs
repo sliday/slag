@@ -29,6 +29,7 @@ use crate::error::SlagError;
 
 const READ_LIMIT_DEFAULT: usize = 2000;
 const BASH_TIMEOUT_DEFAULT: u64 = 120;
+const BASH_TIMEOUT_MAX: u64 = 600;
 const BASH_OUTPUT_CAP: usize = 30_000;
 const GREP_LINE_CAP: usize = 100;
 const DIFF_LINE_CAP: usize = 12;
@@ -324,7 +325,8 @@ impl ToolBox {
 
         if replace_all {
             if matches.is_empty() {
-                if content.contains(new) {
+                // contains("") is always true — never a signal of a prior edit.
+                if !new.is_empty() && content.contains(new) {
                     return Ok("already applied (new_string present, old_string absent)".into());
                 }
                 return Err(SlagError::Tool(format!(
@@ -367,17 +369,21 @@ impl ToolBox {
                 new.lines().map(String::from).collect::<Vec<_>>(),
             )
         } else {
-            if content.contains(new) {
-                return Ok("already applied (new_string present, old_string absent)".into());
-            }
             let file_lines: Vec<&str> = content.lines().collect();
             let needle_lines: Vec<&str> = old.lines().collect();
-            let m = fuzzy_find(&file_lines, &needle_lines).ok_or_else(|| {
-                SlagError::Tool(format!(
+            // The fuzzy ladder gets first shot: the "already applied"
+            // heuristic runs only after every strategy fails, and never for
+            // an empty new_string (contains("") is always true), so a
+            // still-applicable edit is never dropped as a false success.
+            let Some(m) = fuzzy_find(&file_lines, &needle_lines) else {
+                if !new.is_empty() && content.contains(new) {
+                    return Ok("already applied (new_string present, old_string absent)".into());
+                }
+                return Err(SlagError::Tool(format!(
                     "no match for old_string in {raw}.\n{}",
                     near_miss_hint(&content, old)
-                ))
-            })?;
+                )));
+            };
             // Escape-drift guard: a fuzzy match plus stray escapes from JSON
             // serialization would corrupt the write.
             if escape_drift(old, new) {
@@ -427,21 +433,28 @@ impl ToolBox {
             .get("timeout")
             .and_then(Value::as_u64)
             .unwrap_or(BASH_TIMEOUT_DEFAULT)
-            .max(1);
+            .clamp(1, BASH_TIMEOUT_MAX);
         self.run_shell(command, timeout).await
     }
 
     async fn run_shell(&self, command: &str, timeout_secs: u64) -> Result<String, SlagError> {
-        let child = Command::new("sh")
-            .arg("-lc")
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc")
             .arg(command)
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Own process group so a timeout can sweep grandchildren (compiler
+        // workers, backgrounded servers) — kill_on_drop only reaches `sh`.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let child = cmd
             .spawn()
             .map_err(|e| SlagError::Tool(format!("failed to spawn shell: {e}")))?;
+        #[cfg(unix)]
+        let pgid = child.id();
 
         let waited =
             tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
@@ -465,10 +478,22 @@ impl ToolBox {
                 Ok(out)
             }
             Ok(Err(e)) => Err(SlagError::Tool(format!("shell wait failed: {e}"))),
-            // kill_on_drop reaps the child when the timed-out future is dropped.
-            Err(_) => Err(SlagError::Tool(format!(
-                "command timed out after {timeout_secs}s and was killed"
-            ))),
+            Err(_) => {
+                // kill_on_drop reaped `sh` when the timed-out future was
+                // dropped; SIGKILL the whole process group so grandchildren
+                // don't outlive the "was killed" report.
+                #[cfg(unix)]
+                if let Some(pgid) = pgid {
+                    let _ = Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("kill -9 -{pgid} 2>/dev/null"))
+                        .output()
+                        .await;
+                }
+                Err(SlagError::Tool(format!(
+                    "command timed out after {timeout_secs}s and was killed"
+                )))
+            }
         }
     }
 
@@ -592,7 +617,8 @@ struct FuzzyMatch {
     start: usize,
     len: usize,
     strategy: &'static str,
-    /// Set by the indentation-flexible strategy: re-indent new_string to this.
+    /// Matched window's indent: re-indent new_string to this. All fuzzy
+    /// strategies set it; only an exact match splices new_string verbatim.
     indent: Option<String>,
 }
 
@@ -604,14 +630,18 @@ fn fuzzy_find(file_lines: &[&str], needle_lines: &[&str]) -> Option<FuzzyMatch> 
         return None;
     }
 
-    // (b) line-trimmed
+    // (b) line-trimmed. These strategies match despite indentation drift
+    // in the needle, so new_string is re-indented to the matched window's
+    // indent — splicing the drifted indentation verbatim would overwrite
+    // the file's correct indentation (tabs into a space-indented file).
     let starts = scan(file_lines, needle_lines, |a, b| a.trim() == b.trim());
     if starts.len() == 1 {
+        let start = starts[0];
         return Some(FuzzyMatch {
-            start: starts[0],
+            start,
             len: n,
             strategy: "line-trimmed",
-            indent: None,
+            indent: Some(common_indent(&file_lines[start..start + n])),
         });
     }
 
@@ -620,11 +650,12 @@ fn fuzzy_find(file_lines: &[&str], needle_lines: &[&str]) -> Option<FuzzyMatch> 
         normalize_ws(a) == normalize_ws(b)
     });
     if starts.len() == 1 {
+        let start = starts[0];
         return Some(FuzzyMatch {
-            start: starts[0],
+            start,
             len: n,
             strategy: "whitespace-normalized",
-            indent: None,
+            indent: Some(common_indent(&file_lines[start..start + n])),
         });
     }
 
@@ -1048,6 +1079,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_fuzzy_deletion_with_empty_new_string_applies() {
+        let (dir, tb) = setup();
+        // Tab-drifted old_string forces the fuzzy branch; new_string=""
+        // must delete the line, not short-circuit into a false
+        // "already applied" (contains("") is always true).
+        let path = write(&dir, "f.py", "keep\n    foo();\nkeep2\n");
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "f.py", "old_string": "\tfoo();", "new_string": ""}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("edited"), "{}", out.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep\nkeep2\n");
+    }
+
+    #[tokio::test]
+    async fn edit_fuzzy_applies_even_when_new_string_appears_elsewhere() {
+        let (dir, tb) = setup();
+        // new_string already exists at line 1, but the drifted old_string
+        // fuzzy-matches line 2 — the edit must run, not report success.
+        let path = write(&dir, "f.rs", "foo(2);\n    foo(1);\n");
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "f.rs", "old_string": "\tfoo(1);", "new_string": "foo(2);"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("edited"), "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "foo(2);\n    foo(2);\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_fuzzy_reindents_to_file_indentation() {
+        let (dir, tb) = setup();
+        // Tab-drifted needle against a space-indented file: the fuzzy
+        // splice must carry the file's 4-space indent, not the needle's
+        // tab, or the file ends up mixing tabs and spaces.
+        let path = write(&dir, "f.py", "def f():\n    foo();\n");
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "f.py", "old_string": "\tfoo();", "new_string": "\tbar();"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("line-trimmed"), "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "def f():\n    bar();\n"
+        );
+    }
+
+    #[tokio::test]
     async fn bash_happy() {
         let (_dir, tb) = setup();
         let out = tb
@@ -1065,6 +1155,35 @@ mod tests {
             .await;
         assert!(out.is_error);
         assert!(out.output.contains("timed out"), "{}", out.output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_the_whole_process_group() {
+        let (dir, tb) = setup();
+        // A backgrounded process outlives `sh` itself; the timeout must
+        // sweep the whole group, not just the direct child.
+        let out = tb
+            .dispatch(&call(
+                "bash",
+                json!({"command": "sleep 30 & echo $! > pid.txt; wait", "timeout": 1}),
+            ))
+            .await;
+        assert!(out.is_error);
+        assert!(out.output.contains("timed out"), "{}", out.output);
+
+        let pid = std::fs::read_to_string(dir.path().join("pid.txt"))
+            .expect("pid recorded before timeout")
+            .trim()
+            .to_string();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!alive, "backgrounded child (pid {pid}) survived the timeout");
     }
 
     #[tokio::test]

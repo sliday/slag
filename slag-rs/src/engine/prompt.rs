@@ -143,7 +143,11 @@ pub fn workspace_snapshot(root: &Path) -> String {
                 if !log.is_empty() {
                     s.push_str("- last commits:\n");
                     for line in log.lines() {
-                        s.push_str(&format!("  {line}\n"));
+                        // Commit subjects are untrusted text: strip control
+                        // chars and cap length before prompt interpolation.
+                        let clean: String =
+                            line.chars().filter(|c| !c.is_control()).take(100).collect();
+                        s.push_str(&format!("  {clean}\n"));
                     }
                 }
             }
@@ -296,6 +300,32 @@ mod tests {
         let snap = workspace_snapshot(dir.path());
         assert!(snap.contains("no git"));
         assert!(snap.contains("snapshot at session start — re-check with git"));
+    }
+
+    #[test]
+    fn snapshot_sanitizes_commit_subjects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "forge@slag.test"]);
+        run(&["config", "user.name", "slag"]);
+        let subject = format!("evil\x1b[31m {}", "x".repeat(200));
+        run(&["commit", "--allow-empty", "-m", &subject]);
+
+        let snap = workspace_snapshot(root);
+        assert!(!snap.contains('\x1b'), "ESC must not reach the prompt");
+        let line = snap.lines().find(|l| l.contains("evil")).unwrap();
+        // "  " indent + subject line capped at 100 chars.
+        assert!(line.chars().count() <= 102, "got {} chars", line.chars().count());
     }
 
     #[test]

@@ -27,6 +27,15 @@ use smith::EngineHooks;
 async fn main() {
     let cli = Cli::parse();
 
+    // Advertised isolation that silently does nothing corrupts trust (and
+    // repos): until wired, say so loudly instead of ignoring the flag.
+    if cli.worktree {
+        eprintln!(
+            "  \x1b[38;5;220m⚠\x1b[0m --worktree is not implemented yet; \
+             all ingots run in the shared checkout"
+        );
+    }
+
     // Model flags override env; EngineConfig::load reads env downstream.
     if let Some(m) = &cli.model {
         std::env::set_var("SLAG_MODEL_BASE", m);

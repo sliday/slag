@@ -26,11 +26,20 @@ impl Crucible {
         let mut header_lines = Vec::new();
         let mut ingots = Vec::new();
 
-        for line in content.lines() {
+        for (n, line) in content.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with("(ingot ") {
                 if let Some(ingot) = parse_ingot(trimmed) {
                     ingots.push(ingot);
+                } else {
+                    // A corrupted line must not vanish silently: the ingot
+                    // (and its work) would be lost on the next save.
+                    let preview: String = trimmed.chars().take(80).collect();
+                    eprintln!(
+                        "slag: {}:{}: dropped unparseable ingot line: {preview}",
+                        path.display(),
+                        n + 1
+                    );
                 }
             } else {
                 header_lines.push(line.to_string());
@@ -237,6 +246,16 @@ mod tests {
         let c = Crucible::load(f.path()).unwrap();
         assert_eq!(c.ingots.len(), 4);
         assert_eq!(c.header_lines.len(), 2);
+    }
+
+    #[test]
+    fn load_drops_unparseable_ingot_lines_without_keeping_them_as_header() {
+        let mut content = sample_crucible();
+        content.push_str("(ingot corrupted garbage line)\n");
+        let f = write_temp(&content);
+        let c = Crucible::load(f.path()).unwrap();
+        assert_eq!(c.ingots.len(), 4, "corrupt line must not parse");
+        assert_eq!(c.header_lines.len(), 2, "corrupt line must not become header");
     }
 
     #[test]
