@@ -3,55 +3,57 @@
 Source: 8-beat sweep of /Users/stas/Playground/Claude Code src (140 raw ideas, curated to 100).
 Status legend: [ ] todo · [~] in flight · [x] done
 
+Progress: wave 1 (items 1-16) + item 18 shipped in v2.2.0. Wave 2 in flight.
+
 
 ## Wave 1
 
-- [ ] **1. Adopt Retry-After-aware exponential backoff with jitter** (S)
+- [x] **1. Adopt Retry-After-aware exponential backoff with jitter** (S)
   engine/provider.rs: replace BACKOFF_MS=[250,1000] fixed array with base-500ms doubling capped at 32s plus 0-25% jitter; parse the Retry-After response header on 429 and let the server directive override the computed delay.
   _evidence: Claude Code src/services/api/withRetry.ts:519-548_
-- [ ] **2. Broaden retry classification: 408/409/5xx, connect errors, x-should-retry** (S)
+- [x] **2. Broaden retry classification: 408/409/5xx, connect errors, x-should-retry** (S)
   engine/provider.rs chat_impl: extend the '429 || 5xx' check to 408/409/429/5xx plus reqwest connect/timeout errors; honor an x-should-retry header if OpenRouter sends it; expose retryable() on a structured error in error.rs.
   _evidence: Claude Code src/services/api/withRetry.ts:610-621,696-787_
-- [ ] **3. Stop charging heats for transient provider errors** (S)
+- [x] **3. Stop charging heats for transient provider errors** (S)
   pipeline/forge.rs:386-404: classify SlagError::Provider into transient (429/5xx/timeout) vs permanent; transient failures get a separate counter and do NOT increment :heat or run proof/judge. Prevents network weather cracking an ingot in 20 seconds.
   _evidence: Claude Code src/query.ts:1258-1265; slag-rs/src/pipeline/forge.rs:386-404_
-- [ ] **4. Treat empty or truncated 200 responses as retryable** (S)
+- [x] **4. Treat empty or truncated 200 responses as retryable** (S)
   engine/provider.rs normalize(): a 200 with empty choices, null message, or missing finish_reason must classify as a retryable Provider error inside the attempt loop instead of passing through as an empty assistant turn.
   _evidence: Claude Code src/services/api/claude.ts:2337-2364_
-- [ ] **5. Synthesize error tool_results for orphaned tool calls on abort** (S)
+- [x] **5. Synthesize error tool_results for orphaned tool calls on abort** (S)
   engine/agent.rs: when cancel or a provider/tool error aborts mid-batch after tool_calls arrived, append is_error tool_results for every unanswered call before returning, so next-heat transcripts never carry dangling tool_calls (OpenAI-format backends 400 on replay).
   _evidence: Claude Code src/query.ts:123-149,984,1025_
-- [ ] **6. Enforce hard per-ingot and per-run spend caps** (S)
+- [x] **6. Enforce hard per-ingot and per-run spend caps** (S)
   config.rs gains max_cost_per_ingot / max_cost_per_run; agent.rs checks accumulated usage.cost each turn (engine/mod.rs:130-141 already sums it), emits a Warning event at 80% and cracks with reason 'budget' at 100%. Unattended runs need a runaway-spend guard.
   _evidence: Claude Code src/QueryEngine.ts:971-1002; src/components/CostThresholdDialog.tsx_
-- [ ] **7. Add a compaction circuit breaker after 3 failed shrinks** (S)
+- [x] **7. Add a compaction circuit breaker after 3 failed shrinks** (S)
   engine/agent.rs chat_shrinking + engine/compact.rs: count consecutive compactions that fail to get below budget; after 3, crack the ingot with a clear 'context irrecoverable' error instead of halving budgets forever, and record it in the JSONL event stream.
   _evidence: Claude Code src/services/compact/autoCompact.ts:57-70,257-349; src/query.ts:1292-1296_
-- [ ] **8. Gate read_file on byte size before reading** (S)
+- [x] **8. Gate read_file on byte size before reading** (S)
   engine/tools.rs read_file: stat first; if len > 256 KB and no offset/limit given, return an error naming the size and instructing offset/limit use — the error costs ~100 bytes vs ~25K tokens of truncated content.
   _evidence: Claude Code src/tools/FileReadTool/limits.ts:1-18; src/utils/file.ts:48_
-- [ ] **9. Coerce stringly-typed tool args ("true", "5") before parsing** (S)
+- [x] **9. Coerce stringly-typed tool args ("true", "5") before parsing** (S)
   engine/tools.rs arg helpers: as_bool silently drops a string "true" to false today. Add opt_bool/opt_u64 helpers accepting Value::String("true"/"false") and numeric strings, used by edit_file/bash/read_file. Naive truthiness is wrong ('false' -> true).
   _evidence: Claude Code src/utils/semanticBoolean.ts; src/utils/semanticNumber.ts_
-- [ ] **10. Interpret per-command exit codes (grep 1 = no matches, not error)** (S)
+- [x] **10. Interpret per-command exit codes (grep 1 = no matches, not error)** (S)
   engine/tools.rs run_shell: before appending '(exit N)', consult a static map keyed on the last pipeline segment's argv[0] (grep/rg 1='no matches', diff 1='files differ', test 1='condition false'); only >=2 is a real error. Also fixes proofs using grep/diff.
   _evidence: Claude Code src/tools/BashTool/commandSemantics.ts_
-- [ ] **11. Default-deny destructive bash commands with a confirm override** (S)
+- [x] **11. Default-deny destructive bash commands with a confirm override** (S)
   engine/tools.rs bash: port the regex table (git reset --hard, push --force, clean -f, rm -rf, --no-verify, DROP TABLE, terraform destroy...); since slag forges unattended, refuse matches with the warning as the tool error plus a JSONL event; config flag to relax per crucible. Merges the advisory-annotation variant.
   _evidence: Claude Code src/tools/BashTool/destructiveCommandWarning.ts:12-102_
-- [ ] **12. Add a glob tool with 100-file cap and truncation notice** (S)
+- [x] **12. Add a glob tool with 100-file cap and truncation notice** (S)
   engine/tools.rs: new `glob` tool (globset or `rg --files -g`), sandbox-resolved root, 100-file cap with '(Results are truncated...)' notice, paths relative to anvil root, corrected-path suggestion on missing dirs. Stops the smith burning bash calls on `find`.
   _evidence: Claude Code src/tools/GlobTool/GlobTool.ts:154-197_
-- [ ] **13. Warn edit_file about the read_file line-number prefix** (S)
+- [x] **13. Warn edit_file about the read_file line-number prefix** (S)
   engine/tools.rs edit_file spec: slag's read_file emits 'LINENUM|CONTENT' but edit_file never mentions it. Add: never include the prefix in old_string/new_string; match content after the | byte-for-byte. Kills the #1 cause of failed exact-match edits.
   _evidence: Claude Code src/tools/FileEditTool/prompt.ts (getDefaultEditDescription)_
-- [ ] **14. Add numeric length anchors to the smith prompt** (S)
+- [x] **14. Add numeric length anchors to the smith prompt** (S)
   engine/prompt.rs stable band: smiths are headless, inter-tool commentary is pure waste. Add '≤25 words between tool calls; finish summary ≤120 words'. Measured ~1.2% output-token reduction vs qualitative 'be concise'.
   _evidence: Claude Code src/constants/prompts.ts:529-537_
-- [ ] **15. Add the faithful-reporting rule to guard the proof gate** (S)
+- [x] **15. Add the faithful-reporting rule to guard the proof gate** (S)
   engine/prompt.rs '## Rules' + finish tool description in engine/tools.rs: 'report outcomes faithfully; never claim tests pass when output shows failures; never weaken checks to manufacture green'. Pair with 'never modify the proof command or its tests unless the ingot asks'. Written against a measured 29-30% false-claim rate.
   _evidence: Claude Code src/constants/prompts.ts:237-242_
-- [ ] **16. Head-keep bash truncation with '[N lines truncated]' counts** (S)
+- [x] **16. Head-keep bash truncation with '[N lines truncated]' counts** (S)
   engine/tools.rs truncate_tail: switch to head-keep (or head 20% + tail 80% since build errors print last) and report the hidden line count instead of bytes; cap from SLAG_BASH_OUTPUT_CAP with a hard ceiling in config.rs.
   _evidence: Claude Code src/tools/BashTool/utils.ts:133-165; src/utils/shell/outputLimits.ts_
 
@@ -60,7 +62,7 @@ Status legend: [ ] todo · [~] in flight · [x] done
 - [ ] **17. Require read-before-edit and refuse stale edits via mtime** (M)
   engine/tools.rs: ToolBox read_state: Mutex<HashMap<PathBuf,(mtime, checksum)>> updated by read/write/edit; edit_file and write_file on existing files error if never read or mtime moved since. State the enforcement in both tool descriptions ('this tool will error if...'). Protects proof-gated ingots from clobbering parallel-anvil changes.
   _evidence: Claude Code src/tools/FileEditTool/FileEditTool.ts:275-306; src/tools/FileWriteTool/FileWriteTool.ts:190-216_
-- [~] **18. Return a 'file unchanged' stub on repeated identical reads** (M)
+- [x] **18. Return a 'file unchanged' stub on repeated identical reads** (M)
   engine/tools.rs read_file: keep per-session map path -> (mtime, hash, offset/limit); on identical re-read return 'File unchanged since last read — refer to the earlier tool_result' instead of contents. Big token win in long forge loops.
   _evidence: Claude Code src/tools/FileReadTool/prompt.ts (FILE_UNCHANGED_STUB); FileReadTool.ts:686-691_
 - [ ] **19. Spill oversized tool results to disk with preview + path** (M)
