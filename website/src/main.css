@@ -21,7 +21,7 @@
     --table-border-color: #6b7385;
     --separator-color: #6b7385;
 
-    /* Slag palette — maps ANSI colors from slag.sh */
+    /* Slag palette — mirrors COLD/WARM/HOT/BRIGHT/PURE in slag-rs/src/tui.rs */
     --slag-cold: #6b7385;    /* GRAY — dim/inactive */
     --slag-warm: #e06c75;    /* RED — ore, cracked, errors */
     --slag-hot: #ff9940;     /* ORANGE 208 — molten, in-progress */
@@ -166,27 +166,29 @@ a:hover {
   color: var(--slag-hot);
 }
 
-/* Copy button - spans full height of 2-line blocks */
+/* Copy button - minimal icon */
 .copy-btn {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  right: 0;
-  background: var(--background2);
-  color: var(--foreground1);
+  top: 50%;
+  transform: translateY(-50%);
+  right: 1ch;
+  background: none;
+  color: var(--foreground2);
   border: none;
-  border-left: 1px solid var(--foreground2);
-  font-family: var(--font-family);
-  font-size: 0.75rem;
-  padding: 0 1.5ch;
+  padding: 0.25em;
   cursor: pointer;
   display: flex;
   align-items: center;
+  opacity: 0.5;
+  transition: opacity 0.2s, color 0.2s;
+}
+
+.cmd-line:hover .copy-btn {
+  opacity: 1;
 }
 
 .copy-btn:hover {
   color: var(--slag-bright);
-  border-color: var(--slag-bright);
 }
 
 /* Pipeline diagrams */

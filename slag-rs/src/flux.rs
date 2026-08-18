@@ -167,7 +167,14 @@ pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
         - :max = attempts (5 simple, 8+ complex)\n\
         - :smelt = 0 (re-smelt count; system manages this)\n\
         - :proof = shell verification command\n\
-        - :duel = t (force twin-cast A/B duel) | nil (block it) | omit for auto (grade-gated)\n\n\
+        - :duel = t (force multi-cast duel) | nil (block it) | omit for auto (grade-gated)\n\
+        - :casts = 1|2|3 parallel smiths forging the ingot; omit for auto\n\n\
+        CASTS HEURISTICS (set :casts per ingot):\n\
+        - 1: grade <= 2, mechanical work (create/rename/config), a deterministic proof \
+        (test -f / grep -q), or :solo nil\n\
+        - 2: grade 3-4, design-choice work (API shape, refactor strategy, UX), or a retry \
+        after a crack\n\
+        - 3: grade 5, or taste-dominant polish work\n\n\
         PROOF COMMANDS:\n\
         - test -f FILE / test -d DIR\n\
         - grep -q PATTERN FILE\n\
@@ -232,6 +239,7 @@ mod tests {
             proof: "true".into(),
             work: "Do the thing".into(),
             duel: None,
+            casts: None,
             extra: vec![],
         }
     }
@@ -240,6 +248,16 @@ mod tests {
     fn first_heat_flux_states_cmd_contract() {
         let flux = prepare_flux(&sample_ingot(), None);
         assert!(flux.contains("CMD: <shell command to verify>"));
+    }
+
+    #[test]
+    fn founder_prompt_documents_the_casts_field() {
+        let prompt = founder_prompt("build it", "the plan");
+        assert!(prompt.contains(":casts = 1|2|3"), "field table must list :casts");
+        assert!(prompt.contains("CASTS HEURISTICS"), "heuristics block missing");
+        for tier in ["- 1: grade <= 2", "- 2: grade 3-4", "- 3: grade 5"] {
+            assert!(prompt.contains(tier), "missing tier {tier:?}");
+        }
     }
 
     #[test]

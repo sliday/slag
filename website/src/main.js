@@ -7,12 +7,12 @@ function initCopyButtons() {
     const wrapper = el.closest('.cmd-line') || el;
     const btn = document.createElement('button');
     btn.className = 'copy-btn';
-    btn.innerHTML = '📋';
+    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
     btn.title = 'Copy to clipboard';
     const copyText = () => {
       navigator.clipboard.writeText(el.textContent).then(() => {
-        btn.innerHTML = '✓';
-        setTimeout(() => { btn.innerHTML = '📋'; }, 1500);
+        btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>';
+        setTimeout(() => { btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>'; }, 1500);
       });
     };
     btn.addEventListener('click', copyText);

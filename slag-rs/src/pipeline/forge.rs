@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::config::{EngineConfig, CRUCIBLE, LEDGER};
+use crate::config::{DuelMode, EngineConfig, CRUCIBLE, LEDGER};
 use crate::crucible::{Crucible, CRUCIBLE_LOCK};
 use crate::engine::provider::OpenRouter;
 use crate::engine::{emit, EngineEvent};
@@ -116,14 +116,15 @@ pub async fn run(
             for ingot in ingot_snapshots {
                 let smith = crate::smith::make_smith(config, ingot.skill.as_str(), ingot.grade, hooks);
                 let task_hooks = hooks.clone();
-                let duel_cfg = duel::should_duel(config, &ingot).then(|| config.clone());
+                let n_casts = effective_casts(config, &ingot);
+                let duel_cfg = (n_casts >= 2).then(|| (config.clone(), n_casts));
                 set.spawn(async move {
                     emit(
                         &task_hooks.events,
                         EngineEvent::IngotStart { id: ingot.id.clone(), work: ingot.work.clone() },
                     );
-                    let result =
-                        forge_ingot(&ingot, smith.as_ref(), duel_cfg.as_ref(), &task_hooks).await;
+                    let duel = duel_cfg.as_ref().map(|(cfg, n)| (cfg, *n));
+                    let result = forge_ingot(&ingot, smith.as_ref(), duel, &task_hooks).await;
                     (ingot.id.clone(), result)
                 });
             }
@@ -270,27 +271,32 @@ pub async fn run(
     }
 }
 
-/// Forge one solo ingot: twin-cast duel when configured, otherwise (or on
-/// duel fallthrough/error) the normal single-smith strike.
+/// Forge one solo ingot: multi-cast duel when the cast count says so,
+/// otherwise (or on duel fallthrough/error) the normal single-smith
+/// strike.
 async fn forge_ingot(
     ingot: &Ingot,
     smith: &dyn Smith,
-    duel_cfg: Option<&EngineConfig>,
+    duel_cfg: Option<(&EngineConfig, u8)>,
     hooks: &EngineHooks,
 ) -> Result<(), SlagError> {
-    if let Some(cfg) = duel_cfg {
+    if let Some((cfg, n_casts)) = duel_cfg {
         // Casts are rebuilt every round; one shared accumulator keeps the
         // ingot cost cap cumulative across all of an ingot's duel sessions.
         let cast_spend = crate::engine::agent::SpendAccum::default();
         let casts = |cast: char, root: &Path| -> Box<dyn Smith> {
-            let (model, cfg) = if cast == 'a' {
-                (cfg.model_base.clone(), cfg.clone())
-            } else {
-                (cfg.model_alt.clone(), cfg.clone())
+            // Cast A forges on the base model, B on the alt, and the
+            // creative C on the plan model — three flavors when they are
+            // pinned apart, and the direction prompts carry the diversity
+            // when everything routes through openrouter/auto.
+            let model = match cast {
+                'a' => cfg.model_base.clone(),
+                'b' => cfg.model_alt.clone(),
+                _ => cfg.model_plan.clone(),
             };
             Box::new(
                 crate::smith::native::NativeSmith::cast(
-                    cfg,
+                    cfg.clone(),
                     ingot.skill.as_str(),
                     ingot.grade,
                     root.to_path_buf(),
@@ -300,10 +306,25 @@ async fn forge_ingot(
                 .with_ingot_spend(cast_spend.clone()),
             )
         };
-        let judge_provider =
-            OpenRouter::with_base_url(cfg.api_key.clone(), cfg.base_url.clone());
+        // The judge's own LLM calls count against the same caps as the
+        // casts: the wrapper folds their cost into `cast_spend` and the
+        // run-wide spend, and stops calling once the run cap is spent.
+        let judge_provider = crate::engine::agent::SpendTracked::new(
+            OpenRouter::with_base_url(cfg.api_key.clone(), cfg.base_url.clone()),
+            cast_spend.clone(),
+        );
 
-        match duel::duel_ingot(Path::new("."), ingot, cfg, hooks, &casts, &judge_provider).await {
+        match duel::duel_ingot(
+            Path::new("."),
+            ingot,
+            cfg,
+            hooks,
+            &casts,
+            &judge_provider,
+            n_casts,
+        )
+        .await
+        {
             Ok(duel::DuelOutcome::Merged { winner, rounds }) => {
                 if !tui::is_quiet() {
                     println!(
@@ -347,7 +368,17 @@ async fn forge_ingot(
         if fallback.max == 0 {
             return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
         }
-        return strike_ingot(&fallback, smith, hooks).await;
+        // The fallback smith shares the duel's spend accumulator: the
+        // caller-built `smith` starts a fresh $0, which would let one
+        // ingot spend up to 2x SLAG_MAX_COST_INGOT (duel + fallback).
+        let fallback_smith = crate::smith::make_smith_with_spend(
+            cfg,
+            ingot.skill.as_str(),
+            ingot.grade,
+            hooks,
+            cast_spend.clone(),
+        );
+        return strike_ingot(&fallback, fallback_smith.as_ref(), hooks).await;
     }
     strike_ingot(ingot, smith, hooks).await
 }
@@ -355,6 +386,25 @@ async fn forge_ingot(
 /// Heats left after `spent` of a `max` budget.
 fn remaining_budget(max: u8, spent: u8) -> u8 {
     max.saturating_sub(spent)
+}
+
+/// Casts for this ingot right now: the config resolution plus crack-retry
+/// escalation — an ingot back on the anvil after burning heat gets a
+/// second opinion (1 → 2), unless something pinned it to one cast
+/// (explicit `:casts`, `:duel nil`, `SLAG_DUEL=off`, or sequential work).
+fn effective_casts(config: &EngineConfig, ingot: &Ingot) -> u8 {
+    if duel::should_duel(config, ingot) {
+        return config.casts_for(ingot);
+    }
+    if ingot.heat > 0
+        && ingot.solo
+        && ingot.casts.is_none()
+        && ingot.duel != Some(false)
+        && config.duel != DuelMode::Off
+    {
+        return 2;
+    }
+    1
 }
 
 /// True when the smith's own stderr narrator will drive the display: no
@@ -650,6 +700,76 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    fn forge_test_config(duel: DuelMode) -> EngineConfig {
+        EngineConfig {
+            api_key: "sk-or-test".into(),
+            model_base: "base/model".into(),
+            model_plan: "plan/model".into(),
+            model_alt: "alt/model".into(),
+            model_judge: "judge/model".into(),
+            effort: None,
+            base_url: crate::engine::OPENROUTER_BASE.into(),
+            duel,
+            duel_rounds_override: None,
+            screenshot_cmd: None,
+        }
+    }
+
+    fn forge_test_ingot(grade: u8, heat: u8) -> Ingot {
+        Ingot {
+            id: "ix".into(),
+            status: crate::sexp::Status::Ore,
+            solo: true,
+            grade,
+            skill: crate::sexp::Skill::Default,
+            heat,
+            max: 5,
+            smelt: 0,
+            proof: "cargo test".into(),
+            work: "refactor the scheduler".into(),
+            duel: None,
+            casts: None,
+            extra: vec![],
+        }
+    }
+
+    #[test]
+    fn crack_retry_escalates_one_cast_to_two() {
+        let config = forge_test_config(DuelMode::Auto);
+        // Fresh grade-1 ingot: one cast. Same ingot back with heat: two.
+        let fresh = forge_test_ingot(1, 0);
+        assert_eq!(effective_casts(&config, &fresh), 1);
+        let retried = forge_test_ingot(1, 2);
+        assert_eq!(effective_casts(&config, &retried), 2, "heat > 0 bumps 1 → 2");
+
+        // Multi-cast resolutions pass through untouched.
+        let design = forge_test_ingot(4, 1);
+        assert_eq!(effective_casts(&config, &design), 2);
+        let studio = forge_test_ingot(5, 0);
+        assert_eq!(effective_casts(&config, &studio), 3);
+    }
+
+    #[test]
+    fn crack_retry_escalation_respects_single_cast_pins() {
+        let mut retried = forge_test_ingot(1, 2);
+
+        // SLAG_DUEL=off is a kill switch, retry or not.
+        assert_eq!(effective_casts(&forge_test_config(DuelMode::Off), &retried), 1);
+
+        let config = forge_test_config(DuelMode::Auto);
+        // An explicit :casts 1 pin holds through retries.
+        retried.casts = Some(1);
+        assert_eq!(effective_casts(&config, &retried), 1);
+        retried.casts = None;
+        // :duel nil blocks the escalation too.
+        retried.duel = Some(false);
+        assert_eq!(effective_casts(&config, &retried), 1);
+        retried.duel = None;
+        // Sequential work never fans out.
+        retried.solo = false;
+        assert_eq!(effective_casts(&config, &retried), 1);
+    }
 
     #[test]
     fn remaining_budget_never_exceeds_max_or_underflows() {

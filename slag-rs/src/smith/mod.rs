@@ -43,6 +43,22 @@ pub fn make_smith(cfg: &EngineConfig, skill: &str, grade: u8, hooks: &EngineHook
     ))
 }
 
+/// Forge smith factory sharing an existing ingot spend accumulator.
+/// The duel fallback strike uses this so the single-smith path continues
+/// the ingot's budget instead of restarting from $0.
+pub fn make_smith_with_spend(
+    cfg: &EngineConfig,
+    skill: &str,
+    grade: u8,
+    hooks: &EngineHooks,
+    spend: crate::engine::agent::SpendAccum,
+) -> Box<dyn Smith> {
+    Box::new(
+        native::NativeSmith::forge(cfg.clone(), skill, grade, workspace_root(), hooks)
+            .with_ingot_spend(spend),
+    )
+}
+
 /// Plan smith factory (surveyor/founder passes).
 pub fn make_plan_smith(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
     Box::new(native::NativeSmith::plan(cfg.clone(), workspace_root(), hooks))
@@ -170,17 +186,58 @@ mod tests {
 
         // Model per role: forge at grade 1 works on base, both plan-mode
         // factories reason on the plan model.
+        // Each invoke also fetches GET /models for the context window;
+        // only the chat calls carry a JSON body with a model id.
         let models: Vec<String> = server
             .received_requests()
             .await
             .unwrap()
             .iter()
+            .filter(|req| req.url.path().ends_with("/chat/completions"))
             .map(|req| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
                 body["model"].as_str().unwrap().to_string()
             })
             .collect();
         assert_eq!(models, ["test/base", "test/plan", "test/plan"]);
+    }
+
+    #[tokio::test]
+    async fn make_smith_with_spend_shares_the_ingot_accumulator() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": { "content": "forged" },
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                        "cost": 0.25,
+                    },
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        // The duel-fallback factory must continue the shared ingot spend,
+        // not restart from a fresh $0 accumulator.
+        let acc = crate::engine::agent::SpendAccum::default();
+        *acc.lock().unwrap() = 0.50;
+        let cfg = openrouter_only_config(server.uri());
+        let smith = make_smith_with_spend(&cfg, "rust", 1, &EngineHooks::default(), acc.clone());
+        assert_eq!(smith.invoke("do the thing").await.unwrap(), "forged");
+        assert!(
+            (*acc.lock().unwrap() - 0.75).abs() < 1e-9,
+            "session cost folds into the shared accumulator"
+        );
     }
 
     #[test]

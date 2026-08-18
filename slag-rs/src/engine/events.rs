@@ -481,10 +481,13 @@ impl RenderState {
     /// clamped to one terminal row so `\r` rewrites never leave a wrapped
     /// first row behind.
     fn live_text(&self) -> String {
+        // Label and elapsed must describe the SAME call — the oldest
+        // unresolved one — or the line pairs a fresh call's name with a
+        // stale call's timer.
         let mut label = self
             .narrate
             .clone()
-            .or_else(|| self.pending.back().map(PendingCall::label))
+            .or_else(|| self.pending.front().map(PendingCall::label))
             .unwrap_or_default();
         let secs = self
             .pending
@@ -652,6 +655,14 @@ impl StderrNarrator {
             apply_ops(&state.finish());
         })
     }
+}
+
+/// Pipeline-level print path: route a finished line (ingot header, footer,
+/// status) through the shared stderr live-line state instead of a bare
+/// `println!`. A narrator's parked live line is cleared first, so a
+/// spinner row is never orphaned above an ingot footer.
+pub fn print_line(text: impl Into<String>) {
+    apply_ops(&[RenderOp::Print(text.into())]);
 }
 
 #[cfg(test)]
@@ -1184,5 +1195,57 @@ mod tests {
             }
             let _ = state.finish();
         }
+    }
+
+    #[test]
+    fn live_line_label_and_elapsed_track_the_oldest_unresolved_call() {
+        let mut state = RenderState::new(true);
+        state.feed(&start("bash", r#"{"command": "cargo build"}"#));
+        // A second call starts while the first is still unresolved: the
+        // live line keeps describing the first (oldest) call — the same
+        // call whose elapsed timer it shows.
+        let ops = state.feed(&start("read_file", r#"{"path": "src/x.rs"}"#));
+        let live = ops
+            .iter()
+            .find_map(|op| match op {
+                RenderOp::RewriteLive(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("live line");
+        assert!(live.contains("Run(cargo)"), "{live}");
+        assert!(!live.contains("Read(src/x.rs)"), "{live}");
+    }
+
+    #[test]
+    fn ingot_footer_clears_the_live_line_instead_of_orphaning_it() {
+        let mut state = RenderState::new(true);
+        state.feed(&EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        state.feed(&start("bash", r#"{"command": "cargo build"}"#));
+        // Live line is up; the footer's ClearLive must precede its Print
+        // in the op stream or the spinner row is left above the footer.
+        let ops = state.feed(&EngineEvent::IngotDone { id: "i1".into(), ok: true });
+        let clear_at = ops.iter().position(|op| matches!(op, RenderOp::ClearLive));
+        let print_at = ops
+            .iter()
+            .position(|op| matches!(op, RenderOp::Print(s) if s.contains("[i1] forged")));
+        assert!(clear_at.is_some() && print_at.is_some(), "{ops:?}");
+        assert!(clear_at < print_at, "clear must precede the footer: {ops:?}");
+    }
+
+    #[test]
+    fn pipeline_print_clears_a_foreign_live_line_before_an_ingot_footer() {
+        // `print_line` routes pipeline prints through the shared live
+        // flag: narrator A's parked live row is cleared before the ingot
+        // footer lands, never orphaned above it.
+        let mut out: Vec<u8> = Vec::new();
+        let mut live = false;
+        write_ops(&[RenderOp::RewriteLive("  ◐ Run(cargo)".into())], &mut out, &mut live);
+        assert!(live);
+        write_ops(&[RenderOp::Print("  ✅ [i1] forged".into())], &mut out, &mut live);
+        assert!(!live);
+        let s = String::from_utf8(out).unwrap();
+        let footer_at = s.find("[i1] forged").unwrap();
+        let clear_at = s.rfind("\r\x1b[K").unwrap();
+        assert!(clear_at < footer_at, "footer must clear the live row first: {s:?}");
     }
 }

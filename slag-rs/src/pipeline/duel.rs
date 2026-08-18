@@ -1,9 +1,10 @@
-//! duel — twin-cast forging (plan section 9). Two smiths solve the same
-//! ingot in isolated worktrees under opposing directions (minimal vs
-//! robust) on different model families. Proofs gate, the assayer ranks:
-//! a cast that fails `:proof` never reaches the judge. Winner merges via
-//! the same branch/merge mechanics solo ingots use; loser is discarded
-//! with its critique seeding the next round.
+//! duel — multi-cast forging (plan section 9, adaptive casts). Two or
+//! three smiths solve the same ingot in isolated worktrees under
+//! opposing directions (minimal / robust / creative). Proofs gate, the
+//! assayer ranks: a cast that fails `:proof` never reaches the judge.
+//! Three casts are judged pairwise round-robin. Winner merges via the
+//! same branch/merge mechanics solo ingots use; losers are discarded
+//! with the critique seeding the next round.
 
 use std::path::{Path, PathBuf};
 
@@ -30,8 +31,25 @@ const MARGIN_STOP: u8 = 20;
 /// gained less than this versus the prior round.
 const PLATEAU_GAIN: u8 = 5;
 
+/// Escalation trigger (adaptive casts): a 2-cast verdict this close is a
+/// coin flip, so the next round adds a third, creative cast for a real
+/// spread. Round and spend caps still bind.
+const ESCALATE_MARGIN: u8 = 10;
+
 const DIRECTION_A: &str = "\nDirection: minimal — smallest correct change.";
 const DIRECTION_B: &str = "\nDirection: robust — defensive, thorough.";
+const DIRECTION_C: &str = "\nDirection: creative — question the obvious implementation; a \
+different architecture is welcome if the proof passes.";
+
+const CAST_LABELS: [char; 3] = ['a', 'b', 'c'];
+
+fn direction_for(label: char) -> &'static str {
+    match label {
+        'a' => DIRECTION_A,
+        'b' => DIRECTION_B,
+        _ => DIRECTION_C,
+    }
+}
 
 
 #[derive(Debug)]
@@ -43,26 +61,25 @@ pub enum DuelOutcome {
     FellThrough,
 }
 
-/// Duel policy: `:duel t` forces, `:duel nil` blocks, absent defers to
-/// config Auto/On/Off. Sequential (`:solo nil`) ingots never duel — two
-/// casts of overlapping sequential work is a merge-conflict factory.
+/// Duel policy, expressed through the adaptive cast count: an ingot
+/// duels when `casts_for` resolves to two or more. `:casts` pins and
+/// `:duel t`/`:duel nil` overrides win over the configured mode;
+/// sequential (`:solo nil`) ingots never duel — two casts of overlapping
+/// sequential work is a merge-conflict factory.
 pub fn should_duel(cfg: &EngineConfig, ingot: &Ingot) -> bool {
-    if !ingot.solo {
-        return false;
-    }
-    match ingot.duel {
-        Some(force) => force,
-        None => cfg.duel_qualifies(ingot.grade),
-    }
+    cfg.casts_for(ingot) >= 2
 }
 
-/// Run the twin-cast duel loop for one ingot from `repo`.
+/// Run the multi-cast duel loop for one ingot from `repo`.
 ///
-/// Per round: two fresh worktrees off the current base, both casts run
-/// concurrently, both proof-check inside their own worktree. Both fail →
-/// fall through. One passes → merge it (margin 100). Both pass → the
-/// assayer rules; margin >= `MARGIN_STOP` or the final round merges the
-/// winner, anything less discards both and re-casts with the critique.
+/// Per round: `n` fresh worktrees off the current base (n = 2 or 3), all
+/// casts run concurrently under opposing directions (minimal / robust /
+/// creative), each proof-checks inside its own worktree. All fail → fall
+/// through. One passes → merge it (margin 100). Two pass → the assayer
+/// rules pairwise; three pass → pairwise round-robin (AB, AC, BC), most
+/// wins takes the round. Margin >= `MARGIN_STOP` or the final round
+/// merges the winner, anything less discards all and re-casts with the
+/// critique — escalating a too-close 2-cast round to 3 casts.
 pub async fn duel_ingot<F>(
     repo: &Path,
     ingot: &Ingot,
@@ -70,9 +87,10 @@ pub async fn duel_ingot<F>(
     hooks: &EngineHooks,
     casts: &F,
     judge_provider: &dyn Provider,
+    initial_casts: u8,
 ) -> Result<DuelOutcome, SlagError>
 where
-    // Builds the smith for one cast: `('a' | 'b', worktree_root)` → smith.
+    // Builds the smith for one cast: `('a' | 'b' | 'c', worktree_root)` → smith.
     F: Fn(char, &Path) -> Box<dyn Smith> + Send + Sync,
 {
     let _slot = DUEL_SLOT.lock().await;
@@ -80,14 +98,17 @@ where
     // ingot's remaining heat budget (:max - :heat) allows.
     let remaining = ingot.max.saturating_sub(ingot.heat).max(1);
     let rounds = cfg.duel_rounds(ingot.grade).clamp(1, remaining);
+    let mut n = initial_casts.clamp(2, 3) as usize;
     let mut critique: Option<String> = None;
     let mut prev_winner_score: Option<u8> = None;
 
     if !tui::is_quiet() {
         println!(
-            "    {}⚔{} duel: {} vs {} — {} round{}",
+            "    {}⚔{} duel: {} cast{} ({} vs {}) — {} round{}",
             super::fg(tui::BRIGHT),
             super::reset(),
+            n,
+            if n == 1 { "" } else { "s" },
             cfg.model_base,
             cfg.model_alt,
             rounds,
@@ -99,114 +120,183 @@ where
         emit(&hooks.events, EngineEvent::DuelRound { id: ingot.id.clone(), round });
         heat_tick(repo, ingot, hooks).await;
 
-        let id_a = format!("{}-r{round}a", ingot.id);
-        let id_b = format!("{}-r{round}b", ingot.id);
-        let dir_a = worktree::create_in(repo, &id_a).await?;
-        let dir_b = match worktree::create_in(repo, &id_b).await {
-            Ok(dir) => dir,
-            Err(e) => {
-                worktree::discard_in(repo, &id_a).await;
-                return Err(e);
-            }
-        };
-
-        let prompt_a = cast_prompt(ingot, DIRECTION_A, critique.as_deref());
-        let prompt_b = cast_prompt(ingot, DIRECTION_B, critique.as_deref());
-        let smith_a = casts('a', &dir_a);
-        let smith_b = casts('b', &dir_b);
-
-        let (cast_a, cast_b) = tokio::join!(
-            run_cast(smith_a.as_ref(), &prompt_a, &dir_a, ingot, hooks),
-            run_cast(smith_b.as_ref(), &prompt_b, &dir_b, ingot, hooks),
-        );
-        let (cast_a, cast_b) = match (cast_a, cast_b) {
-            (Ok(a), Ok(b)) => (a, b),
-            // Cancelled (Ctrl-C): abort the duel, don't treat as failed casts.
-            (Err(e), _) | (_, Err(e)) => {
-                worktree::discard_in(repo, &id_a).await;
-                worktree::discard_in(repo, &id_b).await;
-                return Err(e);
-            }
-        };
-
-        match (cast_a, cast_b) {
-            (None, None) => {
-                worktree::discard_in(repo, &id_a).await;
-                worktree::discard_in(repo, &id_b).await;
-                if !tui::is_quiet() {
-                    println!(
-                        "    {}⚔✗{} both casts failed proof — single-smith fallback",
-                        super::fg(tui::WARM),
-                        super::reset()
-                    );
+        let labels = &CAST_LABELS[..n];
+        let mut ids: Vec<String> = Vec::with_capacity(n);
+        let mut dirs: Vec<PathBuf> = Vec::with_capacity(n);
+        for &label in labels {
+            let id = format!("{}-r{round}{label}", ingot.id);
+            match worktree::create_in(repo, &id).await {
+                Ok(dir) => {
+                    ids.push(id);
+                    dirs.push(dir);
                 }
-                return Ok(DuelOutcome::FellThrough);
-            }
-            (Some(_), None) => {
-                return crown(repo, ingot, hooks, 'a', &id_a, &dir_a, &id_b, round).await;
-            }
-            (None, Some(_)) => {
-                return crown(repo, ingot, hooks, 'b', &id_b, &dir_b, &id_a, round).await;
-            }
-            (Some(a), Some(b)) => {
-                let images = capture_images(cfg, ingot, &dir_a, &dir_b).await;
-                let verdict = match judge::assay(
-                    judge_provider,
-                    &cfg.model_judge,
-                    &ingot.work,
-                    &a,
-                    &b,
-                    critique.as_deref(),
-                    images,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        worktree::discard_in(repo, &id_a).await;
-                        worktree::discard_in(repo, &id_b).await;
-                        return Err(e);
+                Err(e) => {
+                    for made in &ids {
+                        worktree::discard_in(repo, made).await;
                     }
-                };
-                emit(
-                    &hooks.events,
-                    EngineEvent::DuelVerdict {
-                        id: ingot.id.clone(),
-                        winner: verdict.winner,
-                        margin: verdict.margin(),
-                    },
+                    return Err(e);
+                }
+            }
+        }
+
+        let prompts: Vec<String> = labels
+            .iter()
+            .map(|&l| cast_prompt(ingot, direction_for(l), critique.as_deref()))
+            .collect();
+        let smiths: Vec<Box<dyn Smith>> =
+            labels.iter().zip(&dirs).map(|(&l, dir)| casts(l, dir)).collect();
+
+        let run = |i: usize| run_cast(smiths[i].as_ref(), &prompts[i], &dirs[i], ingot, hooks);
+        let joined: Vec<Result<Option<CastResult>, SlagError>> = if n == 3 {
+            let (a, b, c) = tokio::join!(run(0), run(1), run(2));
+            vec![a, b, c]
+        } else {
+            let (a, b) = tokio::join!(run(0), run(1));
+            vec![a, b]
+        };
+
+        // Cancelled / budget-exhausted: abort the duel, don't treat as
+        // failed casts.
+        let mut results: Vec<Option<CastResult>> = Vec::with_capacity(n);
+        let mut hard_err: Option<SlagError> = None;
+        for outcome in joined {
+            match outcome {
+                Ok(cast) => results.push(cast),
+                Err(e) => {
+                    hard_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = hard_err {
+            for id in &ids {
+                worktree::discard_in(repo, id).await;
+            }
+            return Err(e);
+        }
+
+        let passing: Vec<usize> =
+            results.iter().enumerate().filter_map(|(i, c)| c.is_some().then_some(i)).collect();
+
+        if passing.is_empty() {
+            for id in &ids {
+                worktree::discard_in(repo, id).await;
+            }
+            if !tui::is_quiet() {
+                println!(
+                    "    {}⚔✗{} all casts failed proof — single-smith fallback",
+                    super::fg(tui::WARM),
+                    super::reset()
                 );
-                let winner_score = if verdict.winner == 'a' {
-                    verdict.score_a
-                } else {
-                    verdict.score_b
-                };
-                let plateau = prev_winner_score
-                    .is_some_and(|prev| winner_score.saturating_sub(prev) < PLATEAU_GAIN);
-                if verdict.margin() >= MARGIN_STOP || plateau || round == rounds {
-                    let (win_id, win_dir, lose_id) = if verdict.winner == 'a' {
-                        (&id_a, &dir_a, &id_b)
-                    } else {
-                        (&id_b, &dir_b, &id_a)
-                    };
-                    let merged = merge_winner(repo, ingot, verdict.winner, win_id, win_dir).await;
-                    worktree::discard_in(repo, lose_id).await;
-                    if let Err(e) = merged {
-                        // Keep the proven winner's worktree and branch — its
-                        // commit is the only copy of the work. The stale
-                        // deterministic names are reclaimed by
-                        // `worktree::create_in` on the next duel attempt.
-                        return Err(e);
-                    }
-                    append_ledger(repo, ingot, verdict.winner, round);
-                    return Ok(DuelOutcome::Merged { winner: verdict.winner, rounds: round });
-                }
-                // Convergence not reached: discard both, re-cast with critique.
-                worktree::discard_in(repo, &id_a).await;
-                worktree::discard_in(repo, &id_b).await;
-                critique = Some(verdict.critique);
-                prev_winner_score = Some(winner_score);
             }
+            return Ok(DuelOutcome::FellThrough);
+        }
+
+        if passing.len() == 1 {
+            let w = passing[0];
+            let losers: Vec<String> =
+                ids.iter().enumerate().filter(|&(i, _)| i != w).map(|(_, id)| id.clone()).collect();
+            return crown(repo, ingot, hooks, labels[w], &ids[w], &dirs[w], &losers, round).await;
+        }
+
+        // Two or three proof-passing casts: the assayer rules. On a
+        // 3-way tie (cyclic pairwise wins) `winner_score` is None so the
+        // plateau stop cannot fire on a meaningless score.
+        let ruled = if passing.len() == 3 {
+            let (a, b, c) = (
+                results[0].as_ref().expect("passing"),
+                results[1].as_ref().expect("passing"),
+                results[2].as_ref().expect("passing"),
+            );
+            judge::assay3(
+                judge_provider,
+                &cfg.model_judge,
+                &ingot.work,
+                a,
+                b,
+                c,
+                critique.as_deref(),
+            )
+            .await
+            .map(|v| {
+                let score = (!v.tie).then_some(v.winner_score);
+                (v.winner, v.margin, score, v.critique)
+            })
+        } else {
+            let (i, j) = (passing[0], passing[1]);
+            // Visual assay stays a 2-cast affair: only a full twin-cast
+            // round has exactly the two dirs the config command expects.
+            let images = if n == 2 {
+                capture_images(cfg, ingot, &dirs[i], &dirs[j]).await
+            } else {
+                None
+            };
+            judge::assay(
+                judge_provider,
+                &cfg.model_judge,
+                &ingot.work,
+                results[i].as_ref().expect("passing"),
+                results[j].as_ref().expect("passing"),
+                critique.as_deref(),
+                images,
+            )
+            .await
+            .map(|v| {
+                let (winner, score) = if v.winner == 'a' {
+                    (labels[i], v.score_a)
+                } else {
+                    (labels[j], v.score_b)
+                };
+                (winner, v.margin(), Some(score), v.critique)
+            })
+        };
+        let (winner, margin, winner_score, round_critique) = match ruled {
+            Ok(v) => v,
+            Err(e) => {
+                for id in &ids {
+                    worktree::discard_in(repo, id).await;
+                }
+                return Err(e);
+            }
+        };
+        emit(
+            &hooks.events,
+            EngineEvent::DuelVerdict { id: ingot.id.clone(), winner, margin },
+        );
+
+        let plateau = winner_score.is_some_and(|score| {
+            prev_winner_score.is_some_and(|prev| score.saturating_sub(prev) < PLATEAU_GAIN)
+        });
+        if margin >= MARGIN_STOP || plateau || round == rounds {
+            let w = labels.iter().position(|&l| l == winner).expect("winner label");
+            let merged = merge_winner(repo, ingot, winner, &ids[w], &dirs[w]).await;
+            for (k, id) in ids.iter().enumerate() {
+                if k != w {
+                    worktree::discard_in(repo, id).await;
+                }
+            }
+            if let Err(e) = merged {
+                // Keep the proven winner's worktree and branch — its
+                // commit is the only copy of the work. The stale
+                // deterministic names are reclaimed by
+                // `worktree::create_in` on the next duel attempt.
+                return Err(e);
+            }
+            append_ledger(repo, ingot, winner, round);
+            return Ok(DuelOutcome::Merged { winner, rounds: round });
+        }
+        // Convergence not reached: discard all, re-cast with critique. A
+        // too-close 2-cast verdict escalates the next round to 3 casts —
+        // the rounds clamp above still caps the total heat spend.
+        for id in &ids {
+            worktree::discard_in(repo, id).await;
+        }
+        critique = Some(round_critique);
+        if let Some(score) = winner_score {
+            prev_winner_score = Some(score);
+        }
+        if n == 2 && margin < ESCALATE_MARGIN {
+            n = 3;
         }
     }
 
@@ -214,7 +304,7 @@ where
     Ok(DuelOutcome::FellThrough)
 }
 
-/// One cast merges uncontested (its rival failed proof): margin 100.
+/// One cast merges uncontested (its rivals failed proof): margin 100.
 #[allow(clippy::too_many_arguments)]
 async fn crown(
     repo: &Path,
@@ -223,11 +313,13 @@ async fn crown(
     winner: char,
     win_id: &str,
     win_dir: &Path,
-    lose_id: &str,
+    lose_ids: &[String],
     round: u8,
 ) -> Result<DuelOutcome, SlagError> {
     let merged = merge_winner(repo, ingot, winner, win_id, win_dir).await;
-    worktree::discard_in(repo, lose_id).await;
+    for lose_id in lose_ids {
+        worktree::discard_in(repo, lose_id).await;
+    }
     if let Err(e) = merged {
         // Keep the proven winner's worktree/branch (only copy of the work);
         // `worktree::create_in` reclaims the stale names on the next duel.
@@ -367,9 +459,29 @@ async fn dirty_overlap(repo: &Path, branch: &str) -> bool {
         return false;
     }
     let status = git_in(repo, &["status", "--porcelain"]).await.unwrap_or_default();
-    let dirty: std::collections::HashSet<&str> =
-        status.lines().filter_map(|l| l.get(3..)).collect();
+    let dirty = porcelain_paths(&status);
     changed.lines().any(|f| dirty.contains(f))
+}
+
+/// Paths named by `git status --porcelain` output. Rename/copy lines read
+/// `XY orig -> dest`; both sides count as dirty — taking the raw remainder
+/// (`"orig -> dest"`) would match neither, hiding the overlap from the
+/// merge gate.
+fn porcelain_paths(status: &str) -> std::collections::HashSet<&str> {
+    let mut paths = std::collections::HashSet::new();
+    for line in status.lines() {
+        let Some(rest) = line.get(3..) else { continue };
+        match rest.split_once(" -> ") {
+            Some((from, to)) => {
+                paths.insert(from);
+                paths.insert(to);
+            }
+            None => {
+                paths.insert(rest);
+            }
+        }
+    }
+    paths
 }
 
 /// Visual assay inputs: only for web ingots with a configured screenshot
@@ -527,8 +639,23 @@ mod tests {
             proof: proof.into(),
             work: "duel task".into(),
             duel,
+            casts: None,
             extra: vec![],
         }
+    }
+
+    #[test]
+    fn porcelain_paths_split_rename_lines_into_both_sides() {
+        let status = " M src/lib.rs\nR  src/old.rs -> src/new.rs\n?? notes.txt\n";
+        let paths = porcelain_paths(status);
+        assert!(paths.contains("src/lib.rs"));
+        assert!(paths.contains("notes.txt"));
+        // Regression: a staged rename must dirty BOTH sides — the raw
+        // remainder "src/old.rs -> src/new.rs" matches neither, so a
+        // merge touching the renamed file sailed past the overlap gate.
+        assert!(paths.contains("src/old.rs"), "{paths:?}");
+        assert!(paths.contains("src/new.rs"), "{paths:?}");
+        assert!(!paths.contains("src/old.rs -> src/new.rs"));
     }
 
     #[test]
@@ -682,6 +809,7 @@ mod tests {
             &EngineHooks::default(),
             &casts,
             &NoJudge,
+            2,
         )
         .await
         .expect("duel runs");
@@ -708,7 +836,7 @@ mod tests {
         let (tx, mut rx) = crate::engine::events::channel();
         let hooks = EngineHooks { events: Some(tx), steer: None, cancel: None };
 
-        let outcome = duel_ingot(&repo, &ingot, &cfg(DuelMode::On), &hooks, &casts, &NoJudge)
+        let outcome = duel_ingot(&repo, &ingot, &cfg(DuelMode::On), &hooks, &casts, &NoJudge, 2)
             .await
             .expect("duel runs");
 
@@ -771,7 +899,7 @@ mod tests {
             'a',
             "i5-r1a",
             &win_dir,
-            "i5-r1b",
+            &["i5-r1b".to_string()],
             1,
         )
         .await
@@ -818,7 +946,7 @@ mod tests {
             'a',
             "i6-r1a",
             &win_dir,
-            "i6-r1b",
+            &["i6-r1b".to_string()],
             1,
         )
         .await
@@ -906,6 +1034,7 @@ mod tests {
             &EngineHooks::default(),
             &casts,
             &NoJudge,
+            2,
         )
         .await
         .expect("duel runs");
@@ -933,6 +1062,7 @@ mod tests {
             &EngineHooks::default(),
             &casts,
             &NoJudge,
+            2,
         )
         .await
         .expect_err("cancellation must abort the duel, not read as a failed cast");
@@ -962,6 +1092,7 @@ mod tests {
             &EngineHooks::default(),
             &casts,
             &judge,
+            2,
         )
         .await
         .expect("duel runs");
@@ -970,6 +1101,112 @@ mod tests {
                 assert_eq!(rounds, 1, "must merge at the clamped single round");
             }
             other => panic!("expected merge, got {other:?}"),
+        }
+    }
+
+    /// Casts that record which labels ran (in scheduling order) and
+    /// always produce a passing CMD unique to their label.
+    fn recording_casts(
+        seen: std::sync::Arc<std::sync::Mutex<Vec<char>>>,
+    ) -> impl Fn(char, &Path) -> Box<dyn Smith> + Send + Sync {
+        move |cast, _dir| {
+            seen.lock().unwrap().push(cast);
+            Box::new(MockSmith(format!("CMD: echo {cast} > out-{cast}.txt"))) as Box<dyn Smith>
+        }
+    }
+
+    #[tokio::test]
+    async fn close_two_cast_round_escalates_to_three_casts() {
+        let (_tmp, repo) = test_repo();
+        let ingot = ingot("ie", true, 4, None, "true");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let casts = recording_casts(seen.clone());
+        // Round 1 (2 casts, 2 judge calls): margin 5 — below both the
+        // merge stop and ESCALATE_MARGIN, so round 2 runs 3 casts.
+        // Round 2 (3 casts, 6 judge calls): cast A sweeps its pairs with
+        // margins 30 and 25 → min margin 25 >= MARGIN_STOP merges it.
+        let judge = ScriptedJudge::new(&[
+            r#"{"winner":"a","score_a":60,"score_b":55,"critique":"r1"}"#,
+            r#"{"winner":"b","score_a":55,"score_b":60,"critique":"r1s"}"#,
+            r#"{"winner":"a","score_a":90,"score_b":60,"critique":"ab"}"#,
+            r#"{"winner":"b","score_a":60,"score_b":90,"critique":"abs"}"#,
+            r#"{"winner":"a","score_a":90,"score_b":65,"critique":"ac"}"#,
+            r#"{"winner":"b","score_a":65,"score_b":90,"critique":"acs"}"#,
+            r#"{"winner":"a","score_a":70,"score_b":60,"critique":"bc"}"#,
+            r#"{"winner":"b","score_a":60,"score_b":70,"critique":"bcs"}"#,
+        ]);
+
+        let outcome = duel_ingot(
+            &repo,
+            &ingot,
+            &cfg(DuelMode::On),
+            &EngineHooks::default(),
+            &casts,
+            &judge,
+            2,
+        )
+        .await
+        .expect("duel runs");
+
+        match outcome {
+            DuelOutcome::Merged { winner, rounds } => {
+                assert_eq!(winner, 'a');
+                assert_eq!(rounds, 2, "the escalated round must settle it");
+            }
+            other => panic!("expected merge, got {other:?}"),
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!['a', 'b', 'a', 'b', 'c'],
+            "round 2 must add the creative third cast"
+        );
+        assert_eq!(judge.calls.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert!(repo.join("out-a.txt").exists(), "winner's work must land on main");
+        for label in ['a', 'b', 'c'] {
+            for round in [1, 2] {
+                assert!(
+                    !repo.parent().unwrap().join(format!("slag-anvil-ie-r{round}{label}")).exists(),
+                    "worktree r{round}{label} must be cleaned up"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn three_casts_with_single_passer_crown_without_judge() {
+        let (_tmp, repo) = test_repo();
+        let ingot = ingot("i3c", true, 5, None, "test -f out.txt");
+        // Only the creative cast survives its proof.
+        let casts = |cast: char, _dir: &Path| -> Box<dyn Smith> {
+            Box::new(MockSmith(if cast == 'c' {
+                "CMD: echo forged-by-c > out.txt".into()
+            } else {
+                "CMD: false".to_string()
+            }))
+        };
+
+        let outcome = duel_ingot(
+            &repo,
+            &ingot,
+            &cfg(DuelMode::On),
+            &EngineHooks::default(),
+            &casts,
+            &NoJudge,
+            3,
+        )
+        .await
+        .expect("duel runs");
+
+        match outcome {
+            DuelOutcome::Merged { winner, rounds } => {
+                assert_eq!(winner, 'c');
+                assert_eq!(rounds, 1);
+            }
+            other => panic!("expected merge, got {other:?}"),
+        }
+        assert!(repo.join("out.txt").exists());
+        for label in ['a', 'b', 'c'] {
+            assert!(!repo.parent().unwrap().join(format!("slag-anvil-i3c-r1{label}")).exists());
         }
     }
 
@@ -995,6 +1232,7 @@ mod tests {
             &EngineHooks::default(),
             &casts,
             &judge,
+            2,
         )
         .await
         .expect("duel runs");

@@ -55,6 +55,11 @@ async fn main() {
     if let Some(m) = &cli.judge_model {
         std::env::set_var("SLAG_MODEL_JUDGE", m);
     }
+    // --duel = SLAG_DUEL=on: every solo ingot forges with at least two
+    // casts. EngineConfig::load reads the env downstream like the rest.
+    if cli.duel {
+        std::env::set_var("SLAG_DUEL", "on");
+    }
 
     // `status`, `update` and `key` inspect or repair a broken setup, so
     // none of them may demand the very key the user came here to fix.
@@ -130,15 +135,22 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
         }
     };
 
-    // The duel and judge roles only run when a duel does. Listing a model
-    // slag will never call reads as a promise it does not keep.
+    // The alt and judge roles only run when a duel does. Matched models
+    // no longer idle them: the direction prompts carry cast diversity,
+    // so only SLAG_DUEL=off parks these roles now.
     let duels = cfg.as_ref().is_some_and(|c| c.duel_qualifies(5));
-    let idle = (!duels).then_some("idle — set SLAG_MODEL_ALT to duel");
+    let idle = (!duels).then_some("idle — SLAG_DUEL=off");
+    let duel_state = match cfg.as_ref().map(|c| c.duel) {
+        Some(config::DuelMode::On) => "on — solo ingots forge with 2-3 casts",
+        Some(config::DuelMode::Off) => "off — every ingot forges with a single cast",
+        _ => "auto — 1-3 casts by grade/work; direction prompts carry diversity",
+    };
     let models = [
         ("work", base.as_str(), None),
         ("plan", plan.as_str(), None),
-        ("duel", alt.as_str(), idle),
+        ("alt", alt.as_str(), idle),
         ("judge", judge.as_str(), idle),
+        ("duel", duel_state, None),
     ];
 
     tui::key_panel(source, &models);

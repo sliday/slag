@@ -55,12 +55,26 @@ struct ReadStamp {
     lines: usize,
 }
 
+/// Last known-good view of a file (mtime + content checksum), recorded by
+/// read_file and refreshed by write_file/edit_file. The freshness gate
+/// compares against this before any write to an existing file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileState {
+    mtime: SystemTime,
+    checksum: u64,
+}
+
 /// Native toolbox rooted at an anvil worktree.
 #[derive(Clone)]
 pub struct ToolBox {
     root: PathBuf,
     /// Session read cache (shared across clones of this ToolBox).
     read_cache: Arc<Mutex<HashMap<PathBuf, ReadStamp>>>,
+    /// Read-before-edit state (shared across clones): write_file and
+    /// edit_file on an existing file refuse unless the file was read this
+    /// session and its mtime has not moved since. Protects proof-gated
+    /// ingots from clobbering parallel-anvil changes with stale edits.
+    read_state: Arc<Mutex<HashMap<PathBuf, FileState>>>,
 }
 
 impl ToolBox {
@@ -70,6 +84,7 @@ impl ToolBox {
         Self {
             root,
             read_cache: Arc::new(Mutex::new(HashMap::new())),
+            read_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -92,7 +107,10 @@ impl ToolBox {
             ),
             spec(
                 "write_file",
-                "Create or overwrite a file. The write is verified by re-reading the file.",
+                "Create or overwrite a file. The write is verified by re-reading the file. \
+                 This tool will error if the target file already exists but you have not \
+                 read it this session, or if it changed on disk since your last read; \
+                 read_file it first, then retry.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -108,7 +126,9 @@ impl ToolBox {
                  fuzzy whitespace/indentation fallbacks apply when exact match fails. \
                  Set replace_all to replace every exact occurrence. \
                  read_file output is LINENUM|CONTENT — never include that line-number prefix \
-                 in old_string or new_string.",
+                 in old_string or new_string. \
+                 This tool will error if the file has not been read this session, or if its \
+                 mtime moved since your last read (stale edit); read_file it again first.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -122,7 +142,17 @@ impl ToolBox {
             ),
             spec(
                 "bash",
-                "Run a shell command in the workspace root. stdout and stderr are merged.",
+                "Run a shell command in the workspace root. stdout and stderr are merged. \
+                 Batching: independent commands go in multiple bash tool calls in ONE \
+                 message (they run in parallel); dependent commands chain with '&&'; \
+                 use ';' only when earlier failures don't matter; never newline-separate \
+                 commands. \
+                 Git safety protocol: never use --no-verify; if a pre-commit hook fails, \
+                 the commit did NOT happen, so fix the issue and commit again (never amend \
+                 after a hook failure — amend would destroy the previous commit); stage \
+                 specific files instead of 'git add -A'; write commit messages via heredoc \
+                 (git commit -m \"$(cat <<'EOF' ... EOF)\"); never use interactive -i \
+                 flags (git rebase -i, git add -i) — there is no TTY.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -134,12 +164,22 @@ impl ToolBox {
             ),
             spec(
                 "grep",
-                "Search file contents for a regex pattern. Returns file:line:content matches.",
+                "Search file contents for a regex pattern (ripgrep). Default output_mode \
+                 files_with_matches lists matching file paths; content prints \
+                 file:line:content matches (with optional -A/-B/-C context lines); count \
+                 prints per-file match counts. Paths are workspace-relative.",
                 json!({
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Regex pattern"},
-                        "path": {"type": "string", "description": "Directory or file to search (default workspace root)"}
+                        "path": {"type": "string", "description": "Directory or file to search (default workspace root)"},
+                        "output_mode": {"type": "string", "enum": ["files_with_matches", "content", "count"], "description": "files_with_matches (default): matching file paths; content: matching lines; count: match counts per file"},
+                        "-i": {"type": "boolean", "description": "Case-insensitive search (default false)"},
+                        "glob": {"type": "string", "description": "Filter files by glob (e.g. '*.rs')"},
+                        "-A": {"type": "integer", "description": "Lines of context after each match (content mode only)"},
+                        "-B": {"type": "integer", "description": "Lines of context before each match (content mode only)"},
+                        "-C": {"type": "integer", "description": "Lines of context around each match (content mode only; wins over -A/-B)"},
+                        "head_limit": {"type": "integer", "description": "Cap output at the first N lines (default 100)"}
                     },
                     "required": ["pattern"]
                 }),
@@ -291,13 +331,19 @@ impl ToolBox {
 
         let meta = tokio::fs::metadata(&path).await.ok();
 
-        // Size gate (stat only, before any read): a full read of an
-        // oversized file is refused with instructions to chunk it.
+        // Size gate (before any full read): an oversized file is refused
+        // with instructions to chunk it. A streamed newline count rides
+        // along so the model can pick a sensible offset/limit instead of
+        // probing blind.
         if !partial {
             if let Some(meta) = &meta {
                 if meta.len() > READ_SIZE_MAX {
+                    let lines = match count_lines(&path).await {
+                        Some(n) => format!("; the file has {n} lines"),
+                        None => String::new(),
+                    };
                     return Err(SlagError::Tool(format!(
-                        "read_file: {raw} is {:.1}KB ({} bytes), over the {}KB full-read limit; \
+                        "read_file: {raw} is {:.1}KB ({} bytes), over the {}KB full-read limit{lines}; \
                          pass offset and limit to read it in chunks",
                         meta.len() as f64 / 1024.0,
                         meta.len(),
@@ -330,6 +376,17 @@ impl ToolBox {
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| SlagError::Tool(format!("cannot read {raw}: {e}")))?;
+        // Any successful read (partial or full) arms the read-before-edit
+        // gate: read_to_string always reads the whole file, so the checksum
+        // covers the full content even when only a slice is returned.
+        if let Some(meta) = &meta {
+            if let Ok(mtime) = meta.modified() {
+                self.read_state.lock().unwrap().insert(
+                    path.clone(),
+                    FileState { mtime, checksum: fnv64(content.as_bytes()) },
+                );
+            }
+        }
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
             return Ok("(empty file)".into());
@@ -386,10 +443,71 @@ impl ToolBox {
         self.read_cache.lock().unwrap().remove(path);
     }
 
+    /// Read-before-edit gate: an existing file may only be written or
+    /// edited after a read_file this session, and only while its on-disk
+    /// mtime still matches that read. A moved mtime with identical bytes
+    /// (touch-only) is re-stamped and allowed; anything else is refused so
+    /// a parallel-anvil change is never clobbered by a stale snapshot.
+    async fn ensure_fresh_for_write(
+        &self,
+        path: &Path,
+        raw: &str,
+        tool: &str,
+    ) -> Result<(), SlagError> {
+        let Ok(meta) = tokio::fs::metadata(path).await else {
+            return Ok(()); // new file: nothing to clobber
+        };
+        if !meta.is_file() {
+            return Ok(()); // directories fail later with a clearer error
+        }
+        let mtime = meta
+            .modified()
+            .map_err(|e| SlagError::Tool(format!("cannot stat {raw}: {e}")))?;
+        let known = self.read_state.lock().unwrap().get(path).copied();
+        let Some(state) = known else {
+            return Err(SlagError::Tool(format!(
+                "{tool}: {raw} exists but has not been read this session; \
+                 read_file it first, then retry"
+            )));
+        };
+        if state.mtime == mtime {
+            return Ok(());
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| SlagError::Tool(format!("cannot read {raw}: {e}")))?;
+        if fnv64(&bytes) == state.checksum {
+            // touch-only change: bytes identical, re-stamp the new mtime.
+            self.read_state
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), FileState { mtime, checksum: state.checksum });
+            return Ok(());
+        }
+        Err(SlagError::Tool(format!(
+            "{tool}: refused stale write; {raw} changed on disk since your last \
+             read (mtime moved). read_file it again and re-apply your change"
+        )))
+    }
+
+    /// Record the post-write state so follow-up writes by this session
+    /// pass the freshness gate without an intervening read.
+    async fn stamp_write(&self, path: &Path, bytes: &[u8]) {
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if let Ok(mtime) = meta.modified() {
+                self.read_state
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_path_buf(), FileState { mtime, checksum: fnv64(bytes) });
+            }
+        }
+    }
+
     async fn write_file(&self, args: &Value) -> Result<String, SlagError> {
         let raw = req_str(args, "write_file", "path")?;
         let content = req_str(args, "write_file", "content")?;
         let path = self.resolve(raw)?;
+        self.ensure_fresh_for_write(&path, raw, "write_file").await?;
         self.invalidate_read_cache(&path);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -408,6 +526,7 @@ impl ToolBox {
                 "write verification failed for {raw}: on-disk bytes differ"
             )));
         }
+        self.stamp_write(&path, &back).await;
         Ok(format!("verified: true (checksum {})", &checksum_hex(&back)[..12]))
     }
 
@@ -420,6 +539,7 @@ impl ToolBox {
             return Err(SlagError::Tool("old_string must not be empty".into()));
         }
         let path = self.resolve(raw)?;
+        self.ensure_fresh_for_write(&path, raw, "edit_file").await?;
         self.invalidate_read_cache(&path);
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -446,6 +566,7 @@ impl ToolBox {
             tokio::fs::write(&path, &new_content)
                 .await
                 .map_err(|e| SlagError::Tool(format!("cannot write {raw}: {e}")))?;
+            self.stamp_write(&path, new_content.as_bytes()).await;
             return Ok(format!(
                 "replaced {} occurrence(s) in {raw} (exact)",
                 matches.len()
@@ -531,6 +652,7 @@ impl ToolBox {
         tokio::fs::write(&path, &new_content)
             .await
             .map_err(|e| SlagError::Tool(format!("cannot write {raw}: {e}")))?;
+        self.stamp_write(&path, new_content.as_bytes()).await;
 
         Ok(diff_summary(raw, strategy, at_line, &removed, &added))
     }
@@ -629,30 +751,98 @@ impl ToolBox {
         }
     }
 
+    /// Search file contents with rg (grep fallback). Three output modes:
+    /// files_with_matches (default, rg -l), content (rg -n plus optional
+    /// -A/-B/-C context), and count (rg --count). -i, a glob filter, and
+    /// head_limit pass through. The search runs from the anvil root so
+    /// printed paths come back workspace-relative, not absolute.
     async fn grep(&self, args: &Value) -> Result<String, SlagError> {
         let pattern = req_str(args, "grep", "pattern")?;
         let raw_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let path = self.resolve(raw_path)?;
+        let target = self.resolve(raw_path)?;
+        let mode = args
+            .get("output_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("files_with_matches");
+        if !matches!(mode, "files_with_matches" | "content" | "count") {
+            return Err(SlagError::Tool(format!(
+                "grep: unknown output_mode '{mode}' (use files_with_matches, content, or count)"
+            )));
+        }
+        let insensitive = arg_bool(args, "-i").unwrap_or(false);
+        let glob_filter = args.get("glob").and_then(Value::as_str);
+        let head_limit = arg_u64(args, "head_limit")
+            .map(|v| (v as usize).max(1))
+            .unwrap_or(GREP_LINE_CAP);
+
+        // Context flags apply to content mode only; -C wins over -A/-B.
+        let mut ctx = String::new();
+        if mode == "content" {
+            if let Some(n) = arg_u64(args, "-C") {
+                ctx = format!(" -C {n}");
+            } else {
+                if let Some(n) = arg_u64(args, "-B") {
+                    ctx.push_str(&format!(" -B {n}"));
+                }
+                if let Some(n) = arg_u64(args, "-A") {
+                    ctx.push_str(&format!(" -A {n}"));
+                }
+            }
+        }
+
+        // Search from the root so printed paths are workspace-relative.
+        let rel = target
+            .strip_prefix(&self.root)
+            .ok()
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".".into());
+        let mode_rg = match mode {
+            "content" => format!("-n{ctx}"),
+            "count" => "--count".into(),
+            _ => "-l".into(),
+        };
+        let mode_grep = match mode {
+            "content" => format!("-rn{ctx}"),
+            "count" => "-rc".into(),
+            _ => "-rl".into(),
+        };
+        let case = if insensitive { " -i" } else { "" };
+        let rg_glob = glob_filter
+            .map(|g| format!(" -g {}", sh_quote(g)))
+            .unwrap_or_default();
+        let grep_glob = glob_filter
+            .map(|g| format!(" --include={}", sh_quote(g)))
+            .unwrap_or_default();
         let cmd = format!(
-            "if command -v rg >/dev/null 2>&1; then rg -n --no-heading -e {p} {d}; else grep -rn -e {p} {d}; fi",
+            "cd {root} && if command -v rg >/dev/null 2>&1; then \
+             rg --no-heading -H {mode_rg}{case}{rg_glob} -e {p} {t}; \
+             else grep -H {mode_grep}{case}{grep_glob} -e {p} {t}; fi",
+            root = sh_quote(&self.root.display().to_string()),
             p = sh_quote(pattern),
-            d = sh_quote(&path.display().to_string()),
+            t = sh_quote(&rel),
         );
         let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT).await?;
-        let lines: Vec<&str> = out.lines().collect();
-        if lines.is_empty() || (lines.len() == 1 && lines[0].starts_with("(exit ")) {
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with("(exit "))
+            .map(|l| l.strip_prefix("./").unwrap_or(l))
+            // grep -rc prints zero-count files too; rg --count does not.
+            .filter(|l| mode != "count" || !l.ends_with(":0"))
+            .collect();
+        if lines.is_empty() {
             return Ok("no matches found".into());
         }
         let mut result = lines
             .iter()
-            .take(GREP_LINE_CAP)
+            .take(head_limit)
             .copied()
             .collect::<Vec<_>>()
             .join("\n");
-        if lines.len() > GREP_LINE_CAP {
+        if lines.len() > head_limit {
             result.push_str(&format!(
                 "\n(truncated: {} more lines)",
-                lines.len() - GREP_LINE_CAP
+                lines.len() - head_limit
             ));
         }
         Ok(result)
@@ -768,14 +958,18 @@ fn req_str<'a>(args: &'a Value, tool: &str, key: &str) -> Result<&'a str, SlagEr
         .ok_or_else(|| SlagError::Tool(format!("{tool}: missing required string argument '{key}'")))
 }
 
-/// FNV-1a 64-bit, hex. Labeled "checksum" — integrity marker, not crypto.
-fn checksum_hex(bytes: &[u8]) -> String {
+/// FNV-1a 64-bit. Labeled "checksum" — integrity marker, not crypto.
+fn fnv64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{h:016x}")
+    h
+}
+
+fn checksum_hex(bytes: &[u8]) -> String {
+    format!("{:016x}", fnv64(bytes))
 }
 
 fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
@@ -1025,13 +1219,24 @@ fn diff_summary(
     out
 }
 
-/// Argument coercion: models sometimes send numbers as strings.
+/// Argument coercion: models sometimes send numbers as strings, and some
+/// send fractional numbers (`"limit": 200.0`) where an integer is meant —
+/// truncate those instead of dropping the argument.
 fn arg_u64(args: &Value, key: &str) -> Option<u64> {
     match args.get(key)? {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.trim().parse().ok(),
+        Value::Number(n) => n.as_u64().or_else(|| f64_as_u64(n.as_f64()?)),
+        Value::String(s) => {
+            let s = s.trim();
+            s.parse().ok().or_else(|| f64_as_u64(s.parse().ok()?))
+        }
         _ => None,
     }
+}
+
+/// Truncating f64 → u64 for near-integer inputs; negatives and non-finite
+/// values stay rejected.
+fn f64_as_u64(f: f64) -> Option<u64> {
+    (f.is_finite() && f >= 0.0).then(|| f.trunc() as u64)
 }
 
 /// Argument coercion: "true"/"false" strings become bools. Naive truthiness
@@ -1058,6 +1263,26 @@ fn cap_from(v: Option<&str>) -> usize {
     v.and_then(|s| s.trim().parse::<usize>().ok())
         .map(|n| n.clamp(1, BASH_OUTPUT_CAP_MAX))
         .unwrap_or(BASH_OUTPUT_CAP_DEFAULT)
+}
+
+/// Streamed line count for the size-gate refusal: fixed 64KB buffer, so a
+/// multi-GB file never lands in memory just to be refused. Counts newlines
+/// plus an unterminated final line.
+async fn count_lines(path: &std::path::Path) -> Option<usize> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut newlines = 0usize;
+    let mut last_byte = b'\n';
+    loop {
+        let n = file.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        newlines += buf[..n].iter().filter(|b| **b == b'\n').count();
+        last_byte = buf[n - 1];
+    }
+    Some(newlines + usize::from(last_byte != b'\n'))
 }
 
 /// Head 20% + tail 80% truncation with an elided-line count. The head keeps
@@ -1134,18 +1359,29 @@ fn last_segment_argv0(command: &str) -> &str {
     argv0.rsplit('/').next().unwrap_or(argv0)
 }
 
-/// Split a command line on `;`, `|`, `&`, newlines, parens, and backticks
-/// (runs of separators yield empty segments, which callers skip). Parens
-/// and backticks count so subshells `(rm …)` and substitutions `$(rm …)`
-/// surface their inner command as its own segment.
+/// Split a command line on `;`, `|` (which covers `||`), `&` (which
+/// covers `&&`), newlines, parens, and backticks (runs of separators
+/// yield empty segments, which callers skip). Parens and backticks count
+/// so subshells `(rm …)` and substitutions `$(rm …)` surface their inner
+/// command as its own segment. Every `&` splits — POSIX sh treats an
+/// unquoted `&` as a control operator regardless of surrounding
+/// whitespace, so `echo x&rm -rf ~` really backgrounds `echo x` and runs
+/// the `rm`; a quoted query string (`'?a=1&b=2'`) over-splits into
+/// harmless fragments, which errs toward checking, never toward bypass.
 fn split_segments(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
-    for (i, b) in command.bytes().enumerate() {
-        if matches!(b, b';' | b'\n' | b'|' | b'&' | b'(' | b')' | b'`') {
-            segments.push(&command[start..i]);
-            start = i + 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' | b'\n' | b'|' | b'(' | b')' | b'`' | b'&' => {
+                segments.push(&command[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
+        i += 1;
     }
     segments.push(&command[start..]);
     segments
@@ -1267,7 +1503,10 @@ fn git_destructive(rest: &[&str]) -> Option<&'static str> {
     match sub {
         "reset" if has("--hard") => Some("may discard uncommitted changes"),
         // --force-with-lease is a distinct token and intentionally allowed.
-        "push" if has("--force") || has("-f") => Some("may overwrite remote history"),
+        // Combined short clusters (`git push -fu`) carry the flag too.
+        "push" if has("--force") || rest.iter().any(|t| short_flags(t).contains('f')) => {
+            Some("may overwrite remote history")
+        }
         "clean" => {
             let dry = has("--dry-run") || rest.iter().any(|t| short_flags(t).contains('n'));
             let force = rest.iter().any(|t| short_flags(t).contains('f'));
@@ -1590,6 +1829,15 @@ mod tests {
         path
     }
 
+    /// Read a file through the toolbox so the read-before-edit gate is
+    /// armed for subsequent write_file/edit_file calls.
+    async fn prime(tb: &ToolBox, path: &str) {
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": path, "force": true})))
+            .await;
+        assert!(!out.is_error, "prime read failed: {}", out.output);
+    }
+
     /// Push a fixture's mtime into the past so it clears the racy-clean
     /// settle window and is eligible for the read cache.
     fn backdate(path: &Path) {
@@ -1645,6 +1893,7 @@ mod tests {
     async fn edit_exact_happy() {
         let (dir, tb) = setup();
         let path = write(&dir, "f.rs", "fn main() {\n    let x = 1;\n}\n");
+        prime(&tb, "f.rs").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1661,6 +1910,7 @@ mod tests {
     async fn edit_ladder_line_trimmed() {
         let (dir, tb) = setup();
         let path = write(&dir, "f.rs", "fn main() {\n    let x = 1;\n}\n");
+        prime(&tb, "f.rs").await;
         // Needle has wrong leading indent → exact fails, (b) matches.
         let out = tb
             .dispatch(&call(
@@ -1679,6 +1929,7 @@ mod tests {
         let (dir, tb) = setup();
         // Internal whitespace runs differ → (b) fails, (c) matches.
         let path = write(&dir, "f.rs", "let  y  =\t2;\n");
+        prime(&tb, "f.rs").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1700,6 +1951,7 @@ mod tests {
         let content =
             "mod a {\n    if x {\n        go();\n    }\n}\nmod b {\nif x {\ngo();\n}\n}\n";
         let path = write(&dir, "f.rs", content);
+        prime(&tb, "f.rs").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1723,6 +1975,7 @@ mod tests {
     async fn edit_escape_drift_refused() {
         let (dir, tb) = setup();
         write(&dir, "f.js", "    call(\"q\");\n");
+        prime(&tb, "f.js").await;
         // Trailing-space needle forces a fuzzy match; new_string carrying \" → refuse.
         let out = tb
             .dispatch(&call(
@@ -1742,6 +1995,7 @@ mod tests {
     async fn edit_replace_all_fuzzy_refused() {
         let (dir, tb) = setup();
         write(&dir, "f.rs", "    let x = 1;\n");
+        prime(&tb, "f.rs").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1761,6 +2015,7 @@ mod tests {
     async fn edit_multiple_exact_matches_lists_lines() {
         let (dir, tb) = setup();
         write(&dir, "f.txt", "foo\nbar\nfoo\n");
+        prime(&tb, "f.txt").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1775,6 +2030,7 @@ mod tests {
     async fn edit_already_applied() {
         let (dir, tb) = setup();
         write(&dir, "f.rs", "let x = 2;\n");
+        prime(&tb, "f.rs").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1789,6 +2045,7 @@ mod tests {
     async fn edit_near_miss_hint_on_no_match() {
         let (dir, tb) = setup();
         write(&dir, "f.rs", "fn main() {\n    let z = 9;\n}\n");
+        prime(&tb, "f.rs").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1807,6 +2064,7 @@ mod tests {
         // must delete the line, not short-circuit into a false
         // "already applied" (contains("") is always true).
         let path = write(&dir, "f.py", "keep\n    foo();\nkeep2\n");
+        prime(&tb, "f.py").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1824,6 +2082,7 @@ mod tests {
         // new_string already exists at line 1, but the drifted old_string
         // fuzzy-matches line 2 — the edit must run, not report success.
         let path = write(&dir, "f.rs", "foo(2);\n    foo(1);\n");
+        prime(&tb, "f.rs").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1845,6 +2104,7 @@ mod tests {
         // splice must carry the file's 4-space indent, not the needle's
         // tab, or the file ends up mixing tabs and spaces.
         let path = write(&dir, "f.py", "def f():\n    foo();\n");
+        prime(&tb, "f.py").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -1909,14 +2169,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_happy() {
+    async fn grep_happy_default_lists_matching_files_only() {
         let (dir, tb) = setup();
         write(&dir, "hay.txt", "one\nneedle_here\nthree\n");
+        write(&dir, "other.txt", "nothing\n");
         let out = tb
             .dispatch(&call("grep", json!({"pattern": "needle_here"})))
             .await;
         assert!(!out.is_error, "{}", out.output);
-        assert!(out.output.contains("needle_here"), "{}", out.output);
+        // Default output_mode files_with_matches: paths only, no content.
+        assert_eq!(out.output.trim(), "hay.txt");
+    }
+
+    #[tokio::test]
+    async fn grep_content_mode_shows_lines_and_context() {
+        let (dir, tb) = setup();
+        write(&dir, "hay.txt", "one\nneedle_here\nthree\n");
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "needle_here", "output_mode": "content"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("hay.txt:2:needle_here"), "{}", out.output);
+        assert!(!out.output.contains("one"), "context not requested: {}", out.output);
+
+        // -C context pulls in the surrounding lines.
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "needle_here", "output_mode": "content", "-C": 1}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("one"), "{}", out.output);
+        assert!(out.output.contains("three"), "{}", out.output);
+
+        // -A alone: only the after-context line joins the match.
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "needle_here", "output_mode": "content", "-A": 1}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("three"), "{}", out.output);
+        assert!(!out.output.contains("one"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn grep_case_insensitive_flag() {
+        let (dir, tb) = setup();
+        write(&dir, "hay.txt", "NEEDLE\n");
+        let out = tb.dispatch(&call("grep", json!({"pattern": "needle"}))).await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(out.output, "no matches found");
+        let out = tb
+            .dispatch(&call("grep", json!({"pattern": "needle", "-i": true})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(out.output.trim(), "hay.txt");
+    }
+
+    #[tokio::test]
+    async fn grep_glob_filter_restricts_files() {
+        let (dir, tb) = setup();
+        write(&dir, "a.rs", "needle\n");
+        write(&dir, "b.txt", "needle\n");
+        let out = tb
+            .dispatch(&call("grep", json!({"pattern": "needle", "glob": "*.rs"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("a.rs"), "{}", out.output);
+        assert!(!out.output.contains("b.txt"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn grep_count_mode_reports_per_file_counts() {
+        let (dir, tb) = setup();
+        write(&dir, "hay.txt", "x\nneedle\ny\nneedle\n");
+        write(&dir, "empty.txt", "nothing\n");
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "needle", "output_mode": "count"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("hay.txt:2"), "{}", out.output);
+        // Zero-count files never appear (grep -rc fallback prints them).
+        assert!(!out.output.contains("empty.txt"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn grep_head_limit_caps_output_with_notice() {
+        let (dir, tb) = setup();
+        let body: String = (0..30).map(|i| format!("needle {i}\n")).collect();
+        write(&dir, "hay.txt", &body);
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "needle", "output_mode": "content", "head_limit": 5}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        let hits = out.output.lines().filter(|l| l.contains("needle")).count();
+        assert_eq!(hits, 5, "{}", out.output);
+        assert!(out.output.contains("(truncated: 25 more lines)"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn grep_paths_are_workspace_relative_and_bad_mode_errors() {
+        let (dir, tb) = setup();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        write(&dir, "sub/inner.txt", "needle\n");
+        let out = tb
+            .dispatch(&call("grep", json!({"pattern": "needle", "path": "sub"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(out.output.trim(), "sub/inner.txt");
+        for line in out.output.lines() {
+            assert!(!line.starts_with('/'), "absolute path leaked: {line}");
+        }
+
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "needle", "output_mode": "bogus"}),
+            ))
+            .await;
+        assert!(out.is_error);
+        assert!(out.output.contains("unknown output_mode"), "{}", out.output);
     }
 
     #[tokio::test]
@@ -1992,6 +2376,7 @@ mod tests {
     async fn edit_fuzzy_preserves_crlf_line_endings() {
         let (dir, tb) = setup();
         let path = write(&dir, "f.txt", "alpha\r\nbeta\r\ngamma\r\n");
+        prime(&tb, "f.txt").await;
         // Trailing-space needle forces the fuzzy (line-trimmed) branch.
         let out = tb
             .dispatch(&call(
@@ -2380,6 +2765,227 @@ Collecting\n\
         assert!(again.output.starts_with("[unchanged"), "{}", again.output);
     }
 
+    // -- read-before-edit freshness gate ----------------------------------
+
+    #[tokio::test]
+    async fn write_refused_on_existing_unread_file() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "old\n");
+        let out = tb
+            .dispatch(&call(
+                "write_file",
+                json!({"path": "a.txt", "content": "new\n"}),
+            ))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("not been read"), "{}", out.output);
+        // File untouched by the refused write.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "old\n"
+        );
+        // After a read it goes through.
+        prime(&tb, "a.txt").await;
+        let out = tb
+            .dispatch(&call(
+                "write_file",
+                json!({"path": "a.txt", "content": "new\n"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn edit_refused_on_unread_file() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "alpha\n");
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "alpha", "new_string": "beta"}),
+            ))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("not been read"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn stale_writes_refused_after_external_change() {
+        let (dir, tb) = setup();
+        let p = write(&dir, "a.txt", "alpha\n");
+        backdate(&p);
+        prime(&tb, "a.txt").await;
+        // Parallel-anvil-style change: new content, new mtime.
+        write(&dir, "a.txt", "ALPHA\n");
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "alpha", "new_string": "beta"}),
+            ))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("stale"), "{}", out.output);
+        let out = tb
+            .dispatch(&call(
+                "write_file",
+                json!({"path": "a.txt", "content": "x\n"}),
+            ))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("stale"), "{}", out.output);
+        // Re-reading clears the gate.
+        prime(&tb, "a.txt").await;
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "ALPHA", "new_string": "beta"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "beta\n");
+    }
+
+    #[tokio::test]
+    async fn touch_only_mtime_move_is_restamped_and_allowed() {
+        let (dir, tb) = setup();
+        let p = write(&dir, "a.txt", "alpha\n");
+        backdate(&p);
+        prime(&tb, "a.txt").await;
+        // mtime moves but bytes are identical: allowed, not stale.
+        let status = std::process::Command::new("touch")
+            .args(["-t", "202101010000"])
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "alpha", "new_string": "beta"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "beta\n");
+    }
+
+    #[tokio::test]
+    async fn own_writes_restamp_so_followups_pass_without_reread() {
+        let (dir, tb) = setup();
+        let p = write(&dir, "a.txt", "one\n");
+        backdate(&p);
+        prime(&tb, "a.txt").await;
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "one", "new_string": "two"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        // Second edit without an intervening read: the first edit stamped
+        // its own write.
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "two", "new_string": "three"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "three\n");
+        // write_file after the edits passes, and stamps again for the next.
+        let out = tb
+            .dispatch(&call(
+                "write_file",
+                json!({"path": "a.txt", "content": "four\n"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        let out = tb
+            .dispatch(&call(
+                "write_file",
+                json!({"path": "a.txt", "content": "five\n"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "five\n");
+    }
+
+    #[tokio::test]
+    async fn partial_read_arms_the_write_gate() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "l1\nl2\nl3\n");
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": "a.txt", "limit": 1})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "l2", "new_string": "L2"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+    }
+
+    #[test]
+    fn write_and_edit_specs_state_the_freshness_gate() {
+        let specs = ToolBox::specs();
+        let write = specs.iter().find(|s| s.name == "write_file").unwrap();
+        assert!(
+            write.description.contains("This tool will error if"),
+            "{}",
+            write.description
+        );
+        assert!(write.description.contains("read_file it first"), "{}", write.description);
+        let edit = specs.iter().find(|s| s.name == "edit_file").unwrap();
+        assert!(
+            edit.description.contains("This tool will error if"),
+            "{}",
+            edit.description
+        );
+        assert!(edit.description.contains("mtime"), "{}", edit.description);
+    }
+
+    #[test]
+    fn bash_spec_teaches_git_safety_and_batching() {
+        let bash = ToolBox::specs()
+            .into_iter()
+            .find(|s| s.name == "bash")
+            .unwrap();
+        for phrase in [
+            // git safety protocol
+            "--no-verify",
+            "commit did NOT happen",
+            "never amend",
+            "git add -A",
+            "heredoc",
+            "interactive -i",
+            // parallel-vs-sequential batching
+            "ONE message",
+            "'&&'",
+            "';'",
+            "never newline-separate",
+        ] {
+            assert!(
+                bash.description.contains(phrase),
+                "missing {phrase:?}: {}",
+                bash.description
+            );
+        }
+    }
+
+    #[test]
+    fn grep_spec_documents_output_modes_and_flags() {
+        let g = ToolBox::specs()
+            .into_iter()
+            .find(|s| s.name == "grep")
+            .unwrap();
+        assert!(g.description.contains("files_with_matches"), "{}", g.description);
+        let props = g.parameters["properties"].as_object().unwrap();
+        for key in ["output_mode", "-i", "glob", "-A", "-B", "-C", "head_limit"] {
+            assert!(props.contains_key(key), "missing property {key}");
+        }
+    }
+
     // -- read_file size gate ---------------------------------------------
 
     #[tokio::test]
@@ -2418,7 +3024,8 @@ Collecting\n\
         assert_eq!(arg_u64(&a, "s"), Some(42));
         assert_eq!(arg_u64(&a, "pad"), Some(3));
         assert_eq!(arg_u64(&a, "bad"), None);
-        assert_eq!(arg_u64(&a, "f"), None);
+        // Fractional numbers truncate instead of dropping the argument.
+        assert_eq!(arg_u64(&a, "f"), Some(1));
         assert_eq!(arg_u64(&a, "missing"), None);
 
         let b = json!({"t": true, "st": "true", "sf": "false", "up": "False", "junk": "yes"});
@@ -2435,6 +3042,7 @@ Collecting\n\
     async fn stringly_typed_args_work_end_to_end() {
         let (dir, tb) = setup();
         write(&dir, "f.txt", "foo\nbar\nfoo\n");
+        prime(&tb, "f.txt").await;
         // replace_all as the string "true" replaces both occurrences.
         let out = tb
             .dispatch(&call(
@@ -2448,6 +3056,7 @@ Collecting\n\
 
         // replace_all as the string "false" behaves as false: multi-match error.
         write(&dir, "g.txt", "foo\nfoo\n");
+        prime(&tb, "g.txt").await;
         let out = tb
             .dispatch(&call(
                 "edit_file",
@@ -2765,5 +3374,83 @@ Collecting\n\
             .await;
         assert!(out.is_error);
         assert!(out.output.contains("name collision"), "{}", out.output);
+    }
+
+    #[test]
+    fn arg_u64_truncates_fractional_numbers_and_strings() {
+        let a = json!({
+            "float": 200.7,
+            "float_str": "12.9",
+            "neg": -2.5,
+            "neg_str": "-2.5",
+            "inf": "inf",
+        });
+        assert_eq!(arg_u64(&a, "float"), Some(200));
+        assert_eq!(arg_u64(&a, "float_str"), Some(12));
+        assert_eq!(arg_u64(&a, "neg"), None);
+        assert_eq!(arg_u64(&a, "neg_str"), None);
+        // "inf" parses as f64 infinity; non-finite stays rejected.
+        assert_eq!(arg_u64(&a, "inf"), None);
+    }
+
+    #[test]
+    fn split_segments_treats_every_ampersand_as_a_separator() {
+        // A whitespace-adjacent `&` is the background operator, so a
+        // command launched after it cannot smuggle past the deny table.
+        assert_eq!(
+            destructive_warning("sleep 5 & rm -rf /etc"),
+            Some("may recursively force-remove files outside tmp")
+        );
+        // Regression: sh treats an unquoted `&` as a control operator even
+        // without surrounding whitespace — `echo x&rm …` backgrounds the
+        // echo and RUNS the rm, so the gate must see it as its own segment.
+        assert_eq!(
+            destructive_warning("echo x&rm -rf ~/.ssh"),
+            Some("may recursively force-remove files outside tmp")
+        );
+        assert!(destructive_warning("true&git push -f origin main").is_some());
+        // A quoted query string over-splits into fragments whose argv0
+        // matches nothing destructive — no false refusal.
+        assert_eq!(destructive_warning("echo 'x?a=1&b=2'"), None);
+        // `;` and `||` still separate.
+        let segs = split_segments("grep foo f.txt || echo none; date");
+        assert!(segs.iter().any(|s| s.trim() == "date"), "{segs:?}");
+        assert!(segs.iter().any(|s| s.contains("echo none")), "{segs:?}");
+    }
+
+    #[test]
+    fn git_force_push_detected_inside_combined_short_flags() {
+        assert!(destructive_warning("git push -fu origin main").is_some());
+        assert!(destructive_warning("git push -uf origin main").is_some());
+        assert!(destructive_warning("git push -f origin main").is_some());
+        assert!(destructive_warning("git push --force").is_some());
+        assert!(destructive_warning("git push -u origin main").is_none());
+        // --force-with-lease stays intentionally allowed.
+        assert!(destructive_warning("git push --force-with-lease origin main").is_none());
+    }
+
+    #[tokio::test]
+    async fn count_lines_streams_newlines_and_final_unterminated_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        std::fs::write(&p, "a\nb\nc").unwrap();
+        assert_eq!(count_lines(&p).await, Some(3));
+        std::fs::write(&p, "a\nb\n").unwrap();
+        assert_eq!(count_lines(&p).await, Some(2));
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(count_lines(&p).await, Some(0));
+        assert_eq!(count_lines(&dir.path().join("missing")).await, None);
+    }
+
+    #[tokio::test]
+    async fn read_size_gate_refusal_reports_the_line_count() {
+        let (dir, tb) = setup();
+        // 1500 lines × 200 chars ≈ 295KB — over the 256KB full-read limit.
+        let body = format!("{}\n", vec!["x".repeat(200); 1500].join("\n"));
+        write(&dir, "big.txt", &body);
+        let out = tb.dispatch(&call("read_file", json!({"path": "big.txt"}))).await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("full-read limit"), "{}", out.output);
+        assert!(out.output.contains("1500 lines"), "{}", out.output);
     }
 }

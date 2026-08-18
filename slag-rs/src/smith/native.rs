@@ -146,7 +146,13 @@ impl NativeSmith {
             self.cfg.api_key.clone(),
             self.cfg.base_url.clone(),
         ));
+        // Size the compaction budget to the model's real window (cached
+        // per model on the provider; `None` on fetch failure keeps the
+        // default): a 32k model compacts before it 400s, a 1M model does
+        // not throw context away at the fixed default.
+        let window = provider.context_length(&model).await;
         let mut agent = ForgeAgent::new(provider, ToolBox::new(&self.root), &model)
+            .with_context_window(window)
             .with_effort(effort)
             .with_ingot_spend(self.ingot_spend.clone())
             .with_events(tx);
@@ -215,6 +221,41 @@ mod tests {
         let smith = NativeSmith::plan(cfg(), PathBuf::from("."), &EngineHooks::default());
         assert_eq!(smith.model(), "plan/model");
         assert_eq!(smith.mode, PromptMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn invoke_fetches_the_model_window_to_size_the_token_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `.expect(1)` is verified on MockServer drop: the /models window
+        // fetch must run as part of a real invoke — regression for the
+        // window-derived budget being dead code outside unit tests.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "base/model", "context_length": 32768 }],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": { "content": "done" },
+                    "finish_reason": "stop",
+                }],
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = cfg();
+        config.base_url = server.uri();
+        let smith =
+            NativeSmith::forge(config, "rust", 1, PathBuf::from("."), &EngineHooks::default());
+        assert_eq!(smith.invoke("task").await.unwrap(), "done");
     }
 
     #[test]

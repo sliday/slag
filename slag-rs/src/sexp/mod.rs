@@ -87,6 +87,9 @@ pub struct Ingot {
     /// Twin-cast duel override: `:duel t` forces, `:duel nil` blocks,
     /// absent (None) defers to the configured Auto policy.
     pub duel: Option<bool>,
+    /// Adaptive cast count override: `:casts 1|2|3` pins how many smiths
+    /// forge this ingot; absent (None) defers to the config heuristics.
+    pub casts: Option<u8>,
     /// Preserve unknown fields for forward compatibility
     pub extra: Vec<(String, String)>,
 }

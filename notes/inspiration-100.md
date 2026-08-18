@@ -3,7 +3,7 @@
 Source: 8-beat sweep of /Users/stas/Playground/Claude Code src (140 raw ideas, curated to 100).
 Status legend: [ ] todo · [~] in flight · [x] done
 
-Progress: wave 1 (items 1-16) + item 18 shipped in v2.2.0. Wave 2 in flight.
+Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items incl. 21, 30) + adaptive casts + site refresh in v2.3.0.
 
 
 ## Wave 1

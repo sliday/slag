@@ -45,6 +45,11 @@ pub struct Cli {
     /// Duel judge model (overrides SLAG_MODEL_JUDGE)
     #[arg(long, value_name = "MODEL")]
     pub judge_model: Option<String>,
+
+    /// Force multi-cast forging: every solo ingot gets at least two casts
+    /// (equivalent to SLAG_DUEL=on)
+    #[arg(long)]
+    pub duel: bool,
 }
 
 #[derive(Subcommand)]
@@ -79,6 +84,16 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duel_flag_parses_and_defaults_off() {
+        let cli = Cli::parse_from(["slag", "--duel", "build", "it"]);
+        assert!(cli.duel);
+        assert_eq!(cli.commission_text().as_deref(), Some("build it"));
+
+        let cli = Cli::parse_from(["slag", "build", "it"]);
+        assert!(!cli.duel);
+    }
 
     #[test]
     fn worktree_flag_still_parses_and_help_says_it_is_ignored() {

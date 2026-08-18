@@ -40,6 +40,7 @@ export const exampleIngots = [
     skill: "web",
     heat: 3,
     max: 8,
+    duel: true,
     proof: "npm run build && test -d dist",
     work: "Implement terminal-UI CSS theme with responsive breakpoints"
   },
@@ -83,6 +84,7 @@ export function renderIngots(ingots) {
         <span>grade: ${ingot.grade}</span>
         <span>skill: ${ingot.skill}</span>
         <span>heat: ${ingot.heat}/${ingot.max}</span>
+        ${ingot.duel !== undefined ? `<span>duel: ${ingot.duel ? 't' : 'nil'}</span>` : ''}
       </div>
       <details class="ingot-proof">
         <summary>:proof</summary>
@@ -93,7 +95,8 @@ export function renderIngots(ingots) {
 }
 
 export function toSExpression(ingot) {
-  return `(ingot :id "${ingot.id}" :status ${ingot.status} :solo ${ingot.solo ? 't' : 'nil'} :grade ${ingot.grade} :skill ${ingot.skill} :heat ${ingot.heat} :max ${ingot.max} :proof "${ingot.proof}" :work "${ingot.work}")`;
+  const duel = ingot.duel !== undefined ? ` :duel ${ingot.duel ? 't' : 'nil'}` : '';
+  return `(ingot :id "${ingot.id}" :status ${ingot.status} :solo ${ingot.solo ? 't' : 'nil'} :grade ${ingot.grade} :skill ${ingot.skill} :heat ${ingot.heat} :max ${ingot.max}${duel} :proof "${ingot.proof}" :work "${ingot.work}")`;
 }
 
 export function logSExpressions(ingots) {

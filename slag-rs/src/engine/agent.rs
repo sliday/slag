@@ -7,12 +7,14 @@
 //! Local tool bugs (including panics) become `is_error` tool results;
 //! only provider errors propagate — ingot heat handles those retries.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
-use super::compact::compact;
+use super::compact::{compact, convo_chars};
 use super::events::preview;
 use super::tools::ToolBox;
 use super::{
@@ -23,6 +25,14 @@ use crate::error::SlagError;
 
 const DEFAULT_MAX_TURNS: usize = 40;
 const CHAR_BUDGET: usize = 600_000;
+/// chars/4 is the estimation rule for text appended since the last usage
+/// anchor; token budgets convert to char targets through the same ratio.
+const CHARS_PER_TOKEN: usize = 4;
+const DEFAULT_TOKEN_BUDGET: usize = CHAR_BUDGET / CHARS_PER_TOKEN;
+/// Room reserved out of the model window for its own output.
+const OUTPUT_RESERVE_TOKENS: u64 = 16_384;
+/// Headroom so compaction fires before the hard window edge.
+const COMPACT_BUFFER_TOKENS: u64 = 8_192;
 /// Compaction circuit breaker: after this many overflow-shrink cycles the
 /// context is declared irrecoverable — a permanent failure, not a heat to
 /// keep retrying against.
@@ -32,6 +42,7 @@ const COST_WARN_FRACTION: f64 = 0.8;
 /// Overflow-shrink floor: below this, compaction cannot help — the
 /// system prompt, task, and protected tail alone exceed the window.
 const CHAR_BUDGET_FLOOR: usize = 16_000;
+const TOKEN_BUDGET_FLOOR: usize = CHAR_BUDGET_FLOOR / CHARS_PER_TOKEN;
 const PREVIEW_LEN: usize = 80;
 const STEER_TAG: &str = "[STEER — operator message, follow it]";
 
@@ -41,14 +52,68 @@ const STEER_TAG: &str = "[STEER — operator message, follow it]";
 /// the ingot, not each session from a fresh $0.
 pub type SpendAccum = Arc<std::sync::Mutex<f64>>;
 
-/// Char budget for compaction. `SLAG_CHAR_BUDGET` overrides the default so
-/// smaller-context models compact before the provider rejects the request.
-fn char_budget_from_env() -> usize {
-    std::env::var("SLAG_CHAR_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok())
+/// `SLAG_CHAR_BUDGET` (in chars, converted at chars/4) still overrides
+/// everything so smaller-context models can be forced to compact early;
+/// window-derived budgets only apply when it is unset.
+fn env_token_budget() -> Option<usize> {
+    parse_char_budget(std::env::var("SLAG_CHAR_BUDGET").ok())
+}
+
+fn parse_char_budget(raw: Option<String>) -> Option<usize> {
+    raw.and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(CHAR_BUDGET)
+        .map(|v| (v / CHARS_PER_TOKEN).max(1))
+}
+
+/// Context budget derived from a model window: window minus output reserve
+/// minus compaction headroom, floored where compaction stops helping.
+fn budget_for_window(window_tokens: u64) -> usize {
+    let usable = window_tokens.saturating_sub(OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS);
+    (usable as usize).max(TOKEN_BUDGET_FLOOR)
+}
+
+/// Usage anchor for token estimation: the provider's reported
+/// `prompt_tokens` covers everything sent on the last call exactly; only
+/// messages appended since are estimated at chars/4. Anchors replace each
+/// other — summing per-turn usage would double-count the shared history.
+#[derive(Clone, Copy)]
+struct TokenAnchor {
+    /// `prompt_tokens` of the last response — exact for `messages[..sent]`.
+    tokens: u64,
+    /// `messages.len()` at the time of that call.
+    sent: usize,
+}
+
+/// Estimated prompt tokens for the next call: anchored count plus chars/4
+/// of everything appended since; pure chars/4 before any anchor exists.
+fn estimate_tokens(messages: &[ChatMessage], anchor: Option<TokenAnchor>) -> u64 {
+    match anchor {
+        Some(a) if a.sent <= messages.len() => {
+            a.tokens + (convo_chars(&messages[a.sent..]) / CHARS_PER_TOKEN) as u64
+        }
+        _ => (convo_chars(messages) / CHARS_PER_TOKEN) as u64,
+    }
+}
+
+/// Token-driven compaction: when the estimate exceeds the budget, prune
+/// enough chars to cover the overshoot (at chars/4). Any prune invalidates
+/// the anchor — pruned history no longer matches its counted tokens.
+fn compact_to_tokens(
+    messages: &mut Vec<ChatMessage>,
+    token_budget: usize,
+    anchor: &mut Option<TokenAnchor>,
+) -> bool {
+    let est = estimate_tokens(messages, *anchor);
+    if est <= token_budget as u64 {
+        return false;
+    }
+    let over_chars = (est as usize - token_budget) * CHARS_PER_TOKEN;
+    let target = convo_chars(messages).saturating_sub(over_chars);
+    let changed = compact(messages, target);
+    if changed {
+        *anchor = None;
+    }
+    changed
 }
 
 /// Provider rejection caused by the request exceeding the model's context
@@ -67,10 +132,6 @@ fn is_context_overflow(e: &SlagError) -> bool {
     .any(|needle| s.contains(needle))
 }
 
-fn convo_chars(messages: &[ChatMessage]) -> usize {
-    messages.iter().map(|m| m.content.chars().count()).sum()
-}
-
 /// One smith session: a provider, a toolbox, a model, and a turn budget.
 pub struct ForgeAgent {
     provider: Arc<dyn Provider>,
@@ -78,7 +139,9 @@ pub struct ForgeAgent {
     model: String,
     effort: Option<Effort>,
     max_turns: usize,
-    char_budget: usize,
+    /// Context budget in tokens (window minus reserves, or the env/default
+    /// fallback). Compaction is driven by usage-anchored token estimates.
+    token_budget: usize,
     /// Dollar ceiling for one ingot (all its sessions); `None` = uncapped.
     cost_cap: Option<f64>,
     /// Dollar ceiling for the whole run; `None` = uncapped. Checked in the
@@ -100,7 +163,7 @@ impl ForgeAgent {
             model: model.into(),
             effort: None,
             max_turns: DEFAULT_MAX_TURNS,
-            char_budget: char_budget_from_env(),
+            token_budget: env_token_budget().unwrap_or(DEFAULT_TOKEN_BUDGET),
             cost_cap: crate::config::ingot_cost_cap(),
             run_cap: crate::config::run_cost_cap(),
             ingot_spend: SpendAccum::default(),
@@ -112,7 +175,20 @@ impl ForgeAgent {
 
     #[cfg(test)]
     fn with_char_budget(mut self, chars: usize) -> Self {
-        self.char_budget = chars.max(1);
+        self.token_budget = (chars / CHARS_PER_TOKEN).max(1);
+        self
+    }
+
+    /// Derive the token budget from the model's context window (fetched
+    /// per model from OpenRouter `/models`): window minus output reserve
+    /// minus compaction headroom. `None` (window unknown) keeps the
+    /// default; a `SLAG_CHAR_BUDGET` override always wins.
+    pub fn with_context_window(mut self, window_tokens: Option<u64>) -> Self {
+        if env_token_budget().is_none() {
+            if let Some(window) = window_tokens {
+                self.token_budget = budget_for_window(window);
+            }
+        }
         self
     }
 
@@ -179,23 +255,35 @@ impl ForgeAgent {
     ) -> Result<String, SlagError> {
         let mut messages = vec![ChatMessage::system(system), ChatMessage::user(task)];
         let mut continued = false;
-        let mut char_budget = self.char_budget;
+        let mut token_budget = self.token_budget;
+        let mut anchor: Option<TokenAnchor> = None;
         let mut budget_warned = false;
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
             self.apply_steers(&mut messages, applied_steers);
-            compact(&mut messages, char_budget);
+            compact_to_tokens(&mut messages, token_budget, &mut anchor);
             emit(&self.events, EngineEvent::TurnStart { turn });
             emit(&self.events, EngineEvent::ModelCall { model: self.model.clone() });
 
-            let resp = match self.chat_shrinking(&mut messages, true, &mut char_budget).await {
+            let resp = match self
+                .chat_shrinking(&mut messages, true, &mut token_budget, &mut anchor)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     emit(&self.events, EngineEvent::Error { message: e.to_string() });
                     return Err(e);
                 }
             };
+            // Re-anchor on the provider's own count: prompt_tokens is exact
+            // for everything just sent; chars/4 only ever covers the delta.
+            if resp.usage.prompt_tokens > 0 {
+                anchor = Some(TokenAnchor {
+                    tokens: resp.usage.prompt_tokens,
+                    sent: messages.len(),
+                });
+            }
             // With a router in front, the requested id says nothing about
             // what actually did the work. Report the swap when it happens.
             if let Some(routed) = resp.model.as_deref().filter(|m| *m != self.model) {
@@ -306,8 +394,11 @@ impl ForgeAgent {
         messages.push(ChatMessage::user(
             "no more tool budget — summarize what was done",
         ));
-        compact(&mut messages, char_budget);
-        let resp = match self.chat_shrinking(&mut messages, false, &mut char_budget).await {
+        compact_to_tokens(&mut messages, token_budget, &mut anchor);
+        let resp = match self
+            .chat_shrinking(&mut messages, false, &mut token_budget, &mut anchor)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 emit(&self.events, EngineEvent::Error { message: e.to_string() });
@@ -321,9 +412,10 @@ impl ForgeAgent {
     }
 
     /// Fold one response's cost into the shared ingot accumulator and the
-    /// run-wide spend accumulator.
+    /// run-wide spend accumulator (see `spend_for`).
     fn track_spend(&self, usage: &Usage) {
-        if let Some(c) = usage.cost.filter(|c| *c > 0.0) {
+        let c = spend_for(usage);
+        if c > 0.0 {
             *self.ingot_spend.lock().unwrap() += c;
             crate::config::add_run_spend(c);
         }
@@ -344,20 +436,21 @@ impl ForgeAgent {
     }
 
     /// Chat with context-overflow recovery: on a context-window 400, halve
-    /// the budget, compact, and retry — until the floor is reached or
+    /// the token budget, compact, and retry — until the floor is reached or
     /// compaction stops making progress. Fixed budgets sized for large
     /// windows never fire compaction on smaller-context models otherwise.
     async fn chat_shrinking(
         &self,
         messages: &mut Vec<ChatMessage>,
         with_tools: bool,
-        char_budget: &mut usize,
+        token_budget: &mut usize,
+        anchor: &mut Option<TokenAnchor>,
     ) -> Result<NormalizedResponse, SlagError> {
         let mut shrink_cycles = 0usize;
         loop {
             match self.provider.chat(self.request(messages.clone(), with_tools)).await {
                 Ok(resp) => return Ok(resp),
-                Err(e) if is_context_overflow(&e) && *char_budget > CHAR_BUDGET_FLOOR => {
+                Err(e) if is_context_overflow(&e) && *token_budget > TOKEN_BUDGET_FLOOR => {
                     // Circuit breaker: shrink cycles that keep overflowing
                     // mean the window can never fit — fail permanently
                     // instead of grinding halvings forever.
@@ -367,17 +460,15 @@ impl ForgeAgent {
                             "context irrecoverable after {MAX_SHRINK_CYCLES} compactions: {e}"
                         )));
                     }
-                    *char_budget = (*char_budget / 2).max(CHAR_BUDGET_FLOOR);
-                    let before = convo_chars(messages);
-                    compact(messages, *char_budget);
-                    if convo_chars(messages) == before {
+                    *token_budget = (*token_budget / 2).max(TOKEN_BUDGET_FLOOR);
+                    if !compact_to_tokens(messages, *token_budget, anchor) {
                         return Err(e); // nothing prunable — retrying is futile
                     }
                     emit(
                         &self.events,
                         EngineEvent::Error {
                             message: format!(
-                                "context overflow — compacted to {char_budget} chars, retrying"
+                                "context overflow — compacted to {token_budget} tokens, retrying"
                             ),
                         },
                     );
@@ -532,6 +623,93 @@ fn plan_segments(calls: &[ToolCall]) -> Vec<Vec<usize>> {
         segments.push(readers);
     }
     segments
+}
+
+/// Dollars one response cost. A reported `usage.cost` is the truth — an
+/// explicit `0.0` (OpenRouter `:free` variants report it on every
+/// response) means free, NOT missing, so it must not be overridden by
+/// the estimate or free-model runs accrue phantom spend and trip caps.
+/// Only an absent cost (proxy setups strip the field) falls back to the
+/// token estimate; a negative report is nonsense and treated as absent.
+pub(crate) fn spend_for(usage: &Usage) -> f64 {
+    usage
+        .cost
+        .filter(|c| *c >= 0.0)
+        .unwrap_or_else(|| estimated_cost(usage))
+}
+
+/// Provider wrapper that folds every response's cost into a shared ingot
+/// accumulator and the run-wide spend, and refuses to call out once the
+/// run cap is spent. The judge/assayer holds no `ForgeAgent` (and so no
+/// `track_spend`); without this wrapper its calls bypass both spend caps.
+pub struct SpendTracked<P> {
+    inner: P,
+    accum: SpendAccum,
+    run_cap: Option<f64>,
+}
+
+impl<P: Provider> SpendTracked<P> {
+    pub fn new(inner: P, accum: SpendAccum) -> Self {
+        Self { inner, accum, run_cap: crate::config::run_cost_cap() }
+    }
+
+    /// Override the run-wide cap (tests; `new` reads config/env).
+    #[cfg(test)]
+    pub fn with_run_cap(mut self, cap: Option<f64>) -> Self {
+        self.run_cap = cap;
+        self
+    }
+}
+
+impl<P: Provider> Provider for SpendTracked<P> {
+    fn chat(
+        &self,
+        req: ChatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>> {
+        let accum = self.accum.clone();
+        let run_cap = self.run_cap;
+        Box::pin(async move {
+            if let Some(cap) = run_cap {
+                let spent = crate::config::run_spend_dollars();
+                if spent >= cap {
+                    return Err(SlagError::RunBudgetExhausted { spent, cap });
+                }
+            }
+            let resp = self.inner.chat(req).await?;
+            let c = spend_for(&resp.usage);
+            if c > 0.0 {
+                *accum.lock().unwrap() += c;
+                crate::config::add_run_spend(c);
+            }
+            Ok(resp)
+        })
+    }
+}
+
+/// Conservative flat rate for spend estimation when a provider response
+/// carries no `usage.cost` (proxy setups strip it). Overridable via
+/// SLAG_COST_PER_MTOK; the default errs high so budget caps still bind.
+const COST_PER_MTOK_DEFAULT: f64 = 5.0;
+
+/// Estimated dollars for one response: total tokens at the flat rate.
+fn estimated_cost(usage: &Usage) -> f64 {
+    estimated_cost_at(usage, cost_per_mtok())
+}
+
+fn estimated_cost_at(usage: &Usage, rate_per_mtok: f64) -> f64 {
+    usage.total_tokens as f64 * rate_per_mtok / 1_000_000.0
+}
+
+fn cost_per_mtok() -> f64 {
+    mtok_rate_from(std::env::var("SLAG_COST_PER_MTOK").ok().as_deref())
+}
+
+/// Parse an override rate; junk, negatives, and non-finite values fall
+/// back to the default.
+fn mtok_rate_from(v: Option<&str>) -> f64 {
+    v.and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|r| r.is_finite() && *r >= 0.0)
+        .unwrap_or(COST_PER_MTOK_DEFAULT)
 }
 
 #[cfg(test)]
@@ -1356,5 +1534,221 @@ mod tests {
             .expect_err("cancel must abort the run");
         assert!(err.to_string().contains("interrupted by user"), "got: {err}");
         assert_eq!(inner.requests().len(), 1, "exactly one call before the flag check");
+    }
+
+    #[test]
+    fn token_estimate_prefers_the_usage_anchor_over_chars() {
+        let messages = vec![
+            ChatMessage::system("s".repeat(4000)),
+            ChatMessage::user("t".repeat(4000)),
+            ChatMessage::user("delta".repeat(80)), // 400 chars appended since
+        ];
+        // No anchor: pure chars/4 over everything.
+        assert_eq!(estimate_tokens(&messages, None), (8400 / CHARS_PER_TOKEN) as u64);
+        // Anchored: exact count for the first two, chars/4 for the delta
+        // only — never a cumulative sum of per-turn usage.
+        let anchor = TokenAnchor { tokens: 50_000, sent: 2 };
+        assert_eq!(
+            estimate_tokens(&messages, Some(anchor)),
+            50_000 + (400 / CHARS_PER_TOKEN) as u64
+        );
+        // A stale anchor pointing past the end falls back to chars/4.
+        let stale = TokenAnchor { tokens: 50_000, sent: 99 };
+        assert_eq!(estimate_tokens(&messages, Some(stale)), (8400 / CHARS_PER_TOKEN) as u64);
+    }
+
+    #[test]
+    fn window_budget_subtracts_reserves_and_floors() {
+        assert_eq!(
+            budget_for_window(131_072),
+            131_072 - (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize
+        );
+        // A window smaller than the reserves still leaves a working floor.
+        assert_eq!(budget_for_window(8_192), TOKEN_BUDGET_FLOOR);
+        assert_eq!(budget_for_window(0), TOKEN_BUDGET_FLOOR);
+    }
+
+    #[test]
+    fn with_context_window_derives_the_token_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![]);
+        let base = agent(provider.clone(), dir.path());
+        let default_budget = base.token_budget;
+
+        let sized = agent(provider.clone(), dir.path()).with_context_window(Some(131_072));
+        assert_eq!(sized.token_budget, budget_for_window(131_072));
+        // Unknown window keeps whatever budget was already in place.
+        let unknown = agent(provider, dir.path()).with_context_window(None);
+        assert_eq!(unknown.token_budget, default_budget);
+    }
+
+    #[test]
+    fn char_budget_env_parses_chars_into_tokens() {
+        assert_eq!(parse_char_budget(None), None);
+        assert_eq!(parse_char_budget(Some("400000".into())), Some(100_000));
+        assert_eq!(parse_char_budget(Some("0".into())), None);
+        assert_eq!(parse_char_budget(Some("junk".into())), None);
+    }
+
+    #[tokio::test]
+    async fn usage_anchor_triggers_compaction_before_chars_would() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.path().join(format!("a{i}.txt")), format!("A{i}").repeat(500))
+                .unwrap();
+        }
+
+        // Four fat-token turns: the provider reports a prompt far beyond
+        // the budget while the transcript stays tiny in chars (~4k, worth
+        // ~1k tokens by chars/4). Only the usage anchor can see trouble.
+        let read = |i: usize| {
+            tc("c1", "read_file", serde_json::json!({"path": format!("a{i}.txt")}))
+        };
+        let mut script: Vec<NormalizedResponse> = (0..4)
+            .map(|i| {
+                let mut resp = resp_tools(vec![read(i)]);
+                resp.usage.prompt_tokens = 999_999;
+                resp
+            })
+            .collect();
+        script.push(resp_text("done", FinishReason::Stop));
+        let provider = MockProvider::new(script);
+
+        let result = agent(provider.clone(), dir.path())
+            .with_char_budget(400_000) // 100k tokens — chars/4 never trips it
+            .run("system".into(), "task".into())
+            .await
+            .expect("run ok");
+        assert_eq!(result, "done");
+
+        // The 5th request must be compacted: the anchored estimate crossed
+        // the budget even though raw chars sat far under it.
+        let requests = provider.requests();
+        let last = &requests[4].messages;
+        let compacted = last.len() < 10
+            || last.iter().any(|m| m.content.starts_with("[pruned old tool result"));
+        assert!(compacted, "anchored estimate must drive compaction");
+        // Whatever was pruned, pairing stays intact for strict backends.
+        for (i, m) in last.iter().enumerate() {
+            if m.role == "tool" {
+                let id = m.tool_call_id.as_deref().unwrap();
+                assert!(
+                    last[..i].iter().any(|a| a
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|cs| cs.iter().any(|c| c.id == id))),
+                    "orphan tool result in compacted request"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mtok_rate_parses_overrides_and_falls_back() {
+        assert_eq!(mtok_rate_from(None), COST_PER_MTOK_DEFAULT);
+        assert_eq!(mtok_rate_from(Some("2.5")), 2.5);
+        assert_eq!(mtok_rate_from(Some(" 10 ")), 10.0);
+        assert_eq!(mtok_rate_from(Some("0")), 0.0);
+        assert_eq!(mtok_rate_from(Some("-1")), COST_PER_MTOK_DEFAULT);
+        assert_eq!(mtok_rate_from(Some("NaN")), COST_PER_MTOK_DEFAULT);
+        assert_eq!(mtok_rate_from(Some("junk")), COST_PER_MTOK_DEFAULT);
+    }
+
+    #[test]
+    fn spend_for_trusts_a_reported_zero_cost_over_the_estimate() {
+        // OpenRouter `:free` variants report cost: 0.0 on every response.
+        // 0.0 means free, not missing — the estimate must not override it.
+        let free = Usage { total_tokens: 200_000, cost: Some(0.0), ..Default::default() };
+        assert_eq!(spend_for(&free), 0.0);
+        // Absent cost still falls back to the token estimate.
+        let stripped = Usage { total_tokens: 200_000, cost: None, ..Default::default() };
+        assert!(spend_for(&stripped) > 0.0);
+        // A negative report is nonsense — treated as absent.
+        let junk = Usage { total_tokens: 200_000, cost: Some(-1.0), ..Default::default() };
+        assert!(spend_for(&junk) > 0.0);
+    }
+
+    #[tokio::test]
+    async fn free_model_run_accrues_no_phantom_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let acc = SpendAccum::default();
+
+        // A long free-model turn: huge token counts, reported cost 0.0.
+        // Estimated at $5/Mtok this would be ~$50 of phantom spend and
+        // trip the $1 ingot cap; the reported zero must win.
+        let read = tc("c1", "read_file", serde_json::json!({"path": "a.txt"}));
+        let mut turn = resp_tools(vec![read]);
+        turn.usage.total_tokens = 10_000_000;
+        turn.usage.cost = Some(0.0);
+        let mut done = resp_text("done", FinishReason::Stop);
+        done.usage.total_tokens = 10_000_000;
+        done.usage.cost = Some(0.0);
+
+        let result = agent(MockProvider::new(vec![turn, done]), dir.path())
+            .with_cost_cap(Some(1.0))
+            .with_ingot_spend(acc.clone())
+            .run("system".into(), "task".into())
+            .await
+            .expect("free model must not trip the cap");
+        assert_eq!(result, "done");
+        assert_eq!(*acc.lock().unwrap(), 0.0, "no phantom spend accrued");
+    }
+
+    #[tokio::test]
+    async fn spend_tracked_provider_folds_judge_cost_into_the_accumulator() {
+        let mut resp = resp_text("verdict", FinishReason::Stop);
+        resp.usage.cost = Some(0.5);
+        let inner = MockProvider {
+            script: Mutex::new(vec![resp].into()),
+            requests: Mutex::new(Vec::new()),
+        };
+        let acc = SpendAccum::default();
+        let tracked = SpendTracked::new(inner, acc.clone()).with_run_cap(None);
+
+        let req = ChatRequest {
+            model: "judge/model".into(),
+            messages: vec![ChatMessage::user("rule")],
+            tools: vec![],
+            effort: None,
+            max_tokens: None,
+        };
+        tracked.chat(req).await.expect("chat ok");
+        assert!((*acc.lock().unwrap() - 0.5).abs() < 1e-9, "judge cost tracked");
+    }
+
+    #[tokio::test]
+    async fn spend_tracked_provider_refuses_once_the_run_cap_is_spent() {
+        let inner = MockProvider {
+            script: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+        };
+        // The global run-spend accumulator is always >= 0, so a zero cap
+        // trips deterministically before any provider call.
+        let tracked = SpendTracked::new(inner, SpendAccum::default()).with_run_cap(Some(0.0));
+
+        let req = ChatRequest {
+            model: "judge/model".into(),
+            messages: vec![ChatMessage::user("rule")],
+            tools: vec![],
+            effort: None,
+            max_tokens: None,
+        };
+        let err = tracked.chat(req).await.expect_err("run cap must refuse");
+        assert!(matches!(err, SlagError::RunBudgetExhausted { .. }), "got: {err}");
+        assert!(tracked.inner.requests.lock().unwrap().is_empty(), "no call past the cap");
+    }
+
+    #[test]
+    fn missing_cost_is_estimated_from_tokens_so_caps_still_bind() {
+        // 1M tokens at $5/Mtok — the estimate keeps budget caps binding
+        // when a proxy strips usage.cost from every response.
+        let usage = Usage { total_tokens: 1_000_000, cost: None, ..Default::default() };
+        assert!((estimated_cost_at(&usage, 5.0) - 5.0).abs() < 1e-9);
+        // Cheaper override rate scales linearly.
+        assert!((estimated_cost_at(&usage, 0.5) - 0.5).abs() < 1e-9);
+        // No tokens, no spend: the accumulator ignores zero estimates.
+        let idle = Usage { total_tokens: 0, cost: None, ..Default::default() };
+        assert_eq!(estimated_cost_at(&idle, 5.0), 0.0);
     }
 }

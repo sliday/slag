@@ -3,6 +3,7 @@ use super::{Ingot, Skill, Status};
 /// Known field names that map to typed struct fields
 const KNOWN_FIELDS: &[&str] = &[
     "id", "status", "solo", "grade", "skill", "heat", "max", "smelt", "proof", "work", "duel",
+    "casts",
 ];
 
 /// Parse a single s-expression line into an Ingot.
@@ -38,6 +39,11 @@ pub fn parse_ingot(line: &str) -> Option<Ingot> {
     let proof = get("proof").unwrap_or_else(|| "true".into());
     let work = get("work").unwrap_or_default();
     let duel = get("duel").map(|s| s == "t");
+    // Only 1-3 are meaningful cast counts; anything else falls back to
+    // auto rather than pinning a value the duel loop cannot honor.
+    let casts = get("casts")
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|c| (1..=3).contains(c));
 
     let extra: Vec<(String, String)> = fields
         .into_iter()
@@ -56,6 +62,7 @@ pub fn parse_ingot(line: &str) -> Option<Ingot> {
         proof,
         work,
         duel,
+        casts,
         extra,
     })
 }
@@ -226,6 +233,48 @@ mod tests {
             let written = super::super::writer::write_ingot(&ingot);
             let reparsed = parse_ingot(&written).unwrap();
             assert_eq!(ingot.duel, reparsed.duel, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn parse_casts_field_values() {
+        for (value, expected) in [("1", Some(1)), ("2", Some(2)), ("3", Some(3))] {
+            let line = format!(
+                r#"(ingot :id "i1" :status ore :solo t :grade 3 :heat 0 :max 5 :proof "true" :work "w" :casts {value})"#
+            );
+            let ingot = parse_ingot(&line).unwrap();
+            assert_eq!(ingot.casts, expected, "casts {value}");
+            // Known field: never leaks into extra.
+            assert!(ingot.extra.is_empty(), "casts {value} leaked into extra");
+        }
+
+        // Out-of-range or garbage counts fall back to auto (None).
+        for bad in ["0", "4", "255", "many"] {
+            let line = format!(
+                r#"(ingot :id "i1" :status ore :solo t :grade 3 :heat 0 :max 5 :proof "true" :work "w" :casts {bad})"#
+            );
+            assert_eq!(parse_ingot(&line).unwrap().casts, None, "casts {bad}");
+        }
+
+        // Absent means auto.
+        let absent = parse_ingot(
+            r#"(ingot :id "i1" :status ore :solo t :grade 3 :heat 0 :max 5 :proof "true" :work "w")"#,
+        )
+        .unwrap();
+        assert_eq!(absent.casts, None);
+    }
+
+    #[test]
+    fn casts_field_roundtrips() {
+        for line in [
+            r#"(ingot :id "i1" :status ore :solo t :grade 4 :heat 0 :max 5 :proof "true" :work "w" :casts 1)"#,
+            r#"(ingot :id "i2" :status ore :solo t :grade 4 :heat 0 :max 5 :proof "true" :work "w" :casts 3)"#,
+            r#"(ingot :id "i3" :status ore :solo t :grade 4 :heat 0 :max 5 :proof "true" :work "w")"#,
+        ] {
+            let ingot = parse_ingot(line).unwrap();
+            let written = super::super::writer::write_ingot(&ingot);
+            let reparsed = parse_ingot(&written).unwrap();
+            assert_eq!(ingot.casts, reparsed.casts, "line: {line}");
         }
     }
 

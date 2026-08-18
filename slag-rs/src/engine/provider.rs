@@ -15,17 +15,34 @@ use super::{ChatMessage, ChatRequest, FinishReason, NormalizedResponse, Provider
 use crate::error::SlagError;
 
 const REQUEST_TIMEOUT_SECS: u64 = 600;
-const MAX_ATTEMPTS: usize = 3;
+const DEFAULT_MAX_ATTEMPTS: usize = 8;
 const BACKOFF_BASE_MS: u64 = 500;
 const BACKOFF_CAP_MS: u64 = 32_000;
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 const BODY_EXCERPT_LEN: usize = 300;
+
+/// Retry budget: `SLAG_MAX_RETRIES` overrides the default. Three attempts
+/// over ~1.5s proved far too brittle for overnight forge runs now that
+/// backoff is exponential — eight attempts ride the 500ms→32s curve.
+fn parse_max_attempts(raw: Option<String>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_ATTEMPTS)
+}
+
+fn max_attempts_from_env() -> usize {
+    parse_max_attempts(std::env::var("SLAG_MAX_RETRIES").ok())
+}
 
 /// OpenRouter chat-completions client.
 pub struct OpenRouter {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+    max_attempts: usize,
+    /// Per-model context windows resolved from `/models`, cached so one
+    /// client never fetches the (large) model list twice for the same id.
+    windows: std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
 }
 
 impl OpenRouter {
@@ -42,7 +59,27 @@ impl OpenRouter {
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
                 .build()
                 .expect("reqwest client build"),
+            max_attempts: max_attempts_from_env(),
+            windows: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_attempts(mut self, attempts: usize) -> Self {
+        self.max_attempts = attempts.max(1);
+        self
+    }
+
+    /// Context window (tokens) for `model`, cached per client. `None` when
+    /// the model list is unreachable or the id is unknown — window size is
+    /// an optimization for the compaction budget, never a blocker.
+    pub async fn context_length(&self, model: &str) -> Option<u64> {
+        if let Some(cached) = self.windows.lock().unwrap().get(model) {
+            return *cached;
+        }
+        let window = fetch_context_length(&self.base_url, model).await;
+        self.windows.lock().unwrap().insert(model.to_string(), window);
+        window
     }
 
     fn build_body(req: &ChatRequest) -> Value {
@@ -90,7 +127,7 @@ impl OpenRouter {
         let mut last_err = String::new();
         let mut retry_after: Option<Duration> = None;
 
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             if attempt > 0 {
                 // A server-sent Retry-After beats the computed backoff.
                 let delay = retry_after.take().unwrap_or_else(|| backoff_delay(attempt));
@@ -141,9 +178,10 @@ impl OpenRouter {
             let text = resp.text().await.unwrap_or_default();
             let excerpt = excerpt(&text);
             if retry_hint.unwrap_or_else(|| transient_status(status)) {
-                if status.as_u16() == 429 {
-                    retry_after = retry_after_header;
-                }
+                // Any transient status may carry Retry-After — 429 rate
+                // limits and 502/503 gateway drains alike — so honor it
+                // whenever the server sent one, not only on 429.
+                retry_after = retry_after_header;
                 last_err = format!("{status}: {excerpt}");
                 continue;
             }
@@ -164,7 +202,8 @@ impl OpenRouter {
         }
 
         Err(SlagError::ProviderTransient(format!(
-            "gave up after {MAX_ATTEMPTS} attempts: {last_err}"
+            "gave up after {} attempts: {last_err}",
+            self.max_attempts
         )))
     }
 }
@@ -283,6 +322,49 @@ pub async fn validate_key(api_key: &str, base_url: &str) -> Result<(), SlagError
             Err(SlagError::Provider(format!("key validation failed: {why}")))
         }
     }
+}
+
+/// Context window (tokens) for `model` from GET {base}/models. The
+/// endpoint is public — no auth needed. A variant suffix falls back to the
+/// bare id (`qwen/qwen3-coder:free` → `qwen/qwen3-coder`) since variants
+/// share the base model's window. `None` on any failure.
+pub async fn fetch_context_length(base_url: &str, model: &str) -> Option<u64> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("HTTP-Referer", "https://slag.dev")
+        .header("X-Title", "slag")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let models: ModelsResponse = resp.json().await.ok()?;
+    let bare = model.split(':').next().unwrap_or(model);
+    models
+        .data
+        .iter()
+        .find(|m| m.id == model)
+        .or_else(|| models.data.iter().find(|m| m.id == bare))
+        .and_then(|m| m.context_length)
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    context_length: Option<u64>,
 }
 
 /// Map `ChatMessage` onto the OpenAI wire shape (assistant tool_calls nest
@@ -1139,15 +1221,128 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "choices": [] })))
-            .expect(MAX_ATTEMPTS as u64)
+            .expect(3)
             .mount(&server)
             .await;
 
         let err = OpenRouter::with_base_url("sk-test", server.uri())
+            .with_max_attempts(3)
             .chat(request(vec![], None))
             .await
             .expect_err("all empty");
         assert!(err.retryable(), "exhausted retries stay transient: {err}");
-        assert!(err.to_string().contains("gave up"), "message was: {err}");
+        assert!(err.to_string().contains("gave up after 3"), "message was: {err}");
+    }
+
+    /// Env parsing is tested through the pure helper — mutating the real
+    /// environment races parallel tests.
+    #[test]
+    fn max_attempts_parses_env_and_defaults_to_8() {
+        assert_eq!(parse_max_attempts(None), DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(parse_max_attempts(Some("10".into())), 10);
+        assert_eq!(parse_max_attempts(Some(" 5 ".into())), 5);
+        // Zero and garbage fall back rather than disabling retries.
+        assert_eq!(parse_max_attempts(Some("0".into())), DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(parse_max_attempts(Some("lots".into())), DEFAULT_MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn configured_retry_budget_bounds_the_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "choices": [] })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let err = OpenRouter::with_base_url("sk-test", server.uri())
+            .with_max_attempts(2)
+            .chat(request(vec![], None))
+            .await
+            .expect_err("budget of 2 exhausted");
+        assert!(err.to_string().contains("gave up after 2"), "message was: {err}");
+    }
+
+    fn models_body() -> Value {
+        json!({
+            "data": [
+                { "id": "qwen/qwen3-coder", "context_length": 262144 },
+                { "id": "mystery/model" },
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_context_length_matches_exact_and_variant_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(models_body()))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            fetch_context_length(&server.uri(), "qwen/qwen3-coder").await,
+            Some(262144)
+        );
+        // Variant suffix falls back to the bare id.
+        assert_eq!(
+            fetch_context_length(&server.uri(), "qwen/qwen3-coder:free").await,
+            Some(262144)
+        );
+        // Listed but windowless, and unlisted, both come back None.
+        assert_eq!(fetch_context_length(&server.uri(), "mystery/model").await, None);
+        assert_eq!(fetch_context_length(&server.uri(), "no/such-model").await, None);
+    }
+
+    #[tokio::test]
+    async fn context_length_caches_per_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(models_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        assert_eq!(provider.context_length("qwen/qwen3-coder").await, Some(262144));
+        // Second lookup answers from the cache — the mock allows one GET.
+        assert_eq!(provider.context_length("qwen/qwen3-coder").await, Some(262144));
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_honored_on_503_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "1")
+                    .set_body_string("draining"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let started = std::time::Instant::now();
+        let resp = provider.chat(request(vec![], None)).await.expect("retry ok");
+        assert_eq!(resp.content, "forged");
+        // Computed first-retry backoff tops out at 625ms; only the header
+        // explains a full second of waiting on a gateway 503.
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "waited only {:?}",
+            started.elapsed()
+        );
     }
 }

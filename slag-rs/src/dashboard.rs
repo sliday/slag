@@ -37,6 +37,10 @@ const FEED_CAP: usize = 200;
 const FRAME: Duration = Duration::from_millis(33);
 /// How long "steer queued" stays visible.
 const FLASH: Duration = Duration::from_millis(1500);
+/// A forging ingot with no tokens/tool activity for this long tints yellow.
+const STALL_WARN: Duration = Duration::from_secs(15);
+/// … and red after this long.
+const STALL_DEAD: Duration = Duration::from_secs(60);
 
 const HINT: &str =
     "type+Enter: steer the smith · Esc/q (empty input): quit view · Ctrl-C: cancel forge";
@@ -70,6 +74,9 @@ pub(crate) struct IngotRow {
     pub(crate) work: String,
     pub(crate) heat: u8,
     pub(crate) status: IngotStatus,
+    /// Last time the forge showed signs of life for this row (tokens or a
+    /// tool result). Drives the stalled tint — display only.
+    pub(crate) last_activity: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -97,8 +104,20 @@ impl DashState {
             work: String::new(),
             heat: 0,
             status: IngotStatus::Forging,
+            last_activity: Instant::now(),
         });
         self.ingots.last_mut().unwrap()
+    }
+
+    /// Refresh the activity clock on every row still forging. Token and
+    /// tool events carry no ingot id, so liveness is per-forge, not per-row.
+    fn mark_activity(&mut self) {
+        let now = Instant::now();
+        for row in &mut self.ingots {
+            if row.status == IngotStatus::Forging {
+                row.last_activity = now;
+            }
+        }
     }
 
     fn push_feed(&mut self, color: Color, text: String) {
@@ -113,12 +132,17 @@ impl DashState {
 /// no terminal involved, so tests drive it directly.
 pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
     match &event {
-        EngineEvent::Tokens { usage } => state.totals.add(usage),
+        EngineEvent::Tokens { usage } => {
+            state.totals.add(usage);
+            state.mark_activity();
+        }
+        EngineEvent::ToolResult { .. } => state.mark_activity(),
         EngineEvent::IngotStart { id, work } => {
             let row = state.row_mut(id);
             row.work = preview(work, 60);
             row.heat = 0;
             row.status = IngotStatus::Forging;
+            row.last_activity = Instant::now();
         }
         EngineEvent::HeatTick { id, heat } => state.row_mut(id).heat = *heat,
         EngineEvent::IngotDone { id, ok } => {
@@ -184,6 +208,14 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
             (palette(tui::PURE), format!("⚖ [{id}] cast {winner} wins by {margin}"))
         }
     }
+}
+
+/// True when any forging row has crossed the stall threshold.
+pub(crate) fn has_stalled(state: &DashState, now: Instant) -> bool {
+    state.ingots.iter().any(|row| {
+        row.status == IngotStatus::Forging
+            && now.saturating_duration_since(row.last_activity) >= STALL_WARN
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,8 +284,8 @@ pub(crate) fn draw(f: &mut Frame, state: &DashState) {
     draw_bottom(f, bottom, state);
 }
 
-fn ingot_line(row: &IngotRow) -> Line<'_> {
-    let (glyph, word, color) = match &row.status {
+fn ingot_line(row: &IngotRow, now: Instant) -> Line<'_> {
+    let (glyph, mut word, mut color) = match &row.status {
         IngotStatus::Forging => {
             ("⚒", "forging".to_string(), palette(tui::heat_color(row.heat)))
         }
@@ -266,6 +298,17 @@ fn ingot_line(row: &IngotRow) -> Line<'_> {
             ("⚖", format!("cast {winner} +{margin}"), palette(tui::BRIGHT))
         }
     };
+    if row.status == IngotStatus::Forging {
+        let silent = now.saturating_duration_since(row.last_activity);
+        if silent >= STALL_WARN {
+            word.push_str(&format!(" (stalled {}s)", silent.as_secs()));
+            color = if silent >= STALL_DEAD {
+                palette(tui::WARM)
+            } else {
+                palette(tui::BRIGHT)
+            };
+        }
+    }
     Line::from(vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(format!("[{}] ", row.id), Style::default().fg(palette(tui::PURE))),
@@ -276,7 +319,9 @@ fn ingot_line(row: &IngotRow) -> Line<'_> {
 fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
     let visible = area.height.saturating_sub(2) as usize;
     let skip = state.ingots.len().saturating_sub(visible);
-    let lines: Vec<Line> = state.ingots.iter().skip(skip).map(ingot_line).collect();
+    let now = Instant::now();
+    let lines: Vec<Line> =
+        state.ingots.iter().skip(skip).map(|row| ingot_line(row, now)).collect();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" crucible ")
@@ -457,6 +502,11 @@ async fn event_loop(
                     state.flash_until = None;
                     dirty = true;
                 }
+                // Stalled rows change appearance with no event arriving:
+                // keep the "(stalled Ns)" counter ticking on screen.
+                if has_stalled(&state, Instant::now()) {
+                    dirty = true;
+                }
                 if dirty {
                     terminal.draw(|f| draw(f, &state))?;
                     dirty = false;
@@ -527,6 +577,87 @@ mod tests {
         apply_event(&mut state, EngineEvent::IngotDone { id: "i9".into(), ok: false });
         assert_eq!(state.ingots.len(), 2);
         assert_eq!(state.ingots[1].status, IngotStatus::Cracked);
+    }
+
+    #[test]
+    fn tokens_and_tool_results_refresh_only_forging_rows() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i2".into(), work: "w".into() });
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i2".into(), ok: true });
+
+        // Backdate both clocks; skip on platforms where Instant can't go
+        // that far back (fresh-boot containers).
+        let Some(old) = Instant::now().checked_sub(Duration::from_secs(300)) else { return };
+        for row in &mut state.ingots {
+            row.last_activity = old;
+        }
+
+        apply_event(
+            &mut state,
+            EngineEvent::Tokens { usage: Usage { total_tokens: 1, ..Default::default() } },
+        );
+        assert_ne!(state.ingots[0].last_activity, old, "forging row must refresh");
+        assert_eq!(state.ingots[1].last_activity, old, "forged row must not refresh");
+
+        state.ingots[0].last_activity = old;
+        apply_event(
+            &mut state,
+            EngineEvent::ToolResult { name: "bash".into(), ok: false, preview: "x".into() },
+        );
+        assert_ne!(state.ingots[0].last_activity, old);
+    }
+
+    #[test]
+    fn stalled_forging_rows_tint_yellow_then_red() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        let row = &state.ingots[0];
+        let base = row.last_activity;
+
+        let text_of = |line: &Line| -> String {
+            line.spans.iter().map(|s| s.content.clone()).collect()
+        };
+
+        // Fresh: heat color, no stall suffix.
+        let fresh = ingot_line(row, base);
+        assert!(!text_of(&fresh).contains("stalled"));
+
+        // 20s of silence: yellow, "(stalled 20s)".
+        let warn = ingot_line(row, base + Duration::from_secs(20));
+        assert!(text_of(&warn).contains("(stalled 20s)"));
+        assert_eq!(warn.spans[0].style.fg, Some(palette(tui::BRIGHT)));
+
+        // 90s of silence: red.
+        let dead = ingot_line(row, base + Duration::from_secs(90));
+        assert!(text_of(&dead).contains("(stalled 90s)"));
+        assert_eq!(dead.spans[0].style.fg, Some(palette(tui::WARM)));
+    }
+
+    #[test]
+    fn stall_tint_only_applies_to_forging_rows() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i1".into(), ok: true });
+        let row = &state.ingots[0];
+        let line = ingot_line(row, row.last_activity + Duration::from_secs(90));
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(!text.contains("stalled"), "forged row must never show a stall");
+        assert!(text.contains("forged"));
+    }
+
+    #[test]
+    fn has_stalled_detects_silent_forging_rows() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        let base = state.ingots[0].last_activity;
+
+        assert!(!has_stalled(&state, base + Duration::from_secs(5)));
+        assert!(has_stalled(&state, base + STALL_WARN));
+
+        // Done rows never count as stalled.
+        state.ingots[0].status = IngotStatus::Cracked;
+        assert!(!has_stalled(&state, base + Duration::from_secs(500)));
     }
 
     #[test]

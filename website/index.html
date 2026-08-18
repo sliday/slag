@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2692;</text></svg>" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>slag - bash orchestrator</title>
-    <meta name="description" content="slag: Smelt ideas, skim the bugs, forge the product. A bash-based task orchestrator using metallurgical metaphors and AI-powered development workflows." />
+    <title>slag - forge orchestrator</title>
+    <meta name="description" content="slag: Smelt ideas, skim the bugs, forge the product. A task orchestrator using metallurgical metaphors and AI-powered development workflows. One binary, one OpenRouter key." />
   </head>
   <body>
     <div id="app">
@@ -62,7 +62,7 @@
         <!-- Logo - div instead of pre (no gray bg) -->
         <div class="hero-logo"><span style="color: var(--slag-cold);">░░░</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-pure);">█</span>  <span style="color: var(--slag-pure); font-weight: bold;">SLAG</span>  <span style="color: var(--slag-pure);">█</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-cold);">░░░</span></div>
         <p style="color: var(--slag-pure); margin-top: 1lh; font-size: 1.1rem; font-weight: bold; text-align: center; position: relative; z-index: 1;">Smelt ideas, skim the bugs, forge the product.</p>
-        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Task orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them via Claude agents with automatic retry, re-smelt recovery, and proof-based verification.</p>
+        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Task orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them with its own agentic engine speaking straight to the OpenRouter API: tool loop, retries, re-smelt recovery, proof-gated commits. One binary, one key, no vendor CLI to install first.</p>
         <div class="temp-bar" style="margin-top: 1.5lh; text-align: center; position: relative; z-index: 1;">
           <span style="color: var(--slag-cold);">🧱</span><span style="color: var(--foreground2);"> ore </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-hot);"> 🔥</span><span style="color: var(--foreground2);"> forge </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-pure);"> ✅</span><span style="color: var(--foreground2);"> done </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-warm);"> ❌</span><span style="color: var(--foreground2);"> fail? </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-hot);"> ♻️</span><span style="color: var(--foreground2);"> re-smelt </span><span style="color: var(--foreground2);">↩</span>
         </div>
@@ -75,15 +75,62 @@
         <h2>Quick Start</h2>
         <div class="quickstart-box" box="square">
           <div class="cmd-line cmd-hero">
-            <span class="cmd-comment"># download</span>
-            <code data-copy>curl -fsSL https://slag.dev/slag.sh -o slag && chmod +x slag</code>
+            <span class="cmd-comment"># install</span>
+            <code data-copy>curl -sSf https://slag.dev/install.sh | sh</code>
+          </div>
+          <div class="cmd-line">
+            <span class="cmd-comment"># paste your OpenRouter key, once</span>
+            <code data-copy>slag key</code>
           </div>
           <div class="cmd-line">
             <span class="cmd-comment"># forge</span>
-            <code data-copy>./slag "Build a REST API with auth and rate limiting"</code>
+            <code data-copy>slag "Build a REST API with auth and rate limiting"</code>
+          </div>
+          <div class="cmd-line">
+            <span class="cmd-comment"># or watch and steer it live in the dashboard</span>
+            <code data-copy>slag --tui "Build a REST API with auth and rate limiting"</code>
           </div>
         </div>
-        <p class="disclaimer"><span style="color: var(--slag-warm);">&#x26A0;</span> Runs Claude with <code>--dangerously-skip-permissions</code>. Use at your own discretion.</p>
+        <p class="disclaimer">One <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">OpenRouter key</a> is the whole setup. No Claude CLI, no vendor login, no model to pick: every role runs on <code>openrouter/auto</code> until you override it. The key is verified before it is saved, and lives in <code>~/.config/slag/config.toml</code> at mode 0600. Already have <code>OPENROUTER_API_KEY</code> exported? Skip step two.</p>
+        <p class="disclaimer">slag runs shell commands and edits files in the directory you start it in. Point it at a fresh directory or a repo you can revert.</p>
+        <p class="disclaimer">The published build is macOS on Apple Silicon. Elsewhere, clone the repo and run <code>cargo install --path slag-rs</code>.</p>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S2.5: FEATURES -->
+      <section>
+        <h2>What the Forge Ships</h2>
+        <div class="phase-grid">
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="molten phase-num">&#x2694;</span><span class="phase-name">Twin-Cast Duels</span></div>
+            <p class="phase-desc">High-grade ingots get cast twice in separate git worktrees. A judge model assays both casts and merges the winner; a split verdict discards both and re-casts with the critique. Fires when cast B (<code>SLAG_MODEL_ALT</code>) differs from the worker model, or per ingot via <code>:duel t</code>.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="molten phase-num">&#x25A3;</span><span class="phase-name">Ratatui Dashboard + Steering</span></div>
+            <p class="phase-desc"><code>--tui</code> opens a full-screen dashboard: crucible state, live event feed, token totals. Type a message and press Enter to steer the smith mid-forge without stopping the run.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="forged phase-num">&#x270E;</span><span class="phase-name">Plain-English Narrator</span></div>
+            <p class="phase-desc">A lightweight interpreter turns raw tool calls into one-line narration on the feed, so you read "wiring the auth routes" instead of a wall of diffs and greps.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="forged phase-num">&#x1F4D6;</span><span class="phase-name">Recipes</span></div>
+            <p class="phase-desc">Drop <code>recipes/&lt;name&gt;/RECIPE.md</code> files (frontmatter + markdown) in your repo or <code>~/.config/slag/recipes/</code>. slag indexes them into every ingot prompt and the smith loads them by name.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="ore phase-num">$</span><span class="phase-name">Spend Caps</span></div>
+            <p class="phase-desc">Dollar ceilings per ingot session (<code>SLAG_MAX_COST_INGOT</code>) and per run (<code>SLAG_MAX_COST_RUN</code>), or <code>max_cost_per_ingot</code> / <code>max_cost_per_run</code> in the config file. Default is uncapped.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="forged phase-num">&#x2713;</span><span class="phase-name">Proof-Gated Ingots</span></div>
+            <p class="phase-desc">Every ingot carries a <code>:proof</code> shell command. Exit 0 forges the ingot and commits; anything else feeds the error back and retries. No commit lands without its proof passing.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="molten phase-num">&#x21BB;</span><span class="phase-name">openrouter/auto by Default</span></div>
+            <p class="phase-desc">All four model roles (work, plan, duel, judge) route through <code>openrouter/auto</code> until you pin one. A fresh key forges with zero model configuration.</p>
+          </div>
+        </div>
       </section>
 
       <div is="separator"></div>
@@ -119,18 +166,18 @@
  :solo t? ----yes-----> <span style="color:var(--slag-hot);">ANVIL 1</span>   <span style="color:var(--slag-hot);">ANVIL 2</span>   <span style="color:var(--slag-hot);">ANVIL 3</span>
     |                      |         |         |
     no                     v         v         v
-    |                   (each anvil is independent subshell)
+    |                   (each anvil runs its own smith session)
     v
- <span style="color:var(--slag-bright);">SELECT SMITH</span> by :skill + :grade
+ <span style="color:var(--slag-bright);">SELECT SMITH</span> by :grade
     |
-    |  web/frontend --> +Playwright
-    |  grade >= 3   --> plan mode
-    |  default      --> base tools
+    |  grade >= 3   --> plan model
+    |  default      --> work model
+    |  both         --> openrouter/auto
     v
- <span style="color:var(--slag-hot);">STRIKE</span> (claude invocation)
+ <span style="color:var(--slag-hot);">STRIKE</span> (agent session over OpenRouter)
     |
     v
- <span style="color:var(--slag-cold);">CMD</span> (extract & run shell command)
+ <span style="color:var(--slag-cold);">TOOLS</span> (read, write, edit, grep, bash)
     |
     v
  <span style="color:var(--slag-bright);">PROOF</span> (run :proof shell command)
@@ -139,7 +186,9 @@
     |
     +----- fail ----> :heat++ retry with slag feedback
     |
-    +----- max -----> <span style="color:var(--slag-warm);">:cracked</span> + halt
+    +----- max -----> <span style="color:var(--slag-warm);">:cracked</span> + on to the next ingot
+                        (the run keeps going; ASSAY reports the cracks
+                         and the run exits 1 once nothing is pending)
 </pre>
       </section>
 
@@ -154,7 +203,7 @@
               <span is="badge" class="ore phase-num">1</span>
               <span class="phase-name">SURVEYOR</span>
             </div>
-            <p class="phase-desc">Deep analysis with plan mode. Reads PRD.md (ore), produces BLUEPRINT.md with architecture, dependency graph, risk assessment, and forging sequence. Self-iterates to resolve any ambiguity.</p>
+            <p class="phase-desc">Deep analysis on the plan model. Reads PRD.md (ore), produces BLUEPRINT.md with architecture, dependency graph, risk assessment, and forging sequence. Self-iterates to resolve any ambiguity.</p>
           </div>
           <div class="phase-card" box="square">
             <div>
@@ -168,14 +217,14 @@
               <span is="badge" class="forged phase-num">3</span>
               <span class="phase-name">FORGE</span>
             </div>
-            <p class="phase-desc">Strikes each ingot via Claude. Solo ingots run on parallel anvils (up to 3). Selects smith by skill and grade. Retries with slag feedback on failure. Commits on success.</p>
+            <p class="phase-desc">Strikes each ingot with an agent session over OpenRouter. Solo ingots run on parallel anvils (up to 3). Grade picks the model. Retries with slag feedback on failure. Commits on success.</p>
           </div>
           <div class="phase-card" box="square">
             <div>
               <span is="badge" class="forged phase-num">4</span>
               <span class="phase-name">ASSAY</span>
             </div>
-            <p class="phase-desc">Final quality report. Shows forged/cracked counts, temperature bar, and identifies any cracked ingots. Exits 0 on full forge, 1 if any ingot cracked.</p>
+            <p class="phase-desc">Final quality report. Shows forged/cracked counts, temperature bar, and identifies any cracked ingots. It prints on failed runs too, not only clean ones. Exits 0 on full forge, 1 if any ingot cracked.</p>
           </div>
         </div>
       </section>
@@ -187,13 +236,55 @@
         <h2>Design Decisions</h2>
 
         <details box="square">
+          <summary>Why One Key?</summary>
+          <p>slag speaks to OpenRouter and nothing else. That is one credential to paste, one bill to read, and every model on the router reachable by id. The four roles (work, plan, duel, judge) all default to openrouter/auto, so a fresh key forges without you choosing a model. Override any role when you have an opinion: a flag, an environment variable, or a line in <code>~/.config/slag/config.toml</code>. The file wants the lowercase key; the uppercase name is the environment variable and is ignored inside the file.</p>
+          <table class="field-table">
+            <thead>
+              <tr>
+                <th>Role</th>
+                <th>Env var</th>
+                <th>config.toml key</th>
+                <th>Flag</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>work</td>
+                <td><code>SLAG_MODEL_BASE</code></td>
+                <td><code>model_base</code></td>
+                <td><code>--model</code></td>
+              </tr>
+              <tr>
+                <td>plan</td>
+                <td><code>SLAG_MODEL_PLAN</code></td>
+                <td><code>model_plan</code></td>
+                <td><code>--plan-model</code></td>
+              </tr>
+              <tr>
+                <td>duel</td>
+                <td><code>SLAG_MODEL_ALT</code></td>
+                <td><code>model_alt</code></td>
+                <td></td>
+              </tr>
+              <tr>
+                <td>judge</td>
+                <td><code>SLAG_MODEL_JUDGE</code></td>
+                <td><code>model_judge</code></td>
+                <td><code>--judge-model</code></td>
+              </tr>
+            </tbody>
+          </table>
+          <p>The key itself, the duel knobs, and the spend caps follow the same rule: <code>openrouter_api_key</code>, <code>duel</code>, <code>duel_rounds</code>, <code>screenshot_cmd</code>, <code>max_cost_per_ingot</code>, <code>max_cost_per_run</code> in the file; <code>OPENROUTER_API_KEY</code>, <code>SLAG_DUEL</code>, <code>SLAG_DUEL_ROUNDS</code>, <code>SLAG_SCREENSHOT_CMD</code>, <code>SLAG_MAX_COST_INGOT</code>, <code>SLAG_MAX_COST_RUN</code> in the environment.</p>
+        </details>
+
+        <details box="square">
           <summary>Why S-Expressions?</summary>
-          <p>S-expressions are single-line, grep/sed parseable, require zero dependencies, and survive bash string handling. Every ingot is one line in PLAN.md. The entire orchestrator can manipulate state with sed_i without any JSON/YAML parser. Fields are keyword-prefixed (:id, :status) making them unambiguous to extract with pattern matching.</p>
+          <p>S-expressions are single-line and grep-parseable, so PLAN.md stays readable by you and by a one-line shell command. Every ingot is one line. Fields are keyword-prefixed (:id, :status), which makes them unambiguous to extract with pattern matching and cheap for a model to emit correctly.</p>
         </details>
 
         <details box="square">
           <summary>Why Parallel Anvils?</summary>
-          <p>Independent ingots (:solo t) run concurrently in background subshells, up to MAX_ANVILS=3. This gives 3x throughput for foundation tasks that have no dependencies. Each anvil gets its own smith process. Sequential ingots (:solo nil) run one at a time after parallel work completes.</p>
+          <p>Independent ingots (:solo t) run concurrently, up to MAX_ANVILS=3. This gives 3x throughput for foundation tasks that have no dependencies. Each anvil gets its own smith session. Sequential ingots (:solo nil) run one at a time after parallel work completes.</p>
         </details>
 
         <details box="square">
@@ -252,12 +343,12 @@
             <tr>
               <td><code>:grade</code></td>
               <td>1-5</td>
-              <td>Complexity level; grade &ge; 3 uses plan mode</td>
+              <td>Complexity level; grade &ge; 3 uses the plan model</td>
             </tr>
             <tr>
               <td><code>:skill</code></td>
               <td>web | api | cli | default</td>
-              <td>Selects smith tools/plugins</td>
+              <td>Work-type tag. Today only <code>web</code> changes anything: Playwright note in the prompt, duel screenshots</td>
             </tr>
             <tr>
               <td><code>:heat</code></td>
@@ -270,6 +361,11 @@
               <td>Max retries before cracking</td>
             </tr>
             <tr>
+              <td><code>:smelt</code></td>
+              <td>0 | 1</td>
+              <td>Re-smelt count. A cracked ingot gets one rewrite; at 1 it cracks for good</td>
+            </tr>
+            <tr>
               <td><code>:proof</code></td>
               <td>shell command</td>
               <td>Acceptance test (exit 0 = pass)</td>
@@ -279,6 +375,74 @@
               <td>string</td>
               <td>Task description for the smith</td>
             </tr>
+            <tr>
+              <td><code>:duel</code></td>
+              <td>t | nil</td>
+              <td>Twin-cast override: t forces a duel, nil blocks one, absent follows SLAG_DUEL</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="disclaimer">Those eleven are every field the parser reads. Any other <code>:key value</code> pair survives a rewrite untouched.</p>
+      </section>
+
+      <div is="separator"></div>
+
+      <!-- S8.5: CLI REFERENCE -->
+      <section>
+        <h2>CLI Reference</h2>
+        <table class="field-table">
+          <thead>
+            <tr>
+              <th>Command</th>
+              <th>Role</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>slag "commission"</code></td><td>Write PRD.md from the commission and run the full pipeline</td></tr>
+            <tr><td><code>slag</code></td><td>Forge the PRD.md already in this directory</td></tr>
+            <tr><td><code>slag key [KEY]</code></td><td>Show setup, or verify and store an OpenRouter key</td></tr>
+            <tr><td><code>slag status</code></td><td>Show crucible state</td></tr>
+            <tr><td><code>slag resume</code></td><td>Resume an existing forge</td></tr>
+            <tr><td><code>slag update</code></td><td>Self-update to the latest release</td></tr>
+          </tbody>
+        </table>
+        <table class="field-table" style="margin-top: 1lh;">
+          <thead>
+            <tr>
+              <th>Flag</th>
+              <th>Effect</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>--tui</code></td><td>Full-screen dashboard: crucible, live feed, steering input</td></tr>
+            <tr><td><code>--anvils N</code></td><td>Max parallel anvil workers (default 3)</td></tr>
+            <tr><td><code>--auto</code></td><td>Force <code>openrouter/auto</code> on all four roles, ignoring pinned models</td></tr>
+            <tr><td><code>--model MODEL</code></td><td>Worker model, any OpenRouter id</td></tr>
+            <tr><td><code>--plan-model MODEL</code></td><td>Planner model for grade &ge; 3 ingots</td></tr>
+            <tr><td><code>--judge-model MODEL</code></td><td>Duel judge model</td></tr>
+            <tr><td><code>--worktree</code></td><td>Branch-per-ingot isolation. Not implemented yet: warns and runs in the shared checkout</td></tr>
+          </tbody>
+        </table>
+        <table class="field-table" style="margin-top: 1lh;">
+          <thead>
+            <tr>
+              <th>Environment variable</th>
+              <th>Effect</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>OPENROUTER_API_KEY</code></td><td>The key. Overrides the stored one</td></tr>
+            <tr><td><code>SLAG_MODEL_BASE</code> / <code>_PLAN</code> / <code>_ALT</code> / <code>_JUDGE</code></td><td>Per-role model ids</td></tr>
+            <tr><td><code>SLAG_DUEL</code></td><td><code>auto</code> (default) / <code>on</code> / <code>off</code></td></tr>
+            <tr><td><code>SLAG_DUEL_ROUNDS</code></td><td>Override the duel round cap</td></tr>
+            <tr><td><code>SLAG_MAX_COST_INGOT</code></td><td>Dollar ceiling for a single ingot session</td></tr>
+            <tr><td><code>SLAG_MAX_COST_RUN</code></td><td>Dollar ceiling for the whole run</td></tr>
+            <tr><td><code>SLAG_REASONING_EFFORT</code></td><td><code>low</code> / <code>medium</code> / <code>high</code> for models that take it</td></tr>
+            <tr><td><code>SLAG_SCREENSHOT_CMD</code></td><td>Shell command producing a screenshot for visual assay of web ingots</td></tr>
+            <tr><td><code>SLAG_CHAR_BUDGET</code></td><td>Transcript char budget before an agent session compacts</td></tr>
+            <tr><td><code>SLAG_CONFIG_DIR</code></td><td>Move the config directory off <code>~/.config/slag</code></td></tr>
+            <tr><td><code>SLAG_OPENROUTER_BASE</code></td><td>Point slag at a proxy instead of OpenRouter</td></tr>
+            <tr><td><code>NO_COLOR</code> / <code>COLORTERM</code></td><td>Drop color entirely / enable truecolor</td></tr>
           </tbody>
         </table>
       </section>
@@ -291,9 +455,9 @@
           <span style="color: var(--slag-cold);">&#x25B1;&#x25B1;&#x25B1;</span><span style="color: var(--slag-warm);">&#x25B0;</span><span style="color: var(--slag-hot);">&#x25B0;</span><span style="color: var(--slag-bright);">&#x25B0;</span><span style="color: var(--slag-pure);">&#x25B0;</span>
         </div>
         <p style="color: var(--foreground2);">
-          <a href="https://github.com/AestheticVoyager/slag">GitHub</a>
+          <a href="https://github.com/sliday/slag">GitHub</a>
           &middot;
-          <a href="/slag.sh" download="slag">Download</a>
+          <a href="https://github.com/sliday/slag/releases/latest">Releases</a>
           &middot;
           MIT License
         </p>

@@ -71,6 +71,89 @@ pub async fn assay(
     })
 }
 
+/// Three-way verdict for a triple-cast round: pairwise round-robin
+/// (AB, AC, BC), each pair judged by `assay` with its position swap.
+#[derive(Debug)]
+pub struct TriVerdict {
+    /// 'a' | 'b' | 'c'; on a tie, 'a' with `tie` set.
+    pub winner: char,
+    /// Min winning margin across the winner's pairs; 0 on a tie.
+    pub margin: u8,
+    /// Winner's average score across its two pairs (plateau tracking).
+    pub winner_score: u8,
+    /// Rock-paper-scissors: every cast took exactly one pair. The caller
+    /// re-casts (or crowns 'a' on the final round) instead of trusting
+    /// a cyclic ranking.
+    pub tie: bool,
+    /// All three pair critiques, labelled, for the next round's casts.
+    pub critique: String,
+}
+
+/// Compare three working casts pairwise; the cast with the most pairwise
+/// wins takes the round. Margin is the winner's weakest pairwise margin —
+/// a cast that barely edged one rival has not converged. Cyclic results
+/// (1 win each) surface as a tie with margin 0.
+pub async fn assay3(
+    provider: &dyn Provider,
+    model: &str,
+    work: &str,
+    a: &CastResult,
+    b: &CastResult,
+    c: &CastResult,
+    prior_critique: Option<&str>,
+) -> Result<TriVerdict, SlagError> {
+    // Seat labels inside each pair are always a/b; map back per pair.
+    let pairs: [(char, &CastResult, char, &CastResult); 3] =
+        [('a', a, 'b', b), ('a', a, 'c', c), ('b', b, 'c', c)];
+
+    let mut wins = [('a', 0u8), ('b', 0u8), ('c', 0u8)];
+    let mut margins: Vec<(char, u8, u8)> = Vec::with_capacity(3); // (winner, margin, score)
+    let mut critique = String::new();
+
+    for (first_label, first, second_label, second) in pairs {
+        let v = assay(provider, model, work, first, second, prior_critique, None).await?;
+        // A margin-0 verdict is `assay`'s positional-disagreement collapse
+        // (or a dead-even ruling): it names seat A only as a placeholder,
+        // not as a quality winner. Crediting it a pairwise win would bias
+        // the round-robin toward earlier labels, so a levelled pair
+        // credits no one — only decisive pairs rank.
+        if v.margin() > 0 {
+            let (winner, winner_score) = if v.winner == 'a' {
+                (first_label, v.score_a)
+            } else {
+                (second_label, v.score_b)
+            };
+            if let Some(entry) = wins.iter_mut().find(|(l, _)| *l == winner) {
+                entry.1 += 1;
+            }
+            margins.push((winner, v.margin(), winner_score));
+        }
+        critique.push_str(&format!(
+            "\n[pair {} vs {} — this pair's \"cast A\" is cast {} and \"cast B\" is cast {}]\n{}\n",
+            first_label.to_uppercase(),
+            second_label.to_uppercase(),
+            first_label.to_uppercase(),
+            second_label.to_uppercase(),
+            v.critique,
+        ));
+    }
+
+    let best = wins.iter().map(|(_, w)| *w).max().unwrap_or(0);
+    if best < 2 {
+        // Cycle (a beat b, b beat c, c beat a) — or too many levelled
+        // pairs for any cast to prove itself across two rivals.
+        return Ok(TriVerdict { winner: 'a', margin: 0, winner_score: 0, tie: true, critique });
+    }
+    let winner = wins.iter().find(|(_, w)| *w == best).map(|(l, _)| *l).unwrap_or('a');
+    let won: Vec<&(char, u8, u8)> = margins.iter().filter(|(w, _, _)| *w == winner).collect();
+    let margin = won.iter().map(|(_, m, _)| *m).min().unwrap_or(0);
+    let winner_score = {
+        let sum: u16 = won.iter().map(|(_, _, s)| *s as u16).sum();
+        (sum / won.len().max(1) as u16) as u8
+    };
+    Ok(TriVerdict { winner, margin, winner_score, tie: false, critique })
+}
+
 /// Marker inserted before the swapped pass's critique text.
 const SWAP_NOTE: &str =
     "[note: the following critique was written with seats swapped — its \"cast A\" is the real \
@@ -443,6 +526,121 @@ mod tests {
             Some(&["data:image/png;base64,AA".to_string(), "data:image/png;base64,BB".to_string()][..])
         );
         assert!(requests[1].messages[1].images.is_none());
+    }
+
+    #[tokio::test]
+    async fn three_way_round_robin_ranks_by_pairwise_wins() {
+        // Pairs run AB, AC, BC; each pair judges twice (position swap).
+        // A beats B (margin 20) and C (margin 10); B beats C.
+        let judge = MockJudge::new(&[
+            r#"{"winner":"a","score_a":90,"score_b":70,"critique":"ab"}"#,
+            r#"{"winner":"b","score_a":70,"score_b":90,"critique":"ab-swap"}"#,
+            r#"{"winner":"a","score_a":85,"score_b":75,"critique":"ac"}"#,
+            r#"{"winner":"b","score_a":75,"score_b":85,"critique":"ac-swap"}"#,
+            r#"{"winner":"a","score_a":80,"score_b":60,"critique":"bc"}"#,
+            r#"{"winner":"b","score_a":60,"score_b":80,"critique":"bc-swap"}"#,
+        ]);
+
+        let verdict = assay3(
+            &judge,
+            "openai/gpt-5",
+            "add retry",
+            &cast("DIFF-A", "ok"),
+            &cast("DIFF-B", "ok"),
+            &cast("DIFF-C", "ok"),
+            None,
+        )
+        .await
+        .expect("verdict");
+
+        assert_eq!(verdict.winner, 'a');
+        assert!(!verdict.tie);
+        // Weakest pairwise margin wins: min(20 vs B, 10 vs C).
+        assert_eq!(verdict.margin, 10);
+        // Winner's average score across its pairs: (90 + 85) / 2.
+        assert_eq!(verdict.winner_score, 87);
+        // All three pair critiques ride along, labelled with seat maps.
+        for label in ["[pair A vs B", "[pair A vs C", "[pair B vs C"] {
+            assert!(verdict.critique.contains(label), "missing {label}");
+        }
+
+        // Round-robin + rotation: 6 calls, each pair seated both ways.
+        let requests = judge.requests();
+        assert_eq!(requests.len(), 6);
+        let prompt = |i: usize| requests[i].messages[1].content.clone();
+        let order = |p: &str, x: &str, y: &str| p.find(x).unwrap() < p.find(y).unwrap();
+        assert!(order(&prompt(0), "DIFF-A", "DIFF-B") && !prompt(0).contains("DIFF-C"));
+        assert!(order(&prompt(1), "DIFF-B", "DIFF-A"));
+        assert!(order(&prompt(2), "DIFF-A", "DIFF-C") && !prompt(2).contains("DIFF-B"));
+        assert!(order(&prompt(3), "DIFF-C", "DIFF-A"));
+        assert!(order(&prompt(4), "DIFF-B", "DIFF-C") && !prompt(4).contains("DIFF-A"));
+        assert!(order(&prompt(5), "DIFF-C", "DIFF-B"));
+    }
+
+    #[tokio::test]
+    async fn positional_disagreement_pairs_credit_no_pairwise_win() {
+        // Pairs AB and AC both collapse to positional disagreements (each
+        // judge pass crowned its seat A — unswapped, that is a split
+        // verdict, margin 0). Only BC is a genuine ruling: B wins big.
+        // Before the fix, the two collapsed pairs each credited cast 'a'
+        // a "win" (wins a:2, b:1) and 'a' took the round on pure seat
+        // order. Levelled pairs must credit no one → nobody reaches two
+        // wins → the round is a tie, never an 'a' coronation.
+        let judge = MockJudge::new(&[
+            // AB: both passes say seat A → disagreement after unswap.
+            r#"{"winner":"a","score_a":80,"score_b":60,"critique":"ab"}"#,
+            r#"{"winner":"a","score_a":80,"score_b":60,"critique":"ab-swap"}"#,
+            // AC: same positional collapse.
+            r#"{"winner":"a","score_a":75,"score_b":55,"critique":"ac"}"#,
+            r#"{"winner":"a","score_a":75,"score_b":55,"critique":"ac-swap"}"#,
+            // BC: decisive — B wins both passes by 30.
+            r#"{"winner":"a","score_a":90,"score_b":60,"critique":"bc"}"#,
+            r#"{"winner":"b","score_a":60,"score_b":90,"critique":"bc-swap"}"#,
+        ]);
+
+        let verdict = assay3(
+            &judge,
+            "openai/gpt-5",
+            "add retry",
+            &cast("DIFF-A", "ok"),
+            &cast("DIFF-B", "ok"),
+            &cast("DIFF-C", "ok"),
+            None,
+        )
+        .await
+        .expect("verdict");
+
+        assert!(verdict.tie, "seat-order coin flips must not rank the round");
+        assert_eq!(verdict.margin, 0, "a tie never early-stops the duel");
+    }
+
+    #[tokio::test]
+    async fn three_way_cycle_is_a_tie_with_margin_zero() {
+        // A beats B, C beats A, B beats C: one pairwise win each.
+        let judge = MockJudge::new(&[
+            r#"{"winner":"a","score_a":80,"score_b":70,"critique":"ab"}"#,
+            r#"{"winner":"b","score_a":70,"score_b":80,"critique":"ab-swap"}"#,
+            r#"{"winner":"b","score_a":60,"score_b":80,"critique":"ac"}"#,
+            r#"{"winner":"a","score_a":80,"score_b":60,"critique":"ac-swap"}"#,
+            r#"{"winner":"a","score_a":75,"score_b":65,"critique":"bc"}"#,
+            r#"{"winner":"b","score_a":65,"score_b":75,"critique":"bc-swap"}"#,
+        ]);
+
+        let verdict = assay3(
+            &judge,
+            "openai/gpt-5",
+            "add retry",
+            &cast("DIFF-A", "ok"),
+            &cast("DIFF-B", "ok"),
+            &cast("DIFF-C", "ok"),
+            None,
+        )
+        .await
+        .expect("verdict");
+
+        assert!(verdict.tie, "cycle must not produce a ranking");
+        assert_eq!(verdict.winner, 'a', "tie defaults to cast a");
+        assert_eq!(verdict.margin, 0, "tie margin never early-stops");
     }
 
     #[test]

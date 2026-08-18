@@ -22,6 +22,11 @@ pub fn write_ingot(ingot: &Ingot) -> String {
         s.push_str(&format!(" :duel {}", if duel { "t" } else { "nil" }));
     }
 
+    // Optional cast-count pin: absent stays absent (heuristics decide).
+    if let Some(casts) = ingot.casts {
+        s.push_str(&format!(" :casts {casts}"));
+    }
+
     // Append unknown extra fields for forward compatibility
     for (key, value) in &ingot.extra {
         // If value looks like it needs quoting (contains spaces), quote it
@@ -55,6 +60,7 @@ mod tests {
             proof: "test -f index.html".into(),
             work: "Create HTML structure".into(),
             duel: None,
+            casts: None,
             extra: vec![],
         };
         let s = write_ingot(&ingot);
@@ -81,12 +87,36 @@ mod tests {
             proof: "npm test".into(),
             work: "Deploy app".into(),
             duel: None,
+            casts: None,
             extra: vec![],
         };
         let s = write_ingot(&ingot);
         assert!(s.contains(":solo nil"));
         assert!(s.contains(":status cracked"));
         assert!(s.contains(":smelt 1"));
+    }
+
+    #[test]
+    fn write_casts_pin_only_when_set() {
+        let mut ingot = Ingot {
+            id: "i9".into(),
+            status: Status::Ore,
+            solo: true,
+            grade: 3,
+            skill: Skill::Default,
+            heat: 0,
+            max: 5,
+            smelt: 0,
+            proof: "true".into(),
+            work: "design the API".into(),
+            duel: None,
+            casts: None,
+            extra: vec![],
+        };
+        assert!(!write_ingot(&ingot).contains(":casts"));
+
+        ingot.casts = Some(3);
+        assert!(write_ingot(&ingot).contains(":casts 3"));
     }
 
     #[test]
@@ -103,6 +133,7 @@ mod tests {
             proof: "true".into(),
             work: "test".into(),
             duel: None,
+            casts: None,
             extra: vec![("custom".into(), "hello".into())],
         };
         let s = write_ingot(&ingot);

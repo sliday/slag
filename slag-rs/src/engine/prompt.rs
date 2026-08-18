@@ -35,7 +35,7 @@ impl PromptBands {
 pub fn build(root: &Path, model: &str, mode: PromptMode) -> PromptBands {
     PromptBands {
         stable: stable_band(model, mode),
-        context: workspace_snapshot(root),
+        context: workspace_snapshot(root, model),
         volatile: volatile_band(root),
     }
 }
@@ -89,6 +89,15 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
            path:line references and the exact error.\n\
          - Reference code as path:line when reporting.\n\n",
     );
+    s.push_str("### No gold-plating\n");
+    s.push_str(
+        "- Do only what the ingot asks: no extra features, no drive-by refactors, no \
+           comments beyond the change.\n\
+         - Validate inputs only at system boundaries (CLI args, file reads, network); \
+           trust internal callers.\n\
+         - Three similar lines beat a premature abstraction.\n\
+         - Never remove existing comments unless the ingot asks.\n\n",
+    );
 
     s.push_str("## Rules\n\n");
     s.push_str(
@@ -129,11 +138,13 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
     s
 }
 
-/// Workspace snapshot: git state + detected project facts.
-/// Tolerates non-git directories.
-pub fn workspace_snapshot(root: &Path) -> String {
+/// Workspace snapshot: environment identity + git state + detected
+/// project facts. Tolerates non-git directories. Stable within a session,
+/// so it lives in the cache-safe context band.
+pub fn workspace_snapshot(root: &Path, model: &str) -> String {
     let mut s = String::new();
     s.push_str("# Workspace\n(snapshot at session start — re-check with git)\n\n");
+    s.push_str(&env_block(model));
 
     match git(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
         Some(branch) => {
@@ -170,6 +181,44 @@ pub fn workspace_snapshot(root: &Path) -> String {
     }
 
     s
+}
+
+/// Environment identity: platform, OS version, shell, and which model is
+/// running, plus knowledge cutoffs for the families `openrouter/auto`
+/// routes between. All inputs are stable for the life of a session.
+fn env_block(model: &str) -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
+    format!(
+        "<env>\n\
+         - platform: {os}/{arch}\n\
+         - os version: {ver}\n\
+         - shell: {shell}\n\
+         </env>\n\
+         You are powered by {model}.\n\n\
+         ## Knowledge cutoffs (routed families)\n\
+         - openai/gpt-5*: ~Oct 2024\n\
+         - anthropic/claude*: ~Mar 2025\n\
+         - google/gemini-2.5*: ~Jan 2025\n\
+         - qwen/qwen3*: ~Apr 2025\n\
+         - deepseek*: ~Jul 2024\n\
+         Anything newer than your cutoff: verify in the workspace, do not guess.\n\n",
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        ver = os_version(),
+    )
+}
+
+/// Kernel release via `uname -r`; "unknown" wherever that fails
+/// (e.g. Windows). Good enough for prompt identity, zero new deps.
+fn os_version() -> String {
+    Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
@@ -318,6 +367,56 @@ mod tests {
     }
 
     #[test]
+    fn stable_band_carries_anti_gold_plating_rules() {
+        for mode in [PromptMode::Forge, PromptMode::Plan] {
+            let s = stable_band("qwen/qwen3-coder", mode);
+            let section = &s[s.find("### No gold-plating").unwrap()..];
+            assert!(section.contains("no extra features, no drive-by refactors"));
+            assert!(section.contains("Validate inputs only at system boundaries"));
+            assert!(section.contains("trust internal callers"));
+            assert!(section.contains("Three similar lines beat a premature abstraction."));
+            assert!(section.contains("Never remove existing comments unless the ingot asks."));
+        }
+    }
+
+    #[test]
+    fn env_block_carries_identity_and_cutoffs() {
+        let e = env_block("qwen/qwen3-coder");
+        assert!(e.contains("<env>") && e.contains("</env>"));
+        assert!(e.contains(&format!(
+            "- platform: {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
+        assert!(e.contains("- os version: "));
+        assert!(e.contains("- shell: "));
+        assert!(e.contains("You are powered by qwen/qwen3-coder."));
+        let cutoffs = &e[e.find("## Knowledge cutoffs (routed families)").unwrap()..];
+        for family in ["openai/gpt-5*", "anthropic/claude*", "qwen/qwen3*", "deepseek*"] {
+            assert!(cutoffs.contains(family), "missing cutoff row for {family}");
+        }
+        assert!(cutoffs.contains("verify in the workspace, do not guess"));
+    }
+
+    #[test]
+    fn snapshot_embeds_env_block_before_git_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = workspace_snapshot(dir.path(), "openai/gpt-5");
+        let env = snap.find("<env>").unwrap();
+        let git = snap.find("no git").unwrap();
+        assert!(env < git, "env block must precede git state");
+        assert!(snap.contains("You are powered by openai/gpt-5."));
+    }
+
+    #[test]
+    fn os_version_is_single_trimmed_line() {
+        let v = os_version();
+        assert!(!v.is_empty());
+        assert!(!v.contains('\n'));
+        assert_eq!(v, v.trim());
+    }
+
+    #[test]
     fn stable_band_is_byte_stable_across_runs() {
         let a = stable_band("openai/gpt-5", PromptMode::Forge);
         let b = stable_band("openai/gpt-5", PromptMode::Forge);
@@ -327,7 +426,7 @@ mod tests {
     #[test]
     fn snapshot_tolerates_non_git_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let snap = workspace_snapshot(dir.path());
+        let snap = workspace_snapshot(dir.path(), "qwen/qwen3-coder");
         assert!(snap.contains("no git"));
         assert!(snap.contains("snapshot at session start — re-check with git"));
     }
@@ -351,7 +450,7 @@ mod tests {
         let subject = format!("evil\x1b[31m {}", "x".repeat(200));
         run(&["commit", "--allow-empty", "-m", &subject]);
 
-        let snap = workspace_snapshot(root);
+        let snap = workspace_snapshot(root, "qwen/qwen3-coder");
         assert!(!snap.contains('\x1b'), "ESC must not reach the prompt");
         let line = snap.lines().find(|l| l.contains("evil")).unwrap();
         // "  " indent + subject line capped at 100 chars.

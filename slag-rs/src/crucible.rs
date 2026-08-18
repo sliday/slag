@@ -325,6 +325,7 @@ mod tests {
             proof: "test -f newfile".into(),
             work: "Rewritten task".into(),
             duel: None,
+            casts: None,
             extra: vec![],
         };
         c.replace("i1", vec![new_ingot]);
@@ -349,6 +350,7 @@ mod tests {
             proof: "true".into(),
             work: "Sub-task A".into(),
             duel: None,
+            casts: None,
             extra: vec![],
         };
         let sub_b = Ingot {
@@ -363,6 +365,7 @@ mod tests {
             proof: "true".into(),
             work: "Sub-task B".into(),
             duel: None,
+            casts: None,
             extra: vec![],
         };
         c.replace("i1", vec![sub_a, sub_b]);

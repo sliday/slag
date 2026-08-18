@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::engine::Effort;
 use crate::error::SlagError;
+use crate::sexp::Ingot;
 
 /// File paths used by the pipeline
 pub const BLUEPRINT: &str = "BLUEPRINT.md";
@@ -205,16 +206,42 @@ impl EngineConfig {
     }
 
     /// Grade-gated duel qualification (plan section 9 rule 1): Auto duels
-    /// grade 3 and above, and only when the two casts run different models.
-    /// A duel buys diversity; two casts of the same model id cost triple
-    /// the tokens and buy nothing, which is what the default
-    /// `openrouter/auto` everywhere would otherwise do. `SLAG_DUEL=on`
-    /// still forces it for anyone who wants two rolls of the same dice.
+    /// grade 3 and above. Matched models no longer disqualify a duel: the
+    /// opposing direction prompts (minimal / robust / creative) carry the
+    /// diversity, so even two casts of `openrouter/auto` explore
+    /// different solutions.
     pub fn duel_qualifies(&self, grade: u8) -> bool {
         match self.duel {
             DuelMode::On => true,
             DuelMode::Off => false,
-            DuelMode::Auto => grade >= HIGH_GRADE && self.model_alt != self.model_base,
+            DuelMode::Auto => grade >= HIGH_GRADE,
+        }
+    }
+
+    /// Resolve how many casts forge this ingot (adaptive cast count).
+    ///
+    /// Sequential ingots always get one cast — overlapping sequential
+    /// work from multiple casts is a merge-conflict factory. After that
+    /// gate: an explicit `:casts` pin wins, then the legacy `:duel`
+    /// override, then `SLAG_DUEL` (off forces 1, on forces at least 2),
+    /// then the work-shape heuristics. Crack-retry escalation (heat > 0
+    /// bumps 1 → 2) lives in the forge scheduler, not here.
+    pub fn casts_for(&self, ingot: &Ingot) -> u8 {
+        if !ingot.solo {
+            return 1;
+        }
+        if let Some(n) = ingot.casts {
+            return n.clamp(1, 3);
+        }
+        match ingot.duel {
+            Some(false) => return 1,
+            Some(true) => return heuristic_casts(ingot).max(2),
+            None => {}
+        }
+        match self.duel {
+            DuelMode::Off => 1,
+            DuelMode::On => heuristic_casts(ingot).max(2),
+            DuelMode::Auto => heuristic_casts(ingot),
         }
     }
 
@@ -230,6 +257,48 @@ impl EngineConfig {
             3
         }
     }
+}
+
+/// Work-shape heuristics for the auto cast count: 3 casts for grade 5 or
+/// taste-dominant polish work (a judge earns its keep where taste rules),
+/// 1 cast for low grades, mechanical work, or a deterministic
+/// file/pattern proof (nothing to arbitrate), else 2 for the
+/// design-choice middle (grade 3-4).
+fn heuristic_casts(ingot: &Ingot) -> u8 {
+    if ingot.grade >= 5 || is_taste_dominant(&ingot.work) {
+        return 3;
+    }
+    if ingot.grade < HIGH_GRADE
+        || is_mechanical(&ingot.work)
+        || is_deterministic_proof(&ingot.proof)
+    {
+        return 1;
+    }
+    2
+}
+
+/// Mechanical work has one right answer; a second cast buys nothing.
+fn is_mechanical(work: &str) -> bool {
+    let work = work.to_lowercase();
+    ["create ", "rename", "config", "scaffold", "install ", "mkdir", "copy "]
+        .iter()
+        .any(|kw| work.contains(kw))
+}
+
+/// File-existence and pattern proofs verify a deterministic outcome:
+/// every passing cast produced the same thing the proof checks for.
+fn is_deterministic_proof(proof: &str) -> bool {
+    let proof = proof.trim();
+    proof.starts_with("test -") || proof.starts_with("grep -q")
+}
+
+/// Taste-dominant work has no single right answer; three directions
+/// (minimal / robust / creative) give the judge a real spread to rank.
+fn is_taste_dominant(work: &str) -> bool {
+    let work = work.to_lowercase();
+    ["polish", "aesthetic", "taste", "visual design", "look and feel", "beautiful"]
+        .iter()
+        .any(|kw| work.contains(kw))
 }
 
 /// Persist the OpenRouter key to the config file (0o600 on unix).
@@ -902,25 +971,115 @@ mod tests {
         clear_engine_env();
     }
 
-    /// Two casts of `openrouter/auto` are one model rolled twice: the duel
-    /// costs triple the tokens and buys no diversity, so Auto skips it.
+    /// Matched models no longer disqualify an Auto duel: the direction
+    /// prompts (minimal / robust / creative) carry the diversity, so two
+    /// casts of `openrouter/auto` still explore different solutions.
     #[test]
-    fn auto_duel_needs_two_different_models() {
+    fn auto_duel_no_longer_requires_distinct_models() {
         let mut config = test_config();
         config.model_alt = config.model_base.clone();
-        assert!(!config.duel_qualifies(5));
-        assert!(!config.duel_qualifies(HIGH_GRADE));
-
-        config.model_alt = "other/model".into();
         assert!(config.duel_qualifies(5));
         assert!(config.duel_qualifies(HIGH_GRADE));
         assert!(!config.duel_qualifies(HIGH_GRADE - 1));
 
-        // Explicit opt-in still forces the duel, matched models or not.
-        config.model_alt = config.model_base.clone();
         config.duel = DuelMode::On;
-        assert!(config.duel_qualifies(5));
         assert!(config.duel_qualifies(1));
+    }
+
+    fn casts_ingot(solo: bool, grade: u8, work: &str, proof: &str) -> Ingot {
+        Ingot {
+            id: "ix".into(),
+            status: crate::sexp::Status::Ore,
+            solo,
+            grade,
+            skill: crate::sexp::Skill::Default,
+            heat: 0,
+            max: 5,
+            smelt: 0,
+            proof: proof.into(),
+            work: work.into(),
+            duel: None,
+            casts: None,
+            extra: vec![],
+        }
+    }
+
+    #[test]
+    fn casts_for_heuristic_matrix() {
+        let config = test_config(); // DuelMode::Auto
+        // (solo, grade, work, proof) -> expected casts
+        let cases: &[(bool, u8, &str, &str, u8)] = &[
+            // Grade gates: <=2 mechanical territory, 3-4 design middle, 5 studio.
+            (true, 1, "wire the retry loop", "cargo test", 1),
+            (true, 2, "wire the retry loop", "cargo test", 1),
+            (true, 3, "choose the API shape", "cargo test", 2),
+            (true, 4, "refactor the scheduler", "cargo test", 2),
+            (true, 5, "rebuild the engine", "cargo test", 3),
+            // Mechanical work drags a grade 3-4 down to one cast.
+            (true, 4, "Create the config loader", "cargo test", 1),
+            (true, 3, "rename the module", "cargo test", 1),
+            // A deterministic proof does the same.
+            (true, 4, "wire the loader", "test -f src/loader.rs", 1),
+            (true, 3, "wire the loader", "grep -q loader src/lib.rs", 1),
+            // Taste-dominant work goes to three casts at any grade.
+            (true, 2, "polish the landing page", "true", 3),
+            (true, 4, "visual design pass on the dashboard", "true", 3),
+            // Sequential work never fans out.
+            (false, 5, "rebuild the engine", "cargo test", 1),
+        ];
+        for &(solo, grade, work, proof, expected) in cases {
+            let ingot = casts_ingot(solo, grade, work, proof);
+            assert_eq!(
+                config.casts_for(&ingot),
+                expected,
+                "solo {solo} grade {grade} work {work:?} proof {proof:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn casts_for_explicit_pin_wins_over_everything() {
+        let mut config = test_config();
+        let mut ingot = casts_ingot(true, 1, "wire the retry loop", "test -f x");
+        ingot.casts = Some(3);
+        assert_eq!(config.casts_for(&ingot), 3, "pin beats heuristics");
+
+        config.duel = DuelMode::Off;
+        assert_eq!(config.casts_for(&ingot), 3, "pin beats SLAG_DUEL=off");
+
+        ingot.casts = Some(1);
+        config.duel = DuelMode::On;
+        assert_eq!(config.casts_for(&ingot), 1, "pin beats SLAG_DUEL=on");
+
+        // The sequential gate is the one thing a pin cannot override.
+        ingot.casts = Some(3);
+        ingot.solo = false;
+        assert_eq!(config.casts_for(&ingot), 1, "sequential never fans out");
+    }
+
+    #[test]
+    fn casts_for_mode_and_legacy_duel_overrides() {
+        let mut config = test_config();
+        let design = casts_ingot(true, 4, "refactor the scheduler", "cargo test");
+        let simple = casts_ingot(true, 1, "wire the retry loop", "cargo test");
+
+        config.duel = DuelMode::Off;
+        assert_eq!(config.casts_for(&design), 1, "off forces one cast");
+
+        config.duel = DuelMode::On;
+        assert_eq!(config.casts_for(&simple), 2, "on forces at least two");
+        let studio = casts_ingot(true, 5, "rebuild the engine", "cargo test");
+        assert_eq!(config.casts_for(&studio), 3, "on keeps the 3-cast tier");
+
+        // Legacy :duel override sits between the pin and the mode.
+        config.duel = DuelMode::Off;
+        let mut forced = simple.clone();
+        forced.duel = Some(true);
+        assert_eq!(config.casts_for(&forced), 2, ":duel t beats off");
+        config.duel = DuelMode::On;
+        let mut blocked = design.clone();
+        blocked.duel = Some(false);
+        assert_eq!(config.casts_for(&blocked), 1, ":duel nil beats on");
     }
 
     #[test]
