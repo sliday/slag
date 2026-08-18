@@ -13,12 +13,62 @@ use std::ops::Range;
 
 use serde_json::Value;
 
-use super::ChatMessage;
+use super::agent::{is_context_overflow, parse_overflow_tokens, CHARS_PER_TOKEN};
+use super::{ChatMessage, ChatRequest, Provider};
+use crate::error::SlagError;
 
 const PRUNABLE_MIN_CHARS: usize = 500;
 const KEEP_TAIL: usize = 6;
 const STUB_HEAD_CHARS: usize = 120;
 const STUB_PREFIX: &str = "[pruned old tool result: ";
+/// Summarizer overflow retries: drop oldest rounds and re-ask, then fail.
+const MAX_SUMMARY_RETRIES: usize = 3;
+/// When the overflow 400 carries no "A + B > C" numbers, drop this
+/// fraction of the summarizer's input per retry (1/5 = 20%).
+const SUMMARY_DROP_FALLBACK_DIV: usize = 5;
+/// Extra tokens dropped past a parsed overflow gap so the retry clears it.
+const SUMMARY_GAP_SLACK_TOKENS: u64 = 512;
+
+/// Consequence-first no-tools preamble for text-only LLM calls (the judge
+/// and the compact summarizer). Claude Code measured the tool-call
+/// fallback rate dropping 2.79% -> 0.01% with this framing.
+pub(crate) const NO_TOOLS_PREAMBLE: &str =
+    "Respond with TEXT/JSON ONLY — tool calls will be REJECTED and waste your only turn.";
+/// Matching trailer for the end of the prompt.
+pub(crate) const NO_TOOLS_TRAILER: &str =
+    "Reminder: respond with TEXT/JSON ONLY — any tool call will be REJECTED and waste your \
+only turn.";
+
+/// Rust port of Claude Code's BASE_COMPACT_PROMPT: a 9-section summary
+/// template with an <analysis> scratchpad (stripped before reuse).
+const BASE_COMPACT_PROMPT: &str = "Your task is to create a detailed summary of the \
+conversation so far, paying close attention to the original task and the work already done. \
+The summary must capture the technical details, code patterns, and decisions essential for \
+continuing the work without losing context.
+
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your \
+thoughts: chronologically review the conversation, identifying each request, the approach \
+taken, key decisions, and code changes.
+
+Your summary must include exactly these 9 sections:
+1. Primary Request and Intent: all explicit requests and intents, in detail
+2. Key Technical Concepts: technologies, frameworks, and conventions in play
+3. Files and Code Sections: files examined, modified, or created, with the important snippets
+4. Errors and Fixes: errors hit and how they were fixed, including any feedback received
+5. Problem Solving: problems solved and any ongoing troubleshooting
+6. All User Messages: every non-tool user message, preserving the exact asks
+7. Pending Tasks: tasks explicitly asked for that are not yet done
+8. Current Work: precisely what was being worked on immediately before this summary
+9. Optional Next Step: the single next step that directly continues the current work, or \
+nothing if the last task was completed";
+
+/// Item 44: the summary is delivered as a resume-silently continuation so
+/// the model picks the task back up instead of acknowledging the break.
+const CONTINUATION_PREFIX: &str = "This session is continued from a previous conversation \
+that ran out of context. The summary below covers the earlier conversation. Pick up the \
+last task exactly where it left off, as if the break never happened — do not acknowledge \
+this summary or the interruption. Exact earlier output, if ever needed, is preserved in \
+slag's JSONL event log.";
 
 /// Total conversation chars: message content plus assistant tool-call
 /// arguments — both count against the provider's context window.
@@ -58,6 +108,203 @@ pub fn compact(messages: &mut Vec<ChatMessage>, char_budget: usize) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Stage-three compaction (item 42): when stub-pruning cannot reach the
+/// budget, ask the provider for a 9-section summary of the old history,
+/// replace the head with one user message carrying it (as a resume-silently
+/// continuation), and keep the recent tail verbatim. `file_context` is the
+/// most-recently-touched files' current content; entries whose full read
+/// still survives (unstubbed) in the tail are skipped, the rest ride a
+/// system-reminder after the summary. Returns Ok(false) when there is
+/// nothing beyond system, task, and the protected tail to summarize.
+pub async fn summarize(
+    provider: &dyn Provider,
+    model: &str,
+    messages: &mut Vec<ChatMessage>,
+    file_context: &[(String, String)],
+) -> Result<bool, SlagError> {
+    let Some(cut) = summary_cut(messages) else {
+        return Ok(false);
+    };
+    // Head skips the system message (index 0); it survives verbatim.
+    let mut head: Vec<ChatMessage> = messages[1..cut].to_vec();
+    let tail: Vec<ChatMessage> = messages[cut..].to_vec();
+
+    // Item 45: an overflowing summary call retries with the oldest rounds
+    // dropped — sized to the parsed gap, else 20% — at most 3 times.
+    let mut retries = 0usize;
+    let summary = loop {
+        match provider.chat(summary_request(model, &head)).await {
+            Ok(resp) => break strip_analysis(&resp.content),
+            Err(e) if is_context_overflow(&e) && retries < MAX_SUMMARY_RETRIES => {
+                retries += 1;
+                let need = overflow_gap_chars(&e)
+                    .unwrap_or_else(|| convo_chars(&head) / SUMMARY_DROP_FALLBACK_DIV)
+                    .max(1);
+                if !drop_oldest_rounds(&mut head, need) {
+                    return Err(e); // nothing droppable — retrying is futile
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    if summary.trim().is_empty() {
+        return Ok(false); // a blank summary would erase history for nothing
+    }
+
+    let mut body = format!("{CONTINUATION_PREFIX}\n\n{summary}");
+    let reinject = files_not_in_tail(file_context, &tail);
+    if !reinject.is_empty() {
+        body.push_str(
+            "\n\n<system-reminder>\nCurrent content of the files most recently worked on, \
+re-read after compaction:\n",
+        );
+        for (path, content) in &reinject {
+            body.push_str(&format!("\n## {path}\n{content}\n"));
+        }
+        body.push_str("</system-reminder>");
+    }
+
+    let mut replacement = Vec::with_capacity(2 + tail.len());
+    replacement.push(messages[0].clone());
+    replacement.push(ChatMessage::user(body));
+    replacement.extend(tail);
+    *messages = replacement;
+    Ok(true)
+}
+
+/// Round-aligned boundary: everything before it (bar the system message)
+/// gets summarized, the tail after it is kept verbatim — never splitting
+/// an assistant tool_calls round from its results. None when nothing
+/// beyond system, task, and the protected tail would be summarized.
+fn summary_cut(messages: &[ChatMessage]) -> Option<usize> {
+    let target = messages.len().saturating_sub(KEEP_TAIL);
+    let cut = group_rounds(messages)
+        .into_iter()
+        .find(|r| r.end > target)
+        .map(|r| r.start)?;
+    (cut > 2).then_some(cut)
+}
+
+/// The no-tools summarization request (item 43): tools empty AND the
+/// consequence-first preamble leads, with a matching trailer.
+fn summary_request(model: &str, head: &[ChatMessage]) -> ChatRequest {
+    let prompt = format!(
+        "{BASE_COMPACT_PROMPT}\n\n## Conversation to summarize\n{}\n{NO_TOOLS_TRAILER}",
+        render_transcript(head)
+    );
+    ChatRequest {
+        model: model.to_string(),
+        messages: vec![
+            ChatMessage::system(format!(
+                "{NO_TOOLS_PREAMBLE} You summarize an agent's working conversation so the \
+agent can continue in a fresh context."
+            )),
+            ChatMessage::user(prompt),
+        ],
+        tools: vec![],
+        effort: None,
+        max_tokens: None,
+    }
+}
+
+/// Flatten messages into a role-labelled transcript for the summarizer;
+/// assistant tool calls render inline so the summary can name them.
+fn render_transcript(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        match m.role.as_str() {
+            "tool" => out.push_str(&format!("tool result: {}", m.content)),
+            role => {
+                out.push_str(&format!("{role}: {}", m.content));
+                if let Some(calls) = &m.tool_calls {
+                    for c in calls {
+                        out.push_str(&format!("\n[called {}({})]", c.name, c.arguments));
+                    }
+                }
+            }
+        }
+        out.push_str("\n\n");
+    }
+    out
+}
+
+/// Chars to drop so a retry clears a parsed "input + output > limit" gap.
+fn overflow_gap_chars(e: &SlagError) -> Option<usize> {
+    let (input, output, limit) = parse_overflow_tokens(&e.to_string())?;
+    let over = (input + output).checked_sub(limit)?;
+    Some(((over + SUMMARY_GAP_SLACK_TOKENS) as usize) * CHARS_PER_TOKEN)
+}
+
+/// Drop whole rounds from the front of the summarizer's input — never the
+/// original task at index 0 — until at least `need_chars` are gone or
+/// nothing droppable remains. Returns whether anything was dropped.
+fn drop_oldest_rounds(head: &mut Vec<ChatMessage>, need_chars: usize) -> bool {
+    let mut dropped = 0usize;
+    let mut changed = false;
+    while dropped < need_chars && head.len() > 1 {
+        let Some(round) = group_rounds(head).into_iter().find(|r| r.start >= 1) else {
+            break;
+        };
+        dropped += convo_chars(&head[round.clone()]);
+        head.drain(round);
+        changed = true;
+    }
+    changed
+}
+
+/// Remove the <analysis>…</analysis> scratchpad before the summary is
+/// reused as context.
+fn strip_analysis(text: &str) -> String {
+    const OPEN: &str = "<analysis>";
+    const CLOSE: &str = "</analysis>";
+    let mut out = text.to_string();
+    while let (Some(s), Some(e)) = (out.find(OPEN), out.find(CLOSE)) {
+        if e < s {
+            break;
+        }
+        out.replace_range(s..e + CLOSE.len(), "");
+    }
+    out.trim().to_string()
+}
+
+/// Filter re-injection candidates down to files whose full read does NOT
+/// survive in the kept tail — a live (unstubbed) tail read already has
+/// the content in context.
+fn files_not_in_tail<'a>(
+    file_context: &'a [(String, String)],
+    tail: &[ChatMessage],
+) -> Vec<&'a (String, String)> {
+    let meta = result_meta(tail);
+    let live: Vec<&str> = tail
+        .iter()
+        .zip(&meta)
+        .filter_map(|(m, meta)| match meta {
+            Some((name, Some(path)))
+                if name == "read_file"
+                    && !m.content.starts_with(STUB_PREFIX)
+                    && !m.content.starts_with("[unchanged") =>
+            {
+                Some(path.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    file_context
+        .iter()
+        .filter(|(path, _)| !live.iter().any(|p| same_file(p, path)))
+        .collect()
+}
+
+/// Path equality tolerant of one side being absolute and the other
+/// workspace-relative; two relative paths must match exactly.
+fn same_file(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    (a.starts_with('/') && a.ends_with(&format!("/{b}")))
+        || (b.starts_with('/') && b.ends_with(&format!("/{a}")))
 }
 
 /// Group messages into API rounds: an assistant message carrying tool_calls
@@ -462,5 +709,288 @@ mod tests {
         assert!(ids.contains(&Some("t1")) && ids.contains(&Some("t2")));
         // The old droppable round is gone.
         assert!(!ids.contains(&Some("c0")));
+    }
+
+    // ---- summarizer (stage three) ----
+
+    use crate::engine::{FinishReason, NormalizedResponse, Usage};
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    /// Scripted summarizer provider: pops one Result per chat call.
+    struct MockSummarizer {
+        script: Mutex<VecDeque<Result<String, String>>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl MockSummarizer {
+        fn new(script: Vec<Result<&str, &str>>) -> Self {
+            Self {
+                script: Mutex::new(
+                    script
+                        .into_iter()
+                        .map(|r| r.map(str::to_string).map_err(str::to_string))
+                        .collect(),
+                ),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Provider for MockSummarizer {
+        fn chat(
+            &self,
+            req: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>>
+        {
+            self.requests.lock().unwrap().push(req);
+            let next = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("summarizer script exhausted");
+            Box::pin(async move {
+                next.map(|content| NormalizedResponse {
+                    model: None,
+                    content,
+                    tool_calls: vec![],
+                    finish_reason: FinishReason::Stop,
+                    reasoning: None,
+                    reasoning_details: None,
+                    usage: Usage::default(),
+                })
+                .map_err(SlagError::Provider)
+            })
+        }
+    }
+
+    /// base + 6 read rounds (f0..f5) + a 6-message user tail.
+    fn summarizable_convo() -> Vec<ChatMessage> {
+        let mut messages = base_convo();
+        for i in 0..6 {
+            messages.extend(round(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("f{i}.rs")}),
+                600,
+            ));
+        }
+        pad_tail(&mut messages);
+        messages
+    }
+
+    #[tokio::test]
+    async fn summarizer_replaces_head_and_keeps_tail() {
+        let provider =
+            MockSummarizer::new(vec![Ok("<analysis>scratch notes</analysis>\nTHE-9-SECTIONS")]);
+        let mut messages = summarizable_convo();
+        let tail_before: Vec<String> =
+            messages[messages.len() - KEEP_TAIL..].iter().map(|m| m.content.clone()).collect();
+
+        let changed = summarize(&provider, "test/model", &mut messages, &[])
+            .await
+            .expect("summarize ok");
+        assert!(changed);
+
+        // system | continuation user | verbatim tail.
+        assert_eq!(messages.len(), 2 + KEEP_TAIL);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        let body = &messages[1].content;
+        assert!(body.contains("continued from a previous conversation"), "{body}");
+        assert!(body.contains("as if the break never happened"), "{body}");
+        assert!(body.contains("JSONL event log"), "{body}");
+        assert!(body.contains("THE-9-SECTIONS"), "{body}");
+        // The <analysis> scratchpad never reaches the continued context.
+        assert!(!body.contains("analysis"), "{body}");
+        assert!(!body.contains("scratch notes"), "{body}");
+        let tail_after: Vec<String> =
+            messages[2..].iter().map(|m| m.content.clone()).collect();
+        assert_eq!(tail_before, tail_after);
+
+        // The summary call: no tools, consequence-first preamble leading
+        // the system message, template + trailer in the user prompt.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert!(req.tools.is_empty());
+        assert!(req.messages[0].content.starts_with(NO_TOOLS_PREAMBLE));
+        let prompt = &req.messages[1].content;
+        assert!(prompt.contains("Primary Request and Intent"), "template present");
+        assert!(prompt.contains("Optional Next Step"), "all 9 sections");
+        assert!(prompt.contains("f0.rs"), "head transcript present");
+        assert!(prompt.trim_end().ends_with(NO_TOOLS_TRAILER), "trailer");
+    }
+
+    #[tokio::test]
+    async fn summarizer_is_a_noop_when_only_protected_messages_exist() {
+        let provider = MockSummarizer::new(vec![]);
+        let mut messages = base_convo();
+        pad_tail(&mut messages);
+        let before: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+
+        let changed = summarize(&provider, "test/model", &mut messages, &[])
+            .await
+            .expect("noop ok");
+        assert!(!changed);
+        let after: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(before, after);
+        assert!(provider.requests().is_empty(), "no provider call");
+    }
+
+    #[tokio::test]
+    async fn overflowing_summary_call_drops_oldest_rounds_and_retries() {
+        let provider = MockSummarizer::new(vec![
+            Err("400: maximum context length exceeded"),
+            Ok("SUMMARY"),
+        ]);
+        let mut messages = summarizable_convo();
+
+        let changed = summarize(&provider, "test/model", &mut messages, &[])
+            .await
+            .expect("retry ok");
+        assert!(changed);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let first = &requests[0].messages[1].content;
+        let retry = &requests[1].messages[1].content;
+        // Oldest round dropped from the retry; newest survives; the
+        // original task message is never dropped.
+        assert!(first.contains("f0.rs"));
+        assert!(!retry.contains("f0.rs"), "oldest round dropped");
+        assert!(retry.contains("f5.rs"), "newest round kept");
+        assert!(retry.contains("task"), "original task protected");
+        assert!(retry.len() < first.len());
+    }
+
+    #[tokio::test]
+    async fn summary_overflow_fails_after_three_drop_retries() {
+        let overflow = || Err("400: maximum context length exceeded");
+        let provider =
+            MockSummarizer::new(vec![overflow(), overflow(), overflow(), overflow()]);
+        let mut messages = summarizable_convo();
+        let before = messages.len();
+
+        let err = summarize(&provider, "test/model", &mut messages, &[])
+            .await
+            .expect_err("must fail after 3 retries");
+        assert!(err.to_string().contains("context"), "got: {err}");
+        assert_eq!(provider.requests().len(), 4, "initial call + 3 retries");
+        assert_eq!(messages.len(), before, "failed summarize leaves history intact");
+    }
+
+    #[tokio::test]
+    async fn reinjected_files_skip_reads_surviving_in_the_tail() {
+        let provider = MockSummarizer::new(vec![Ok("SUMMARY")]);
+        // Head: 4 rounds. Tail: a LIVE read of a.rs plus 4 user turns.
+        let mut messages = base_convo();
+        for i in 0..4 {
+            messages.extend(round(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("f{i}.rs")}),
+                600,
+            ));
+        }
+        messages.extend(round("ra", "read_file", serde_json::json!({"path": "a.rs"}), 600));
+        for i in 0..4 {
+            messages.push(ChatMessage::user(format!("turn {i}")));
+        }
+
+        let file_context = vec![
+            ("a.rs".to_string(), "AAA-CONTENT".to_string()),
+            ("b.rs".to_string(), "BBB-CONTENT".to_string()),
+        ];
+        let changed = summarize(&provider, "test/model", &mut messages, &file_context)
+            .await
+            .expect("summarize ok");
+        assert!(changed);
+
+        let body = &messages[1].content;
+        assert!(body.contains("<system-reminder>"), "{body}");
+        assert!(body.contains("## b.rs"), "{body}");
+        assert!(body.contains("BBB-CONTENT"), "{body}");
+        // a.rs's read survives live in the tail — not re-injected.
+        assert!(!body.contains("## a.rs"), "{body}");
+        assert!(!body.contains("AAA-CONTENT"), "{body}");
+        // The live tail read itself survived.
+        assert!(messages.iter().any(|m| m.tool_call_id.as_deref() == Some("ra")));
+    }
+
+    #[tokio::test]
+    async fn stubbed_tail_reads_do_not_block_reinjection() {
+        let provider = MockSummarizer::new(vec![Ok("SUMMARY")]);
+        let mut messages = base_convo();
+        for i in 0..4 {
+            messages.extend(round(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("f{i}.rs")}),
+                600,
+            ));
+        }
+        // Tail read of a.rs already stubbed by stage-one pruning: its
+        // content is gone from context, so re-injection must proceed.
+        messages.push(ChatMessage::assistant(
+            "",
+            Some(vec![call("ra", "read_file", serde_json::json!({"path": "a.rs"}))]),
+        ));
+        messages.push(ChatMessage::tool_result("ra", format!("{STUB_PREFIX}1|old...]")));
+        for i in 0..4 {
+            messages.push(ChatMessage::user(format!("turn {i}")));
+        }
+
+        let file_context = vec![("a.rs".to_string(), "AAA-CONTENT".to_string())];
+        summarize(&provider, "test/model", &mut messages, &file_context)
+            .await
+            .expect("summarize ok");
+        let body = &messages[1].content;
+        assert!(body.contains("## a.rs"), "{body}");
+        assert!(body.contains("AAA-CONTENT"), "{body}");
+    }
+
+    #[test]
+    fn strip_analysis_removes_the_scratchpad() {
+        assert_eq!(
+            strip_analysis("<analysis>thinking...</analysis>\nSummary body"),
+            "Summary body"
+        );
+        assert_eq!(strip_analysis("no scratchpad here"), "no scratchpad here");
+        // Unclosed tag: left alone rather than eating the summary.
+        assert_eq!(strip_analysis("<analysis>oops no close"), "<analysis>oops no close");
+        // Multiple spans all go.
+        assert_eq!(
+            strip_analysis("<analysis>a</analysis>X<analysis>b</analysis>Y"),
+            "XY"
+        );
+    }
+
+    #[test]
+    fn overflow_gap_chars_sizes_the_drop_from_parsed_numbers() {
+        let e = SlagError::Provider(
+            "input length and max_tokens exceed context limit: 1100 + 100 > 1000".into(),
+        );
+        // (1100 + 100 - 1000 + 512 slack) tokens * 4 chars.
+        assert_eq!(overflow_gap_chars(&e), Some((200 + 512) * 4));
+        // No numbers → None → caller falls back to the 20% drop.
+        let plain = SlagError::Provider("400: maximum context length exceeded".into());
+        assert_eq!(overflow_gap_chars(&plain), None);
+    }
+
+    #[test]
+    fn same_file_tolerates_relative_vs_absolute() {
+        assert!(same_file("src/a.rs", "src/a.rs"));
+        assert!(same_file("/root/ws/src/a.rs", "src/a.rs"));
+        assert!(same_file("src/a.rs", "/root/ws/src/a.rs"));
+        assert!(!same_file("b/a.rs", "a.rs"), "component boundary respected");
+        assert!(!same_file("src/a.rs", "src/b.rs"));
     }
 }

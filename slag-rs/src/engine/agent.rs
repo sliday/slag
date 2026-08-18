@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
-use super::compact::{compact, convo_chars};
+use super::compact::{compact, convo_chars, summarize};
 use super::events::preview;
 use super::tools::ToolBox;
 use super::{
@@ -27,7 +27,7 @@ const DEFAULT_MAX_TURNS: usize = 40;
 const CHAR_BUDGET: usize = 600_000;
 /// chars/4 is the estimation rule for text appended since the last usage
 /// anchor; token budgets convert to char targets through the same ratio.
-const CHARS_PER_TOKEN: usize = 4;
+pub(crate) const CHARS_PER_TOKEN: usize = 4;
 const DEFAULT_TOKEN_BUDGET: usize = CHAR_BUDGET / CHARS_PER_TOKEN;
 /// Room reserved out of the model window for its own output.
 const OUTPUT_RESERVE_TOKENS: u64 = 16_384;
@@ -45,6 +45,36 @@ const CHAR_BUDGET_FLOOR: usize = 16_000;
 const TOKEN_BUDGET_FLOOR: usize = CHAR_BUDGET_FLOOR / CHARS_PER_TOKEN;
 const PREVIEW_LEN: usize = 80;
 const STEER_TAG: &str = "[STEER — operator message, follow it]";
+/// Silent-escalation output cap: the first Length truncation retries the
+/// same request once with this max_tokens before any continuation nudge.
+const RAISED_MAX_TOKENS: u32 = 32_768;
+/// Continuation nudges after the silent escalation, before failing.
+const MAX_CONTINUE_NUDGES: usize = 3;
+/// CC's proven continuation text: resume directly, no apology, no recap.
+const CONTINUE_NUDGE: &str = "Continue your previous response from exactly where it was cut \
+off — resume directly, no apology, no recap, do not repeat earlier output.";
+/// Output room kept in reserve when shrinking max_tokens to fit a parsed
+/// "input + output > limit" overflow.
+const OUTPUT_SHRINK_BUFFER: u64 = 1_024;
+/// Below this much output room, shrinking max_tokens cannot help — the
+/// input itself must be compacted.
+const MIN_SHRUNK_OUTPUT_TOKENS: u64 = 512;
+/// Files re-read and re-injected after a summarization compaction.
+const REINJECT_FILES: usize = 5;
+/// Per-file char cap for post-compaction re-injection.
+const REINJECT_FILE_CAP: usize = 20_000;
+/// Fraction of the token budget the whole re-injection may occupy (the
+/// divisor): budget/4 = 25%.
+const REINJECT_BUDGET_DIV: usize = 4;
+
+/// Per-file char cap for post-compaction re-injection, sized to the live
+/// (possibly halved) token budget: the total re-injection stays within a
+/// quarter of the budget instead of a fixed 100k chars that could
+/// overflow the very window summarization was shrinking toward. The
+/// fixed per-file ceiling still applies on large windows.
+fn reinject_file_cap(token_budget: usize) -> usize {
+    (token_budget * CHARS_PER_TOKEN / REINJECT_BUDGET_DIV / REINJECT_FILES).min(REINJECT_FILE_CAP)
+}
 
 /// Cross-session ingot spend accumulator. One smith invocation is one
 /// session, but an ingot burns through many sessions (heats, transient
@@ -118,18 +148,83 @@ fn compact_to_tokens(
 
 /// Provider rejection caused by the request exceeding the model's context
 /// window (OpenRouter surfaces these as 400s with varying phrasings).
-fn is_context_overflow(e: &SlagError) -> bool {
+pub(crate) fn is_context_overflow(e: &SlagError) -> bool {
     let s = e.to_string().to_lowercase();
     [
         "context length",
         "context_length",
         "context window",
+        "context limit",
         "maximum context",
         "too many tokens",
         "input is too long",
     ]
     .iter()
     .any(|needle| s.contains(needle))
+}
+
+/// Parse "A + B > C" token counts from a context-overflow 400 body
+/// (Anthropic phrasing: "input length and max_tokens exceed context
+/// limit: 195017 + 21333 > 204698"). Returns (input, output, limit).
+pub(crate) fn parse_overflow_tokens(msg: &str) -> Option<(u64, u64, u64)> {
+    let b = msg.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            if let Some(triple) = parse_overflow_triple(b, i) {
+                return Some(triple);
+            }
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn parse_overflow_triple(b: &[u8], mut i: usize) -> Option<(u64, u64, u64)> {
+    fn take_num(b: &[u8], i: &mut usize) -> Option<u64> {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i == start {
+            return None;
+        }
+        std::str::from_utf8(&b[start..*i]).ok()?.parse().ok()
+    }
+    fn skip_ws(b: &[u8], i: &mut usize) {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    }
+    let input = take_num(b, &mut i)?;
+    skip_ws(b, &mut i);
+    if b.get(i) != Some(&b'+') {
+        return None;
+    }
+    i += 1;
+    skip_ws(b, &mut i);
+    let output = take_num(b, &mut i)?;
+    skip_ws(b, &mut i);
+    if b.get(i) != Some(&b'>') {
+        return None;
+    }
+    i += 1;
+    skip_ws(b, &mut i);
+    let limit = take_num(b, &mut i)?;
+    Some((input, output, limit))
+}
+
+/// max_tokens that fits a parsed "input + output > limit" overflow, or
+/// None when the message carries no numbers or the room left after the
+/// input is too small to be worth an output-only retry.
+fn shrunk_output_cap(e: &SlagError) -> Option<u32> {
+    let (input, _output, limit) = parse_overflow_tokens(&e.to_string())?;
+    let room = limit.saturating_sub(input).saturating_sub(OUTPUT_SHRINK_BUFFER);
+    (room >= MIN_SHRUNK_OUTPUT_TOKENS).then_some(room.min(u32::MAX as u64) as u32)
 }
 
 /// One smith session: a provider, a toolbox, a model, and a turn budget.
@@ -254,10 +349,14 @@ impl ForgeAgent {
         applied_steers: &mut Vec<String>,
     ) -> Result<String, SlagError> {
         let mut messages = vec![ChatMessage::system(system), ChatMessage::user(task)];
-        let mut continued = false;
         let mut token_budget = self.token_budget;
         let mut anchor: Option<TokenAnchor> = None;
         let mut budget_warned = false;
+        // Output-cap recovery ladder state (item 51): silent escalation
+        // first, then counted continuation nudges.
+        let mut out_tokens: Option<u32> = None;
+        let mut escalated = false;
+        let mut nudges = 0usize;
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
@@ -267,7 +366,7 @@ impl ForgeAgent {
             emit(&self.events, EngineEvent::ModelCall { model: self.model.clone() });
 
             let resp = match self
-                .chat_shrinking(&mut messages, true, &mut token_budget, &mut anchor)
+                .chat_shrinking(&mut messages, true, &mut token_budget, &mut anchor, &mut out_tokens)
                 .await
             {
                 Ok(resp) => resp,
@@ -299,12 +398,29 @@ impl ForgeAgent {
             self.track_spend(&resp.usage);
 
             if resp.tool_calls.is_empty() {
-                if resp.finish_reason == FinishReason::Length && !continued {
-                    // Truncated mid-thought: nudge once, then take what comes.
-                    continued = true;
-                    messages.push(ChatMessage::assistant(resp.content, None));
-                    messages.push(ChatMessage::user("continue"));
-                    continue;
+                if resp.finish_reason == FinishReason::Length {
+                    if !escalated {
+                        // Silent escalation: discard the partial and retry
+                        // the same request with a raised output cap — no
+                        // transcript noise when the cap alone was the issue.
+                        escalated = true;
+                        out_tokens = Some(out_tokens.unwrap_or(0).max(RAISED_MAX_TOKENS));
+                        continue;
+                    }
+                    if nudges < MAX_CONTINUE_NUDGES {
+                        // Truncated even at the raised cap: keep the partial
+                        // and nudge a direct resume.
+                        nudges += 1;
+                        messages.push(ChatMessage::assistant(resp.content, None));
+                        messages.push(ChatMessage::user(CONTINUE_NUDGE));
+                        continue;
+                    }
+                    let e = SlagError::SmithFailed(format!(
+                        "output truncated at the token cap despite a raised max_tokens retry \
+and {MAX_CONTINUE_NUDGES} continuation nudges"
+                    ));
+                    emit(&self.events, EngineEvent::Error { message: e.to_string() });
+                    return Err(e);
                 }
                 emit(&self.events, EngineEvent::Finish { summary: resp.content.clone() });
                 return Ok(resp.content);
@@ -396,7 +512,7 @@ impl ForgeAgent {
         ));
         compact_to_tokens(&mut messages, token_budget, &mut anchor);
         let resp = match self
-            .chat_shrinking(&mut messages, false, &mut token_budget, &mut anchor)
+            .chat_shrinking(&mut messages, false, &mut token_budget, &mut anchor, &mut out_tokens)
             .await
         {
             Ok(resp) => resp,
@@ -435,22 +551,51 @@ impl ForgeAgent {
         Ok(())
     }
 
-    /// Chat with context-overflow recovery: on a context-window 400, halve
-    /// the token budget, compact, and retry — until the floor is reached or
-    /// compaction stops making progress. Fixed budgets sized for large
-    /// windows never fire compaction on smaller-context models otherwise.
+    /// Chat with context-overflow recovery, cheapest remedy first: (1) a
+    /// parsed "input + output > limit" 400 retries once with a shrunk
+    /// max_tokens — no history lost when only the output budget overflowed;
+    /// (2) halve the token budget, stub-prune/drop-rounds compact, retry —
+    /// until the floor is reached or pruning stops making progress; (3) one
+    /// LLM summarization pass replaces the head with a 9-section summary
+    /// before giving up.
     async fn chat_shrinking(
         &self,
         messages: &mut Vec<ChatMessage>,
         with_tools: bool,
         token_budget: &mut usize,
         anchor: &mut Option<TokenAnchor>,
+        out_tokens: &mut Option<u32>,
     ) -> Result<NormalizedResponse, SlagError> {
         let mut shrink_cycles = 0usize;
+        let mut output_shrunk = false;
+        let mut summarized = false;
         loop {
-            match self.provider.chat(self.request(messages.clone(), with_tools)).await {
+            match self
+                .provider
+                .chat(self.request(messages.clone(), with_tools, *out_tokens))
+                .await
+            {
                 Ok(resp) => return Ok(resp),
-                Err(e) if is_context_overflow(&e) && *token_budget > TOKEN_BUDGET_FLOOR => {
+                Err(e) if is_context_overflow(&e) => {
+                    // Output-only overflow: shrink max_tokens once before
+                    // any compaction — cheaper when the input still fits.
+                    if !output_shrunk {
+                        output_shrunk = true;
+                        if let Some(cap) = shrunk_output_cap(&e) {
+                            if out_tokens.map_or(true, |t| cap < t) {
+                                *out_tokens = Some(cap);
+                                emit(
+                                    &self.events,
+                                    EngineEvent::Error {
+                                        message: format!(
+                                            "context overflow — shrunk max_tokens to {cap}, retrying"
+                                        ),
+                                    },
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     // Circuit breaker: shrink cycles that keep overflowing
                     // mean the window can never fit — fail permanently
                     // instead of grinding halvings forever.
@@ -460,18 +605,48 @@ impl ForgeAgent {
                             "context irrecoverable after {MAX_SHRINK_CYCLES} compactions: {e}"
                         )));
                     }
+                    let can_prune = *token_budget > TOKEN_BUDGET_FLOOR;
                     *token_budget = (*token_budget / 2).max(TOKEN_BUDGET_FLOOR);
-                    if !compact_to_tokens(messages, *token_budget, anchor) {
-                        return Err(e); // nothing prunable — retrying is futile
+                    if can_prune && compact_to_tokens(messages, *token_budget, anchor) {
+                        emit(
+                            &self.events,
+                            EngineEvent::Error {
+                                message: format!(
+                                    "context overflow — compacted to {token_budget} tokens, retrying"
+                                ),
+                            },
+                        );
+                        continue;
                     }
-                    emit(
-                        &self.events,
-                        EngineEvent::Error {
-                            message: format!(
-                                "context overflow — compacted to {token_budget} tokens, retrying"
-                            ),
-                        },
-                    );
+                    // Stage two: pruning cannot reach the budget — one LLM
+                    // summarization pass before giving up.
+                    if summarized {
+                        return Err(e);
+                    }
+                    summarized = true;
+                    let snapshots = self
+                        .toolbox
+                        .recent_file_snapshots(REINJECT_FILES, reinject_file_cap(*token_budget));
+                    // The summarizer's calls carry nearly the whole
+                    // conversation head — the largest requests of the
+                    // session. Route them through the spend wrapper so
+                    // they count against the ingot/run accumulators and
+                    // stop at the run cap like every other call.
+                    let tracked = SpendTracked::new(self.provider.as_ref(), self.ingot_spend.clone())
+                        .with_run_cap(self.run_cap);
+                    match summarize(&tracked, &self.model, messages, &snapshots).await {
+                        Ok(true) => {
+                            *anchor = None;
+                            emit(
+                                &self.events,
+                                EngineEvent::Error {
+                                    message: "context overflow — summarized history, retrying"
+                                        .into(),
+                                },
+                            );
+                        }
+                        _ => return Err(e),
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -519,13 +694,18 @@ impl ForgeAgent {
         }
     }
 
-    fn request(&self, messages: Vec<ChatMessage>, with_tools: bool) -> ChatRequest {
+    fn request(
+        &self,
+        messages: Vec<ChatMessage>,
+        with_tools: bool,
+        max_tokens: Option<u32>,
+    ) -> ChatRequest {
         ChatRequest {
             model: self.model.clone(),
             messages,
             tools: if with_tools { ToolBox::specs() } else { Vec::new() },
             effort: self.effort,
-            max_tokens: None,
+            max_tokens,
         }
     }
 
@@ -653,8 +833,8 @@ impl<P: Provider> SpendTracked<P> {
         Self { inner, accum, run_cap: crate::config::run_cost_cap() }
     }
 
-    /// Override the run-wide cap (tests; `new` reads config/env).
-    #[cfg(test)]
+    /// Override the run-wide cap (`new` reads config/env; the agent's
+    /// summarize wrapper passes its own, test-overridable cap through).
     pub fn with_run_cap(mut self, cap: Option<f64>) -> Self {
         self.run_cap = cap;
         self
@@ -683,6 +863,16 @@ impl<P: Provider> Provider for SpendTracked<P> {
             }
             Ok(resp)
         })
+    }
+
+    /// Observability wiring must survive the spend wrapper: forward the
+    /// heartbeat sink and cancel flag to the wrapped provider.
+    fn set_event_sink(&self, tx: EventTx) {
+        self.inner.set_event_sink(tx)
+    }
+
+    fn set_cancel_flag(&self, f: CancelFlag) {
+        self.inner.set_cancel_flag(f)
     }
 }
 
@@ -940,7 +1130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn length_truncation_gets_exactly_one_continue() {
+    async fn length_truncation_first_retries_silently_with_a_raised_cap() {
         let dir = tempfile::tempdir().unwrap();
 
         let provider = MockProvider::new(vec![
@@ -956,24 +1146,226 @@ mod tests {
 
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
-        let msgs = &requests[1].messages;
-        assert_eq!(msgs[msgs.len() - 1].content, "continue");
-        assert_eq!(msgs[msgs.len() - 2].content, "partial");
+        // Silent escalation: same conversation re-sent (partial discarded,
+        // no nudge appended), only max_tokens raised.
+        assert_eq!(requests[0].max_tokens, None);
+        assert_eq!(requests[1].max_tokens, Some(RAISED_MAX_TOKENS));
+        assert_eq!(requests[0].messages.len(), requests[1].messages.len());
+        assert!(requests[1]
+            .messages
+            .iter()
+            .all(|m| m.content != "partial" && m.content != CONTINUE_NUDGE));
     }
 
     #[tokio::test]
-    async fn second_length_truncation_returns_content() {
+    async fn truncation_at_the_raised_cap_gets_a_continuation_nudge() {
         let dir = tempfile::tempdir().unwrap();
         let provider = MockProvider::new(vec![
             resp_text("partial", FinishReason::Length),
             resp_text("still partial", FinishReason::Length),
+            resp_text("complete", FinishReason::Stop),
         ]);
 
-        let result = agent(provider, dir.path())
+        let result = agent(provider.clone(), dir.path())
             .run("system".into(), "task".into())
             .await
             .expect("run ok");
-        assert_eq!(result, "still partial");
+        assert_eq!(result, "complete");
+
+        // Call 1 truncates → silent escalation; call 2 truncates at the
+        // raised cap → the partial is kept and the resume nudge follows.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        let msgs = &requests[2].messages;
+        assert_eq!(msgs[msgs.len() - 1].content, CONTINUE_NUDGE);
+        assert_eq!(msgs[msgs.len() - 2].content, "still partial");
+        assert_eq!(msgs[msgs.len() - 2].role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn persistent_truncation_fails_after_escalation_and_three_nudges() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1 original + 1 escalated retry + 3 nudged retries, all truncated.
+        let provider = MockProvider::new(vec![
+            resp_text("p1", FinishReason::Length),
+            resp_text("p2", FinishReason::Length),
+            resp_text("p3", FinishReason::Length),
+            resp_text("p4", FinishReason::Length),
+            resp_text("p5", FinishReason::Length),
+        ]);
+
+        let err = agent(provider.clone(), dir.path())
+            .run("system".into(), "task".into())
+            .await
+            .expect_err("must fail, not loop or return a stump");
+        assert!(err.to_string().contains("output truncated"), "got: {err}");
+        assert_eq!(provider.requests().len(), 5);
+    }
+
+    #[test]
+    fn overflow_token_parser_reads_a_plus_b_gt_c() {
+        assert_eq!(
+            parse_overflow_tokens(
+                "400: input length and max_tokens exceed context limit: 195017 + 21333 > 204698"
+            ),
+            Some((195017, 21333, 204698))
+        );
+        // Whitespace variants still parse.
+        assert_eq!(parse_overflow_tokens("5000+9000>10000"), Some((5000, 9000, 10000)));
+        // Plain phrasings without the arithmetic carry no numbers to act on.
+        assert_eq!(parse_overflow_tokens("maximum context length is 8192 tokens"), None);
+        assert_eq!(parse_overflow_tokens("no numbers at all"), None);
+    }
+
+    #[tokio::test]
+    async fn output_only_overflow_shrinks_max_tokens_before_compacting() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = FlakyProvider::new(vec![
+            Err("400: input length and max_tokens exceed context limit: 5000 + 9000 > 10000"
+                .into()),
+            Ok(resp_text("done", FinishReason::Stop)),
+        ]);
+
+        let result = ForgeAgent::new(provider.clone(), ToolBox::new(dir.path()), "test/model")
+            .run("system".into(), "task".into())
+            .await
+            .expect("shrunk-output retry must recover");
+        assert_eq!(result, "done");
+
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        // max_tokens = limit - input - buffer; history untouched.
+        assert_eq!(requests[1].max_tokens, Some((10000 - 5000 - 1024) as u32));
+        assert_eq!(requests[0].messages.len(), requests[1].messages.len());
+        assert!(requests[1]
+            .messages
+            .iter()
+            .all(|m| !m.content.starts_with("[pruned old tool result")));
+    }
+
+    #[tokio::test]
+    async fn stage_two_summarization_rescues_an_unprunable_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), format!("content of f{i}\n"))
+                .unwrap();
+        }
+
+        // 8 small read rounds (nothing stub-eligible at the char floor,
+        // estimates far under budget — pruning cannot help), then a
+        // context overflow: stage two must summarize and retry.
+        let read = |i: usize| tc("c1", "read_file", serde_json::json!({"path": format!("f{i}.txt")}));
+        let mut script: Vec<Result<NormalizedResponse, String>> =
+            (0..8).map(|i| Ok(resp_tools(vec![read(i)]))).collect();
+        script.push(Err("400: maximum context length exceeded".into()));
+        script.push(Ok(resp_text("1..9 summary sections", FinishReason::Stop)));
+        script.push(Ok(resp_text("done", FinishReason::Stop)));
+        let provider = FlakyProvider::new(script);
+
+        let result = ForgeAgent::new(provider.clone(), ToolBox::new(dir.path()), "test/model")
+            .with_char_budget(400_000)
+            .run("system".into(), "task".into())
+            .await
+            .expect("summarization must rescue the overflow");
+        assert_eq!(result, "done");
+
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 11, "8 turns + overflow + summary call + retry");
+
+        // The summary call itself: no tools, consequence-first preamble.
+        let summary_req = &requests[9];
+        assert!(summary_req.tools.is_empty());
+        assert!(summary_req.messages[0]
+            .content
+            .starts_with("Respond with TEXT/JSON ONLY"));
+
+        // The retried request: head replaced by the resume-silently
+        // continuation; recently-read files whose reads fell out of the
+        // tail are re-injected; tail-surviving reads are not.
+        let retry = &requests[10];
+        let continuation = retry
+            .messages
+            .iter()
+            .find(|m| m.content.contains("continued from a previous conversation"))
+            .expect("continuation message present");
+        assert!(continuation.content.contains("1..9 summary sections"));
+        assert!(continuation.content.contains("<system-reminder>"), "re-injection rides along");
+        assert!(continuation.content.contains("## f3.txt"), "{}", continuation.content);
+        assert!(continuation.content.contains("content of f4"), "{}", continuation.content);
+        assert!(
+            !continuation.content.contains("## f7.txt"),
+            "tail-surviving read must not be re-injected"
+        );
+        // Tail rounds stay paired for strict backends.
+        for (i, m) in retry.messages.iter().enumerate() {
+            if m.role == "tool" {
+                let id = m.tool_call_id.as_deref().unwrap();
+                assert!(
+                    retry.messages[..i].iter().any(|a| a
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|cs| cs.iter().any(|c| c.id == id))),
+                    "orphan tool result after summarization"
+                );
+            }
+        }
+    }
+
+    /// Regression: `summarize` hit the raw provider and dropped
+    /// `resp.usage`, so up to 4 near-full-context LLM calls accrued zero
+    /// spend — the ingot/run caps lied. The summarizer's cost must land
+    /// in the shared accumulator.
+    #[tokio::test]
+    async fn summarizer_spend_lands_in_the_ingot_accumulator() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), format!("content of f{i}\n"))
+                .unwrap();
+        }
+
+        let read = |i: usize| tc("c1", "read_file", serde_json::json!({"path": format!("f{i}.txt")}));
+        let mut script: Vec<Result<NormalizedResponse, String>> =
+            (0..8).map(|i| Ok(resp_tools(vec![read(i)]))).collect();
+        script.push(Err("400: maximum context length exceeded".into()));
+        let mut summary = resp_text("1..9 summary sections", FinishReason::Stop);
+        summary.usage.cost = Some(0.07);
+        script.push(Ok(summary));
+        script.push(Ok(resp_text("done", FinishReason::Stop)));
+        let provider = FlakyProvider::new(script);
+
+        let acc = SpendAccum::default();
+        ForgeAgent::new(provider, ToolBox::new(dir.path()), "test/model")
+            .with_char_budget(400_000)
+            .with_cost_cap(None)
+            .with_run_cap(None)
+            .with_ingot_spend(acc.clone())
+            .run("system".into(), "task".into())
+            .await
+            .expect("summarization must rescue the overflow");
+        assert!(
+            (*acc.lock().unwrap() - 0.07).abs() < 1e-9,
+            "summarizer cost missing from the ingot accumulator: {}",
+            *acc.lock().unwrap()
+        );
+    }
+
+    /// Regression: post-compaction re-injection was a fixed 5 x 20k chars
+    /// (~25k tokens) regardless of the shrunk budget — on a small window
+    /// the summarized retry could exceed the very limit that triggered
+    /// summarization. The cap now scales with the live token budget.
+    #[test]
+    fn reinject_cap_scales_with_the_token_budget() {
+        // Large windows keep the fixed per-file ceiling.
+        assert_eq!(reinject_file_cap(DEFAULT_TOKEN_BUDGET), REINJECT_FILE_CAP);
+        // At the floor the whole re-injection fits in a quarter of the
+        // budget and never disappears entirely.
+        let cap = reinject_file_cap(TOKEN_BUDGET_FLOOR);
+        assert!(cap > 0);
+        assert!(
+            cap * REINJECT_FILES <= TOKEN_BUDGET_FLOOR * CHARS_PER_TOKEN / REINJECT_BUDGET_DIV,
+            "re-injection ({} chars) must fit the floored budget",
+            cap * REINJECT_FILES
+        );
     }
 
     #[tokio::test]

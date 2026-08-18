@@ -14,7 +14,7 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     let blueprint = std::fs::read_to_string(BLUEPRINT)
         .unwrap_or_else(|_| "No blueprint".into());
 
-    let prompt = flux::founder_prompt(&ore, &blueprint);
+    let prompt = with_briefing_rules(&flux::founder_prompt(&ore, &blueprint));
     log_to_file("FOUNDER_PROMPT", &prompt);
 
     let spinner = tui::spinner("casting...");
@@ -88,8 +88,69 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     Ok(())
 }
 
+/// Ingots ARE zero-context subagent prompts: the smith forging one sees
+/// nothing but the ingot's :work text. These rules ride the founder prompt
+/// so every :work briefs like a colleague joining with zero context —
+/// which is what raises the first-heat pass rate.
+const BRIEFING_RULES: &str = "\
+BRIEFING RULES (each :work is read by a smith with ZERO context — \
+it sees only the ingot, never this commission or blueprint):\n\
+- State the GOAL and WHY it matters, not just the mechanical step.\n\
+- Name what is RULED OUT: approaches to avoid, files not to touch.\n\
+- Use CONCRETE file paths (src/api/routes.js), never 'the config' or 'that module'.\n\
+- Lookups get the EXACT command to run; investigations get the QUESTION to answer.\n\
+- Never delegate understanding: the ingot carries every fact needed to start cold.";
+
+/// Append the zero-context briefing rules to the founder prompt.
+fn with_briefing_rules(base: &str) -> String {
+    format!("{base}\n\n{BRIEFING_RULES}")
+}
+
 fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
     let _ = std::fs::write(&path, content);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn briefing_rules_cover_the_zero_context_contract() {
+        for required in [
+            "ZERO context",
+            "GOAL",
+            "WHY",
+            "RULED OUT",
+            "file paths",
+            "EXACT command",
+            "QUESTION",
+            "Never delegate understanding",
+        ] {
+            assert!(
+                BRIEFING_RULES.contains(required),
+                "briefing rules must mention {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_briefing_rules_appends_after_the_base_prompt() {
+        let prompt = with_briefing_rules("BASE PROMPT");
+        assert!(prompt.starts_with("BASE PROMPT"), "{prompt}");
+        assert!(prompt.ends_with(BRIEFING_RULES), "{prompt}");
+        assert_eq!(
+            prompt.matches("BRIEFING RULES").count(),
+            1,
+            "rules must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn founder_prompt_carries_briefing_rules() {
+        let prompt = with_briefing_rules(&flux::founder_prompt("ore", "blueprint"));
+        assert!(prompt.contains("OUTPUT: S-expressions only"), "{prompt}");
+        assert!(prompt.contains("BRIEFING RULES"), "{prompt}");
+    }
 }

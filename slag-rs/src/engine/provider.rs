@@ -11,15 +11,34 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{ChatMessage, ChatRequest, FinishReason, NormalizedResponse, Provider, ToolCall, Usage};
-use crate::error::SlagError;
+use super::{
+    CancelFlag, ChatMessage, ChatRequest, EngineEvent, EventTx, FinishReason, NormalizedResponse,
+    Provider, ToolCall, Usage,
+};
+use crate::error::{ProviderApiError, ProviderErrorCategory, SlagError};
 
-const REQUEST_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_ATTEMPTS: usize = 8;
 const BACKOFF_BASE_MS: u64 = 500;
 const BACKOFF_CAP_MS: u64 = 32_000;
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 const BODY_EXCERPT_LEN: usize = 300;
+/// Unattended mode: capacity backoff caps at 5 minutes per wait…
+const UNATTENDED_BACKOFF_CAP_MS: u64 = 300_000;
+/// …a server reset timestamp is honored up to an hour…
+const UNATTENDED_WAIT_CEILING: Duration = Duration::from_secs(60 * 60);
+/// …and cumulative capacity waiting stops at 6 hours, so a dead account
+/// cannot hang an unattended forge forever.
+const UNATTENDED_TOTAL_CEILING: Duration = Duration::from_secs(6 * 60 * 60);
+/// Long unattended waits sleep in 30s slices, one `ApiRetry` heartbeat
+/// per slice, so the dashboard and JSONL logs stay alive.
+const HEARTBEAT_SLICE: Duration = Duration::from_secs(30);
+/// Floor for unattended capacity waits. A server-sent `Retry-After: 0`
+/// (OpenRouter's daily free-tier limit does this) or a reset timestamp a
+/// few ms ahead must not become a zero-delay request storm: every free
+/// retry waits at least this long, so `unattended_waited` strictly grows
+/// and the cumulative 6h ceiling always terminates the loop.
+const UNATTENDED_MIN_DELAY: Duration = Duration::from_secs(1);
 
 /// Retry budget: `SLAG_MAX_RETRIES` overrides the default. Three attempts
 /// over ~1.5s proved far too brittle for overnight forge runs now that
@@ -34,12 +53,51 @@ fn max_attempts_from_env() -> usize {
     parse_max_attempts(std::env::var("SLAG_MAX_RETRIES").ok())
 }
 
+/// Request timeout: `SLAG_API_TIMEOUT_MS` overrides the ~300s default.
+/// Zero and garbage fall back rather than disabling the timeout.
+fn parse_timeout_ms(raw: Option<String>) -> Duration {
+    Duration::from_millis(
+        raw.and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_MS),
+    )
+}
+
+fn timeout_from_env() -> Duration {
+    parse_timeout_ms(std::env::var("SLAG_API_TIMEOUT_MS").ok())
+}
+
+/// Build the HTTP client. `drop_idle_pool` disables connection reuse for
+/// the client that replaces one whose pooled connections went stale.
+fn build_client(timeout: Duration, drop_idle_pool: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if drop_idle_pool {
+        builder = builder.pool_max_idle_per_host(0);
+    }
+    builder.build().expect("reqwest client build")
+}
+
 /// OpenRouter chat-completions client.
 pub struct OpenRouter {
     api_key: String,
     base_url: String,
-    http: reqwest::Client,
+    /// Behind a mutex so a stale-connection retry can swap in a fresh
+    /// client (`rebuild_client`) without `&mut self`.
+    http: std::sync::Mutex<reqwest::Client>,
+    timeout: Duration,
     max_attempts: usize,
+    /// Second entry of OpenRouter's native `models: [primary, fallback]`
+    /// routing array — capacity failover inside one request.
+    fallback_model: Option<String>,
+    /// Unattended persistent-retry mode: 429/529 retry past the attempt
+    /// budget (see `plan_retry`).
+    unattended: bool,
+    /// Event sink for `ApiRetry` heartbeats, when wired.
+    events: std::sync::Mutex<Option<EventTx>>,
+    /// Cancel flag, when wired: checked between heartbeat slices and after
+    /// bounded waits, so a Ctrl-C ends a retry wait instead of sleeping it
+    /// out and firing more (billable) requests.
+    cancel: std::sync::Mutex<Option<CancelFlag>>,
     /// Per-model context windows resolved from `/models`, cached so one
     /// client never fetches the (large) model list twice for the same id.
     windows: std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
@@ -52,14 +110,17 @@ impl OpenRouter {
 
     /// Base URL override enables wiremock tests and proxies.
     pub fn with_base_url(api_key: impl Into<String>, url: impl Into<String>) -> Self {
+        let timeout = timeout_from_env();
         Self {
             api_key: api_key.into(),
             base_url: url.into().trim_end_matches('/').to_string(),
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-                .build()
-                .expect("reqwest client build"),
+            http: std::sync::Mutex::new(build_client(timeout, false)),
+            timeout,
             max_attempts: max_attempts_from_env(),
+            fallback_model: crate::config::fallback_model(),
+            unattended: crate::config::unattended_retry(),
+            events: std::sync::Mutex::new(None),
+            cancel: std::sync::Mutex::new(None),
             windows: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -68,6 +129,58 @@ impl OpenRouter {
     fn with_max_attempts(mut self, attempts: usize) -> Self {
         self.max_attempts = attempts.max(1);
         self
+    }
+
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self.http = std::sync::Mutex::new(build_client(timeout, false));
+        self
+    }
+
+    /// Pin the fallback (tests must not depend on ambient env).
+    #[cfg(test)]
+    fn with_fallback(mut self, fallback: Option<&str>) -> Self {
+        self.fallback_model = fallback.map(str::to_string);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_unattended(mut self, unattended: bool) -> Self {
+        self.unattended = unattended;
+        self
+    }
+
+    /// Swap in a fresh client with no idle pool: a connect/reset failure
+    /// usually means the pooled connections went stale (server rotated
+    /// or dropped them), and retrying on the same pool replays the
+    /// failure instead of healing it.
+    fn rebuild_client(&self) {
+        *self.http.lock().unwrap() = build_client(self.timeout, true);
+    }
+
+    fn emit_heartbeat(&self, attempt: usize, status: u16, remaining_secs: u64) {
+        if let Some(tx) = self.events.lock().unwrap().as_ref() {
+            let _ = tx.send(EngineEvent::ApiRetry { attempt, status, remaining_secs });
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_event_sink(&self) -> bool {
+        self.events.lock().unwrap().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cancel_flag(&self) -> bool {
+        self.cancel.lock().unwrap().is_some()
     }
 
     /// Context window (tokens) for `model`, cached per client. `None` when
@@ -82,12 +195,20 @@ impl OpenRouter {
         window
     }
 
-    fn build_body(req: &ChatRequest) -> Value {
+    fn build_body(&self, req: &ChatRequest) -> Value {
         let mut body = json!({
             "model": req.model,
             "messages": wire_messages(&req.messages),
             "usage": { "include": true },
         });
+        // OpenRouter's native fallback routing: when the primary sheds
+        // load (429/529-class), the router retries the same request on
+        // the fallback inside one round trip — no client-side retry turn
+        // needed. The response's `model` field then names the fallback,
+        // which the agent already surfaces as a `ModelRouted` event.
+        if let Some(fb) = self.fallback_model.as_deref().filter(|fb| *fb != req.model) {
+            body["models"] = json!([req.model, fb]);
+        }
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req
                 .tools
@@ -121,21 +242,112 @@ impl OpenRouter {
         body
     }
 
-    async fn chat_impl(&self, req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
-        let body = Self::build_body(&req);
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut last_err = String::new();
-        let mut retry_after: Option<Duration> = None;
+    /// Wait out one retry delay. Unattended (heartbeat) waits sleep in
+    /// 30s slices, one `ApiRetry` event per slice, so the dashboard and
+    /// JSONL logs stay alive through a minutes-long rate-limit window.
+    /// Returns false when the cancel flag was raised — the caller must
+    /// stop instead of firing another request.
+    async fn wait_out(&self, attempt: usize, plan: &RetryPlan) -> bool {
+        if !plan.heartbeats {
+            tokio::time::sleep(plan.delay).await;
+            return !self.is_cancelled();
+        }
+        for (remaining_secs, slice) in heartbeat_slices(plan.delay) {
+            if self.is_cancelled() {
+                return false;
+            }
+            self.emit_heartbeat(attempt, plan.status, remaining_secs);
+            tokio::time::sleep(slice).await;
+        }
+        !self.is_cancelled()
+    }
 
-        for attempt in 0..self.max_attempts {
-            if attempt > 0 {
-                // A server-sent Retry-After beats the computed backoff.
-                let delay = retry_after.take().unwrap_or_else(|| backoff_delay(attempt));
-                tokio::time::sleep(delay).await;
+    /// Decide whether one more retry happens and how long to wait.
+    ///
+    /// Bounded failures ride the 500ms→32s curve until the attempt budget
+    /// runs out. In unattended mode, capacity errors (429/529) are free —
+    /// they never consume the budget — and wait until the server's
+    /// rate-limit reset timestamp when it sent one (no polling), else
+    /// Retry-After, else backoff capped at 5 minutes; a cumulative 6h
+    /// ceiling still ends a hopeless wait. `None` = stop retrying.
+    fn plan_retry(
+        &self,
+        status: Option<u16>,
+        retry_after: Option<Duration>,
+        reset_wait: Option<Duration>,
+        attempts_made: usize,
+        budget_used: usize,
+        unattended_waited: Duration,
+    ) -> Option<RetryPlan> {
+        let capacity = matches!(status, Some(429) | Some(529));
+        if self.unattended && capacity {
+            // A zero server hint (`Retry-After: 0`) means "the limit is
+            // still on" here, not "retry now": treat it as absent so the
+            // backoff curve applies, and floor whatever remains so every
+            // free retry advances `unattended_waited` toward the ceiling.
+            let delay = reset_wait
+                .or(retry_after)
+                .filter(|d| !d.is_zero())
+                .unwrap_or_else(|| {
+                    backoff_delay_capped(attempts_made, UNATTENDED_BACKOFF_CAP_MS)
+                })
+                .clamp(UNATTENDED_MIN_DELAY, UNATTENDED_WAIT_CEILING);
+            if unattended_waited + delay > UNATTENDED_TOTAL_CEILING {
+                return None;
+            }
+            return Some(RetryPlan {
+                delay,
+                status: status.unwrap_or(0),
+                free: true,
+                heartbeats: true,
+            });
+        }
+        if budget_used >= self.max_attempts {
+            return None;
+        }
+        Some(RetryPlan {
+            // A server-sent Retry-After beats the computed backoff. The
+            // reset timestamp is ignored here on purpose: a bounded retry
+            // must not silently sleep for minutes.
+            delay: retry_after.unwrap_or_else(|| backoff_delay(attempts_made)),
+            status: status.unwrap_or(0),
+            free: false,
+            heartbeats: false,
+        })
+    }
+
+    async fn chat_impl(&self, req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
+        let body = self.build_body(&req);
+        let url = format!("{}/chat/completions", self.base_url);
+        // Definite-assignment checked: every `break` below writes it first.
+        let mut last_err;
+        let mut attempts_made = 0usize;
+        let mut budget_used = 0usize;
+        let mut unattended_waited = Duration::ZERO;
+        // Set by the previous failure's plan: how to wait before this
+        // attempt and whether it consumes the bounded budget.
+        let mut next: Option<RetryPlan> = None;
+
+        loop {
+            let free = match next.take() {
+                Some(plan) => {
+                    if !self.wait_out(attempts_made, &plan).await {
+                        return Err(SlagError::Cancelled);
+                    }
+                    if plan.heartbeats {
+                        unattended_waited += plan.delay;
+                    }
+                    plan.free
+                }
+                None => false,
+            };
+            attempts_made += 1;
+            if !free {
+                budget_used += 1;
             }
 
-            let sent = self
-                .http
+            let client = self.http.lock().unwrap().clone();
+            let sent = client
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .header("HTTP-Referer", "https://slag.dev")
@@ -150,44 +362,80 @@ impl OpenRouter {
                 // the remaining send errors rarely heal but a bounded retry
                 // costs little.
                 Err(e) => {
+                    if is_stale_connection(&e) {
+                        self.rebuild_client();
+                    }
                     last_err = format!("request failed: {e}");
-                    continue;
+                    match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited) {
+                        Some(plan) => {
+                            next = Some(plan);
+                            continue;
+                        }
+                        None => break,
+                    }
                 }
             };
 
             let status = resp.status();
             let retry_hint = should_retry_override(resp.headers());
             if status.is_success() {
-                let api: ApiResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| SlagError::Provider(format!("malformed response: {e}")))?;
+                let api: ApiResponse = match resp.json().await {
+                    Ok(api) => api,
+                    Err(e) => {
+                        return Err(SlagError::ProviderApi(ProviderApiError {
+                            status: Some(200),
+                            category: ProviderErrorCategory::BadResponse,
+                            retryable: false,
+                            excerpt: format!("malformed response: {e}"),
+                        }))
+                    }
+                };
                 match normalize(api) {
                     // Empty 200s (no choices, no message, no finish_reason)
                     // are upstream hiccups; burn a retry instead of handing
                     // the agent an empty turn.
                     Err(SlagError::ProviderTransient(why)) => {
                         last_err = format!("empty 200: {why}");
-                        continue;
+                        match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited) {
+                            Some(plan) => {
+                                next = Some(plan);
+                                continue;
+                            }
+                            None => break,
+                        }
                     }
                     other => return other,
                 }
             }
 
             let retry_after_header = parse_retry_after(resp.headers());
+            let reset_wait = parse_ratelimit_reset(resp.headers(), now_epoch_ms());
+            let code = status.as_u16();
             let text = resp.text().await.unwrap_or_default();
             let excerpt = excerpt(&text);
             if retry_hint.unwrap_or_else(|| transient_status(status)) {
                 // Any transient status may carry Retry-After — 429 rate
                 // limits and 502/503 gateway drains alike — so honor it
                 // whenever the server sent one, not only on 429.
-                retry_after = retry_after_header;
                 last_err = format!("{status}: {excerpt}");
-                continue;
+                match self.plan_retry(
+                    Some(code),
+                    retry_after_header,
+                    reset_wait,
+                    attempts_made,
+                    budget_used,
+                    unattended_waited,
+                ) {
+                    Some(plan) => {
+                        next = Some(plan);
+                        continue;
+                    }
+                    None => break,
+                }
             }
             // Auth and billing failures have a fix; a bare status line does
             // not tell the user what it is.
-            let remedy = match status.as_u16() {
+            let remedy = match code {
                 401 | 403 => Some(
                     "OpenRouter rejected the key. Run `slag key` to set a new one \
                      (a shell OPENROUTER_API_KEY overrides the saved key)",
@@ -195,17 +443,113 @@ impl OpenRouter {
                 402 => Some("OpenRouter is out of credit. Top up at https://openrouter.ai/credits"),
                 _ => None,
             };
-            return Err(SlagError::Provider(match remedy {
-                Some(remedy) => format!("{remedy} [{status}: {excerpt}]"),
-                None => format!("{status}: {excerpt}"),
+            // Classified once, here; the category label leads the Display
+            // string, so the dashboard's Error event reads "credit balance
+            // low" instead of a raw body excerpt.
+            return Err(SlagError::ProviderApi(ProviderApiError {
+                status: Some(code),
+                category: classify_status(code),
+                retryable: false,
+                excerpt: match remedy {
+                    Some(remedy) => format!("{remedy} [{status}: {excerpt}]"),
+                    None => excerpt,
+                },
             }));
         }
 
         Err(SlagError::ProviderTransient(format!(
-            "gave up after {} attempts: {last_err}",
-            self.max_attempts
+            "gave up after {attempts_made} attempts: {last_err}"
         )))
     }
+}
+
+/// One planned retry: the wait, which failure it answers, whether it
+/// consumes the bounded attempt budget, and whether the wait emits
+/// chunked heartbeats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetryPlan {
+    delay: Duration,
+    /// Status the wait is attributed to in heartbeats (0 = network).
+    status: u16,
+    free: bool,
+    heartbeats: bool,
+}
+
+/// Slice a wait into 30s heartbeat chunks: (remaining secs at emit,
+/// slice to sleep). A zero wait still yields one slice, so every
+/// unattended retry produces at least one heartbeat.
+fn heartbeat_slices(total: Duration) -> Vec<(u64, Duration)> {
+    let mut out = Vec::new();
+    let mut remaining = total;
+    loop {
+        let slice = remaining.min(HEARTBEAT_SLICE);
+        out.push((remaining.as_secs(), slice));
+        remaining = remaining.saturating_sub(slice);
+        if remaining.is_zero() {
+            return out;
+        }
+    }
+}
+
+/// Provider error category from an HTTP status, decided exactly once.
+fn classify_status(status: u16) -> ProviderErrorCategory {
+    match status {
+        401 | 403 => ProviderErrorCategory::Auth,
+        402 => ProviderErrorCategory::Billing,
+        429 => ProviderErrorCategory::RateLimit,
+        503 | 529 => ProviderErrorCategory::Overloaded,
+        500..=599 => ProviderErrorCategory::Server,
+        _ => ProviderErrorCategory::InvalidRequest,
+    }
+}
+
+/// Stale-connection detection: the pooled connection died underneath the
+/// request (connect failure, or a reset/abort/broken-pipe anywhere in
+/// the error chain). These heal on a fresh client, not on a re-send.
+fn is_stale_connection(e: &reqwest::Error) -> bool {
+    if e.is_connect() {
+        return true;
+    }
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                return true;
+            }
+        }
+        source = std::error::Error::source(err);
+    }
+    false
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// `X-RateLimit-Reset` (unix epoch milliseconds, OpenRouter's shape) as
+/// a wait-until-reset duration, capped at an hour. Past timestamps and
+/// unparseable values fall back to the computed backoff — waiting until
+/// the reset beats polling the limit every few seconds.
+fn parse_ratelimit_reset(headers: &reqwest::header::HeaderMap, now_ms: u64) -> Option<Duration> {
+    let reset: u64 = headers
+        .get("x-ratelimit-reset")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if reset <= now_ms {
+        return None;
+    }
+    Some(Duration::from_millis(reset - now_ms).min(UNATTENDED_WAIT_CEILING))
 }
 
 /// Statuses worth another attempt: timeouts (408), races (409), rate
@@ -260,9 +604,16 @@ fn next_jitter_percent() -> u64 {
 /// Delay before retry `retry` (1-based): 500ms doubling capped at 32s,
 /// plus 0-25% jitter so parallel anvils do not stampede in lockstep.
 fn backoff_delay(retry: usize) -> Duration {
-    // 500 << 6 hits the 32s cap exactly; larger shifts would drop bits.
-    let shift = retry.saturating_sub(1).min(6) as u32;
-    let base = (BACKOFF_BASE_MS << shift).min(BACKOFF_CAP_MS);
+    backoff_delay_capped(retry, BACKOFF_CAP_MS)
+}
+
+/// The same 500ms-doubling curve under an arbitrary cap (unattended mode
+/// caps at 5 minutes instead of 32s).
+fn backoff_delay_capped(retry: usize, cap_ms: u64) -> Duration {
+    // 500 << 10 already clears every cap in use; larger shifts would
+    // only overflow.
+    let shift = retry.saturating_sub(1).min(10) as u32;
+    let base = (BACKOFF_BASE_MS << shift).min(cap_ms);
     Duration::from_millis(base + base * next_jitter_percent() / 100)
 }
 
@@ -272,6 +623,17 @@ impl Provider for OpenRouter {
         req: ChatRequest,
     ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>> {
         Box::pin(async move { self.chat_impl(req).await })
+    }
+
+    /// Wire the heartbeat sink: `ApiRetry` events flow here during
+    /// unattended waits.
+    fn set_event_sink(&self, tx: EventTx) {
+        *self.events.lock().unwrap() = Some(tx);
+    }
+
+    /// Wire the cancel flag: retry waits abort when it goes up.
+    fn set_cancel_flag(&self, f: CancelFlag) {
+        *self.cancel.lock().unwrap() = Some(f);
     }
 }
 
@@ -566,6 +928,19 @@ mod tests {
         }
     }
 
+    /// Provider with the env-derived knobs pinned, so concurrent tests
+    /// mutating `SLAG_MODEL_FALLBACK` / `SLAG_UNATTENDED_RETRY` cannot
+    /// leak into body and retry assertions.
+    fn pinned(base_url: &str) -> OpenRouter {
+        OpenRouter::with_base_url("sk-test", base_url)
+            .with_fallback(None)
+            .with_unattended(false)
+    }
+
+    fn body_builder() -> OpenRouter {
+        pinned("http://localhost:0")
+    }
+
     fn request(tools: Vec<ToolSpec>, effort: Option<Effort>) -> ChatRequest {
         ChatRequest {
             model: "qwen/qwen3-coder".into(),
@@ -606,7 +981,7 @@ mod tests {
 
     #[test]
     fn body_wraps_tools_and_sets_tool_choice() {
-        let body = OpenRouter::build_body(&request(vec![spec()], Some(Effort::High)));
+        let body = body_builder().build_body(&request(vec![spec()], Some(Effort::High)));
         assert_eq!(body["tool_choice"], json!("auto"));
         assert_eq!(body["tools"][0]["type"], json!("function"));
         assert_eq!(body["tools"][0]["function"]["name"], json!("read_file"));
@@ -616,7 +991,7 @@ mod tests {
 
     #[test]
     fn body_omits_tool_choice_and_reasoning_when_absent() {
-        let body = OpenRouter::build_body(&request(vec![], None));
+        let body = body_builder().build_body(&request(vec![], None));
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("reasoning").is_none());
@@ -634,7 +1009,7 @@ mod tests {
             }]),
         ));
         req.messages.push(ChatMessage::tool_result("call_1", "ok"));
-        let body = OpenRouter::build_body(&req);
+        let body = body_builder().build_body(&req);
         let assistant = &body["messages"][2];
         assert_eq!(assistant["tool_calls"][0]["type"], json!("function"));
         assert_eq!(
@@ -659,7 +1034,7 @@ mod tests {
             )
             .with_reasoning_details(Some(details.clone())),
         );
-        let body = OpenRouter::build_body(&req);
+        let body = body_builder().build_body(&req);
         assert_eq!(body["messages"][2]["reasoning_details"], details);
         // Messages without details must not carry the key at all.
         assert!(body["messages"][0].get("reasoning_details").is_none());
@@ -671,7 +1046,7 @@ mod tests {
         let mut user = ChatMessage::user("compare the casts");
         user.images = Some(vec!["data:image/png;base64,QUJD".into()]);
         req.messages.push(user);
-        let body = OpenRouter::build_body(&req);
+        let body = body_builder().build_body(&req);
         // Plain messages keep string content.
         assert_eq!(body["messages"][1]["content"], json!("forge it"));
         // Image-bearing message becomes [text part, image_url part].
@@ -1344,5 +1719,420 @@ mod tests {
             "waited only {:?}",
             started.elapsed()
         );
+    }
+
+    // ─── Item 53: configurable timeout + stale-connection rebuild ───
+
+    #[test]
+    fn timeout_parses_env_and_defaults_to_300s() {
+        assert_eq!(parse_timeout_ms(None), Duration::from_millis(300_000));
+        assert_eq!(parse_timeout_ms(Some("5000".into())), Duration::from_millis(5000));
+        assert_eq!(parse_timeout_ms(Some(" 1500 ".into())), Duration::from_millis(1500));
+        // Zero and garbage fall back rather than disabling the timeout.
+        assert_eq!(parse_timeout_ms(Some("0".into())), Duration::from_millis(300_000));
+        assert_eq!(parse_timeout_ms(Some("forever".into())), Duration::from_millis(300_000));
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_cuts_a_hung_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ok_body())
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+
+        let err = pinned(&server.uri())
+            .with_timeout(Duration::from_millis(50))
+            .with_max_attempts(1)
+            .chat(request(vec![], None))
+            .await
+            .expect_err("timeout must cut the request");
+        assert!(err.retryable(), "timeouts are transient: {err}");
+        assert!(err.to_string().contains("request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connect_refused_classifies_as_stale_connection() {
+        // Bind then drop: the port is guaranteed dead.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect_err("nothing listens there");
+        assert!(is_stale_connection(&err), "{err}");
+    }
+
+    /// A dead endpoint exercises the rebuild path (fresh client with no
+    /// idle pool) on every retry; the outcome stays a clean transient.
+    #[tokio::test]
+    async fn dead_endpoint_rebuilds_the_client_and_gives_up_transient() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = pinned(&format!("http://127.0.0.1:{port}"))
+            .with_max_attempts(2)
+            .chat(request(vec![], None))
+            .await
+            .expect_err("dead endpoint");
+        assert!(err.retryable(), "{err}");
+        assert!(err.to_string().contains("gave up after 2"), "{err}");
+    }
+
+    // ─── Item 48: native fallback-model routing ───
+
+    #[test]
+    fn build_body_sends_the_native_fallback_routing_array() {
+        let body = body_builder()
+            .with_fallback(Some("deepseek/deepseek-chat"))
+            .build_body(&request(vec![], None));
+        assert_eq!(
+            body["models"],
+            json!(["qwen/qwen3-coder", "deepseek/deepseek-chat"])
+        );
+        // The plain model field stays for older proxies.
+        assert_eq!(body["model"], json!("qwen/qwen3-coder"));
+
+        // No fallback, or a fallback equal to the primary: no array.
+        let body = body_builder().build_body(&request(vec![], None));
+        assert!(body.get("models").is_none());
+        let body = body_builder()
+            .with_fallback(Some("qwen/qwen3-coder"))
+            .build_body(&request(vec![], None));
+        assert!(body.get("models").is_none(), "self-fallback is pointless");
+    }
+
+    #[tokio::test]
+    async fn fallback_routing_array_goes_on_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "model": "qwen/qwen3-coder",
+                "models": ["qwen/qwen3-coder", "deepseek/deepseek-chat"],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = pinned(&server.uri())
+            .with_fallback(Some("deepseek/deepseek-chat"))
+            .chat(request(vec![], None))
+            .await
+            .expect("chat ok");
+        assert_eq!(resp.content, "forged");
+    }
+
+    // ─── Item 49: unattended persistent retry + heartbeats ───
+
+    #[tokio::test]
+    async fn unattended_capacity_errors_retry_past_the_budget_with_heartbeats() {
+        for status in [429u16, 529] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("retry-after", "0")
+                        .set_body_string("capacity"),
+                )
+                .up_to_n_times(3)
+                .expect(3)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let provider = pinned(&server.uri())
+                .with_max_attempts(1)
+                .with_unattended(true);
+            let (tx, mut rx) = crate::engine::events::channel();
+            provider.set_event_sink(tx);
+
+            let resp = provider.chat(request(vec![], None)).await.expect("outlasted the limit");
+            assert_eq!(resp.content, "forged", "status {status}");
+
+            let mut heartbeats = 0;
+            while let Ok(event) = rx.try_recv() {
+                let EngineEvent::ApiRetry { attempt, status: s, remaining_secs } = event else {
+                    panic!("unexpected event");
+                };
+                assert_eq!(s, status);
+                assert!(attempt >= 1 && attempt <= 3, "attempt {attempt}");
+                // Regression: `Retry-After: 0` used to plan zero-delay
+                // retries — an unbounded request storm. Every free retry
+                // now waits a real, floored delay.
+                assert!(remaining_secs >= 1, "zero-delay retry storm is back");
+                heartbeats += 1;
+            }
+            // One heartbeat per free retry, even for zero-length waits.
+            assert_eq!(heartbeats, 3, "status {status}");
+        }
+    }
+
+    /// Unattended mode frees only capacity errors. Everything else keeps
+    /// the bounded budget — a broken request must still fail.
+    #[tokio::test]
+    async fn unattended_leaves_non_capacity_errors_bounded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let err = pinned(&server.uri())
+            .with_max_attempts(2)
+            .with_unattended(true)
+            .chat(request(vec![], None))
+            .await
+            .expect_err("500 stays bounded");
+        assert!(err.to_string().contains("gave up after 2"), "{err}");
+    }
+
+    #[test]
+    fn plan_retry_prefers_reset_over_retry_after_and_caps_waits() {
+        let provider = pinned("http://localhost:0").with_unattended(true).with_max_attempts(1);
+
+        // Reset timestamp wins over Retry-After: wait until the window
+        // opens instead of polling it.
+        let plan = provider
+            .plan_retry(
+                Some(429),
+                Some(Duration::from_secs(3)),
+                Some(Duration::from_secs(120)),
+                1,
+                1,
+                Duration::ZERO,
+            )
+            .expect("free retry");
+        assert_eq!(plan.delay, Duration::from_secs(120));
+        assert!(plan.free && plan.heartbeats);
+        assert_eq!(plan.status, 429);
+
+        // No reset: Retry-After.
+        let plan = provider
+            .plan_retry(Some(429), Some(Duration::from_secs(3)), None, 1, 1, Duration::ZERO)
+            .unwrap();
+        assert_eq!(plan.delay, Duration::from_secs(3));
+
+        // Neither: computed backoff, capped at 5 minutes (+25% jitter).
+        let plan = provider
+            .plan_retry(Some(529), None, None, 30, 1, Duration::ZERO)
+            .unwrap();
+        assert!(plan.delay >= Duration::from_secs(300), "{:?}", plan.delay);
+        assert!(plan.delay <= Duration::from_secs(375), "{:?}", plan.delay);
+
+        // A reset hours away is clamped to the one-hour ceiling.
+        let plan = provider
+            .plan_retry(Some(429), None, Some(Duration::from_secs(2 * 3600)), 1, 1, Duration::ZERO)
+            .unwrap();
+        assert_eq!(plan.delay, UNATTENDED_WAIT_CEILING);
+    }
+
+    /// Regression: a server-controlled `Retry-After: 0` (or a reset
+    /// timestamp ms ahead) used to plan `Duration::ZERO` waits forever —
+    /// `unattended_waited` never grew, the 6h ceiling never fired, and the
+    /// loop hammered the API at full speed. Every capacity wait is floored.
+    #[test]
+    fn plan_retry_floors_zero_and_near_zero_capacity_waits() {
+        let provider = pinned("http://localhost:0").with_unattended(true).with_max_attempts(1);
+
+        let plan = provider
+            .plan_retry(Some(429), Some(Duration::ZERO), None, 1, 1, Duration::ZERO)
+            .expect("free retry");
+        assert!(plan.delay >= UNATTENDED_MIN_DELAY, "{:?}", plan.delay);
+
+        let plan = provider
+            .plan_retry(Some(429), None, Some(Duration::from_millis(1)), 1, 1, Duration::ZERO)
+            .expect("free retry");
+        assert!(plan.delay >= UNATTENDED_MIN_DELAY, "{:?}", plan.delay);
+
+        // The floor keeps the ceiling reachable: at the edge, stop.
+        let waited = UNATTENDED_TOTAL_CEILING - Duration::from_millis(500);
+        assert!(
+            provider.plan_retry(Some(429), Some(Duration::ZERO), None, 1, 1, waited).is_none(),
+            "floored delay must trip the cumulative ceiling"
+        );
+    }
+
+    /// Regression: the cancel flag was invisible inside retry waits — a
+    /// Ctrl-C left an unattended forge sleeping and re-requesting for up
+    /// to 6 hours. A raised flag now aborts before the next request.
+    #[tokio::test]
+    async fn cancel_flag_aborts_a_retry_wait_before_the_next_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("limited"))
+            .expect(1) // cancelled during the first wait: no second request
+            .mount(&server)
+            .await;
+
+        let provider = pinned(&server.uri()).with_unattended(true);
+        let cancel = crate::engine::CancelFlag::default();
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        provider.set_cancel_flag(cancel);
+
+        let err = provider.chat(request(vec![], None)).await.expect_err("cancelled");
+        assert!(matches!(err, SlagError::Cancelled), "{err}");
+    }
+
+    #[test]
+    fn plan_retry_enforces_the_unattended_total_ceiling() {
+        let provider = pinned("http://localhost:0").with_unattended(true).with_max_attempts(1);
+        // Cumulative waiting at the ceiling: even a capacity error stops.
+        let plan = provider.plan_retry(
+            Some(429),
+            Some(Duration::from_secs(1)),
+            None,
+            5,
+            1,
+            UNATTENDED_TOTAL_CEILING,
+        );
+        assert!(plan.is_none(), "ceiling must end the wait");
+    }
+
+    #[test]
+    fn plan_retry_bounded_path_respects_the_budget() {
+        let provider = pinned("http://localhost:0").with_max_attempts(3);
+        let plan = provider
+            .plan_retry(Some(500), None, None, 1, 1, Duration::ZERO)
+            .expect("budget left");
+        assert!(!plan.free && !plan.heartbeats);
+        assert!(provider.plan_retry(Some(500), None, None, 3, 3, Duration::ZERO).is_none());
+        // Without unattended mode a 429 is bounded like everything else.
+        assert!(provider.plan_retry(Some(429), None, None, 3, 3, Duration::ZERO).is_none());
+        // Reset timestamps never stretch a bounded wait.
+        let plan = provider
+            .plan_retry(Some(429), None, Some(Duration::from_secs(600)), 1, 1, Duration::ZERO)
+            .unwrap();
+        assert!(plan.delay < Duration::from_secs(2), "{:?}", plan.delay);
+    }
+
+    #[test]
+    fn ratelimit_reset_reads_epoch_ms_and_caps_at_an_hour() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let now = 1_700_000_000_000u64;
+        assert_eq!(parse_ratelimit_reset(&headers, now), None);
+
+        headers.insert("x-ratelimit-reset", format!("{}", now + 90_000).parse().unwrap());
+        assert_eq!(parse_ratelimit_reset(&headers, now), Some(Duration::from_secs(90)));
+
+        // Past and garbage values fall back to computed backoff.
+        headers.insert("x-ratelimit-reset", format!("{}", now - 1).parse().unwrap());
+        assert_eq!(parse_ratelimit_reset(&headers, now), None);
+        headers.insert("x-ratelimit-reset", "soon".parse().unwrap());
+        assert_eq!(parse_ratelimit_reset(&headers, now), None);
+
+        // A reset days away is clamped to the ceiling.
+        headers.insert(
+            "x-ratelimit-reset",
+            format!("{}", now + 48 * 3600 * 1000).parse().unwrap(),
+        );
+        assert_eq!(parse_ratelimit_reset(&headers, now), Some(UNATTENDED_WAIT_CEILING));
+    }
+
+    #[test]
+    fn heartbeat_slices_chunk_long_waits_into_thirty_seconds() {
+        assert_eq!(
+            heartbeat_slices(Duration::from_secs(95)),
+            vec![
+                (95, Duration::from_secs(30)),
+                (65, Duration::from_secs(30)),
+                (35, Duration::from_secs(30)),
+                (5, Duration::from_secs(5)),
+            ]
+        );
+        assert_eq!(heartbeat_slices(Duration::from_secs(30)), vec![(30, Duration::from_secs(30))]);
+        // Zero wait still emits one heartbeat.
+        assert_eq!(heartbeat_slices(Duration::ZERO), vec![(0, Duration::ZERO)]);
+    }
+
+    #[test]
+    fn backoff_capped_reaches_and_respects_the_five_minute_cap() {
+        let ms = backoff_delay_capped(20, UNATTENDED_BACKOFF_CAP_MS).as_millis() as u64;
+        assert!(ms >= UNATTENDED_BACKOFF_CAP_MS, "{ms}");
+        assert!(ms <= UNATTENDED_BACKOFF_CAP_MS + UNATTENDED_BACKOFF_CAP_MS / 4, "{ms}");
+    }
+
+    // ─── Item 54: typed provider error taxonomy ───
+
+    #[test]
+    fn classify_status_covers_the_taxonomy() {
+        assert_eq!(classify_status(401), ProviderErrorCategory::Auth);
+        assert_eq!(classify_status(403), ProviderErrorCategory::Auth);
+        assert_eq!(classify_status(402), ProviderErrorCategory::Billing);
+        assert_eq!(classify_status(429), ProviderErrorCategory::RateLimit);
+        assert_eq!(classify_status(503), ProviderErrorCategory::Overloaded);
+        assert_eq!(classify_status(529), ProviderErrorCategory::Overloaded);
+        assert_eq!(classify_status(500), ProviderErrorCategory::Server);
+        assert_eq!(classify_status(400), ProviderErrorCategory::InvalidRequest);
+        assert_eq!(classify_status(404), ProviderErrorCategory::InvalidRequest);
+    }
+
+    /// Permanent failures come back typed: status + category + retryable
+    /// + excerpt, with the human label leading the Display string the
+    /// dashboard shows.
+    #[tokio::test]
+    async fn permanent_failures_carry_the_typed_taxonomy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(402).set_body_string("insufficient credits"))
+            .mount(&server)
+            .await;
+
+        let err = pinned(&server.uri())
+            .chat(request(vec![], None))
+            .await
+            .expect_err("402 is permanent");
+        let SlagError::ProviderApi(api) = &err else {
+            panic!("expected typed error, got: {err}");
+        };
+        assert_eq!(api.status, Some(402));
+        assert_eq!(api.category, ProviderErrorCategory::Billing);
+        assert!(!api.retryable);
+        assert!(api.excerpt.contains("insufficient credits"), "{}", api.excerpt);
+        let msg = err.to_string();
+        assert!(msg.contains("credit balance low"), "{msg}");
+        assert!(msg.contains("(402)"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn malformed_200_is_typed_bad_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let err = pinned(&server.uri())
+            .chat(request(vec![], None))
+            .await
+            .expect_err("garbage 200");
+        let SlagError::ProviderApi(api) = &err else {
+            panic!("expected typed error, got: {err}");
+        };
+        assert_eq!(api.category, ProviderErrorCategory::BadResponse);
+        assert!(!err.retryable());
+        assert!(err.to_string().contains("malformed response"), "{err}");
     }
 }

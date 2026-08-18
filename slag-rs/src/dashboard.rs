@@ -92,6 +92,13 @@ pub(crate) struct DashState {
     pub(crate) totals: Usage,
     pub(crate) input: String,
     pub(crate) flash_until: Option<Instant>,
+    /// Current turn number; picks the metallurgical verb.
+    pub(crate) turn: usize,
+    /// When the current turn started — the live status line's clock.
+    /// `None` between turns and after Finish/Error.
+    pub(crate) turn_started: Option<Instant>,
+    /// Tokens folded since the turn started (EngineEvent::Tokens deltas).
+    pub(crate) turn_tokens: u64,
 }
 
 impl DashState {
@@ -134,7 +141,16 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
     match &event {
         EngineEvent::Tokens { usage } => {
             state.totals.add(usage);
+            state.turn_tokens += usage.total_tokens;
             state.mark_activity();
+        }
+        EngineEvent::TurnStart { turn } => {
+            state.turn = *turn;
+            state.turn_started = Some(Instant::now());
+            state.turn_tokens = 0;
+        }
+        EngineEvent::Finish { .. } | EngineEvent::Error { .. } => {
+            state.turn_started = None;
         }
         EngineEvent::ToolResult { .. } => state.mark_activity(),
         EngineEvent::IngotStart { id, work } => {
@@ -207,7 +223,27 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
         EngineEvent::DuelVerdict { id, winner, margin } => {
             (palette(tui::PURE), format!("⚖ [{id}] cast {winner} wins by {margin}"))
         }
+        EngineEvent::ApiRetry { attempt, status, remaining_secs } => (
+            palette(tui::BRIGHT),
+            format!("⟳ api {status} — retry {attempt} in {remaining_secs}s"),
+        ),
     }
+}
+
+/// The bottom bar's live spinner status: `⚒ Forging… (12s · 4.1k tok ·
+/// 38 tok/s · esc to interrupt)`. `Some` only while a turn is running and
+/// at least one ingot is still forging — otherwise the bar shows plain
+/// totals.
+pub(crate) fn forge_status(state: &DashState, now: Instant) -> Option<String> {
+    let started = state.turn_started?;
+    if !state.ingots.iter().any(|r| r.status == IngotStatus::Forging) {
+        return None;
+    }
+    Some(crate::progress::spinner_status(
+        tui::forge_verb(state.turn),
+        now.saturating_duration_since(started),
+        state.turn_tokens,
+    ))
 }
 
 /// True when any forging row has crossed the stall threshold.
@@ -238,6 +274,9 @@ pub(crate) fn handle_key(
     if key.kind != KeyEventKind::Press {
         return KeyOutcome::Stay;
     }
+    // Feed the notification idleness gate: a user actively typing here
+    // must not get a desktop ping for the finish they are watching.
+    tui::mark_user_activity();
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
@@ -347,10 +386,15 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &DashState) {
 }
 
 fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
-    let totals = match state.totals.cost {
+    let mut totals = match state.totals.cost {
         Some(cost) => format!("  Σ {} tok · ${cost:.4}", state.totals.total_tokens),
         None => format!("  Σ {} tok", state.totals.total_tokens),
     };
+    let mut totals_color = palette(tui::PURE);
+    if let Some(status) = forge_status(state, Instant::now()) {
+        totals = format!("  {status}");
+        totals_color = palette(tui::HOT);
+    }
     let mut input_spans = vec![
         Span::styled("  > ", Style::default().fg(palette(tui::HOT))),
         Span::styled(state.input.clone(), Style::default().fg(palette(tui::PURE))),
@@ -363,7 +407,7 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
         ));
     }
     let lines = vec![
-        Line::from(Span::styled(totals, Style::default().fg(palette(tui::PURE)))),
+        Line::from(Span::styled(totals, Style::default().fg(totals_color))),
         Line::from(input_spans),
         Line::from(Span::styled(format!("  {HINT}"), Style::default().fg(palette(tui::COLD)))),
     ];
@@ -505,6 +549,11 @@ async fn event_loop(
                 // Stalled rows change appearance with no event arriving:
                 // keep the "(stalled Ns)" counter ticking on screen.
                 if has_stalled(&state, Instant::now()) {
+                    dirty = true;
+                }
+                // Same for the bottom-bar spinner status: its elapsed
+                // seconds tick with no event arriving.
+                if forge_status(&state, Instant::now()).is_some() {
                     dirty = true;
                 }
                 if dirty {
@@ -658,6 +707,70 @@ mod tests {
         // Done rows never count as stalled.
         state.ingots[0].status = IngotStatus::Cracked;
         assert!(!has_stalled(&state, base + Duration::from_secs(500)));
+    }
+
+    #[test]
+    fn forge_status_folds_turn_tokens_and_elapsed_into_the_live_line() {
+        let mut state = DashState::default();
+        // No turn yet: no status line.
+        assert_eq!(forge_status(&state, Instant::now()), None);
+
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 0 });
+        apply_event(
+            &mut state,
+            EngineEvent::Tokens {
+                usage: Usage { total_tokens: 4100, ..Default::default() },
+            },
+        );
+
+        let t0 = state.turn_started.unwrap();
+        let line = forge_status(&state, t0 + Duration::from_secs(12)).unwrap();
+        assert_eq!(line, "⚒ Forging… (12s · 4.1k tok · 342 tok/s · esc to interrupt)");
+
+        // A new turn re-zeros the token fold and rotates the verb.
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
+        assert_eq!(state.turn_tokens, 0);
+        let t1 = state.turn_started.unwrap();
+        let line = forge_status(&state, t1 + Duration::from_secs(2)).unwrap();
+        assert!(line.starts_with("⚒ Smelting… (2s · 0 tok"), "{line}");
+        assert!(!line.contains("tok/s"), "rate guarded below 5s/2000 tok: {line}");
+    }
+
+    #[test]
+    fn forge_status_disappears_when_nothing_is_forging_or_the_run_ends() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 3 });
+        assert!(forge_status(&state, Instant::now()).is_some());
+
+        // All rows done: totals take the bar back.
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i1".into(), ok: true });
+        assert_eq!(forge_status(&state, Instant::now()), None);
+
+        // Finish/Error clear the turn clock even with a forging row left.
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i2".into(), work: "w".into() });
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 4 });
+        apply_event(&mut state, EngineEvent::Error { message: "boom".into() });
+        assert_eq!(forge_status(&state, Instant::now()), None);
+    }
+
+    #[test]
+    fn bottom_bar_shows_the_spinner_status_while_forging() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 0 });
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("⚒ Forging…"), "spinner status must render");
+        assert!(content.contains("esc to interrupt"));
     }
 
     #[test]

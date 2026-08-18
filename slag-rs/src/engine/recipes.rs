@@ -276,6 +276,129 @@ fn read_snapshot(path: &Path) -> Option<Snapshot> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Substitute invocation arguments into a recipe body before injection.
+/// Turns static recipes into parameterized ones.
+///
+/// `raw_args` is the argument string after the recipe name (e.g. everything
+/// past `--` in `slag recipe run <name> -- args`), tokenized with shell
+/// quoting rules (`shell-words`); malformed quoting falls back to a plain
+/// whitespace split. Tokens shaped `name=value` become named args; the rest
+/// are positional.
+///
+/// Placeholders (both `$NAME` and `${NAME}` spellings):
+/// - `$ARGUMENTS` — all positional args joined by single spaces
+/// - `$0`..`$n`   — positional args by index; out of range → empty
+/// - `$name`      — named args; unknown names stay literal, so shell
+///   variables inside recipe bodies (`$HOME`) survive untouched
+///
+/// When the template contains no recognized placeholder and args were
+/// given, `ARGUMENTS: ...` is appended so the invocation never drops.
+pub fn substitute_args(template: &str, raw_args: &str) -> String {
+    let (named, positional) = parse_invocation_args(raw_args);
+    let joined = positional.join(" ");
+
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    let mut substituted = false;
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        match read_placeholder(after) {
+            Some((name, consumed)) => match resolve(name, &named, &positional, &joined) {
+                Some(value) => {
+                    out.push_str(&value);
+                    substituted = true;
+                    rest = &after[consumed..];
+                }
+                None => {
+                    // Unknown name: keep the `$` and re-scan after it so a
+                    // later `$` in the same run is still found.
+                    out.push('$');
+                    rest = after;
+                }
+            },
+            None => {
+                out.push('$');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+
+    let raw_trimmed = raw_args.trim();
+    if !substituted && !raw_trimmed.is_empty() {
+        out.push_str("\n\nARGUMENTS: ");
+        out.push_str(raw_trimmed);
+    }
+    out
+}
+
+/// Read a placeholder name right after a `$`. Returns the name and how many
+/// bytes of the input it consumed (including braces for `${name}`).
+fn read_placeholder(after: &str) -> Option<(&str, usize)> {
+    if let Some(inner) = after.strip_prefix('{') {
+        let end = inner.find('}')?;
+        let name = &inner[..end];
+        if name.is_empty() || !name.bytes().all(is_word_byte) {
+            return None;
+        }
+        return Some((name, end + 2));
+    }
+    let len = after.bytes().take_while(|b| is_word_byte(*b)).count();
+    if len == 0 {
+        return None;
+    }
+    Some((&after[..len], len))
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn resolve(
+    name: &str,
+    named: &std::collections::HashMap<String, String>,
+    positional: &[String],
+    joined: &str,
+) -> Option<String> {
+    if name == "ARGUMENTS" {
+        return Some(joined.to_string());
+    }
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        let idx: usize = name.parse().ok()?;
+        return Some(positional.get(idx).cloned().unwrap_or_default());
+    }
+    named.get(name).cloned()
+}
+
+/// Tokenize with shell quoting; split `name=value` tokens into named args.
+/// A named key must be an identifier (`[A-Za-z_][A-Za-z0-9_]*`), so `2=3`
+/// or `--flag=x` stay positional.
+fn parse_invocation_args(
+    raw: &str,
+) -> (std::collections::HashMap<String, String>, Vec<String>) {
+    let tokens = shell_words::split(raw)
+        .unwrap_or_else(|_| raw.split_whitespace().map(str::to_string).collect());
+    let mut named = std::collections::HashMap::new();
+    let mut positional = Vec::new();
+    for tok in tokens {
+        if let Some((key, value)) = tok.split_once('=') {
+            if is_identifier(key) {
+                named.insert(key.to_string(), value.to_string());
+                continue;
+            }
+        }
+        positional.push(tok);
+    }
+    (named, positional)
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(is_word_byte)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +584,85 @@ mod tests {
         assert!(!without.contains("web"));
         let with = index_in(ws.path(), Some(cfg.path()), &tools(&["bash", "browser"]));
         assert!(with.contains("- web: needs browser"), "{with}");
+    }
+
+    #[test]
+    fn arguments_placeholder_joins_all_positionals() {
+        let out = substitute_args("Deploy $ARGUMENTS now", "web prod");
+        assert_eq!(out, "Deploy web prod now");
+        let out = substitute_args("Deploy ${ARGUMENTS} now", "web prod");
+        assert_eq!(out, "Deploy web prod now");
+    }
+
+    #[test]
+    fn positional_placeholders_index_from_zero() {
+        let out = substitute_args("first=$0 second=${1} missing=$2.", "a b");
+        assert_eq!(out, "first=a second=b missing=.");
+    }
+
+    #[test]
+    fn multi_digit_index_is_one_placeholder_not_index_plus_literal() {
+        let args = "a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10";
+        assert_eq!(substitute_args("got $10", args), "got a10");
+    }
+
+    #[test]
+    fn named_args_substitute_and_leave_positionals_clean() {
+        let out = substitute_args(
+            "env=$env target=${target} rest: $ARGUMENTS",
+            "env=prod target=web extra stuff",
+        );
+        assert_eq!(out, "env=prod target=web rest: extra stuff");
+    }
+
+    #[test]
+    fn shell_quoting_keeps_spaces_inside_one_arg() {
+        let out = substitute_args("msg=$0 next=$1", "\"hello world\" x");
+        assert_eq!(out, "msg=hello world next=x");
+    }
+
+    #[test]
+    fn malformed_quoting_falls_back_to_whitespace_split() {
+        // Unterminated quote: shell-words errors; whitespace split applies.
+        let out = substitute_args("$0|$1", "\"unterminated two");
+        assert_eq!(out, "\"unterminated|two");
+    }
+
+    #[test]
+    fn no_placeholder_appends_arguments_line() {
+        let out = substitute_args("Static recipe body", "web prod");
+        assert_eq!(out, "Static recipe body\n\nARGUMENTS: web prod");
+    }
+
+    #[test]
+    fn no_placeholder_and_no_args_leaves_template_untouched() {
+        assert_eq!(substitute_args("Static recipe body", "   "), "Static recipe body");
+    }
+
+    #[test]
+    fn unknown_names_stay_literal_and_still_trigger_append() {
+        // $HOME is not a recipe placeholder: it survives verbatim, and since
+        // nothing substituted, the args are appended instead of dropped.
+        let out = substitute_args("cd $HOME && ls", "web");
+        assert_eq!(out, "cd $HOME && ls\n\nARGUMENTS: web");
+    }
+
+    #[test]
+    fn dollar_edge_cases_pass_through() {
+        assert_eq!(substitute_args("cost: $ or ${bad name} or $", "x"),
+            "cost: $ or ${bad name} or $\n\nARGUMENTS: x");
+    }
+
+    #[test]
+    fn non_identifier_equals_tokens_stay_positional() {
+        let out = substitute_args("$0 and $1 and $ARGUMENTS", "2=3 --flag=x");
+        assert_eq!(out, "2=3 and --flag=x and 2=3 --flag=x");
+    }
+
+    #[test]
+    fn builtin_arguments_wins_over_a_named_collision() {
+        let out = substitute_args("$ARGUMENTS", "ARGUMENTS=hijack real");
+        assert_eq!(out, "real");
     }
 
     #[test]

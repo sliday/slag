@@ -1,5 +1,6 @@
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor, ResetColor};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -333,6 +334,142 @@ pub fn spinner_frame(i: usize) -> &'static str {
     SPINNER_FRAMES[i % SPINNER_FRAMES.len()]
 }
 
+/// Metallurgical verbs for the live spinner status line. One per turn,
+/// picked by turn number, so a long forge reads like shop work instead of
+/// repeating "Forging…" forever.
+pub const FORGE_VERBS: [&str; 12] = [
+    "Forging",
+    "Smelting",
+    "Hammering",
+    "Tempering",
+    "Annealing",
+    "Quenching",
+    "Casting",
+    "Striking",
+    "Alloying",
+    "Riveting",
+    "Sintering",
+    "Burnishing",
+];
+
+/// Verb for turn `i`; wraps forever like `spinner_frame`.
+pub fn forge_verb(i: usize) -> &'static str {
+    FORGE_VERBS[i % FORGE_VERBS.len()]
+}
+
+// ─── terminal notifications ─────────────────────────────────────────────
+//
+// A finished (or failed) forge should ping the user who tabbed away —
+// but never the one actively typing in the dashboard. The dashboard
+// records every keypress via `mark_user_activity`; `notify` only fires
+// after `NOTIFY_IDLE` of silence. Headless runs never record activity,
+// so they always notify.
+
+/// User must be hands-off this long before a notification fires.
+pub const NOTIFY_IDLE: Duration = Duration::from_secs(6);
+
+/// Last dashboard keypress. `None` = no interactive session ever touched
+/// this process (headless forge), which counts as idle.
+static LAST_KEYPRESS: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Record a user keypress (dashboard input loop).
+pub fn mark_user_activity() {
+    if let Ok(mut last) = LAST_KEYPRESS.lock() {
+        *last = Some(Instant::now());
+    }
+}
+
+pub(crate) fn last_user_activity() -> Option<Instant> {
+    LAST_KEYPRESS.lock().ok().and_then(|l| *l)
+}
+
+/// Pure idleness gate: no recorded activity counts as idle.
+pub fn idle_enough(last: Option<Instant>, now: Instant, threshold: Duration) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= threshold,
+    }
+}
+
+/// Which notification escape this terminal understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyProto {
+    /// iTerm2-style `OSC 9 ; message BEL`.
+    Osc9,
+    /// kitty desktop notifications, `OSC 99`.
+    Osc99,
+    /// urxvt/WezTerm/ghostty `OSC 777 ; notify ; title ; body`.
+    Osc777,
+    /// Unknown terminal: the BEL alone still dings and marks the tab.
+    BelOnly,
+}
+
+/// Detect the notification protocol from `TERM_PROGRAM` (primary) and
+/// `TERM` (fallback). Unknown terminals get BEL only — a wrong OSC would
+/// print garbage into the scrollback.
+pub fn notify_proto(term_program: Option<&str>, term: Option<&str>) -> NotifyProto {
+    match term_program.unwrap_or("") {
+        "iTerm.app" => return NotifyProto::Osc9,
+        "kitty" => return NotifyProto::Osc99,
+        "WezTerm" | "ghostty" => return NotifyProto::Osc777,
+        "Apple_Terminal" => return NotifyProto::BelOnly,
+        _ => {}
+    }
+    let term = term.unwrap_or("");
+    if term.contains("kitty") {
+        NotifyProto::Osc99
+    } else if term.contains("rxvt") {
+        NotifyProto::Osc777
+    } else {
+        NotifyProto::BelOnly
+    }
+}
+
+/// Strip control characters (ESC included) so notification text can never
+/// smuggle its own escape sequences into the terminal, and `;` for the
+/// OSC 777 field separator.
+fn notify_clean(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() || c == ';' { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The bytes to write: BEL first (audible bell + tab marker everywhere),
+/// then the richest OSC the terminal understands.
+pub fn notify_sequence(proto: NotifyProto, title: &str, body: &str) -> String {
+    let title = notify_clean(title);
+    let body = notify_clean(body);
+    let mut s = String::from("\x07");
+    match proto {
+        NotifyProto::Osc9 => s.push_str(&format!("\x1b]9;{title}: {body}\x07")),
+        NotifyProto::Osc99 => s.push_str(&format!("\x1b]99;;{title}: {body}\x1b\\")),
+        NotifyProto::Osc777 => s.push_str(&format!("\x1b]777;notify;{title};{body}\x1b\\")),
+        NotifyProto::BelOnly => {}
+    }
+    s
+}
+
+/// Send a terminal notification, gated on user idleness and a real
+/// terminal. Silent no-op when the user typed within `NOTIFY_IDLE` (they
+/// are watching) or stderr is redirected (escape bytes in a log file).
+pub fn notify(title: &str, body: &str) {
+    if !idle_enough(last_user_activity(), Instant::now(), NOTIFY_IDLE) {
+        return;
+    }
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let proto = notify_proto(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    );
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(notify_sequence(proto, title, body).as_bytes());
+    let _ = err.flush();
+}
+
 /// Paint `s` in `color` when color is on; plain text otherwise. String
 /// form (not a Display adapter) so render state machines can build lines
 /// without touching a terminal.
@@ -502,6 +639,78 @@ mod tests {
             assert!(paint(HOT, "x").contains('x'));
             assert!(dim("meta").contains("meta"));
         }
+    }
+
+    /// Verbs wrap by turn number like spinner frames wrap by tick.
+    #[test]
+    fn forge_verb_wraps_and_starts_with_forging() {
+        assert_eq!(forge_verb(0), "Forging");
+        assert_eq!(forge_verb(FORGE_VERBS.len()), "Forging");
+        assert_eq!(forge_verb(FORGE_VERBS.len() + 3), FORGE_VERBS[3]);
+    }
+
+    #[test]
+    fn notify_proto_detects_terminals() {
+        assert_eq!(notify_proto(Some("iTerm.app"), None), NotifyProto::Osc9);
+        assert_eq!(notify_proto(Some("kitty"), None), NotifyProto::Osc99);
+        assert_eq!(notify_proto(Some("WezTerm"), None), NotifyProto::Osc777);
+        assert_eq!(notify_proto(Some("ghostty"), None), NotifyProto::Osc777);
+        // Terminal.app has no OSC notification support — BEL only.
+        assert_eq!(notify_proto(Some("Apple_Terminal"), None), NotifyProto::BelOnly);
+        // TERM fallback when TERM_PROGRAM is absent or unknown.
+        assert_eq!(notify_proto(None, Some("xterm-kitty")), NotifyProto::Osc99);
+        assert_eq!(notify_proto(None, Some("rxvt-unicode-256color")), NotifyProto::Osc777);
+        assert_eq!(notify_proto(None, Some("xterm-256color")), NotifyProto::BelOnly);
+        assert_eq!(notify_proto(None, None), NotifyProto::BelOnly);
+    }
+
+    /// Every sequence leads with BEL (dings everywhere), then the OSC.
+    #[test]
+    fn notify_sequence_writes_bel_plus_the_right_osc() {
+        let s = notify_sequence(NotifyProto::Osc9, "slag", "forge complete");
+        assert!(s.starts_with('\x07'), "{s:?}");
+        assert!(s.contains("\x1b]9;slag: forge complete\x07"), "{s:?}");
+
+        let s = notify_sequence(NotifyProto::Osc99, "slag", "forge complete");
+        assert!(s.contains("\x1b]99;;slag: forge complete\x1b\\"), "{s:?}");
+
+        let s = notify_sequence(NotifyProto::Osc777, "slag", "forge complete");
+        assert!(s.contains("\x1b]777;notify;slag;forge complete\x1b\\"), "{s:?}");
+
+        assert_eq!(notify_sequence(NotifyProto::BelOnly, "slag", "x"), "\x07");
+    }
+
+    /// Notification text is data, not escape codes: ESC and `;` (the OSC
+    /// 777 field separator) must not survive into the sequence body.
+    #[test]
+    fn notify_sequence_strips_injection_bytes_from_text() {
+        let s = notify_sequence(NotifyProto::Osc777, "t\x1b]0;evil", "a;b\x07c");
+        // The only ESC bytes are the two we wrote (open + ST terminator),
+        // and the only `;` are the three protocol separators.
+        assert_eq!(s.matches('\x1b').count(), 2, "{s:?}");
+        let osc = &s[1..]; // past the leading BEL
+        assert_eq!(osc.matches(';').count(), 3, "{osc:?}");
+        assert!(!osc.contains('\x07'), "{osc:?}");
+    }
+
+    /// No recorded keypress = headless = idle; a fresh keypress blocks;
+    /// an old one passes.
+    #[test]
+    fn idle_gate_blocks_active_users_and_passes_headless_runs() {
+        let now = Instant::now();
+        assert!(idle_enough(None, now, NOTIFY_IDLE), "headless is always idle");
+        assert!(!idle_enough(Some(now), now + Duration::from_secs(2), NOTIFY_IDLE));
+        assert!(idle_enough(Some(now), now + NOTIFY_IDLE, NOTIFY_IDLE));
+    }
+
+    #[test]
+    fn mark_user_activity_records_a_recent_keypress() {
+        mark_user_activity();
+        let last = last_user_activity().expect("keypress recorded");
+        assert!(
+            !idle_enough(Some(last), Instant::now(), NOTIFY_IDLE),
+            "a just-pressed key must block notifications"
+        );
     }
 
     /// A Cyrillic or CJK commission used to slice mid-codepoint and abort

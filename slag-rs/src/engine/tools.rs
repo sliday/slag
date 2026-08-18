@@ -20,6 +20,7 @@ pub mod judge;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -62,6 +63,10 @@ struct ReadStamp {
 struct FileState {
     mtime: SystemTime,
     checksum: u64,
+    /// Monotonic touch order (session-wide): bumped on every read, write,
+    /// and edit so post-compaction re-injection can pick the files the
+    /// model worked with most recently.
+    seq: u64,
 }
 
 /// Native toolbox rooted at an anvil worktree.
@@ -75,6 +80,8 @@ pub struct ToolBox {
     /// session and its mtime has not moved since. Protects proof-gated
     /// ingots from clobbering parallel-anvil changes with stale edits.
     read_state: Arc<Mutex<HashMap<PathBuf, FileState>>>,
+    /// Session-wide touch counter feeding `FileState::seq`.
+    touch_seq: Arc<AtomicU64>,
 }
 
 impl ToolBox {
@@ -85,7 +92,45 @@ impl ToolBox {
             root,
             read_cache: Arc::new(Mutex::new(HashMap::new())),
             read_state: Arc::new(Mutex::new(HashMap::new())),
+            touch_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn next_touch(&self) -> u64 {
+        self.touch_seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Paths read or written this session, most recently touched first.
+    pub fn recent_files(&self, n: usize) -> Vec<PathBuf> {
+        let state = self.read_state.lock().unwrap();
+        let mut entries: Vec<(PathBuf, u64)> =
+            state.iter().map(|(p, s)| (p.clone(), s.seq)).collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.into_iter().take(n).map(|(p, _)| p).collect()
+    }
+
+    /// (workspace-relative path, content capped at `cap_chars`) for the
+    /// `n` most recently touched files — the post-compaction re-injection
+    /// payload. Files that vanished from disk are skipped.
+    pub fn recent_file_snapshots(&self, n: usize, cap_chars: usize) -> Vec<(String, String)> {
+        self.recent_files(n)
+            .into_iter()
+            .filter_map(|p| {
+                let content = std::fs::read_to_string(&p).ok()?;
+                let display = p
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .into_owned();
+                let capped = if content.chars().count() > cap_chars {
+                    let head: String = content.chars().take(cap_chars).collect();
+                    format!("{head}\n… [truncated at {cap_chars} chars]")
+                } else {
+                    content
+                };
+                Some((display, capped))
+            })
+            .collect()
     }
 
     /// Tool schemas advertised to the model.
@@ -383,7 +428,7 @@ impl ToolBox {
             if let Ok(mtime) = meta.modified() {
                 self.read_state.lock().unwrap().insert(
                     path.clone(),
-                    FileState { mtime, checksum: fnv64(content.as_bytes()) },
+                    FileState { mtime, checksum: fnv64(content.as_bytes()), seq: self.next_touch() },
                 );
             }
         }
@@ -481,7 +526,10 @@ impl ToolBox {
             self.read_state
                 .lock()
                 .unwrap()
-                .insert(path.to_path_buf(), FileState { mtime, checksum: state.checksum });
+                .insert(
+                    path.to_path_buf(),
+                    FileState { mtime, checksum: state.checksum, seq: state.seq },
+                );
             return Ok(());
         }
         Err(SlagError::Tool(format!(
@@ -498,7 +546,10 @@ impl ToolBox {
                 self.read_state
                     .lock()
                     .unwrap()
-                    .insert(path.to_path_buf(), FileState { mtime, checksum: fnv64(bytes) });
+                    .insert(
+                        path.to_path_buf(),
+                        FileState { mtime, checksum: fnv64(bytes), seq: self.next_touch() },
+                    );
             }
         }
     }
@@ -3452,5 +3503,55 @@ Collecting\n\
         assert!(out.is_error, "{}", out.output);
         assert!(out.output.contains("full-read limit"), "{}", out.output);
         assert!(out.output.contains("1500 lines"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn recent_files_orders_by_touch_recency_across_reads_and_edits() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "alpha\n");
+        write(&dir, "b.txt", "beta\n");
+        write(&dir, "c.txt", "gamma\n");
+        prime(&tb, "a.txt").await;
+        prime(&tb, "b.txt").await;
+        prime(&tb, "c.txt").await;
+        // Editing a.txt re-stamps it as the most recent touch.
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "alpha", "new_string": "ALPHA"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+
+        let recent = tb.recent_files(2);
+        assert_eq!(recent.len(), 2);
+        assert!(recent[0].ends_with("a.txt"), "{:?}", recent);
+        assert!(recent[1].ends_with("c.txt"), "{:?}", recent);
+        // Beyond the map: asking for more than touched returns all, newest first.
+        assert_eq!(tb.recent_files(10).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn recent_file_snapshots_are_relative_and_capped() {
+        let (dir, tb) = setup();
+        write(&dir, "long.txt", &"z".repeat(50));
+        write(&dir, "short.txt", "ok\n");
+        prime(&tb, "long.txt").await;
+        prime(&tb, "short.txt").await;
+
+        let snaps = tb.recent_file_snapshots(5, 10);
+        assert_eq!(snaps.len(), 2);
+        // Newest first, workspace-relative display paths.
+        assert_eq!(snaps[0].0, "short.txt");
+        assert_eq!(snaps[0].1, "ok\n");
+        assert_eq!(snaps[1].0, "long.txt");
+        assert!(snaps[1].1.starts_with(&"z".repeat(10)), "{}", snaps[1].1);
+        assert!(snaps[1].1.contains("[truncated at 10 chars]"), "{}", snaps[1].1);
+
+        // A file deleted from disk since its read is skipped, not an error.
+        std::fs::remove_file(dir.path().join("short.txt")).unwrap();
+        let snaps = tb.recent_file_snapshots(5, 10);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].0, "long.txt");
     }
 }

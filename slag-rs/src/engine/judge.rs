@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 // `crate::engine`, not `super`: this file is mounted via a #[path] shim in
 // tools.rs while engine/mod.rs is frozen. Revert to `super` when it moves.
+use crate::engine::compact::{NO_TOOLS_PREAMBLE, NO_TOOLS_TRAILER};
 use crate::engine::{ChatMessage, ChatRequest, Effort, Provider, Verdict};
 use crate::error::SlagError;
 
@@ -172,7 +173,12 @@ async fn judge_once(
 ) -> Result<Verdict, SlagError> {
     let mut user = ChatMessage::user(rubric_prompt(work, first, second, prior_critique));
     user.images = images;
-    let mut messages = vec![ChatMessage::system(SYSTEM_PROMPT), user];
+    // Consequence-first no-tools framing (item 43): the preamble leads the
+    // system prompt; rubric_prompt appends the matching trailer.
+    let mut messages = vec![
+        ChatMessage::system(format!("{NO_TOOLS_PREAMBLE} {SYSTEM_PROMPT}")),
+        user,
+    ];
 
     for attempt in 0..2 {
         let resp = provider
@@ -231,6 +237,7 @@ Reply with ONLY this JSON object as your entire reply:\n\
         truncate_diff(&second.diff),
         second.proof_output,
     ));
+    prompt.push_str(&format!("\n{NO_TOOLS_TRAILER}"));
     prompt
 }
 
@@ -641,6 +648,39 @@ mod tests {
         assert!(verdict.tie, "cycle must not produce a ranking");
         assert_eq!(verdict.winner, 'a', "tie defaults to cast a");
         assert_eq!(verdict.margin, 0, "tie margin never early-stops");
+    }
+
+    #[tokio::test]
+    async fn no_tools_preamble_leads_the_system_prompt_and_trailer_ends_the_rubric() {
+        let judge = MockJudge::new(&[
+            r#"{"winner":"a","score_a":80,"score_b":70,"critique":"c1"}"#,
+            r#"{"winner":"b","score_a":70,"score_b":80,"critique":"c2"}"#,
+        ]);
+
+        assay(
+            &judge,
+            "openai/gpt-5",
+            "add retry",
+            &cast("diff-a", "ok"),
+            &cast("diff-b", "ok"),
+            None,
+            None,
+        )
+        .await
+        .expect("verdict");
+
+        for req in judge.requests() {
+            assert!(req.tools.is_empty(), "judge never carries tools");
+            assert!(
+                req.messages[0].content.starts_with(NO_TOOLS_PREAMBLE),
+                "consequence-first preamble leads: {}",
+                req.messages[0].content
+            );
+            assert!(
+                req.messages[1].content.trim_end().ends_with(NO_TOOLS_TRAILER),
+                "matching trailer ends the rubric"
+            );
+        }
     }
 
     #[test]

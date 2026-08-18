@@ -419,6 +419,14 @@ impl RenderState {
                 self.flush_streak(&mut prints);
                 prints.push(line(BRIGHT, "⚠", &preview(message, 110)));
             }
+            EngineEvent::ApiRetry { attempt, status, remaining_secs } => {
+                self.flush_streak(&mut prints);
+                prints.push(line(
+                    BRIGHT,
+                    "⏳",
+                    &dim(&format!("api retry {attempt} · {status} · {remaining_secs}s left")),
+                ));
+            }
             EngineEvent::IngotStart { id, work } => {
                 self.flush_streak(&mut prints);
                 self.accum.reset();
@@ -1149,7 +1157,7 @@ mod tests {
     #[test]
     fn kept_events_still_print_their_lines() {
         let mut state = RenderState::new(false);
-        let cases: [(EngineEvent, &str); 6] = [
+        let cases: [(EngineEvent, &str); 7] = [
             (EngineEvent::Steer { text: "focus".into() }, "steer: focus"),
             (EngineEvent::Warning { message: "spend at 80%".into() }, "spend at 80%"),
             (EngineEvent::Error { message: "cracked".into() }, "cracked"),
@@ -1158,6 +1166,12 @@ mod tests {
             (
                 EngineEvent::DuelVerdict { id: "i1".into(), winner: 'a', margin: 3 },
                 "[i1] cast a wins by 3",
+            ),
+            // Heartbeats print their own line — an unattended forge waiting
+            // out a rate limit must not look frozen in the logs.
+            (
+                EngineEvent::ApiRetry { attempt: 2, status: 429, remaining_secs: 240 },
+                "api retry 2 · 429 · 240s left",
             ),
         ];
         for (event, needle) in cases {
@@ -1190,11 +1204,33 @@ mod tests {
                 EngineEvent::IngotDone { id: "i1".into(), ok: true },
                 EngineEvent::DuelRound { id: "i1".into(), round: 1 },
                 EngineEvent::DuelVerdict { id: "i1".into(), winner: 'b', margin: 2 },
+                EngineEvent::ApiRetry { attempt: 1, status: 529, remaining_secs: 30 },
             ] {
                 let _ = state.feed(&event);
             }
             let _ = state.finish();
         }
+    }
+
+    /// The JSONL stream carries heartbeats with their fields, so a log
+    /// tail can tell a rate-limit wait from a hang.
+    #[test]
+    fn api_retry_serializes_with_its_fields() {
+        let v = serde_json::to_value(EngineEvent::ApiRetry {
+            attempt: 3,
+            status: 429,
+            remaining_secs: 120,
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "event": "api_retry",
+                "attempt": 3,
+                "status": 429,
+                "remaining_secs": 120,
+            })
+        );
     }
 
     #[test]

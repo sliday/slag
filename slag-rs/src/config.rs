@@ -49,6 +49,42 @@ fn cost_cap(env_var: &str, file_key: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+/// Env-or-file string setting, same precedence as the cost caps: env wins,
+/// then the config file, then None.
+fn env_or_file(env_var: &str, file_key: &str) -> Option<String> {
+    env_nonempty(env_var).or_else(|| {
+        let entries = config_file_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|c| parse_config_lines(&c))
+            .unwrap_or_default();
+        file_value(&entries, file_key)
+    })
+}
+
+/// Fallback model for capacity errors (`SLAG_MODEL_FALLBACK` env,
+/// `fallback_model` file key). When set, the provider sends OpenRouter's
+/// native `models: [primary, fallback]` routing array so a saturated
+/// primary fails over inside one request — no extra round trip. Default
+/// None = no fallback.
+pub fn fallback_model() -> Option<String> {
+    env_or_file("SLAG_MODEL_FALLBACK", "fallback_model")
+}
+
+/// Unattended persistent-retry mode (`SLAG_UNATTENDED_RETRY` env,
+/// `unattended_retry` file key). Truthy values: 1/true/on/yes. When on,
+/// capacity errors (429/529) retry past the normal attempt budget with
+/// backoff capped at 5 minutes — slag is an unattended orchestrator, and
+/// an overnight run should outlast a rate-limit window, not crack on it.
+pub fn unattended_retry() -> bool {
+    parse_truthy(env_or_file("SLAG_UNATTENDED_RETRY", "unattended_retry"))
+}
+
+/// 1/true/on/yes (any case) are on; everything else, including unset, off.
+fn parse_truthy(raw: Option<String>) -> bool {
+    raw.map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
 /// Run-wide spend accumulator, shared by every anvil in the process.
 /// Millicents (1/1000 of a cent) in a u64: f64 has no atomic add, and at
 /// this resolution u64 never saturates on real spend.
@@ -542,6 +578,8 @@ mod tests {
         "SLAG_CONFIG_DIR",
         "SLAG_MAX_COST_INGOT",
         "SLAG_MAX_COST_RUN",
+        "SLAG_MODEL_FALLBACK",
+        "SLAG_UNATTENDED_RETRY",
     ];
 
     fn clear_engine_env() {
@@ -1124,6 +1162,67 @@ mod tests {
         }
 
         clear_engine_env();
+    }
+
+    #[test]
+    fn fallback_model_env_overrides_file_and_defaults_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+
+        assert_eq!(fallback_model(), None);
+
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "fallback_model = \"deepseek/deepseek-chat\"\n",
+        )
+        .unwrap();
+        assert_eq!(fallback_model().as_deref(), Some("deepseek/deepseek-chat"));
+
+        std::env::set_var("SLAG_MODEL_FALLBACK", "qwen/qwen3-coder");
+        assert_eq!(fallback_model().as_deref(), Some("qwen/qwen3-coder"));
+
+        // Blank env export falls through to the file, not to "".
+        std::env::set_var("SLAG_MODEL_FALLBACK", "  ");
+        assert_eq!(fallback_model().as_deref(), Some("deepseek/deepseek-chat"));
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn unattended_retry_parses_truthy_values_and_defaults_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+
+        assert!(!unattended_retry());
+
+        for on in ["1", "true", "ON", "yes"] {
+            std::env::set_var("SLAG_UNATTENDED_RETRY", on);
+            assert!(unattended_retry(), "value {on:?} should enable");
+        }
+        for off in ["0", "false", "off", "sometimes"] {
+            std::env::set_var("SLAG_UNATTENDED_RETRY", off);
+            assert!(!unattended_retry(), "value {off:?} should disable");
+        }
+
+        // File key works; env still wins.
+        std::env::remove_var("SLAG_UNATTENDED_RETRY");
+        std::fs::write(dir.path().join("config.toml"), "unattended_retry = \"on\"\n").unwrap();
+        assert!(unattended_retry());
+        std::env::set_var("SLAG_UNATTENDED_RETRY", "off");
+        assert!(!unattended_retry());
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn parse_truthy_covers_the_edge_spellings() {
+        assert!(parse_truthy(Some(" True ".into())));
+        assert!(!parse_truthy(Some("".into())));
+        assert!(!parse_truthy(None));
     }
 
     #[test]

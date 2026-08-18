@@ -13,7 +13,7 @@ use crate::engine::events::{self, StderrNarrator};
 use crate::engine::prompt::{self, PromptMode};
 use crate::engine::provider::OpenRouter;
 use crate::engine::tools::ToolBox;
-use crate::engine::Effort;
+use crate::engine::{Effort, EventTx, Provider};
 use crate::error::SlagError;
 
 /// Engine-backed smith. One invoke = one full agent session.
@@ -108,6 +108,22 @@ impl NativeSmith {
         }
     }
 
+    /// Build the provider with its observability wired: the event sink
+    /// carries `ApiRetry` heartbeats through unattended waits (without it
+    /// a rate-limit wait looks like a frozen run), and the cancel flag
+    /// lets Ctrl-C abort a retry wait instead of sleeping out the window.
+    fn build_provider(&self, tx: &EventTx) -> Arc<OpenRouter> {
+        let provider = Arc::new(OpenRouter::with_base_url(
+            self.cfg.api_key.clone(),
+            self.cfg.base_url.clone(),
+        ));
+        provider.set_event_sink(tx.clone());
+        if let Some(cancel) = &self.hooks.cancel {
+            provider.set_cancel_flag(cancel.clone());
+        }
+        provider
+    }
+
     async fn invoke_impl(&self, prompt_text: &str) -> Result<String, SlagError> {
         let model = self.model().to_string();
         let bands = prompt::build(&self.root, &model, self.mode);
@@ -142,10 +158,7 @@ impl NativeSmith {
             }
         });
 
-        let provider = Arc::new(OpenRouter::with_base_url(
-            self.cfg.api_key.clone(),
-            self.cfg.base_url.clone(),
-        ));
+        let provider = self.build_provider(&tx);
         // Size the compaction budget to the model's real window (cached
         // per model on the provider; `None` on fetch failure keeps the
         // default): a 32k model compacts before it 400s, a 1M model does
@@ -256,6 +269,30 @@ mod tests {
         let smith =
             NativeSmith::forge(config, "rust", 1, PathBuf::from("."), &EngineHooks::default());
         assert_eq!(smith.invoke("task").await.unwrap(), "done");
+    }
+
+    /// Regression: production never called `set_event_sink`, so the
+    /// provider's `ApiRetry` heartbeats (item 49) were dead code — an
+    /// unattended rate-limit wait rendered as a stalled/dead ingot. The
+    /// cancel flag has the same wiring requirement.
+    #[test]
+    fn build_provider_wires_heartbeat_sink_and_cancel_flag() {
+        let hooks = EngineHooks {
+            events: None,
+            steer: None,
+            cancel: Some(crate::engine::CancelFlag::default()),
+        };
+        let smith = NativeSmith::forge(cfg(), "rust", 1, PathBuf::from("."), &hooks);
+        let (tx, _rx) = events::channel();
+        let provider = smith.build_provider(&tx);
+        assert!(provider.has_event_sink(), "ApiRetry heartbeats need a sink");
+        assert!(provider.has_cancel_flag(), "Ctrl-C must reach retry waits");
+
+        // Without a cancel hook the sink is still wired.
+        let smith = NativeSmith::forge(cfg(), "rust", 1, PathBuf::from("."), &EngineHooks::default());
+        let provider = smith.build_provider(&tx);
+        assert!(provider.has_event_sink());
+        assert!(!provider.has_cancel_flag());
     }
 
     #[test]

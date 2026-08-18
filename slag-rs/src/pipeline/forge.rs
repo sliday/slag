@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::config::{DuelMode, EngineConfig, CRUCIBLE, LEDGER};
 use crate::crucible::{Crucible, CRUCIBLE_LOCK};
 use crate::engine::provider::OpenRouter;
-use crate::engine::{emit, EngineEvent};
+use crate::engine::{emit, EngineEvent, Provider};
 use crate::error::SlagError;
 use crate::flux;
 use crate::proof;
@@ -42,11 +42,21 @@ pub async fn run(
         }
 
         if !crucible.has_pending() {
-            // Check for cracked
+            // Check for cracked. Either way the run is over: ping the
+            // user who tabbed away (tui::notify gates on 6s of keyboard
+            // idleness, so an attentive user never gets double-told).
             let counts = crucible.counts();
             if counts.cracked > 0 {
+                tui::notify(
+                    "slag",
+                    &format!("forge finished — {} ingot(s) cracked", counts.cracked),
+                );
                 return Err(SlagError::ForgeFailed(counts.cracked));
             }
+            tui::notify(
+                "slag",
+                &format!("forge complete — {} ingot(s) forged", counts.forged),
+            );
             return Ok(());
         }
 
@@ -67,6 +77,7 @@ pub async fn run(
                     );
                 }
                 append_assay_note(&note);
+                tui::notify("slag", "run budget exhausted — forge paused");
                 return Ok(());
             }
         }
@@ -313,6 +324,14 @@ async fn forge_ingot(
             OpenRouter::with_base_url(cfg.api_key.clone(), cfg.base_url.clone()),
             cast_spend.clone(),
         );
+        // Same observability wiring as the cast smiths: heartbeats keep a
+        // judge-side rate-limit wait visible, and Ctrl-C aborts it.
+        if let Some(tx) = &hooks.events {
+            judge_provider.set_event_sink(tx.clone());
+        }
+        if let Some(cancel) = &hooks.cancel {
+            judge_provider.set_cancel_flag(cancel.clone());
+        }
 
         match duel::duel_ingot(
             Path::new("."),
@@ -433,6 +452,7 @@ async fn finish_run_over_budget(
         println!("\n  {}⚠{} {note}", super::fg(tui::BRIGHT), super::reset());
     }
     append_assay_note(&note);
+    tui::notify("slag", "run budget exhausted — forge paused");
     Ok(())
 }
 

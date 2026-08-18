@@ -175,6 +175,35 @@ pub trait Provider: Send + Sync {
         &self,
         req: ChatRequest,
     ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>>;
+
+    /// Hand the provider an event channel for retry heartbeats
+    /// (`ApiRetry`). Default no-op: mock providers and wrappers that do
+    /// not sleep have nothing to report.
+    fn set_event_sink(&self, _tx: EventTx) {}
+
+    /// Hand the provider the run's cancel flag so a Ctrl-C aborts a
+    /// retry wait instead of sleeping it out (and firing more requests).
+    /// Default no-op: mock providers and wrappers do not sleep.
+    fn set_cancel_flag(&self, _f: CancelFlag) {}
+}
+
+/// Forwarding impl so borrowed providers (`&P`, `&dyn Provider`) can be
+/// handed to adapters like `agent::SpendTracked` without cloning an Arc.
+impl<P: Provider + ?Sized> Provider for &P {
+    fn chat(
+        &self,
+        req: ChatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>> {
+        (**self).chat(req)
+    }
+
+    fn set_event_sink(&self, tx: EventTx) {
+        (**self).set_event_sink(tx)
+    }
+
+    fn set_cancel_flag(&self, f: CancelFlag) {
+        (**self).set_cancel_flag(f)
+    }
 }
 
 /// Typed engine events. One stream feeds TUI, JSONL logs, and --json mode.
@@ -198,6 +227,11 @@ pub enum EngineEvent {
     Narrate { text: String },
     /// Soft alert (e.g. spend at 80% of budget). Display + JSONL only.
     Warning { message: String },
+    /// Retry heartbeat: the provider is waiting out a transient failure.
+    /// Long unattended waits are chunked into slices, one heartbeat per
+    /// slice, so the dashboard and JSONL logs stay alive through a
+    /// minutes-long rate-limit window.
+    ApiRetry { attempt: usize, status: u16, remaining_secs: u64 },
     // Pipeline-level events (emitted by forge, consumed by the dashboard).
     IngotStart { id: String, work: String },
     HeatTick { id: String, heat: u8 },
