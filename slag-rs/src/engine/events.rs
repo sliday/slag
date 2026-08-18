@@ -673,6 +673,90 @@ pub fn print_line(text: impl Into<String>) {
     apply_ops(&[RenderOp::Print(text.into())]);
 }
 
+// ─── Run log (item 81) ──────────────────────────────────────────────────
+//
+// One self-describing JSONL file per forge run: typed metadata at the
+// top (run id, git branch, model, crucible fingerprint), ingot outcomes
+// as they land, and the assay verdict at the bottom — a runs lister
+// needs no sidecar files. Distinct from the per-session engine-*.jsonl
+// event streams: this is the run's ledger, not its firehose.
+
+/// One typed line in the run log.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "entry", rename_all = "snake_case")]
+pub enum RunEntry {
+    /// First line of every run log.
+    RunMeta {
+        run_id: String,
+        started: String,
+        git_branch: Option<String>,
+        model: String,
+        duel: String,
+        /// FNV fingerprint of the crucible (PLAN.md) at forge start, so
+        /// a lister can tell which runs forged the same plan.
+        crucible_hash: Option<String>,
+    },
+    /// One ingot left the forge.
+    IngotDone { id: String, ok: bool, heat: u8 },
+    /// Free-form note (budget pauses and the like).
+    Note { message: String },
+    /// Last line: the assay verdict.
+    Assay { total: usize, forged: usize, cracked: usize, ok: bool },
+}
+
+/// Append-only run log writer. Synchronous and best-effort: entries are
+/// rare (per-ingot, not per-token) and logging must never kill the forge.
+pub struct RunLog {
+    path: PathBuf,
+    warned: std::sync::Mutex<bool>,
+}
+
+impl RunLog {
+    /// Create `logs/run-<run_id>.jsonl` under `dir` and write the meta
+    /// entry as its first line.
+    pub fn create(dir: &std::path::Path, run_id: &str, meta: RunEntry) -> Self {
+        let log = Self {
+            path: dir.join(format!("run-{run_id}.jsonl")),
+            warned: std::sync::Mutex::new(false),
+        };
+        log.append(&meta);
+        log
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn append(&self, entry: &RunEntry) {
+        let line = match serde_json::to_string(entry) {
+            Ok(line) => line,
+            Err(e) => return self.warn(&e.to_string()),
+        };
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let write = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut f| {
+                f.write_all(line.as_bytes())?;
+                f.write_all(b"\n")
+            });
+        if let Err(e) = write {
+            self.warn(&e.to_string());
+        }
+    }
+
+    fn warn(&self, err: &str) {
+        let mut warned = self.warned.lock().unwrap_or_else(|p| p.into_inner());
+        if !*warned {
+            eprintln!("slag: run log {} failed: {err}", self.path.display());
+            *warned = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,6 +1350,58 @@ mod tests {
             .position(|op| matches!(op, RenderOp::Print(s) if s.contains("[i1] forged")));
         assert!(clear_at.is_some() && print_at.is_some(), "{ops:?}");
         assert!(clear_at < print_at, "clear must precede the footer: {ops:?}");
+    }
+
+    /// Item 81: one self-describing run log — typed meta first, ingot
+    /// outcomes in the middle, the assay verdict last.
+    #[test]
+    fn run_log_is_one_self_describing_jsonl_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RunLog::create(
+            dir.path(),
+            "20260818_101500-4242",
+            RunEntry::RunMeta {
+                run_id: "20260818_101500-4242".into(),
+                started: "2026-08-18T10:15:00".into(),
+                git_branch: Some("main".into()),
+                model: "qwen/qwen3-coder".into(),
+                duel: "auto".into(),
+                crucible_hash: Some("00ff00ff00ff00ff".into()),
+            },
+        );
+        log.append(&RunEntry::IngotDone { id: "i1".into(), ok: true, heat: 2 });
+        log.append(&RunEntry::Note { message: "run budget exhausted".into() });
+        log.append(&RunEntry::Assay { total: 3, forged: 2, cracked: 1, ok: false });
+
+        let raw = std::fs::read_to_string(log.path()).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["entry"], "run_meta");
+        assert_eq!(lines[0]["git_branch"], "main");
+        assert_eq!(lines[0]["crucible_hash"], "00ff00ff00ff00ff");
+        assert_eq!(lines[1]["entry"], "ingot_done");
+        assert_eq!(lines[1]["heat"], 2);
+        assert_eq!(lines[3]["entry"], "assay");
+        assert_eq!(lines[3]["ok"], false);
+        assert!(
+            log.path().file_name().unwrap().to_str().unwrap().starts_with("run-"),
+            "{}",
+            log.path().display()
+        );
+    }
+
+    #[test]
+    fn run_log_survives_an_unwritable_path() {
+        let log = RunLog::create(
+            std::path::Path::new("/dev/null/impossible"),
+            "x",
+            RunEntry::Note { message: "doomed".into() },
+        );
+        // Must not panic; later appends stay quiet too.
+        log.append(&RunEntry::Assay { total: 0, forged: 0, cracked: 0, ok: true });
     }
 
     #[test]

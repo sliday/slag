@@ -82,11 +82,36 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
     flux
 }
 
+/// Human line for whole-job spend, restored from
+/// `.slag/session-costs.json`. A re-melt is the same job resumed, so the
+/// figure covers every prior invocation, not just the last one.
+pub fn spend_note(record: Option<&crate::dashboard::CostRecord>) -> String {
+    match record {
+        Some(r) => {
+            let mut s = format!("{} tok", r.total_tokens);
+            if let Some(cost) = r.cost {
+                s.push_str(&format!(" · ${cost:.2}"));
+            }
+            s.push_str(" spent across all invocations of this job");
+            s
+        }
+        None => "none recorded".into(),
+    }
+}
+
+/// Reload the persisted whole-job spend for the current crucible.
+fn session_spend() -> String {
+    let plan = std::fs::read_to_string(CRUCIBLE).unwrap_or_default();
+    let run_id = crate::dashboard::run_id_for_plan(&plan);
+    spend_note(crate::dashboard::load_session_cost(&run_id).as_ref())
+}
+
 /// Build the re-smelt analysis prompt for a cracked ingot
 pub fn prepare_resmelt_flux(ingot: &Ingot, failure_logs: &str) -> String {
     let blueprint = std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "None".into());
     let crucible = std::fs::read_to_string(CRUCIBLE).unwrap_or_else(|_| "Empty".into());
     let git_state = git_log_and_diff();
+    let spend = session_spend();
 
     format!(
         "=== RE-SMELT ANALYSIS ===\n\
@@ -101,6 +126,7 @@ pub fn prepare_resmelt_flux(ingot: &Ingot, failure_logs: &str) -> String {
         {failure_logs}\n\n\
         GIT STATE:\n\
         {git_state}\n\n\
+        JOB SPEND SO FAR: {spend}\n\n\
         === YOUR TASK ===\n\
         Analyze WHY this ingot failed. Then choose ONE action:\n\n\
         OPTION A - REWRITE: If the work or proof was wrong, output a corrected ingot.\n\
@@ -258,6 +284,34 @@ mod tests {
         for tier in ["- 1: grade <= 2", "- 2: grade 3-4", "- 3: grade 5"] {
             assert!(prompt.contains(tier), "missing tier {tier:?}");
         }
+    }
+
+    /// The re-melt prompt carries whole-job spend restored from
+    /// `.slag/session-costs.json` — the smith budgets against the job,
+    /// not the invocation.
+    #[test]
+    fn resmelt_flux_reports_whole_job_spend() {
+        let flux = prepare_resmelt_flux(&sample_ingot(), "boom");
+        assert!(flux.contains("JOB SPEND SO FAR:"), "spend section missing");
+    }
+
+    #[test]
+    fn spend_note_formats_restored_records_and_the_fresh_case() {
+        let rec = crate::dashboard::CostRecord {
+            total_tokens: 118_234,
+            cost: Some(0.31),
+            ..Default::default()
+        };
+        assert_eq!(
+            spend_note(Some(&rec)),
+            "118234 tok · $0.31 spent across all invocations of this job"
+        );
+
+        // Costless providers still report tokens.
+        let free = crate::dashboard::CostRecord { total_tokens: 42, ..Default::default() };
+        assert_eq!(spend_note(Some(&free)), "42 tok spent across all invocations of this job");
+
+        assert_eq!(spend_note(None), "none recorded");
     }
 
     #[test]

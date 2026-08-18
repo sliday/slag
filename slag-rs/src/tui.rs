@@ -458,16 +458,173 @@ pub fn notify(title: &str, body: &str) {
     if !idle_enough(last_user_activity(), Instant::now(), NOTIFY_IDLE) {
         return;
     }
-    if !std::io::stderr().is_terminal() {
-        return;
-    }
     let proto = notify_proto(
         std::env::var("TERM_PROGRAM").ok().as_deref(),
         std::env::var("TERM").ok().as_deref(),
     );
+    write_osc(&notify_sequence(proto, title, body));
+}
+
+// ─── OSC plumbing: progress, title, multiplexer passthrough ─────────────
+//
+// Terminal chrome (taskbar progress pips, the tab title) speaks OSC.
+// Inside tmux/screen a bare OSC stops at the multiplexer, so every
+// emission funnels through `write_osc`, which wraps the sequence in a DCS
+// passthrough envelope when `$TMUX`/`$STY` says one is in the way.
+
+/// Which terminal multiplexer wraps this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Multiplexer {
+    None,
+    Tmux,
+    Screen,
+}
+
+/// `$TMUX` beats `$STY`: tmux-inside-screen keeps `$STY` around, but the
+/// innermost multiplexer is the one that must be tunneled through.
+pub fn detect_multiplexer(tmux: Option<&str>, sty: Option<&str>) -> Multiplexer {
+    if tmux.is_some_and(|v| !v.is_empty()) {
+        Multiplexer::Tmux
+    } else if sty.is_some_and(|v| !v.is_empty()) {
+        Multiplexer::Screen
+    } else {
+        Multiplexer::None
+    }
+}
+
+fn current_multiplexer() -> Multiplexer {
+    detect_multiplexer(
+        std::env::var("TMUX").ok().as_deref(),
+        std::env::var("STY").ok().as_deref(),
+    )
+}
+
+/// DCS passthrough envelope (Claude Code's `wrapForMultiplexer`): tmux
+/// needs every inner ESC doubled inside `ESC Ptmux; … ESC \`; screen takes
+/// the sequence raw inside `ESC P … ESC \`.
+pub fn wrap_for_multiplexer(seq: &str, mux: Multiplexer) -> String {
+    match mux {
+        Multiplexer::None => seq.to_string(),
+        Multiplexer::Tmux => {
+            format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
+        }
+        Multiplexer::Screen => format!("\x1bP{seq}\x1b\\"),
+    }
+}
+
+/// The single funnel for every OSC emission. Gates on a real stderr
+/// terminal (escape bytes in a redirected log help nobody), wraps for the
+/// multiplexer, writes, flushes.
+pub fn write_osc(seq: &str) {
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let wrapped = wrap_for_multiplexer(seq, current_multiplexer());
     let mut err = std::io::stderr().lock();
-    let _ = err.write_all(notify_sequence(proto, title, body).as_bytes());
+    let _ = err.write_all(wrapped.as_bytes());
     let _ = err.flush();
+}
+
+/// OSC 9;4 taskbar progress states (ConEmu dialect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscProgress {
+    /// Remove the progress pip.
+    Clear,
+    /// Determinate progress, 0–100.
+    Set(u8),
+    /// Error state (red pip) — a crack happened.
+    Error,
+}
+
+pub fn osc_progress_sequence(p: OscProgress) -> String {
+    match p {
+        OscProgress::Clear => "\x1b]9;4;0;\x1b\\".into(),
+        OscProgress::Set(pct) => format!("\x1b]9;4;1;{}\x1b\\", pct.min(100)),
+        OscProgress::Error => "\x1b]9;4;2;\x1b\\".into(),
+    }
+}
+
+/// Terminals that render OSC 9;4 progress. Claude Code's allowlist minus
+/// Windows Terminal (its taskbar pulse distracts more than it informs —
+/// CC excludes it too). Unknown terminals get nothing: a wrong OSC prints
+/// garbage into the scrollback.
+pub fn osc_progress_capable(term_program: Option<&str>, term: Option<&str>) -> bool {
+    match term_program.unwrap_or("") {
+        "ghostty" | "WezTerm" | "iTerm.app" => return true,
+        _ => {}
+    }
+    let term = term.unwrap_or("");
+    term.contains("ghostty") || term.contains("wezterm")
+}
+
+/// Emit an OSC 9;4 progress state, gated on the terminal allowlist.
+pub fn osc_progress(p: OscProgress) {
+    static CAPABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let capable = *CAPABLE.get_or_init(|| {
+        osc_progress_capable(
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+        )
+    });
+    if capable {
+        write_osc(&osc_progress_sequence(p));
+    }
+}
+
+/// Strip control bytes so title text can never smuggle its own escape
+/// sequences into the terminal (`;` is legal in an OSC 0 payload).
+fn osc_text_clean(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string()
+}
+
+/// `ESC ] 0 ; title BEL` — icon name + window title, understood everywhere.
+pub fn title_sequence(title: &str) -> String {
+    format!("\x1b]0;{}\x07", osc_text_clean(title))
+}
+
+/// Set the terminal title (through the multiplexer wrapper).
+pub fn set_title(title: &str) {
+    write_osc(&title_sequence(title));
+}
+
+/// Clear the title on the way out — a dead `⚒ slag 3/9` outlives the
+/// process otherwise.
+pub fn clear_title() {
+    write_osc(&title_sequence(""));
+}
+
+/// DEC 2026 synchronized output: terminals that buffer a frame between
+/// BSU/ESU render it in one blit instead of flickering mid-draw. Never
+/// inside tmux/screen — the passthrough would sync the multiplexer's own
+/// redraw, not the inner pane's.
+pub fn sync_output_capable(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    mux: Multiplexer,
+) -> bool {
+    if mux != Multiplexer::None {
+        return false;
+    }
+    match term_program.unwrap_or("") {
+        "ghostty" | "WezTerm" | "iTerm.app" | "kitty" => return true,
+        _ => {}
+    }
+    let term = term.unwrap_or("");
+    ["kitty", "alacritty", "foot", "ghostty", "wezterm", "contour"]
+        .iter()
+        .any(|t| term.contains(t))
+}
+
+/// Memoized capability check for the dashboard draw loop.
+pub fn sync_updates_enabled() -> bool {
+    static YES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *YES.get_or_init(|| {
+        sync_output_capable(
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+            current_multiplexer(),
+        )
+    })
 }
 
 /// Paint `s` in `color` when color is on; plain text otherwise. String
@@ -711,6 +868,79 @@ mod tests {
             !idle_enough(Some(last), Instant::now(), NOTIFY_IDLE),
             "a just-pressed key must block notifications"
         );
+    }
+
+    /// tmux wins over screen: `$STY` survives inside tmux-in-screen, but
+    /// the innermost multiplexer is the tunnel that matters.
+    #[test]
+    fn detect_multiplexer_prefers_tmux_and_ignores_empty_vars() {
+        assert_eq!(detect_multiplexer(None, None), Multiplexer::None);
+        assert_eq!(detect_multiplexer(Some("/tmp/tmux-1"), None), Multiplexer::Tmux);
+        assert_eq!(detect_multiplexer(None, Some("1234.pts-0")), Multiplexer::Screen);
+        assert_eq!(detect_multiplexer(Some("/t"), Some("s")), Multiplexer::Tmux);
+        // Empty exports (`TMUX=`) mean "not inside one".
+        assert_eq!(detect_multiplexer(Some(""), Some("")), Multiplexer::None);
+    }
+
+    /// tmux passthrough doubles every inner ESC inside `ESC Ptmux; … ESC \`;
+    /// screen wraps raw; no multiplexer passes through untouched.
+    #[test]
+    fn wrap_for_multiplexer_builds_dcs_envelopes() {
+        let osc = "\x1b]0;slag\x07";
+        assert_eq!(wrap_for_multiplexer(osc, Multiplexer::None), osc);
+
+        let tmux = wrap_for_multiplexer(osc, Multiplexer::Tmux);
+        assert_eq!(tmux, "\x1bPtmux;\x1b\x1b]0;slag\x07\x1b\\");
+
+        let screen = wrap_for_multiplexer(osc, Multiplexer::Screen);
+        assert_eq!(screen, "\x1bP\x1b]0;slag\x07\x1b\\");
+    }
+
+    #[test]
+    fn osc_progress_sequence_covers_set_error_clear_and_clamps() {
+        assert_eq!(osc_progress_sequence(OscProgress::Clear), "\x1b]9;4;0;\x1b\\");
+        assert_eq!(osc_progress_sequence(OscProgress::Set(42)), "\x1b]9;4;1;42\x1b\\");
+        assert_eq!(osc_progress_sequence(OscProgress::Error), "\x1b]9;4;2;\x1b\\");
+        // A ratio rounding past 100 must not confuse the terminal.
+        assert_eq!(osc_progress_sequence(OscProgress::Set(200)), "\x1b]9;4;1;100\x1b\\");
+    }
+
+    /// The allowlist minus Windows Terminal: unknown terminals (including
+    /// WT, which sets no TERM_PROGRAM) get nothing.
+    #[test]
+    fn osc_progress_capable_follows_the_allowlist() {
+        for tp in ["ghostty", "WezTerm", "iTerm.app"] {
+            assert!(osc_progress_capable(Some(tp), None), "{tp}");
+        }
+        assert!(osc_progress_capable(None, Some("xterm-ghostty")));
+        assert!(!osc_progress_capable(Some("Apple_Terminal"), None));
+        assert!(!osc_progress_capable(None, Some("xterm-256color")));
+        assert!(!osc_progress_capable(None, None), "Windows Terminal / unknown");
+    }
+
+    /// Title text is data: control bytes must not survive into the OSC 0
+    /// payload, and the sequence must terminate with BEL.
+    #[test]
+    fn title_sequence_wraps_clean_text_in_osc_0() {
+        assert_eq!(title_sequence("⚒ slag 3/9 forging i4"), "\x1b]0;⚒ slag 3/9 forging i4\x07");
+        assert_eq!(title_sequence(""), "\x1b]0;\x07", "clear form");
+        let s = title_sequence("evil\x1b]2;x\x07title");
+        assert_eq!(s.matches('\x1b').count(), 1, "{s:?}");
+        assert_eq!(s.matches('\x07').count(), 1, "{s:?}");
+    }
+
+    /// DEC 2026 sync: allowlisted terminals only, and never through a
+    /// multiplexer — the envelope would sync tmux's redraw, not the pane's.
+    #[test]
+    fn sync_output_capable_gates_on_terminal_and_multiplexer() {
+        for tp in ["ghostty", "WezTerm", "iTerm.app", "kitty"] {
+            assert!(sync_output_capable(Some(tp), None, Multiplexer::None), "{tp}");
+        }
+        assert!(sync_output_capable(None, Some("alacritty"), Multiplexer::None));
+        assert!(sync_output_capable(None, Some("foot-extra"), Multiplexer::None));
+        assert!(!sync_output_capable(None, Some("xterm-256color"), Multiplexer::None));
+        assert!(!sync_output_capable(Some("ghostty"), None, Multiplexer::Tmux), "tmux excluded");
+        assert!(!sync_output_capable(Some("kitty"), None, Multiplexer::Screen), "screen excluded");
     }
 
     /// A Cyrillic or CJK commission used to slice mid-codepoint and abort

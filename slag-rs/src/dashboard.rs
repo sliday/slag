@@ -9,8 +9,9 @@
 //! The dashboard never owns the forge. Detaching (Esc/q) leaves the forge
 //! running headless; Ctrl-C sets the shared `CancelFlag` and detaches.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,9 +28,13 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use serde::{Deserialize, Serialize};
+
+use crate::config::CRUCIBLE;
+use crate::crucible::CrucibleCounts;
 use crate::engine::events::preview;
 use crate::engine::{CancelFlag, EngineEvent, SteerQueue, Usage};
-use crate::tui;
+use crate::{progress, tui};
 
 /// Rolling feed cap.
 const FEED_CAP: usize = 200;
@@ -254,6 +259,168 @@ pub(crate) fn has_stalled(state: &DashState, now: Instant) -> bool {
     })
 }
 
+/// Ingot lifecycle events are the only ones that move the terminal
+/// chrome (title + taskbar progress).
+fn is_ingot_event(ev: &EngineEvent) -> bool {
+    matches!(ev, EngineEvent::IngotStart { .. } | EngineEvent::IngotDone { .. })
+}
+
+fn is_crack(ev: &EngineEvent) -> bool {
+    matches!(ev, EngineEvent::IngotDone { ok: false, .. })
+}
+
+/// Dashboard rows folded back into crucible-shaped counts, plus the id of
+/// the most recently started ingot still forging (for the title). Total is
+/// only the rows this view has seen — `run` bumps it to the plan's true
+/// size so the title ratio never shrinks its denominator mid-run.
+pub(crate) fn dash_counts(state: &DashState) -> (CrucibleCounts, Option<String>) {
+    let mut counts = CrucibleCounts { total: state.ingots.len(), ..Default::default() };
+    let mut active = None;
+    for row in &state.ingots {
+        match row.status {
+            IngotStatus::Forged => counts.forged += 1,
+            IngotStatus::Cracked => counts.cracked += 1,
+            IngotStatus::Forging | IngotStatus::Duel(_) | IngotStatus::Verdict { .. } => {
+                counts.molten += 1;
+                if row.status == IngotStatus::Forging {
+                    active = Some(row.id.clone());
+                }
+            }
+        }
+    }
+    (counts, active)
+}
+
+// ------------------------------------------------------- session cost state
+//
+// Each invocation's Usage totals start at zero, so a resumed job used to
+// report only the last invocation's spend. The record in
+// `.slag/session-costs.json` (keyed by run id) carries whole-job spend
+// across resumes: `run` seeds its totals from it, and saves the cumulative
+// figure back on exit and on every crack.
+
+/// Where whole-job spend survives between invocations.
+pub const SESSION_COSTS: &str = ".slag/session-costs.json";
+
+/// One run's cumulative spend, JSON-shaped for `.slag/session-costs.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CostRecord {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub cost: Option<f64>,
+}
+
+impl CostRecord {
+    pub fn from_usage(u: &Usage) -> Self {
+        Self {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cost: u.cost,
+        }
+    }
+
+    pub fn to_usage(&self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            cost: self.cost,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total_tokens == 0 && self.cost.is_none()
+    }
+}
+
+/// FNV-1a — deterministic across runs and toolchains, unlike
+/// `DefaultHasher` (whose algorithm is not a stability guarantee).
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Stable run id for a plan: the crucible's `;; CRUCIBLE <timestamp>`
+/// header, hashed. The header survives every save — including re-smelt
+/// rewrites and splits, which change the ingot set — so one job keeps one
+/// id across resumes, and a freshly cast plan starts a fresh record.
+pub fn run_id_for_plan(plan: &str) -> String {
+    plan.lines()
+        .map(str::trim_start)
+        .find(|l| l.starts_with(";; CRUCIBLE"))
+        .map(|l| format!("{:016x}", fnv1a(l.trim_end())))
+        .unwrap_or_else(|| "default".into())
+}
+
+/// Run id for the crucible on disk RIGHT NOW. The dashboard spawns
+/// before surveyor/founder create PLAN.md on a fresh commission, so the
+/// id must be recomputed at every save — an id captured at start would
+/// be "default" and the whole first invocation's spend (surveyor +
+/// founder included) would be lost to resumes.
+fn current_run_id() -> String {
+    run_id_for_plan(&std::fs::read_to_string(CRUCIBLE).unwrap_or_default())
+}
+
+/// "default" (no `;; CRUCIBLE` header on disk) is not a job identity:
+/// spend saved under it would leak into every later job in the same
+/// directory, and seeding from it would display unrelated jobs' spend.
+fn persistable(run_id: &str) -> bool {
+    run_id != "default"
+}
+
+fn load_session_costs_at(path: &Path) -> BTreeMap<String, CostRecord> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Read one run's persisted spend from an explicit file (tests inject a
+/// scratch path; production goes through `load_session_cost`).
+pub fn load_session_cost_at(path: &Path, run_id: &str) -> Option<CostRecord> {
+    load_session_costs_at(path).remove(run_id)
+}
+
+/// Merge one run's record into the costs file, keeping other runs' rows.
+/// Replace, not add: the caller's record is already cumulative (its totals
+/// were seeded from this file), so adding would double-count.
+pub fn save_session_cost_at(
+    path: &Path,
+    run_id: &str,
+    record: &CostRecord,
+) -> io::Result<()> {
+    let mut map = load_session_costs_at(path);
+    map.insert(run_id.to_string(), record.clone());
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&map)?)
+}
+
+pub fn load_session_cost(run_id: &str) -> Option<CostRecord> {
+    load_session_cost_at(Path::new(SESSION_COSTS), run_id)
+}
+
+/// Best-effort persist: a failed write must never take the dashboard down.
+fn save_session_cost(run_id: &str, record: &CostRecord) {
+    if record.is_empty() || !persistable(run_id) {
+        return;
+    }
+    let _ = save_session_cost_at(Path::new(SESSION_COSTS), run_id, record);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyOutcome {
     Stay,
@@ -419,6 +586,10 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = crossterm::execute!(io::stderr(), LeaveAlternateScreen, crossterm::cursor::Show);
+    // Terminal chrome must not outlive the view: a stale `⚒ slag 3/9`
+    // title or taskbar pip after exit (or a panic — the hook lands here
+    // too) reads as a forge that never finished.
+    progress::clear_forge_state();
 }
 
 /// Panic hook that leaves the alternate screen before the default hook
@@ -486,8 +657,28 @@ pub async fn run(
     let stop = Arc::new(AtomicBool::new(false));
     let mut keys = spawn_key_reader(stop.clone());
 
-    let result = event_loop(&mut terminal, &mut rx, &mut keys, &steer, &cancel).await;
+    // Whole-job cost state: seed this invocation's totals from the
+    // persisted record so a resumed run's Σ (and the record it saves
+    // back) covers the whole job, not just this invocation. The run id
+    // is recomputed at every save: on a fresh commission the crucible
+    // does not exist yet at this point, and its header (and so the id)
+    // only appears once the founder writes PLAN.md.
+    let plan = std::fs::read_to_string(CRUCIBLE).unwrap_or_default();
+    let run_id = run_id_for_plan(&plan);
+    let plan_total =
+        plan.lines().filter(|l| l.trim_start().starts_with("(ingot ")).count();
+    let mut state = DashState::default();
+    if persistable(&run_id) {
+        if let Some(prior) = load_session_cost(&run_id) {
+            state.totals = prior.to_usage();
+        }
+    }
 
+    let result =
+        event_loop(&mut terminal, &mut state, plan_total, &mut rx, &mut keys, &steer, &cancel)
+            .await;
+
+    save_session_cost(&current_run_id(), &CostRecord::from_usage(&state.totals));
     stop.store(true, Ordering::Relaxed);
     restore_terminal();
     tui::set_quiet(false);
@@ -495,14 +686,16 @@ pub async fn run(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    state: &mut DashState,
+    plan_total: usize,
     rx: &mut UnboundedReceiver<EngineEvent>,
     keys: &mut UnboundedReceiver<Event>,
     steer: &SteerQueue,
     cancel: &CancelFlag,
 ) -> io::Result<()> {
-    let mut state = DashState::default();
     let mut interval = tokio::time::interval(FRAME);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -513,10 +706,27 @@ async fn event_loop(
             ev = rx.recv(), if !engine_done => {
                 match ev {
                     Some(ev) => {
-                        apply_event(&mut state, ev);
+                        let mut ingot_ev = is_ingot_event(&ev);
+                        let mut cracked = is_crack(&ev);
+                        apply_event(state, ev);
                         // Coalesce bursts into one redraw.
                         while let Ok(ev) = rx.try_recv() {
-                            apply_event(&mut state, ev);
+                            ingot_ev |= is_ingot_event(&ev);
+                            cracked |= is_crack(&ev);
+                            apply_event(state, ev);
+                        }
+                        if ingot_ev {
+                            // Live forge state → terminal title + taskbar
+                            // pip. The plan's true size keeps the ratio's
+                            // denominator from growing as rows appear.
+                            let (mut counts, active) = dash_counts(state);
+                            counts.total = counts.total.max(plan_total);
+                            progress::report_forge_state(&counts, active.as_deref());
+                        }
+                        if cracked {
+                            // A crack may precede an ugly exit: flush the
+                            // whole-job spend now, not just at detach.
+                            save_session_cost(&current_run_id(), &CostRecord::from_usage(&state.totals));
                         }
                         dirty = true;
                     }
@@ -532,7 +742,7 @@ async fn event_loop(
             }
             key = keys.recv() => {
                 match key {
-                    Some(Event::Key(k)) => match handle_key(&mut state, k, steer, cancel) {
+                    Some(Event::Key(k)) => match handle_key(state, k, steer, cancel) {
                         KeyOutcome::Stay => dirty = true,
                         KeyOutcome::Detach | KeyOutcome::Cancel => return Ok(()),
                     },
@@ -553,11 +763,30 @@ async fn event_loop(
                 }
                 // Same for the bottom-bar spinner status: its elapsed
                 // seconds tick with no event arriving.
-                if forge_status(&state, Instant::now()).is_some() {
+                if forge_status(state, Instant::now()).is_some() {
                     dirty = true;
                 }
                 if dirty {
-                    terminal.draw(|f| draw(f, &state))?;
+                    // DEC 2026 synchronized output: capable terminals
+                    // buffer the frame between BSU/ESU and blit it whole
+                    // — no half-drawn panes on slow links. ESU always
+                    // follows BSU, even when the draw errors, so the
+                    // terminal never sticks in sync mode.
+                    let sync = tui::sync_updates_enabled();
+                    if sync {
+                        let _ = crossterm::execute!(
+                            io::stderr(),
+                            crossterm::terminal::BeginSynchronizedUpdate
+                        );
+                    }
+                    let drawn = terminal.draw(|f| draw(f, state));
+                    if sync {
+                        let _ = crossterm::execute!(
+                            io::stderr(),
+                            crossterm::terminal::EndSynchronizedUpdate
+                        );
+                    }
+                    drawn?;
                     dirty = false;
                 }
             }
@@ -885,6 +1114,125 @@ mod tests {
             let mapped = palette(color);
             assert_ne!(mapped, Color::Reset, "{color:?} fell through to Reset");
         }
+    }
+
+    /// Rows fold back into crucible-shaped counts; the newest still-forging
+    /// row is the "forging iN" the title names.
+    #[test]
+    fn dash_counts_folds_rows_and_names_the_active_ingot() {
+        let mut state = DashState::default();
+        for (id, ev) in [
+            ("i1", EngineEvent::IngotStart { id: "i1".into(), work: "w".into() }),
+            ("i2", EngineEvent::IngotStart { id: "i2".into(), work: "w".into() }),
+            ("i3", EngineEvent::IngotStart { id: "i3".into(), work: "w".into() }),
+        ] {
+            let _ = id;
+            apply_event(&mut state, ev);
+        }
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i1".into(), ok: true });
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i2".into(), ok: false });
+
+        let (counts, active) = dash_counts(&state);
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.forged, 1);
+        assert_eq!(counts.cracked, 1);
+        assert_eq!(counts.molten, 1);
+        assert_eq!(active.as_deref(), Some("i3"));
+
+        // A duel row counts as molten but is not "forging" for the title.
+        apply_event(&mut state, EngineEvent::DuelRound { id: "i3".into(), round: 1 });
+        let (counts, active) = dash_counts(&state);
+        assert_eq!(counts.molten, 1);
+        assert_eq!(active, None);
+    }
+
+    /// One job = one `;; CRUCIBLE <timestamp>` header. Re-smelt splits
+    /// change the ingot set but keep the header, so the id survives them;
+    /// a freshly cast plan (new timestamp) starts a fresh record.
+    #[test]
+    fn run_id_hangs_off_the_crucible_header_not_the_ingots() {
+        let plan_a = ";; CRUCIBLE 2026-08-18 10:00\n(ingot :id \"i1\" ...)\n";
+        let split = ";; CRUCIBLE 2026-08-18 10:00\n(ingot :id \"i1a\" ...)\n(ingot :id \"i1b\" ...)\n";
+        let plan_b = ";; CRUCIBLE 2026-08-19 09:00\n(ingot :id \"i1\" ...)\n";
+
+        assert_eq!(run_id_for_plan(plan_a), run_id_for_plan(split), "split keeps the id");
+        assert_ne!(run_id_for_plan(plan_a), run_id_for_plan(plan_b), "new plan, new id");
+        assert_eq!(run_id_for_plan("no header here"), "default");
+        assert_eq!(run_id_for_plan(plan_a).len(), 16, "16 hex chars");
+    }
+
+    /// "default" is the no-crucible placeholder, not a job: persisting
+    /// under it would misattribute a fresh commission's early spend to
+    /// every later job in the directory, and seeding from it would show
+    /// prior unrelated jobs' totals. The save path recomputes the id at
+    /// save time instead, when PLAN.md (and its header) exists.
+    #[test]
+    fn default_run_id_is_never_a_persistence_key() {
+        assert!(!persistable("default"));
+        assert!(persistable(&run_id_for_plan(";; CRUCIBLE 2026-08-18 10:00\n")));
+    }
+
+    /// Save → load round-trips through `.slag/session-costs.json`; a second
+    /// run id coexists, and re-saving a run replaces its record (the
+    /// caller's totals are already cumulative — adding would double-count).
+    #[test]
+    fn session_costs_round_trip_and_replace_per_run() {
+        let dir = std::env::temp_dir()
+            .join(format!("slag-costs-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let path = dir.join("session-costs.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(load_session_cost_at(&path, "r1"), None, "missing file reads empty");
+
+        let first = CostRecord { total_tokens: 4100, cost: Some(0.31), ..Default::default() };
+        save_session_cost_at(&path, "r1", &first).unwrap();
+        let other = CostRecord { total_tokens: 7, cost: None, ..Default::default() };
+        save_session_cost_at(&path, "r2", &other).unwrap();
+
+        assert_eq!(load_session_cost_at(&path, "r1"), Some(first));
+        assert_eq!(load_session_cost_at(&path, "r2"), Some(other.clone()));
+
+        // Resume: cumulative record replaces, other runs stay untouched.
+        let resumed = CostRecord {
+            total_tokens: 9000,
+            cost: Some(0.55),
+            prompt_tokens: 6000,
+            completion_tokens: 3000,
+        };
+        save_session_cost_at(&path, "r1", &resumed).unwrap();
+        assert_eq!(load_session_cost_at(&path, "r1"), Some(resumed));
+        assert_eq!(load_session_cost_at(&path, "r2"), Some(other));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Usage ↔ record conversion is lossless — the resumed dashboard's Σ
+    /// must equal what the previous invocation persisted.
+    #[test]
+    fn cost_record_round_trips_usage() {
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 42,
+            total_tokens: 142,
+            cost: Some(0.05),
+        };
+        let rec = CostRecord::from_usage(&usage);
+        let back = rec.to_usage();
+        assert_eq!(back.prompt_tokens, 100);
+        assert_eq!(back.completion_tokens, 42);
+        assert_eq!(back.total_tokens, 142);
+        assert_eq!(back.cost, Some(0.05));
+
+        assert!(CostRecord::default().is_empty(), "zero spend is not worth a file");
+        assert!(!rec.is_empty());
+    }
+
+    #[test]
+    fn crack_events_are_the_flush_trigger() {
+        assert!(is_crack(&EngineEvent::IngotDone { id: "i1".into(), ok: false }));
+        assert!(!is_crack(&EngineEvent::IngotDone { id: "i1".into(), ok: true }));
+        assert!(is_ingot_event(&EngineEvent::IngotStart { id: "i1".into(), work: "w".into() }));
+        assert!(!is_ingot_event(&EngineEvent::TurnStart { turn: 1 }));
     }
 
     #[test]

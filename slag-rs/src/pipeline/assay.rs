@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::config::CRUCIBLE;
 use crate::crucible::Crucible;
+use crate::engine::stats;
 use crate::error::SlagError;
 use crate::sexp::Status;
 use crate::tui;
@@ -36,6 +37,18 @@ pub fn show() -> Result<(), SlagError> {
     println!();
 
     tui::temper_bar(&counts);
+
+    // Items 87 + 89: where the time went, and which tools thrashed.
+    // `wall 4m12s · api 2m01s (retries +18s) · tools 1m40s` diagnoses
+    // whether slowness was the model, retry storms, or proofs; the error
+    // tally surfaces a flailing edit ladder directly.
+    let run = stats::snapshot();
+    if let Some(line) = stats::durations_line(&run) {
+        println!("\n  {}{}{}", super::fg(tui::COLD), line, super::reset());
+    }
+    if let Some(line) = stats::tool_errors_line(&run) {
+        println!("  {}{}{}", super::fg(tui::WARM), line, super::reset());
+    }
 
     if counts.cracked > 0 {
         println!("\n  {}Cracked:{}", super::fg(tui::WARM), super::reset());

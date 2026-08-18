@@ -2,6 +2,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crate::config::LEDGER;
+use crate::crucible::CrucibleCounts;
 use crate::sexp::Ingot;
 use crate::tui;
 
@@ -80,6 +81,51 @@ impl LiveStatus {
     pub fn line_at(&self, now: Instant) -> String {
         spinner_status(self.verb, now.saturating_duration_since(self.started), self.tokens)
     }
+}
+
+// ─── terminal chrome: title + OSC 9;4 taskbar progress ──────────────────
+//
+// Forge state, visible from another window: the tab title carries the
+// live ratio and active ingot, OSC 9;4 puts the same ratio on the
+// taskbar (error-red once anything cracks). Emission funnels through
+// `tui::write_osc`, so tmux/screen passthrough is handled in one place;
+// `dashboard::restore_terminal` clears both on every exit path.
+
+/// `⚒ slag 3/9 forging i4` — the tab title while the forge runs.
+pub fn forge_title(counts: &CrucibleCounts, active: Option<&str>) -> String {
+    let mut t = format!("⚒ slag {}/{}", counts.forged, counts.total);
+    if let Some(id) = active {
+        t.push_str(&format!(" forging {id}"));
+    }
+    if counts.cracked > 0 {
+        t.push_str(&format!(" · {} cracked", counts.cracked));
+    }
+    t
+}
+
+/// OSC 9;4 state for the current counts: error pip once anything cracked
+/// (a red taskbar is the fastest "come look" there is), ratio otherwise.
+pub fn progress_state(counts: &CrucibleCounts) -> tui::OscProgress {
+    if counts.cracked > 0 {
+        tui::OscProgress::Error
+    } else {
+        tui::OscProgress::Set(counts.pct_forged())
+    }
+}
+
+/// Push live forge state to the terminal chrome. Call on IngotStart and
+/// after each IngotDone; both emissions gate themselves on a real
+/// terminal (and the progress pip on its allowlist).
+pub fn report_forge_state(counts: &CrucibleCounts, active: Option<&str>) {
+    tui::set_title(&forge_title(counts, active));
+    tui::osc_progress(progress_state(counts));
+}
+
+/// Clear title and progress pip — a dead `⚒ slag 3/9` outlives the
+/// process otherwise.
+pub fn clear_forge_state() {
+    tui::osc_progress(tui::OscProgress::Clear);
+    tui::clear_title();
 }
 
 /// Structured progress entry for PROGRESS.md
@@ -219,6 +265,32 @@ mod tests {
         let next = LiveStatus::start(1);
         assert_eq!(next.tokens(), 0);
         assert!(next.line_at(next.started).starts_with("⚒ Smelting…"));
+    }
+
+    fn counts(total: usize, forged: usize, cracked: usize) -> CrucibleCounts {
+        CrucibleCounts { total, forged, cracked, ..Default::default() }
+    }
+
+    /// The title reads like the evidence line: `⚒ slag 3/9 forging i4`.
+    #[test]
+    fn forge_title_carries_ratio_active_ingot_and_cracks() {
+        assert_eq!(forge_title(&counts(9, 3, 0), Some("i4")), "⚒ slag 3/9 forging i4");
+        assert_eq!(forge_title(&counts(9, 9, 0), None), "⚒ slag 9/9");
+        assert_eq!(
+            forge_title(&counts(9, 6, 2), Some("i8")),
+            "⚒ slag 6/9 forging i8 · 2 cracked"
+        );
+    }
+
+    /// One crack flips the taskbar pip to error; otherwise it tracks the
+    /// forged ratio.
+    #[test]
+    fn progress_state_is_error_on_crack_and_ratio_otherwise() {
+        assert_eq!(progress_state(&counts(10, 4, 0)), tui::OscProgress::Set(40));
+        assert_eq!(progress_state(&counts(10, 10, 0)), tui::OscProgress::Set(100));
+        assert_eq!(progress_state(&counts(10, 4, 1)), tui::OscProgress::Error);
+        // Empty crucible: 0%, not a divide-by-zero.
+        assert_eq!(progress_state(&counts(0, 0, 0)), tui::OscProgress::Set(0));
     }
 
     #[test]

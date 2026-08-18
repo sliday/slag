@@ -6,6 +6,7 @@ mod dashboard;
 mod engine;
 mod error;
 mod flux;
+mod migrations;
 mod pipeline;
 mod progress;
 mod proof;
@@ -61,10 +62,19 @@ async fn main() {
         std::env::set_var("SLAG_DUEL", "on");
     }
 
+    // Idempotent fixups (deprecated model slugs, old crucible headers)
+    // run before any command touches those files.
+    migrations::run();
+
     // `status`, `update` and `key` inspect or repair a broken setup, so
     // none of them may demand the very key the user came here to fix.
     let result = match cli.command {
-        Some(Command::Status) => show_status(),
+        Some(Command::Status { json: true }) => {
+            cli::status_json().map(|line| println!("{line}"))
+        }
+        Some(Command::Status { json: false }) => show_status(),
+        Some(Command::Runs) => cli::show_runs(),
+        Some(Command::Ps) => cli::show_ps(),
         Some(Command::Update) => update::self_update().await,
         Some(Command::Key { key }) => run_key(key).await,
         Some(Command::Resume) => forge(None, cli.anvils, cli.tui).await,
@@ -76,8 +86,38 @@ async fn main() {
 
     if let Err(e) = result {
         eprintln!("\n  {}✗{} {e}\n", fg(tui::WARM), reset());
+        resume_hint();
         std::process::exit(1);
     }
+}
+
+/// After an interrupted exit (dashboard Ctrl-C, provider failure, budget
+/// stop) with work still in the crucible, tell the operator the run is
+/// resumable. Printed on the error path only, after the ratatui teardown,
+/// so it lands on the real terminal where copy-paste works.
+fn resume_hint() {
+    let path = Path::new(config::CRUCIBLE);
+    if !path.exists() {
+        return;
+    }
+    let Ok(crucible) = crucible::Crucible::load(path) else {
+        return;
+    };
+    let counts = crucible.counts();
+    if counts.ore + counts.molten == 0 {
+        return;
+    }
+    let molten = if counts.molten > 0 {
+        format!(", {} molten (reset to ore on resume)", counts.molten)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "  {} ore{molten} remaining — resume with: {}slag resume{}\n",
+        counts.ore,
+        fg(tui::HOT),
+        reset()
+    );
 }
 
 /// Resolve the key (onboarding on first run) and forge. The key gate
@@ -88,11 +128,38 @@ async fn forge(
     anvils: usize,
     tui_flag: bool,
 ) -> Result<(), error::SlagError> {
+    // Two forges rewriting one crucible corrupt each other; refuse the
+    // second before any project file is touched. Dead pids were already
+    // pruned by the liveness check, so only a genuinely live forge blocks.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Some(dir) = cli::sessions_dir() {
+        if let Some(other) = cli::conflict_in(&dir, &cwd) {
+            return Err(error::SlagError::Config(format!(
+                "another forge (pid {}, started {}) is already lit on this crucible \
+                 directory — wait for it, or kill it and rerun",
+                other.pid, other.started_at
+            )));
+        }
+    }
+
     let config = EngineConfig::resolve().await?;
     // Only a forge writes logs. `slag key` run from $HOME should not leave
     // an empty ~/logs behind.
     let _ = std::fs::create_dir_all(config::LOG_DIR);
-    run_pipeline(commission, &config, anvils, tui_flag).await
+
+    // Register in the PID registry so `slag ps` sees this forge; the
+    // entry is removed on clean exit, and a crashed forge's stale entry
+    // is pruned by the next liveness check.
+    let run_id = format!("run-{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+    let session = cli::sessions_dir()
+        .and_then(|dir| cli::register_session_in(&dir, &run_id, "forge"));
+
+    let result = run_pipeline(commission, &config, anvils, tui_flag).await;
+
+    if let Some(path) = session {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 /// `slag key [KEY]` — the whole configuration surface. With a key it

@@ -11,14 +11,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::task::JoinHandle;
 
 use super::compact::{compact, convo_chars, summarize};
 use super::events::preview;
 use super::tools::ToolBox;
+use super::transcript::{self, TranscriptWriter};
 use super::{
-    emit, CancelFlag, ChatMessage, ChatRequest, Effort, EngineEvent, EventTx, FinishReason,
+    emit, stats, CancelFlag, ChatMessage, ChatRequest, Effort, EngineEvent, EventTx, FinishReason,
     NormalizedResponse, Provider, SteerQueue, ToolCall, ToolOutcome, Usage,
 };
 use crate::error::SlagError;
@@ -248,6 +250,16 @@ pub struct ForgeAgent {
     events: Option<EventTx>,
     steer: Option<SteerQueue>,
     cancel: Option<CancelFlag>,
+    /// Root the transcript journal resolves under (default: the run's
+    /// working directory, where `logs/` lives). Tests point it at a
+    /// tempdir.
+    transcript_root: std::path::PathBuf,
+    /// Only the explicit crash-resume path (forge scheduler →
+    /// `resume_session`) may replay an open transcript. A fresh strike
+    /// always begins fresh: a stale open transcript from a previous job
+    /// at the same (ingot, heat) must never hijack a new heat's
+    /// conversation.
+    resume: bool,
 }
 
 impl ForgeAgent {
@@ -265,7 +277,22 @@ impl ForgeAgent {
             events: None,
             steer: None,
             cancel: None,
+            transcript_root: std::path::PathBuf::from("."),
+            resume: false,
         }
+    }
+
+    /// Opt in to replaying an open transcript at this (ingot, heat).
+    /// Only the crash-resume path sets this; everything else begins fresh.
+    pub fn with_resume(mut self, resume: bool) -> Self {
+        self.resume = resume;
+        self
+    }
+
+    /// Override where `logs/transcripts/` resolves (tests).
+    pub fn with_transcript_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.transcript_root = root.into();
+        self
     }
 
     #[cfg(test)]
@@ -332,10 +359,18 @@ impl ForgeAgent {
 
     /// Run the loop to completion. Returns the final summary text.
     pub async fn run(&self, system: String, task: String) -> Result<String, SlagError> {
+        // Item 67: inside a forge attempt (`transcript::scope`), every
+        // message is journaled to logs/transcripts/<ingot>-h<heat>.jsonl.
+        // The `end` entry closes the transcript on any exit; only a
+        // process death leaves it open — and resumable.
+        let tw = TranscriptWriter::for_current(&self.transcript_root);
         // Steers drained into the conversation die with it if the provider
         // errors: re-queue them so the ingot's next heat re-delivers them.
         let mut applied_steers: Vec<String> = Vec::new();
-        let result = self.run_inner(system, task, &mut applied_steers).await;
+        let result = self.run_inner(system, task, &mut applied_steers, tw.as_ref()).await;
+        if let Some(w) = &tw {
+            w.end(result.is_ok());
+        }
         if result.is_err() {
             self.requeue_steers(&applied_steers);
         }
@@ -347,8 +382,41 @@ impl ForgeAgent {
         system: String,
         task: String,
         applied_steers: &mut Vec<String>,
+        tw: Option<&TranscriptWriter>,
     ) -> Result<String, SlagError> {
-        let mut messages = vec![ChatMessage::system(system), ChatMessage::user(task)];
+        // Resume-or-begin: on the explicit crash-resume path an open
+        // transcript at this same (ingot, heat) replays its recorded
+        // conversation and the loop continues where it died; otherwise the
+        // attempt starts fresh and records from the top (begin truncates
+        // any stale transcript a dead prior job left behind). A resumed
+        // session gets a fresh turn budget — the recorded context is what
+        // matters.
+        let recorded = if self.resume {
+            tw.and_then(|w| transcript::resumable_messages(w.path()))
+        } else {
+            None
+        };
+        let mut messages = match recorded {
+            Some(recorded) => {
+                emit(
+                    &self.events,
+                    EngineEvent::Warning {
+                        message: format!(
+                            "resumed transcript ({} messages) — continuing the interrupted session",
+                            recorded.len()
+                        ),
+                    },
+                );
+                recorded
+            }
+            None => {
+                let fresh = vec![ChatMessage::system(system), ChatMessage::user(task)];
+                if let Some(w) = tw {
+                    w.begin(&fresh);
+                }
+                fresh
+            }
+        };
         let mut token_budget = self.token_budget;
         let mut anchor: Option<TokenAnchor> = None;
         let mut budget_warned = false;
@@ -360,13 +428,21 @@ impl ForgeAgent {
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
+            let steered = applied_steers.len();
             self.apply_steers(&mut messages, applied_steers);
-            compact_to_tokens(&mut messages, token_budget, &mut anchor);
+            if applied_steers.len() > steered {
+                // Steers rewrite an existing tool result in place: the
+                // append-only journal can only stay true via a redump.
+                record_rewrite(tw, &messages);
+            }
+            if compact_to_tokens(&mut messages, token_budget, &mut anchor) {
+                record_rewrite(tw, &messages);
+            }
             emit(&self.events, EngineEvent::TurnStart { turn });
             emit(&self.events, EngineEvent::ModelCall { model: self.model.clone() });
 
             let resp = match self
-                .chat_shrinking(&mut messages, true, &mut token_budget, &mut anchor, &mut out_tokens)
+                .chat_shrinking(&mut messages, true, &mut token_budget, &mut anchor, &mut out_tokens, tw)
                 .await
             {
                 Ok(resp) => resp,
@@ -413,6 +489,8 @@ impl ForgeAgent {
                         nudges += 1;
                         messages.push(ChatMessage::assistant(resp.content, None));
                         messages.push(ChatMessage::user(CONTINUE_NUDGE));
+                        record_msg(tw, &messages[messages.len() - 2]);
+                        record_msg(tw, &messages[messages.len() - 1]);
                         continue;
                     }
                     let e = SlagError::SmithFailed(format!(
@@ -467,6 +545,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                 ChatMessage::assistant(resp.content.clone(), Some(calls.clone()))
                     .with_reasoning_details(resp.reasoning_details.clone()),
             );
+            record_msg(tw, messages.last().unwrap());
 
             let outcomes = self.dispatch_batch(&calls).await;
 
@@ -480,6 +559,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     outcome.output.clone()
                 };
                 messages.push(ChatMessage::tool_result(&call.id, content));
+                record_msg(tw, messages.last().unwrap());
                 if call.name == "finish" && !outcome.is_error && finish_summary.is_none() {
                     finish_summary = Some(outcome.output.clone());
                 }
@@ -500,7 +580,11 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
 
             // Drain again right after tool execution: a steer typed during
             // a long bash lands before the next model call.
+            let steered = applied_steers.len();
             self.apply_steers(&mut messages, applied_steers);
+            if applied_steers.len() > steered {
+                record_rewrite(tw, &messages);
+            }
         }
 
         // Turn budget exhausted: one final no-tools call for a summary.
@@ -510,9 +594,12 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         messages.push(ChatMessage::user(
             "no more tool budget — summarize what was done",
         ));
-        compact_to_tokens(&mut messages, token_budget, &mut anchor);
+        record_msg(tw, messages.last().unwrap());
+        if compact_to_tokens(&mut messages, token_budget, &mut anchor) {
+            record_rewrite(tw, &messages);
+        }
         let resp = match self
-            .chat_shrinking(&mut messages, false, &mut token_budget, &mut anchor, &mut out_tokens)
+            .chat_shrinking(&mut messages, false, &mut token_budget, &mut anchor, &mut out_tokens, tw)
             .await
         {
             Ok(resp) => resp,
@@ -565,16 +652,24 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         token_budget: &mut usize,
         anchor: &mut Option<TokenAnchor>,
         out_tokens: &mut Option<u32>,
+        tw: Option<&TranscriptWriter>,
     ) -> Result<NormalizedResponse, SlagError> {
         let mut shrink_cycles = 0usize;
         let mut output_shrunk = false;
         let mut summarized = false;
+        let mut attempts = 0usize;
         loop {
-            match self
+            // Item 87: each provider.chat() is timed; attempts past the
+            // first are retry overhead (overflow shrink/summarize
+            // re-sends), split out in the assay durations line.
+            attempts += 1;
+            let started = Instant::now();
+            let outcome = self
                 .provider
                 .chat(self.request(messages.clone(), with_tools, *out_tokens))
-                .await
-            {
+                .await;
+            stats::record_api(started.elapsed(), attempts > 1);
+            match outcome {
                 Ok(resp) => return Ok(resp),
                 Err(e) if is_context_overflow(&e) => {
                     // Output-only overflow: shrink max_tokens once before
@@ -608,6 +703,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     let can_prune = *token_budget > TOKEN_BUDGET_FLOOR;
                     *token_budget = (*token_budget / 2).max(TOKEN_BUDGET_FLOOR);
                     if can_prune && compact_to_tokens(messages, *token_budget, anchor) {
+                        record_rewrite(tw, messages);
                         emit(
                             &self.events,
                             EngineEvent::Error {
@@ -637,6 +733,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     match summarize(&tracked, &self.model, messages, &snapshots).await {
                         Ok(true) => {
                             *anchor = None;
+                            record_rewrite(tw, messages);
                             emit(
                                 &self.events,
                                 EngineEvent::Error {
@@ -712,6 +809,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
     /// Execute a tool batch in reader/writer segments, preserving model
     /// order in the returned outcomes.
     async fn dispatch_batch(&self, calls: &[ToolCall]) -> Vec<ToolOutcome> {
+        let batch_started = Instant::now();
         let mut outcomes: Vec<Option<ToolOutcome>> = calls.iter().map(|_| None).collect();
 
         for segment in plan_segments(calls) {
@@ -754,9 +852,15 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                         preview: preview(&outcome.output, PREVIEW_LEN),
                     },
                 );
+                // Item 89: failed tool calls tally per tool with a coarse
+                // error class for the assay report.
+                if outcome.is_error {
+                    stats::record_tool_error(&calls[i].name, &outcome.output);
+                }
                 outcomes[i] = Some(outcome);
             }
         }
+        stats::record_tools(batch_started.elapsed());
 
         let skipped = if self.is_cancelled() {
             "cancelled: interrupted before this tool ran"
@@ -775,9 +879,28 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
     }
 
     fn spawn_call(&self, call: &ToolCall) -> JoinHandle<ToolOutcome> {
-        let toolbox = self.toolbox.clone();
+        // Task-locals do not cross tokio::spawn: capture the attempt
+        // context here (the agent's task) and bind it onto the dispatched
+        // toolbox so write/edit checkpointing (item 68) still knows which
+        // attempt it belongs to.
+        let toolbox = self.toolbox.clone().with_attempt(transcript::current());
         let call = call.clone();
         tokio::spawn(async move { toolbox.dispatch(&call).await })
+    }
+}
+
+/// Journal one appended message (no-op outside a forge attempt).
+fn record_msg(tw: Option<&TranscriptWriter>, msg: &ChatMessage) {
+    if let Some(w) = tw {
+        w.record(msg);
+    }
+}
+
+/// Journal a wholesale history rewrite (compaction, summarization, steer
+/// injection): boundary + redump, so resume loads only the live view.
+fn record_rewrite(tw: Option<&TranscriptWriter>, messages: &[ChatMessage]) {
+    if let Some(w) = tw {
+        w.boundary_and_redump(messages);
     }
 }
 
@@ -2142,5 +2265,118 @@ mod tests {
         // No tokens, no spend: the accumulator ignores zero estimates.
         let idle = Usage { total_tokens: 0, cost: None, ..Default::default() };
         assert_eq!(estimated_cost_at(&idle, 5.0), 0.0);
+    }
+
+    // ─── Transcripts (item 67) ───
+
+    /// Inside a forge attempt scope the whole session journals to
+    /// logs/transcripts/<ingot>-h<heat>.jsonl, closed by an `end` entry.
+    #[tokio::test]
+    async fn scoped_session_journals_messages_and_closes_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("c1", "read_file", serde_json::json!({"path": "a.txt"}))]),
+            resp_text("done", FinishReason::Stop),
+        ]);
+        let a = agent(provider, dir.path()).with_transcript_root(dir.path());
+
+        transcript::scope("i1".into(), 2, a.run("system".into(), "task".into()))
+            .await
+            .expect("run ok");
+
+        let path = transcript::path_for(dir.path(), "i1", 2);
+        let raw = std::fs::read_to_string(&path).expect("transcript written");
+        // system, task, assistant tool_calls, tool result, and the end.
+        assert_eq!(raw.lines().count(), 5, "{raw}");
+        assert!(raw.contains("\"entry\":\"end\""), "{raw}");
+        assert!(raw.contains("\"tool_call_id\":\"c1\""), "{raw}");
+        // Closed transcripts never resume.
+        assert!(!transcript::is_resumable(dir.path(), "i1", 2));
+    }
+
+    /// A crashed session's open transcript resumes: the next run at the
+    /// same (ingot, heat) replays the recorded history instead of
+    /// starting over from system + task.
+    #[tokio::test]
+    async fn open_transcript_resumes_the_recorded_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate the crash artifact: an open transcript with real
+        // progress (a tool round) and no end entry.
+        let w = transcript::TranscriptWriter::new(transcript::path_for(dir.path(), "i1", 3));
+        let call = tc("c1", "bash", serde_json::json!({"command": "cargo test"}));
+        w.begin(&[ChatMessage::system("original system"), ChatMessage::user("original task")]);
+        w.record(&ChatMessage::assistant("running tests", Some(vec![call])));
+        w.record(&ChatMessage::tool_result("c1", "212 passed"));
+
+        let provider = MockProvider::new(vec![resp_text("finished the ingot", FinishReason::Stop)]);
+        let a = agent(provider.clone(), dir.path())
+            .with_transcript_root(dir.path())
+            .with_resume(true);
+        let result = transcript::scope(
+            "i1".into(),
+            3,
+            a.run("fresh system (ignored)".into(), "fresh task (ignored)".into()),
+        )
+        .await
+        .expect("resumed run ok");
+        assert_eq!(result, "finished the ingot");
+
+        // The one model call carried the recorded history, not the fresh
+        // system/task pair.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let msgs = &requests[0].messages;
+        assert_eq!(msgs[0].content, "original system");
+        assert_eq!(msgs[1].content, "original task");
+        assert!(msgs.iter().any(|m| m.content == "212 passed"));
+        assert!(msgs.iter().all(|m| !m.content.contains("fresh system")));
+
+        // The resumed session closed the transcript: no double resume.
+        assert!(!transcript::is_resumable(dir.path(), "i1", 3));
+    }
+
+    /// Without the explicit resume opt-in, a stale open transcript from a
+    /// previous job at the same (ingot, heat) must NOT hijack a fresh
+    /// heat: the new session begins from its own system+task and the
+    /// stale file is truncated.
+    #[tokio::test]
+    async fn fresh_strike_ignores_a_stale_open_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        // Stale artifact from a killed prior job: open, with progress.
+        let path = transcript::path_for(dir.path(), "i1", 1);
+        let w = transcript::TranscriptWriter::new(path.clone());
+        w.begin(&[ChatMessage::system("old job system"), ChatMessage::user("old job task")]);
+        w.record(&ChatMessage::assistant("old job progress", None));
+        assert!(transcript::is_resumable(dir.path(), "i1", 1));
+
+        let provider = MockProvider::new(vec![resp_text("done", FinishReason::Stop)]);
+        let a = agent(provider.clone(), dir.path()).with_transcript_root(dir.path());
+        transcript::scope("i1".into(), 1, a.run("new system".into(), "new task".into()))
+            .await
+            .expect("fresh run ok");
+
+        // The model saw the new job's conversation, not the stale one.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].messages[0].content, "new system");
+        assert!(requests[0].messages.iter().all(|m| !m.content.contains("old job")));
+
+        // And the stale content is gone from the journal.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("old job"), "{raw}");
+    }
+
+    /// Outside a scope (plan passes, duel casts, tests) nothing journals.
+    #[tokio::test]
+    async fn unscoped_sessions_write_no_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![resp_text("done", FinishReason::Stop)]);
+        agent(provider, dir.path())
+            .with_transcript_root(dir.path())
+            .run("system".into(), "task".into())
+            .await
+            .expect("run ok");
+        assert!(!dir.path().join(transcript::TRANSCRIPT_DIR).exists());
     }
 }

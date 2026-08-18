@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod worktree;
 
 // The parallel anvil logic is integrated directly into pipeline/forge.rs

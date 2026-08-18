@@ -82,6 +82,11 @@ pub struct ToolBox {
     read_state: Arc<Mutex<HashMap<PathBuf, FileState>>>,
     /// Session-wide touch counter feeding `FileState::seq`.
     touch_seq: Arc<AtomicU64>,
+    /// Attempt checkpoint recorder (item 68): when set, write_file and
+    /// edit_file back up each file's pre-modification bytes so a failed
+    /// heat can rewind the workspace. `None` (plan passes, tests, duel
+    /// casts) records nothing.
+    checkpoint: Option<Arc<crate::anvil::checkpoint::Checkpoint>>,
 }
 
 impl ToolBox {
@@ -93,6 +98,27 @@ impl ToolBox {
             read_cache: Arc::new(Mutex::new(HashMap::new())),
             read_state: Arc::new(Mutex::new(HashMap::new())),
             touch_seq: Arc::new(AtomicU64::new(0)),
+            checkpoint: None,
+        }
+    }
+
+    /// Bind this toolbox (or a per-dispatch clone) to an attempt so its
+    /// writes are checkpointed under `logs/checkpoints/<ingot>-h<heat>`.
+    pub fn with_attempt(mut self, ctx: Option<(String, u8)>) -> Self {
+        self.checkpoint = ctx.map(|(id, heat)| {
+            Arc::new(crate::anvil::checkpoint::Checkpoint::for_attempt(
+                self.root.clone(),
+                &id,
+                heat,
+            ))
+        });
+        self
+    }
+
+    /// Best-effort pre-modification backup; never blocks the write.
+    fn checkpoint_record(&self, path: &Path) {
+        if let Some(c) = &self.checkpoint {
+            c.record(path);
         }
     }
 
@@ -559,6 +585,7 @@ impl ToolBox {
         let content = req_str(args, "write_file", "content")?;
         let path = self.resolve(raw)?;
         self.ensure_fresh_for_write(&path, raw, "write_file").await?;
+        self.checkpoint_record(&path);
         self.invalidate_read_cache(&path);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -591,6 +618,7 @@ impl ToolBox {
         }
         let path = self.resolve(raw)?;
         self.ensure_fresh_for_write(&path, raw, "edit_file").await?;
+        self.checkpoint_record(&path);
         self.invalidate_read_cache(&path);
         let content = tokio::fs::read_to_string(&path)
             .await
@@ -1010,7 +1038,9 @@ fn req_str<'a>(args: &'a Value, tool: &str, key: &str) -> Result<&'a str, SlagEr
 }
 
 /// FNV-1a 64-bit. Labeled "checksum" — integrity marker, not crypto.
-fn fnv64(bytes: &[u8]) -> u64 {
+/// pub(crate): forge.rs uses it to fingerprint the crucible for run
+/// metadata (item 81).
+pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= b as u64;
@@ -3553,5 +3583,56 @@ Collecting\n\
         let snaps = tb.recent_file_snapshots(5, 10);
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].0, "long.txt");
+    }
+
+    /// Item 68: an attempt-bound toolbox backs up files before write and
+    /// edit, and the checkpoint rewind restores the attempt-start state.
+    #[tokio::test]
+    async fn attempt_bound_writes_are_checkpointed_and_rewindable() {
+        let (dir, tb) = setup();
+        // ToolBox canonicalizes its root; the rewind must use the same.
+        let root = dir.path().canonicalize().unwrap();
+        write(&dir, "a.txt", "original\n");
+        let tb = tb.with_attempt(Some(("i1".into(), 2)));
+        prime(&tb, "a.txt").await;
+
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "original", "new_string": "edited"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        let out = tb
+            .dispatch(&call(
+                "write_file",
+                json!({"path": "fresh.txt", "content": "made this heat\n"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+
+        let restored = crate::anvil::checkpoint::rewind_attempt(&root, "i1", 2);
+        assert_eq!(restored, 2);
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "original\n");
+        assert!(!root.join("fresh.txt").exists(), "created file rolled back");
+    }
+
+    #[tokio::test]
+    async fn unbound_toolbox_records_no_checkpoints() {
+        let (dir, tb) = setup();
+        let root = dir.path().canonicalize().unwrap();
+        write(&dir, "a.txt", "v0\n");
+        prime(&tb, "a.txt").await;
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "v0", "new_string": "v1"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(
+            !root.join(crate::anvil::checkpoint::CHECKPOINT_DIR).exists(),
+            "no attempt binding, no checkpoint store"
+        );
     }
 }

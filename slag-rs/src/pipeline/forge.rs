@@ -1,9 +1,14 @@
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::anvil::checkpoint;
 use crate::config::{DuelMode, EngineConfig, CRUCIBLE, LEDGER};
 use crate::crucible::{Crucible, CRUCIBLE_LOCK};
+use crate::engine::agent::ForgeAgent;
+use crate::engine::events::{RunEntry, RunLog};
 use crate::engine::provider::OpenRouter;
-use crate::engine::{emit, EngineEvent, Provider};
+use crate::engine::tools::ToolBox;
+use crate::engine::{emit, stats, transcript, Effort, EngineEvent, Provider};
 use crate::error::SlagError;
 use crate::flux;
 use crate::proof;
@@ -17,11 +22,71 @@ use super::{duel, resmelt};
 /// one surfaces and burns the heat like a real failure.
 pub(crate) const MAX_TRANSIENT_PER_HEAT: u8 = 5;
 
-/// Phase 3: Forge loop — parallel anvils then sequential
+/// Phase 3: Forge loop — parallel anvils then sequential. The wrapper
+/// anchors run-wide accounting (item 87) and brackets the run log (item
+/// 81): typed metadata first, the assay verdict last.
 pub async fn run(
     config: &EngineConfig,
     max_anvils: usize,
     hooks: &EngineHooks,
+) -> Result<(), SlagError> {
+    stats::mark_run_start();
+    let run_log = open_run_log(config);
+    let result = run_inner(config, max_anvils, hooks, &run_log).await;
+    if let Ok(crucible) = Crucible::load(Path::new(CRUCIBLE)) {
+        let counts = crucible.counts();
+        run_log.append(&RunEntry::Assay {
+            total: counts.total,
+            forged: counts.forged,
+            cracked: counts.cracked,
+            ok: result.is_ok(),
+        });
+    }
+    result
+}
+
+/// `logs/run-<ts>-<pid>.jsonl` with the run's metadata as its first line.
+fn open_run_log(config: &EngineConfig) -> RunLog {
+    let now = chrono::Local::now();
+    let run_id = format!("{}-{}", now.format("%Y%m%d_%H%M%S"), std::process::id());
+    let meta = RunEntry::RunMeta {
+        run_id: run_id.clone(),
+        started: now.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        git_branch: git_branch(),
+        model: config.model_base.clone(),
+        duel: duel_label(config.duel).to_string(),
+        crucible_hash: std::fs::read(CRUCIBLE)
+            .ok()
+            .map(|b| format!("{:016x}", crate::engine::tools::fnv64(&b))),
+    };
+    RunLog::create(Path::new(crate::config::LOG_DIR), &run_id, meta)
+}
+
+fn git_branch() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+fn duel_label(mode: DuelMode) -> &'static str {
+    match mode {
+        DuelMode::Auto => "auto",
+        DuelMode::On => "on",
+        DuelMode::Off => "off",
+    }
+}
+
+async fn run_inner(
+    config: &EngineConfig,
+    max_anvils: usize,
+    hooks: &EngineHooks,
+    run_log: &RunLog,
 ) -> Result<(), SlagError> {
     loop {
         // Ctrl-C from the dashboard: stop between ingots instead of
@@ -36,6 +101,25 @@ pub async fn run(
         // to Ore so it gets rescheduled instead of busy-spinning forever.
         let guard = CRUCIBLE_LOCK.lock().await;
         let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+
+        // Item 67: a Molten ingot whose transcript is still open is a
+        // crashed session, not stale state — resume the recorded
+        // conversation instead of resetting to ore and burning a heat.
+        let resumable = crucible
+            .ingots
+            .iter()
+            .find(|i| {
+                i.status == Status::Molten
+                    && transcript::is_resumable(Path::new("."), &i.id, i.heat)
+            })
+            .cloned();
+        if let Some(ingot) = resumable {
+            drop(guard);
+            // Cancel/budget propagate as Err; success and heat-failure
+            // both update the crucible and the loop reschedules.
+            resume_crashed_ingot(config, &ingot, hooks, run_log).await?;
+            continue;
+        }
 
         if crucible.reset_stale_molten() > 0 {
             crucible.save()?;
@@ -77,6 +161,7 @@ pub async fn run(
                     );
                 }
                 append_assay_note(&note);
+                run_log.append(&RunEntry::Note { message: note });
                 tui::notify("slag", "run budget exhausted — forge paused");
                 return Ok(());
             }
@@ -150,6 +235,8 @@ pub async fn run(
                         let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
                         crucible.set_status(&id, Status::Forged);
                         crucible.save()?;
+                        let heat = crucible.get(&id).map(|i| i.heat).unwrap_or(0);
+                        run_log.append(&RunEntry::IngotDone { id: id.clone(), ok: true, heat });
                         emit(&hooks.events, EngineEvent::IngotDone { id, ok: true });
                     }
                     Ok((id, Err(SlagError::Cancelled))) => {
@@ -184,6 +271,12 @@ pub async fn run(
                             } else {
                                 crucible.set_status(&id, Status::Cracked);
                                 crucible.save()?;
+                                let heat = crucible.get(&id).map(|i| i.heat).unwrap_or(0);
+                                run_log.append(&RunEntry::IngotDone {
+                                    id: id.clone(),
+                                    ok: false,
+                                    heat,
+                                });
                                 emit(&hooks.events, EngineEvent::IngotDone { id, ok: false });
                             }
                         }
@@ -207,7 +300,7 @@ pub async fn run(
             }
 
             if let Some((spent, cap)) = budget_stop {
-                return finish_run_over_budget(spent, cap, hooks).await;
+                return finish_run_over_budget(spent, cap, hooks, run_log).await;
             }
 
             // Show status
@@ -251,13 +344,15 @@ pub async fn run(
             crucible.set_status(&ingot.id, Status::Ore);
             crucible.save()?;
             drop(_guard);
-            return finish_run_over_budget(spent, cap, hooks).await;
+            return finish_run_over_budget(spent, cap, hooks, run_log).await;
         }
         if struck.is_ok() {
             let _guard = CRUCIBLE_LOCK.lock().await;
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
             crucible.set_status(&ingot.id, Status::Forged);
             crucible.save()?;
+            let heat = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(0);
+            run_log.append(&RunEntry::IngotDone { id: ingot.id.clone(), ok: true, heat });
             emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
         } else {
             let _guard = CRUCIBLE_LOCK.lock().await;
@@ -269,6 +364,8 @@ pub async fn run(
             } else {
                 crucible.set_status(&ingot.id, Status::Cracked);
                 crucible.save()?;
+                let heat = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(0);
+                run_log.append(&RunEntry::IngotDone { id: ingot.id.clone(), ok: false, heat });
                 emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: false });
             }
         }
@@ -441,6 +538,7 @@ async fn finish_run_over_budget(
     spent: f64,
     cap: f64,
     hooks: &EngineHooks,
+    run_log: &RunLog,
 ) -> Result<(), SlagError> {
     let ore_left = {
         let _guard = CRUCIBLE_LOCK.lock().await;
@@ -452,6 +550,7 @@ async fn finish_run_over_budget(
         println!("\n  {}⚠{} {note}", super::fg(tui::BRIGHT), super::reset());
     }
     append_assay_note(&note);
+    run_log.append(&RunEntry::Note { message: note });
     tui::notify("slag", "run budget exhausted — forge paused");
     Ok(())
 }
@@ -478,6 +577,208 @@ fn append_assay_note(note: &str) {
             use std::io::Write;
             f.write_all(entry.as_bytes())
         });
+}
+
+/// Resume a crashed forge session (item 67): rebuild the agent directly
+/// on the ingot's model, let it reload the open transcript at
+/// `logs/transcripts/<id>-h<heat>.jsonl`, and finish the interrupted
+/// heat — no heat burned, no context thrown away. Success seals the
+/// ingot like a normal strike; failure sends it back to ore with its
+/// heat budget intact and rewinds the crashed attempt's checkpoint.
+/// Crash-resumes of one (ingot, heat) transcript absorbed before the
+/// forge closes it and falls back to the normal heat path. Each resume
+/// re-pays the recorded context, and a deterministic crash cause (OOM, a
+/// proof that kills the box) would otherwise re-spend it on every
+/// restart forever — the run-cost cap resets with the process.
+pub(crate) const MAX_RESUME_ATTEMPTS: usize = 3;
+
+async fn resume_crashed_ingot(
+    config: &EngineConfig,
+    ingot: &Ingot,
+    hooks: &EngineHooks,
+    run_log: &RunLog,
+) -> Result<(), SlagError> {
+    // Resume-attempt cap: markers persist in the transcript itself, so
+    // the count survives process deaths (unlike the in-process spend
+    // accumulator the run cap gates on).
+    let tpath = transcript::path_for(Path::new("."), &ingot.id, ingot.heat);
+    if transcript::resume_attempts(&tpath) >= MAX_RESUME_ATTEMPTS {
+        return back_to_ore_after_resume(
+            ingot,
+            hooks,
+            &format!("crashed {MAX_RESUME_ATTEMPTS} resumes in a row — transcript closed"),
+        )
+        .await;
+    }
+    transcript::TranscriptWriter::new(tpath).mark_resume();
+    emit(
+        &hooks.events,
+        EngineEvent::IngotStart { id: ingot.id.clone(), work: ingot.work.clone() },
+    );
+    if !tui::is_quiet() {
+        println!(
+            "\n  {}↻{} {}{}[{}]{} resuming interrupted heat {}/{}",
+            super::fg(tui::BRIGHT),
+            super::reset(),
+            super::bold(),
+            super::fg(tui::PURE),
+            ingot.id,
+            super::reset(),
+            ingot.heat,
+            ingot.max,
+        );
+    }
+
+    // Spawned so a panicking resume is contained like a panicking anvil
+    // (the JoinSet catches those) instead of killing the whole run.
+    let outcome = {
+        let (config, ingot, hooks) = (config.clone(), ingot.clone(), hooks.clone());
+        match tokio::spawn(async move { resume_session(&config, &ingot, &hooks).await }).await {
+            Ok(result) => result,
+            Err(e) => Err(SlagError::SmithFailed(format!("resume panicked: {e}"))),
+        }
+    };
+
+    match outcome {
+        Ok(response) => match verify_and_seal(ingot, &response).await {
+            Ok(()) => {
+                let _guard = CRUCIBLE_LOCK.lock().await;
+                let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                crucible.set_status(&ingot.id, Status::Forged);
+                crucible.save()?;
+                append_ledger(ingot, ingot.heat);
+                emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
+                run_log.append(&RunEntry::IngotDone {
+                    id: ingot.id.clone(),
+                    ok: true,
+                    heat: ingot.heat,
+                });
+                Ok(())
+            }
+            Err(why) => back_to_ore_after_resume(ingot, hooks, &why).await,
+        },
+        Err(e @ SlagError::Cancelled) => {
+            let _guard = CRUCIBLE_LOCK.lock().await;
+            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            crucible.set_status(&ingot.id, Status::Ore);
+            crucible.save()?;
+            Err(e)
+        }
+        Err(SlagError::RunBudgetExhausted { .. }) => {
+            // Back to ore; the scheduler's loop-top budget gate ends the
+            // run with the standard pause note.
+            let _guard = CRUCIBLE_LOCK.lock().await;
+            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            crucible.set_status(&ingot.id, Status::Ore);
+            crucible.save()?;
+            Ok(())
+        }
+        Err(e) => back_to_ore_after_resume(ingot, hooks, &e.to_string()).await,
+    }
+}
+
+/// Failed resume: ore again (heat budget intact — the transcript closed,
+/// so it will not resume twice), and the crashed attempt's files rewind
+/// to their attempt-start state so the next heat starts clean.
+async fn back_to_ore_after_resume(
+    ingot: &Ingot,
+    hooks: &EngineHooks,
+    why: &str,
+) -> Result<(), SlagError> {
+    // Belt and braces: the agent closes the transcript on any exit it
+    // reaches, but a panicked resume never got there — close it here or
+    // the scheduler would resume (and panic) forever.
+    transcript::TranscriptWriter::new(transcript::path_for(Path::new("."), &ingot.id, ingot.heat))
+        .end(false);
+    let restored = checkpoint::rewind_attempt(Path::new("."), &ingot.id, ingot.heat);
+    emit(
+        &hooks.events,
+        EngineEvent::Warning {
+            message: format!(
+                "[{}] resume failed ({}) — back to ore, {restored} file(s) rewound",
+                ingot.id,
+                crate::engine::events::preview(why, 80)
+            ),
+        },
+    );
+    if !tui::is_quiet() {
+        println!(
+            "    {}↻✗{} resume failed — rescheduled ({restored} file(s) rewound)",
+            super::fg(tui::WARM),
+            super::reset()
+        );
+    }
+    let _guard = CRUCIBLE_LOCK.lock().await;
+    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    crucible.set_status(&ingot.id, Status::Ore);
+    crucible.save()?;
+    Ok(())
+}
+
+/// One resumed agent session. The system/task bands are rebuilt as a
+/// fallback, but the open transcript supersedes them inside the agent.
+async fn resume_session(
+    config: &EngineConfig,
+    ingot: &Ingot,
+    hooks: &EngineHooks,
+) -> Result<String, SlagError> {
+    let model = config.model_for_grade(ingot.grade).to_string();
+    let provider = Arc::new(OpenRouter::with_base_url(
+        config.api_key.clone(),
+        config.base_url.clone(),
+    ));
+    if let Some(tx) = &hooks.events {
+        provider.set_event_sink(tx.clone());
+    }
+    if let Some(cancel) = &hooks.cancel {
+        provider.set_cancel_flag(cancel.clone());
+    }
+    let window = provider.context_length(&model).await;
+    let mut agent = ForgeAgent::new(provider, ToolBox::new("."), &model)
+        .with_context_window(window)
+        .with_resume(true)
+        .with_effort(config.effort.or(Some(Effort::from_grade(ingot.grade))));
+    if let Some(tx) = &hooks.events {
+        agent = agent.with_events(tx.clone());
+    }
+    if let Some(steer) = &hooks.steer {
+        agent = agent.with_steer(steer.clone());
+    }
+    if let Some(cancel) = &hooks.cancel {
+        agent = agent.with_cancel(cancel.clone());
+    }
+
+    let bands = crate::engine::prompt::build(
+        Path::new("."),
+        &model,
+        crate::engine::prompt::PromptMode::Forge,
+    );
+    let flux_text = flux::prepare_flux(ingot, None);
+    transcript::scope(
+        ingot.id.clone(),
+        ingot.heat,
+        agent.run(bands.join(), flux_text),
+    )
+    .await
+}
+
+/// The strike's acceptance gate, factored for the resume path: extract
+/// CMD, run it, verify the proof, commit. `Err` carries the slag line a
+/// retry heat would have been fed.
+async fn verify_and_seal(ingot: &Ingot, response: &str) -> Result<(), String> {
+    let cmd = proof::extract_cmd(response).ok_or("NO CMD: line in response".to_string())?;
+    let (ok, output) = proof::run_shell(&cmd).await;
+    if !ok {
+        return Err(format!("CMD failed (exit 1): {output}"));
+    }
+    if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
+        let (proof_ok, proof_output) = proof::run_shell(&ingot.proof).await;
+        if !proof_ok {
+            return Err(format!("Proof failed [{}]: {proof_output}", ingot.proof));
+        }
+    }
+    proof::git_commit(&ingot.id, &ingot.work).await;
+    Ok(())
 }
 
 /// Invoke the smith, absorbing transient provider errors: up to
@@ -553,14 +854,20 @@ async fn strike_ingot(
 
     for heat in 1..=ingot.max {
         // Update heat in crucible file
-        {
+        let current = {
             let _guard = CRUCIBLE_LOCK.lock().await;
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
             crucible.increment_heat(&ingot.id);
             crucible.save()?;
             let current = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(heat);
             emit(&hooks.events, EngineEvent::HeatTick { id: ingot.id.clone(), heat: current });
-        }
+            current
+        };
+        // Item 68: attempt-start snapshot boundary. The toolbox backs up
+        // each file lazily before its first modification; a failed heat
+        // rewinds to this boundary so the retry starts clean.
+        let ckpt = checkpoint::Checkpoint::for_attempt(Path::new("."), &ingot.id, current);
+        ckpt.begin();
 
         if !quiet {
             let hc = match heat {
@@ -598,12 +905,12 @@ async fn strike_ingot(
             tui::spinner(spinner_msg)
         };
 
-        let response = match invoke_absorbing_transients(
-            smith,
-            &flux_text,
-            &ingot.id,
-            MAX_TRANSIENT_PER_HEAT,
-            hooks,
+        // Item 67: the ingot scope makes the agent journal this session
+        // to logs/transcripts/<id>-h<current>.jsonl for crash resume.
+        let response = match transcript::scope(
+            ingot.id.clone(),
+            current,
+            invoke_absorbing_transients(smith, &flux_text, &ingot.id, MAX_TRANSIENT_PER_HEAT, hooks),
         )
         .await
         {
@@ -626,6 +933,7 @@ async fn strike_ingot(
                 if !quiet {
                     println!("{}✗{}", super::fg(tui::WARM), super::reset());
                 }
+                rewind_failed_heat(&ckpt, ingot, heat, hooks);
                 continue;
             }
         };
@@ -640,6 +948,7 @@ async fn strike_ingot(
                 if !quiet {
                     println!("{}✗{} no CMD", super::fg(tui::WARM), super::reset());
                 }
+                rewind_failed_heat(&ckpt, ingot, heat, hooks);
                 continue;
             }
         };
@@ -665,6 +974,7 @@ async fn strike_ingot(
                     if !quiet {
                         println!("{}✗{} impure", super::fg(tui::WARM), super::reset());
                     }
+                    rewind_failed_heat(&ckpt, ingot, heat, hooks);
                     continue;
                 }
             }
@@ -680,10 +990,38 @@ async fn strike_ingot(
             if !quiet {
                 println!("{}✗{}", super::fg(tui::WARM), super::reset());
             }
+            rewind_failed_heat(&ckpt, ingot, heat, hooks);
         }
     }
 
     Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max))
+}
+
+/// Item 68: a failed heat with retries left rewinds the workspace to the
+/// attempt-start snapshot — the retry builds from clean state, not the
+/// wreck of the failed attempt. The final heat never rewinds: a cracked
+/// ingot's debris is what resmelt and the operator inspect.
+fn rewind_failed_heat(
+    ckpt: &checkpoint::Checkpoint,
+    ingot: &Ingot,
+    heat: u8,
+    hooks: &EngineHooks,
+) {
+    if heat >= ingot.max {
+        return;
+    }
+    let restored = ckpt.rewind();
+    if restored > 0 {
+        emit(
+            &hooks.events,
+            EngineEvent::Warning {
+                message: format!(
+                    "[{}] rewound {restored} file(s) to attempt start for a clean retry",
+                    ingot.id
+                ),
+            },
+        );
+    }
 }
 
 fn append_ledger(ingot: &Ingot, heat: u8) {
