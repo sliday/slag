@@ -3,7 +3,13 @@
 Source: 8-beat sweep of /Users/stas/Playground/Claude Code src (140 raw ideas, curated to 100).
 Status legend: [ ] todo · [~] in flight · [x] done
 
-Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive casts + site in v2.3.0. Wave 3 (15 items: compaction v3, provider resilience, founder briefing, observability) in v2.4.0. ~45/100 through v2.4.0. Wave 4 (15 items: transcripts + crash-resume + rewind checkpoints, status --json, runs/ps, OSC progress, cost persistence) in v2.5.0 — ~60/100 shipped. Wave 5 (6 L items) pending assessment.
+Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive casts + site in v2.3.0. Wave 3 (15 items: compaction v3, provider resilience, founder briefing, observability) in v2.4.0. ~45/100 through v2.4.0. Wave 4 (15 items: transcripts + crash-resume + rewind checkpoints, status --json, runs/ps, OSC progress, cost persistence) in v2.5.0 — ~60/100 shipped. Wave 5 assessed 2026-08-18 — recommended order for future sessions by value-per-risk:
+1. #99 MCP stdio client (opens the whole MCP tool ecosystem; well-scoped)
+2. #95 command policy engine (the real bash guard rail beyond wave-1 deny list)
+3. #97-S sleep-guard subset only (cheap; full background-bash later)
+4. #100 slag insights (isolated, zero-risk learning loop)
+5. #96 read-only bash classifier (speed win; misclassification risk needs care)
+6. #98 recipe fork-context (powerful but rides better after #99)
 
 
 ## Wave 1
