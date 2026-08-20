@@ -218,6 +218,9 @@ impl ToolBox {
                  message (they run in parallel); dependent commands chain with '&&'; \
                  use ';' only when earlier failures don't matter; never newline-separate \
                  commands. \
+                 Never wait by sleeping: a leading 'sleep N' with N >= 2 is refused. \
+                 Run the check itself and raise timeout when it is slow, or poll it \
+                 in an 'until' loop. \
                  Git safety protocol: never use --no-verify; if a pre-commit hook fails, \
                  the commit did NOT happen, so fix the issue and commit again (never amend \
                  after a hook failure — amend would destroy the previous commit); stage \
@@ -759,6 +762,17 @@ impl ToolBox {
             }
             None => None,
         };
+        // Sleep guard: a leading blocking sleep is refused with the remedy.
+        if let Some(pattern) = blocked_sleep(command) {
+            return Err(SlagError::Tool(format!(
+                "refused: {pattern}. A leading sleep spends the ingot's clock \
+                 and learns nothing. Run the check itself and raise `timeout` \
+                 when it is slow, or poll through the checker's own retry \
+                 (curl --retry 5 --retry-connrefused) or \
+                 `until <check>; do sleep 1; done`. Pacing under \
+                 {SLEEP_GUARD_MIN_SECS}s still passes."
+            )));
+        }
         // Lossless-in-spirit noise reduction on successful bash output only:
         // errors (Err path) and other tools (grep calls run_shell directly)
         // are untouched.
@@ -1680,6 +1694,50 @@ fn sh_quote(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Sleep guard, ported from Claude Code's BashTool detectBlockedSleepPattern.
+// A leading blocking `sleep N` spends the ingot's clock and a tool round-trip
+// to learn nothing. Slag has no background bash yet, so the refusal points at
+// `timeout`, retry flags, and poll loops instead of run_in_background.
+// ---------------------------------------------------------------------------
+
+/// Shorter sleeps are deliberate pacing (rate limits, debounce) and pass.
+const SLEEP_GUARD_MIN_SECS: u64 = 2;
+
+/// A leading `sleep N` with an integer N >= SLEEP_GUARD_MIN_SECS, described
+/// for the refusal message. Everything else passes: a float duration
+/// (`sleep 0.5`) is pacing, a backgrounded `sleep 5 &` never blocks, and a
+/// sleep inside a pipeline, a loop body, or after another command is the
+/// legitimate case of waiting on something you just started.
+fn blocked_sleep(command: &str) -> Option<String> {
+    let arg = command
+        .trim_start()
+        .strip_prefix("sleep")?
+        .strip_prefix(char::is_whitespace)?
+        .trim_start();
+    let at = arg.find(|c: char| !c.is_ascii_digit()).unwrap_or(arg.len());
+    let (secs, tail) = arg.split_at(at);
+    let secs: u64 = secs.parse().ok()?;
+    let tail = tail.trim_start();
+    // `sleep 5.5` and `sleep 5s` are not the bare integer form.
+    if tail.starts_with(|c: char| c == '.' || c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if secs < SLEEP_GUARD_MIN_SECS {
+        return None;
+    }
+    // A lone `&` backgrounds the sleep; `&&` chains a command onto it.
+    if tail.strip_prefix('&').is_some_and(|t| !t.starts_with('&')) {
+        return None;
+    }
+    let rest = tail.trim_start_matches(['&', ';', '|']).trim();
+    Some(if rest.is_empty() {
+        format!("standalone sleep {secs}")
+    } else {
+        format!("sleep {secs} followed by: {rest}")
+    })
+}
+
+// ---------------------------------------------------------------------------
 // cmd-strip: deterministic, idempotent noise reduction for bash tool output.
 // Patterns ported conservatively from tamp's command rewriters
 // (cargo/npm/pip/wget-curl): when unsure a line is progress noise, keep it.
@@ -2213,8 +2271,12 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_kills() {
         let (_dir, tb) = setup();
+        // Blocks forever without a leading sleep, which the sleep guard refuses.
         let out = tb
-            .dispatch(&call("bash", json!({"command": "sleep 5", "timeout": 1})))
+            .dispatch(&call(
+                "bash",
+                json!({"command": "tail -f /dev/null", "timeout": 1}),
+            ))
             .await;
         assert!(out.is_error);
         assert!(out.output.contains("timed out"), "{}", out.output);
@@ -2721,7 +2783,10 @@ Collecting\n\
 
         // is_error outputs come back untouched by reductions.
         let out = tb
-            .dispatch(&call("bash", json!({"command": "sleep 5", "timeout": 1})))
+            .dispatch(&call(
+                "bash",
+                json!({"command": "tail -f /dev/null", "timeout": 1}),
+            ))
             .await;
         assert!(out.is_error);
         assert!(out.output.contains("timed out"), "{}", out.output);
@@ -3508,6 +3573,72 @@ Collecting\n\
         assert!(destructive_warning("git push -u origin main").is_none());
         // --force-with-lease stays intentionally allowed.
         assert!(destructive_warning("git push --force-with-lease origin main").is_none());
+    }
+
+    // -- sleep guard -------------------------------------------------------
+
+    #[test]
+    fn sleep_guard_refuses_leading_blocking_sleeps() {
+        assert_eq!(
+            blocked_sleep("sleep 5").as_deref(),
+            Some("standalone sleep 5")
+        );
+        assert_eq!(
+            blocked_sleep("  sleep   30").as_deref(),
+            Some("standalone sleep 30")
+        );
+        assert_eq!(
+            blocked_sleep("sleep 30 && cargo test").as_deref(),
+            Some("sleep 30 followed by: cargo test")
+        );
+        assert_eq!(
+            blocked_sleep("sleep 5; curl localhost:3000").as_deref(),
+            Some("sleep 5 followed by: curl localhost:3000")
+        );
+    }
+
+    #[test]
+    fn sleep_guard_allows_pacing_and_non_blocking_sleeps() {
+        // Sub-2s pacing and float durations are legitimate.
+        assert!(blocked_sleep("sleep 1").is_none());
+        assert!(blocked_sleep("sleep 0.5").is_none());
+        assert!(blocked_sleep("sleep 2.5").is_none());
+        // `&` backgrounds the sleep, so nothing blocks.
+        assert!(blocked_sleep("sleep 30 & echo $! > pid.txt; wait").is_none());
+        // Waiting on something you just started, in a loop, or in a subshell.
+        assert!(blocked_sleep("npm run dev & sleep 5 && curl localhost:3000").is_none());
+        assert!(blocked_sleep("until curl -sf localhost:3000; do sleep 5; done").is_none());
+        assert!(blocked_sleep("(sleep 5; echo woke)").is_none());
+        assert!(blocked_sleep("echo hi | sleep 5").is_none());
+        // Not the sleep builtin at all.
+        assert!(blocked_sleep("sleepy 5").is_none());
+        assert!(blocked_sleep("sleep").is_none());
+        assert!(blocked_sleep("cargo test").is_none());
+    }
+
+    #[tokio::test]
+    async fn bash_refuses_a_leading_sleep_with_the_remedy() {
+        let (_dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "sleep 9 && ls"})))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(
+            out.output.contains("sleep 9 followed by: ls"),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("timeout"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn bash_still_runs_a_short_pacing_sleep() {
+        let (_dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "sleep 1 && echo woke"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("woke"), "{}", out.output);
     }
 
     #[tokio::test]

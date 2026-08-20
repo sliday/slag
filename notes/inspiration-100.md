@@ -6,7 +6,7 @@ Status legend: [ ] todo · [~] in flight · [x] done
 Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive casts + site in v2.3.0. Wave 3 (15 items: compaction v3, provider resilience, founder briefing, observability) in v2.4.0. ~45/100 through v2.4.0. Wave 4 (15 items: transcripts + crash-resume + rewind checkpoints, status --json, runs/ps, OSC progress, cost persistence) in v2.5.0 — ~60/100 shipped. Wave 5 assessed 2026-08-18 — recommended order for future sessions by value-per-risk:
 1. #99 MCP stdio client (opens the whole MCP tool ecosystem; well-scoped)
 2. #95 command policy engine (the real bash guard rail beyond wave-1 deny list)
-3. #97-S sleep-guard subset only (cheap; full background-bash later)
+3. ~~#97-S sleep-guard subset only~~ shipped 2026-08-20 (full background-bash later)
 4. #100 slag insights (isolated, zero-risk learning loop)
 5. #96 read-only bash classifier (speed win; misclassification risk needs care)
 6. #98 recipe fork-context (powerful but rides better after #99)
@@ -314,8 +314,9 @@ Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive
 - [ ] **96. Classify provably read-only bash for concurrent scheduling** (L)
   engine/tools.rs path_access returns None for bash today, forcing every bash call to be treated as unscheduled. A trimmed classifier (ls/cat/rg/fd/git status/diff/log with safe-flag tables, excluding execution escapes like -exec and jq -f) lets agent.rs run read-only bash concurrently with readers and lets duels share a repo view safely.
   _evidence: Claude Code src/tools/BashTool/readOnlyValidation.ts:35-90,1509_
-- [ ] **97. Support background bash with run_in_background and sleep guards** (L)
+- [~] **97. Support background bash with run_in_background and sleep guards** (L)
   engine/tools.rs + agent.rs: run_in_background arg spawns the process group detached with stdout redirected to logs/bg/<id>.log, returns id+path immediately, injects a completion note via the existing steer channel. The S-size subset — reject `sleep >2s` with 'background it instead' guidance — is worth doing alone.
+  _shipped (S subset): tools.rs `blocked_sleep()` refuses a leading integer `sleep N` with N>=2 and names the remedy (raise `timeout`, curl --retry, `until` loop). Float durations, sub-2s pacing, `sleep 5 &`, and sleeps inside pipelines/loops/subshells pass. The bash spec teaches the rule. run_in_background still pending._
   _evidence: Claude Code src/tools/BashTool/BashTool.tsx:241,525-530,610_
 - [ ] **98. Grow recipe frontmatter: allowed-tools, model, fork context, paths gating** (L)
   recipes.rs Recipe struct gains allowed_tools, model, context (inline|fork), paths. `context: fork` spawns a sub-smith via smith/native.rs with only the recipe as its brief (forge.rs already runs parallel smiths); `paths` globs hide recipes until matching files are touched, cutting index tokens.
