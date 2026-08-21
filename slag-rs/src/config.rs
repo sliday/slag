@@ -526,9 +526,17 @@ fn env_nonempty(name: &str) -> Option<String> {
 /// Skips blanks, comments, and lines without `=`. Quotes optional.
 fn parse_config_lines(contents: &str) -> Vec<(String, String)> {
     let mut entries = Vec::new();
+    let mut section = String::new();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `[section]` headers namespace the keys under them, so the flat
+        // top-level settings and an `[mcp]` server named `model_base`
+        // cannot collide.
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim().to_string();
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -543,10 +551,29 @@ fn parse_config_lines(contents: &str) -> Vec<(String, String)> {
             value = &value[1..value.len() - 1];
         }
         if !key.is_empty() && !value.is_empty() {
-            entries.push((key.to_string(), value.to_string()));
+            let key = if section.is_empty() {
+                key.to_string()
+            } else {
+                format!("{section}.{key}")
+            };
+            entries.push((key, value.to_string()));
         }
     }
     entries
+}
+
+/// MCP stdio servers from the `[mcp]` table: one `name = "command args…"`
+/// line each. File-only, no env override — a server is a local command,
+/// not a per-run knob.
+pub fn mcp_servers() -> Vec<(String, String)> {
+    let entries = config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_config_lines(&c))
+        .unwrap_or_default();
+    entries
+        .into_iter()
+        .filter_map(|(key, value)| key.strip_prefix("mcp.").map(|n| (n.to_string(), value)))
+        .collect()
 }
 
 fn file_value(entries: &[(String, String)], key: &str) -> Option<String> {
@@ -606,6 +633,65 @@ mod tests {
             Some("openai/gpt-5")
         );
         assert_eq!(file_value(&parsed, "broken line"), None);
+    }
+
+    #[test]
+    fn section_headers_namespace_their_keys() {
+        let parsed = parse_config_lines(
+            "model_base = qwen/qwen3-coder\n[mcp]\nfilesystem = \"npx -y server-fs /tmp\"\nmodel_base = shadowed\n",
+        );
+        // Top-level lookups ignore anything under a section header.
+        assert_eq!(
+            file_value(&parsed, "model_base").as_deref(),
+            Some("qwen/qwen3-coder")
+        );
+        assert_eq!(
+            file_value(&parsed, "mcp.filesystem").as_deref(),
+            Some("npx -y server-fs /tmp")
+        );
+        assert_eq!(
+            file_value(&parsed, "mcp.model_base").as_deref(),
+            Some("shadowed")
+        );
+    }
+
+    #[test]
+    fn mcp_servers_read_the_mcp_table_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "openrouter_api_key = \"sk-or-x\"\nmodel_base = m\n\n[mcp]\nfs = \"npx -y server-fs /tmp\"\ngithub = 'gh-mcp --stdio'\n",
+        )
+        .unwrap();
+
+        let servers = mcp_servers();
+        assert_eq!(
+            servers,
+            vec![
+                ("fs".to_string(), "npx -y server-fs /tmp".to_string()),
+                ("github".to_string(), "gh-mcp --stdio".to_string()),
+            ]
+        );
+        // The flat settings still load with the table present.
+        let config = EngineConfig::load().expect("key stored in file");
+        assert_eq!(config.api_key, "sk-or-x");
+        assert_eq!(config.model_base, "m");
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn mcp_servers_empty_without_a_table() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(dir.path().join("config.toml"), "model_base = m\n").unwrap();
+        assert!(mcp_servers().is_empty());
+        clear_engine_env();
     }
 
     #[test]

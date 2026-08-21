@@ -282,7 +282,9 @@ fn project_facts(root: &Path) -> Vec<String> {
 
 fn volatile_band(root: &Path) -> String {
     let date = chrono::Local::now().format("%Y-%m-%d");
-    let tool_names: Vec<String> = super::tools::ToolBox::specs()
+    // MCP names count here too, so a recipe gated on `requires_tools:
+    // mcp__github__create_issue` appears exactly when that server is up.
+    let tool_names: Vec<String> = super::tools::ToolBox::all_specs()
         .into_iter()
         .map(|s| s.name)
         .collect();

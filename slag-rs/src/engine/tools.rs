@@ -159,7 +159,16 @@ impl ToolBox {
             .collect()
     }
 
-    /// Tool schemas advertised to the model.
+    /// Every schema advertised to the model: the natives plus whatever the
+    /// connected MCP servers export. Empty MCP registry (plan passes,
+    /// tests, any run without an `[mcp]` table) leaves the native eight.
+    pub fn all_specs() -> Vec<ToolSpec> {
+        let mut specs = Self::specs();
+        specs.extend(super::mcp::specs());
+        specs
+    }
+
+    /// The native tool schemas.
     pub fn specs() -> Vec<ToolSpec> {
         vec![
             spec(
@@ -330,6 +339,7 @@ impl ToolBox {
             "glob" => self.glob(&args).await,
             "recipe_view" => self.recipe_view(&args).await,
             "finish" => Ok(req_str(&args, "finish", "summary")?.to_string()),
+            other if super::mcp::handles(other) => super::mcp::call(other, &args).await,
             other => Err(SlagError::Tool(format!("unknown tool: {other}"))),
         }
     }
@@ -1384,7 +1394,7 @@ async fn count_lines(path: &std::path::Path) -> Option<usize> {
 /// error context that often appears first (command echo, first failure);
 /// the tail keeps the usually-decisive final output. Cut points align to
 /// line boundaries where possible.
-fn truncate_middle(s: &str, max: usize) -> String {
+pub(super) fn truncate_middle(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -3573,6 +3583,31 @@ Collecting\n\
         assert!(destructive_warning("git push -u origin main").is_none());
         // --force-with-lease stays intentionally allowed.
         assert!(destructive_warning("git push --force-with-lease origin main").is_none());
+    }
+
+    // -- mcp routing -------------------------------------------------------
+
+    #[tokio::test]
+    async fn mcp_named_tools_route_to_the_registry_not_unknown_tool() {
+        let (_dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("mcp__demo__echo", json!({"text": "hi"})))
+            .await;
+        assert!(out.is_error);
+        // No servers connected in tests, so the registry answers, not the
+        // native "unknown tool" arm.
+        assert!(
+            out.output.contains("no MCP servers are connected"),
+            "{}",
+            out.output
+        );
+        let out = tb.dispatch(&call("nope", json!({}))).await;
+        assert!(out.output.contains("unknown tool"), "{}", out.output);
+    }
+
+    #[test]
+    fn all_specs_is_the_natives_when_no_server_is_connected() {
+        assert_eq!(ToolBox::all_specs().len(), ToolBox::specs().len());
     }
 
     // -- sleep guard -------------------------------------------------------

@@ -800,7 +800,11 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         ChatRequest {
             model: self.model.clone(),
             messages,
-            tools: if with_tools { ToolBox::specs() } else { Vec::new() },
+            tools: if with_tools {
+                ToolBox::all_specs()
+            } else {
+                Vec::new()
+            },
             effort: self.effort,
             max_tokens,
         }

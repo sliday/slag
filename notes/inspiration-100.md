@@ -4,7 +4,7 @@ Source: 8-beat sweep of /Users/stas/Playground/Claude Code src (140 raw ideas, c
 Status legend: [ ] todo · [~] in flight · [x] done
 
 Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive casts + site in v2.3.0. Wave 3 (15 items: compaction v3, provider resilience, founder briefing, observability) in v2.4.0. ~45/100 through v2.4.0. Wave 4 (15 items: transcripts + crash-resume + rewind checkpoints, status --json, runs/ps, OSC progress, cost persistence) in v2.5.0 — ~60/100 shipped. Wave 5 assessed 2026-08-18 — recommended order for future sessions by value-per-risk:
-1. #99 MCP stdio client (opens the whole MCP tool ecosystem; well-scoped)
+1. ~~#99 MCP stdio client~~ shipped 2026-08-21
 2. #95 command policy engine (the real bash guard rail beyond wave-1 deny list)
 3. ~~#97-S sleep-guard subset only~~ shipped 2026-08-20 (full background-bash later)
 4. #100 slag insights (isolated, zero-risk learning loop)
@@ -321,8 +321,9 @@ Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive
 - [ ] **98. Grow recipe frontmatter: allowed-tools, model, fork context, paths gating** (L)
   recipes.rs Recipe struct gains allowed_tools, model, context (inline|fork), paths. `context: fork` spawns a sub-smith via smith/native.rs with only the recipe as its brief (forge.rs already runs parallel smiths); `paths` globs hide recipes until matching files are touched, cutting index tokens.
   _evidence: Claude Code skills/loadSkillsDir.ts:185-263; types/command.ts_
-- [ ] **99. Add a minimal MCP stdio client to import external tools** (L)
+- [x] **99. Add a minimal MCP stdio client to import external tools** (L)
   engine/tools.rs adds an mcp.rs adapter: spawn configured stdio servers (config.rs [mcp] table), initialize + tools/list at startup, expose each as a slag tool with mcp__server__tool naming; recipes' requires_tools works unchanged. Scope to stdio-only, no OAuth/HTTP transports.
+  _shipped: engine/mcp.rs (newline-delimited JSON-RPC over the child's stdio), `[mcp]` table via section-aware parse_config_lines, `ToolBox::all_specs()` = natives + MCP, dispatch routes the `mcp__` prefix, prompt.rs feeds MCP names to the recipe gate, main.rs connects before the pipeline and prints what came up. Failed servers warn and are skipped._
   _evidence: Claude Code services/mcp/client.ts; services/mcp/config.ts_
 - [ ] **100. Build `slag insights`: offline analytics over run logs with cached facets** (L)
   New cli.rs subcommand over logs/*.jsonl: deterministic stats (ingots forged/cracked, heats per ingot, cost per ingot, duel margins, tool errors) plus optional cheap-model facet extraction per run cached as logs/facets/<run>.json. Turns the slag heap into a learning loop across projects.

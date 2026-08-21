@@ -81,6 +81,18 @@ model_plan = "openai/gpt-5"
 
 The file reads ten keys, all lowercase: `openrouter_api_key`, `model_base`, `model_plan`, `model_alt`, `model_judge`, `duel`, `duel_rounds`, `screenshot_cmd`, `max_cost_per_ingot`, `max_cost_per_run`. Anything else in the file is left alone and never read.
 
+### MCP servers
+
+An `[mcp]` table adds Model Context Protocol servers over stdio, one command per line:
+
+```toml
+[mcp]
+filesystem = "npx -y @modelcontextprotocol/server-filesystem /tmp"
+github = "gh-mcp --stdio"
+```
+
+slag spawns each server at forge start and hands the smith every tool it advertises, named `mcp__<server>__<tool>`, beside the built-in eight. A server that will not start is named in a warning and skipped; the forge runs on the natives. stdio transport only, so no HTTP, SSE, or OAuth servers.
+
 `--auto` forces `openrouter/auto` on all four roles, overriding whatever is in your environment or config file. Explicit model flags still win over it. Because it resets `model_alt` too, it also switches duels off for that run: a duel needs two different models.
 
 ## Why

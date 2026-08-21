@@ -224,6 +224,27 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
     Ok(())
 }
 
+/// Spawn the `[mcp]` servers and report what came up. Runs before the
+/// dashboard takes the terminal so warnings stay readable. Servers that
+/// fail are named and skipped; the forge proceeds on the natives alone.
+async fn connect_mcp() {
+    for warning in engine::mcp::connect_configured().await {
+        tui::status_line("⚠", tui::WARM, &warning);
+    }
+    let Some(registry) = engine::mcp::registry().filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let (servers, tools) = registry.counts();
+    tui::status_line(
+        "⚙",
+        tui::COLD,
+        &format!(
+            "mcp: {servers} server(s) up ({}), {tools} tool(s)",
+            registry.server_names().join(", ")
+        ),
+    );
+}
+
 /// Run the pipeline, optionally under the full-screen dashboard.
 /// `--tui` needs a real terminal on stdin for the key reader; headless
 /// runs (CI, pipes) silently keep the stream-mode display.
@@ -233,6 +254,8 @@ async fn run_pipeline(
     anvils: usize,
     tui_flag: bool,
 ) -> Result<(), error::SlagError> {
+    connect_mcp().await;
+
     if !(tui_flag && std::io::stdin().is_terminal()) {
         return pipeline::run(commission, config, anvils, EngineHooks::default()).await;
     }
