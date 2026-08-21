@@ -5,6 +5,21 @@
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 #
 # ┌─────────────────────────────────────────────────────────────────────────┐
+# │  DEPRECATED - this is slag v1, the Claude CLI path.                     │
+# │                                                                         │
+# │  It shells out to `claude --dangerously-skip-permissions` and needs     │
+# │  the Claude CLI on your PATH. It is superseded and gets no new          │
+# │  features. It stays here so old runs remain reproducible.               │
+# │                                                                         │
+# │  The current slag is a single binary that talks to OpenRouter and       │
+# │  needs one key, no CLI:                                                 │
+# │                                                                         │
+# │      curl -sSf https://slag.dev/install.sh | sh                         │
+# │      slag key                                                           │
+# │      slag "Build a REST API with auth and rate limiting"                │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
 # │                           SLAG WORKFLOW                                 │
 # ├─────────────────────────────────────────────────────────────────────────┤
 # │                                                                         │

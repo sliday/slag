@@ -1,1 +1,5 @@
 logs/
+.DS_Store
+.playwright-mcp/
+codedb.snapshot
+dist-local/logs/
