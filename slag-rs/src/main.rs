@@ -11,8 +11,11 @@ mod migrations;
 mod pipeline;
 mod progress;
 mod proof;
+mod render;
 mod sexp;
+mod shutdown;
 mod smith;
+mod steer_history;
 mod tui;
 mod update;
 
@@ -63,6 +66,13 @@ async fn main() {
         std::env::set_var("SLAG_DUEL", "on");
     }
 
+    // Cleanup routing, installed before anything can register a chore:
+    // a panic mid-draw and a shell Ctrl-C both drain the same registry,
+    // so neither leaves the terminal in raw mode or drops buffered
+    // events. Registrations come later, from whoever claims a resource.
+    shutdown::install_panic_hook();
+    shutdown::install_signal_handler();
+
     // Idempotent fixups (deprecated model slugs, old crucible headers)
     // run before any command touches those files.
     migrations::run();
@@ -75,14 +85,17 @@ async fn main() {
         }
         Some(Command::Status { json: false }) => show_status(),
         Some(Command::Runs) => cli::show_runs(),
+        Some(Command::Cost) => cli::show_cost().await,
         Some(Command::Insights { refresh }) => insights::run(Path::new("."), refresh),
         Some(Command::Ps) => cli::show_ps(),
         Some(Command::Update) => update::self_update().await,
         Some(Command::Key { key }) => run_key(key).await,
-        Some(Command::Resume) => forge(None, cli.anvils, cli.tui).await,
+        Some(Command::Resume) => forge(None, cli.anvils, cli.tui, cli.trace.clone()).await,
+        Some(Command::Rewind { ingot, heat }) => cli::show_rewind(ingot.as_deref(), heat),
+        Some(Command::Hooks { action: cli::HooksAction::List }) => cli::show_hooks(),
         None => {
             let commission = cli.commission_text();
-            forge(commission.as_deref(), cli.anvils, cli.tui).await
+            forge(commission.as_deref(), cli.anvils, cli.tui, cli.trace.clone()).await
         }
     };
 
@@ -129,6 +142,7 @@ async fn forge(
     commission: Option<&str>,
     anvils: usize,
     tui_flag: bool,
+    trace: Option<std::path::PathBuf>,
 ) -> Result<(), error::SlagError> {
     // Two forges rewriting one crucible corrupt each other; refuse the
     // second before any project file is touched. Dead pids were already
@@ -156,7 +170,18 @@ async fn forge(
     let session = cli::sessions_dir()
         .and_then(|dir| cli::register_session_in(&dir, &run_id, "forge"));
 
-    let result = run_pipeline(commission, &config, anvils, tui_flag).await;
+    // Only a forge can strand Molten ingots, so the rescue registers here
+    // rather than in main: `slag status` has nothing to hand back.
+    shutdown::register_crucible_rescue();
+    if let Some(path) = session.clone() {
+        // Drop the PID entry on an abrupt exit too, or `slag ps` reports
+        // a ghost forge until the next liveness sweep prunes it.
+        shutdown::register(move || {
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    let result = run_pipeline(commission, &config, anvils, tui_flag, trace).await;
 
     if let Some(path) = session {
         let _ = std::fs::remove_file(path);
@@ -255,11 +280,19 @@ async fn run_pipeline(
     config: &EngineConfig,
     anvils: usize,
     tui_flag: bool,
+    trace: Option<std::path::PathBuf>,
 ) -> Result<(), error::SlagError> {
     connect_mcp().await;
 
     if !(tui_flag && std::io::stdin().is_terminal()) {
-        return pipeline::run(commission, config, anvils, EngineHooks::default()).await;
+        // `--trace` without `--tui` is the useful headless case: no
+        // dashboard holds the channel, so the trace sink takes it.
+        let (hooks, sink) = render::trace::attach(EngineHooks::default(), trace);
+        let result = pipeline::run(commission, config, anvils, hooks).await;
+        if let Some(sink) = sink {
+            let _ = sink.await;
+        }
+        return result;
     }
 
     let (tx, rx) = engine::events::channel();
@@ -270,6 +303,9 @@ async fn run_pipeline(
         steer: Some(steer.clone()),
         cancel: Some(cancel.clone()),
     };
+    // Tee before the dashboard: the trace needs the same stream, and the
+    // dashboard must not lose an event to get it.
+    let (hooks, trace_sink) = render::trace::attach(hooks, trace);
 
     tui::set_quiet(true);
     let dash = tokio::spawn(dashboard::run(rx, steer, cancel));
@@ -291,6 +327,11 @@ async fn run_pipeline(
     // terminal and un-quiets the stream tui itself.
     drop(hooks);
     let _ = dash.await;
+    // The tee closes with the hooks; wait for the trace's closing bracket
+    // before returning, or a fast exit truncates the file.
+    if let Some(sink) = trace_sink {
+        let _ = sink.await;
+    }
     tui::set_quiet(false);
 
     // The alternate screen took the in-dashboard ASSAY output with it;

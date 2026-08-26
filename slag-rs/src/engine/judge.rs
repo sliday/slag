@@ -13,7 +13,7 @@ use serde::Deserialize;
 // `crate::engine`, not `super`: this file is mounted via a #[path] shim in
 // tools.rs while engine/mod.rs is frozen. Revert to `super` when it moves.
 use crate::engine::compact::{NO_TOOLS_PREAMBLE, NO_TOOLS_TRAILER};
-use crate::engine::{ChatMessage, ChatRequest, Effort, Provider, Verdict};
+use crate::engine::{ChatMessage, ChatRequest, Effort, Provider, RetryPolicy, Role, Verdict};
 use crate::error::SlagError;
 
 const MAX_DIFF_CHARS: usize = 30_000;
@@ -188,6 +188,8 @@ async fn judge_once(
                 tools: vec![],
                 effort: Some(Effort::High),
                 max_tokens: None,
+                role: Role::Judge,
+                retry: RetryPolicy::side(),
             })
             .await?;
 
@@ -294,6 +296,103 @@ fn unswap(v: Verdict) -> Verdict {
 
 fn midpoint(x: u8, y: u8) -> u8 {
     ((x as u16 + y as u16) / 2) as u8
+}
+
+/// One gate's answer for a prompt hook (item 74).
+#[derive(Debug)]
+pub struct Ruling {
+    pub block: bool,
+    pub reason: String,
+}
+
+const RULE_PROMPT: &str = "You are a gate in slag's forge. You are shown one lifecycle event and \
+one instruction describing what to refuse. Decide whether to allow the event or block it. Blocking \
+stops real work, so block only when the instruction clearly calls for it; when in doubt, allow and \
+say why in the reason. You never write code and you never call tools. Your entire reply must be a \
+single JSON object.";
+
+/// Rule on one lifecycle event: allow it, or block it with a reason.
+///
+/// The cheap sibling of `assay` — `Effort::Low`, because this fires on every
+/// matching event and a gate costing more than the work it guards does not
+/// get used. Malformed JSON gets one retry nudge, then an error. The caller
+/// (`hooks::run_prompt`) maps that error to `CODE_FAILED`, never to a block:
+/// a broken gate must not wedge a forge.
+pub async fn rule(
+    provider: &dyn Provider,
+    model: &str,
+    instruction: &str,
+    payload: &str,
+) -> Result<Ruling, SlagError> {
+    let mut messages = vec![
+        ChatMessage::system(format!("{NO_TOOLS_PREAMBLE} {RULE_PROMPT}")),
+        ChatMessage::user(rule_prompt(instruction, payload)),
+    ];
+
+    for attempt in 0..2 {
+        let resp = provider
+            .chat(ChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: vec![],
+                effort: Some(Effort::Low),
+                max_tokens: None,
+                role: Role::Judge,
+                retry: RetryPolicy::side(),
+            })
+            .await?;
+
+        if let Some(ruling) = parse_ruling(&resp.content) {
+            return Ok(ruling);
+        }
+        if attempt == 0 {
+            messages.push(ChatMessage::assistant(resp.content, None));
+            messages.push(ChatMessage::user(RETRY_NUDGE));
+        }
+    }
+
+    Err(SlagError::Provider(
+        "hook gate returned malformed ruling JSON after retry".into(),
+    ))
+}
+
+fn rule_prompt(instruction: &str, payload: &str) -> String {
+    format!(
+        "## Instruction\n{instruction}\n\
+\n## Event payload (JSON)\n{payload}\n\
+\n## Ruling\n\
+Reply with ONLY this JSON object as your entire reply:\n\
+{{\"decision\":\"allow\"|\"block\",\"reason\":\"...\"}}\n\
+{NO_TOOLS_TRAILER}"
+    )
+}
+
+#[derive(Deserialize)]
+struct RawRuling {
+    decision: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Lenient JSON extraction, same discipline as `parse_verdict`: outermost
+/// brace span, then a strict parse. An unrecognized decision is malformed,
+/// never a silent allow.
+fn parse_ruling(content: &str) -> Option<Ruling> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let raw: RawRuling = serde_json::from_str(&content[start..=end]).ok()?;
+    let block = match raw.decision.trim().to_lowercase().as_str() {
+        "allow" => false,
+        "block" => true,
+        _ => return None,
+    };
+    Some(Ruling {
+        block,
+        reason: raw.reason,
+    })
 }
 
 #[cfg(test)]
@@ -694,5 +793,99 @@ mod tests {
         assert_eq!(verdict.score_b, 100); // clamped
         assert!(parse_verdict("no braces at all").is_none());
         assert!(parse_verdict(r#"{"winner":"c","score_a":1,"score_b":2,"critique":""}"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn rule_blocks_on_a_block_decision() {
+        let judge = MockJudge::new(&[
+            r#"{"decision":"block","reason":"writes outside the scope"}"#,
+        ]);
+        let ruling = rule(&judge, "openai/gpt-5", "refuse scope escapes", "{}")
+            .await
+            .expect("ruling");
+        assert!(ruling.block);
+        assert_eq!(ruling.reason, "writes outside the scope");
+    }
+
+    #[tokio::test]
+    async fn rule_allows_and_carries_the_reason() {
+        let judge = MockJudge::new(&[r#"{"decision":"allow","reason":"in scope"}"#]);
+        let ruling = rule(&judge, "openai/gpt-5", "gate", "{}")
+            .await
+            .expect("ruling");
+        assert!(!ruling.block);
+        assert_eq!(ruling.reason, "in scope");
+    }
+
+    #[tokio::test]
+    async fn rule_retries_once_on_malformed_json() {
+        let judge = MockJudge::new(&[
+            "I think this is fine, honestly.",
+            r#"{"decision":"allow","reason":"second try parsed"}"#,
+        ]);
+        let ruling = rule(&judge, "openai/gpt-5", "gate", "{}")
+            .await
+            .expect("ruling");
+        assert!(!ruling.block);
+        assert_eq!(ruling.reason, "second try parsed");
+        let reqs = judge.requests();
+        assert_eq!(reqs.len(), 2, "one retry, not more");
+        // The nudge rides on the second call, after the bad reply.
+        let second = &reqs[1].messages;
+        assert!(second.last().unwrap().content.contains(RETRY_NUDGE));
+    }
+
+    #[tokio::test]
+    async fn rule_errors_after_a_second_malformed_reply() {
+        let judge = MockJudge::new(&["not json", "still not json"]);
+        let err = rule(&judge, "openai/gpt-5", "gate", "{}")
+            .await
+            .expect_err("two malformed replies must not fabricate an allow");
+        assert!(err.to_string().contains("malformed"));
+    }
+
+    #[tokio::test]
+    async fn rule_refuses_an_unrecognized_decision() {
+        // "maybe" is not allow and not block. Silently allowing would turn a
+        // confused model into an open gate.
+        let judge = MockJudge::new(&[
+            r#"{"decision":"maybe","reason":"unsure"}"#,
+            r#"{"decision":"maybe","reason":"still unsure"}"#,
+        ]);
+        assert!(rule(&judge, "openai/gpt-5", "gate", "{}").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rule_extracts_an_object_wrapped_in_prose() {
+        let judge = MockJudge::new(&[
+            "Sure! ```json\n{\"decision\":\"block\",\"reason\":\"rm -rf\"}\n``` hope that helps",
+        ]);
+        let ruling = rule(&judge, "openai/gpt-5", "gate", "{}")
+            .await
+            .expect("ruling");
+        assert!(ruling.block);
+        assert_eq!(ruling.reason, "rm -rf");
+    }
+
+    #[tokio::test]
+    async fn rule_frames_the_call_as_no_tools_and_carries_the_payload() {
+        let judge = MockJudge::new(&[r#"{"decision":"allow","reason":""}"#]);
+        rule(
+            &judge,
+            "openai/gpt-5",
+            "block anything touching secrets",
+            r#"{"tool":"bash","command":"cat .env"}"#,
+        )
+        .await
+        .expect("ruling");
+
+        let req = &judge.requests()[0];
+        assert!(req.tools.is_empty(), "a gate never calls tools");
+        assert_eq!(req.role, Role::Judge);
+        assert!(req.messages[0].content.starts_with(NO_TOOLS_PREAMBLE));
+        let user = &req.messages[1].content;
+        assert!(user.contains("block anything touching secrets"));
+        assert!(user.contains("cat .env"), "the event payload reaches the model");
+        assert!(user.trim_end().ends_with(NO_TOOLS_TRAILER));
     }
 }

@@ -34,21 +34,36 @@ use crate::config::CRUCIBLE;
 use crate::crucible::CrucibleCounts;
 use crate::engine::events::preview;
 use crate::engine::{CancelFlag, EngineEvent, SteerQueue, Usage};
-use crate::{progress, tui};
+use crate::{progress, steer_history, tui};
 
 /// Rolling feed cap.
 const FEED_CAP: usize = 200;
 /// Draw coalescing: at most one render per frame (~30fps).
 const FRAME: Duration = Duration::from_millis(33);
-/// How long "steer queued" stays visible.
-const FLASH: Duration = Duration::from_millis(1500);
+/// How long a first Ctrl-C stays armed. A forge can be twenty minutes of
+/// model spend, so one stray keystroke must not throw it away; a second
+/// press inside this window is deliberate.
+const DOUBLE_PRESS: Duration = Duration::from_millis(800);
 /// A forging ingot with no tokens/tool activity for this long tints yellow.
 const STALL_WARN: Duration = Duration::from_secs(15);
 /// … and red after this long.
 const STALL_DEAD: Duration = Duration::from_secs(60);
 
 const HINT: &str =
-    "type+Enter: steer the smith · Esc/q (empty input): quit view · Ctrl-C: cancel forge";
+    "type+Enter: steer · ↑: past steers · Ctrl-O: expand results · Esc/q (empty input): quit · Ctrl-C: cancel";
+
+/// `(43 lines · 1.2kB · 0.3s)` — what a collapsed tool result is hiding.
+/// Sub-second durations read in ms; a `0.0s` says nothing.
+pub(crate) fn result_counts(lines: usize, bytes: usize, ms: u64) -> String {
+    let size = if bytes < 1024 {
+        format!("{bytes}B")
+    } else {
+        format!("{:.1}kB", bytes as f64 / 1024.0)
+    };
+    let took = if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", ms as f64 / 1000.0) };
+    let unit = if lines == 1 { "line" } else { "lines" };
+    format!("({lines} {unit} · {size} · {took})")
+}
 
 /// tui.rs palette (crossterm) → ratatui, same values. Runs through the
 /// same truecolor downgrade so the dashboard and the stream view never
@@ -88,6 +103,9 @@ pub(crate) struct IngotRow {
 pub(crate) struct FeedLine {
     pub(crate) color: Color,
     pub(crate) text: String,
+    /// Full tool output, shown only while Ctrl-O has the feed expanded.
+    /// `None` for everything that is already its whole self on one line.
+    pub(crate) detail: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -96,7 +114,15 @@ pub(crate) struct DashState {
     pub(crate) feed: VecDeque<FeedLine>,
     pub(crate) totals: Usage,
     pub(crate) input: String,
-    pub(crate) flash_until: Option<Instant>,
+    /// Steers pushed but not yet confirmed delivered, oldest first —
+    /// mirrors the live `SteerQueue`. A smith only reads its queue at a
+    /// turn boundary, so a steer sent mid-tool-call can sit here for
+    /// minutes; a 1.5s flash left the user unsure it ever landed.
+    pub(crate) queued: Vec<String>,
+    /// When Ctrl-C was last pressed, while that press is still armed.
+    /// A second press inside `DOUBLE_PRESS` cancels; otherwise the arm
+    /// lapses and the next press starts over.
+    pub(crate) pending_cancel: Option<Instant>,
     /// Current turn number; picks the metallurgical verb.
     pub(crate) turn: usize,
     /// When the current turn started — the live status line's clock.
@@ -104,6 +130,22 @@ pub(crate) struct DashState {
     pub(crate) turn_started: Option<Instant>,
     /// Tokens folded since the turn started (EngineEvent::Tokens deltas).
     pub(crate) turn_tokens: u64,
+    /// Ctrl-O: show full tool previews instead of collapsed one-liners.
+    pub(crate) expanded: bool,
+    /// Latest context fill, as a percentage of the compaction trigger.
+    /// `None` before the first turn boundary — the gauge stays off the bar
+    /// rather than claiming a confident 0%.
+    pub(crate) ctx: Option<(u8, u64, usize)>,
+    /// Past steers for the Up arrow, newest first and already deduped —
+    /// what `steer_history::recall` hands back at attach.
+    pub(crate) history: Vec<String>,
+    /// How far Up has walked. `None` means the input is the operator's own
+    /// draft, not a recalled entry.
+    pub(crate) history_pos: Option<usize>,
+    /// What was in the input when the walk started, restored when Down
+    /// steps back past the newest entry. Losing a half-typed line to a
+    /// stray Up is the failure this field exists to prevent.
+    pub(crate) draft: String,
 }
 
 impl DashState {
@@ -133,7 +175,11 @@ impl DashState {
     }
 
     fn push_feed(&mut self, color: Color, text: String) {
-        self.feed.push_back(FeedLine { color, text });
+        self.push_feed_detail(color, text, None);
+    }
+
+    fn push_feed_detail(&mut self, color: Color, text: String, detail: Option<String>) {
+        self.feed.push_back(FeedLine { color, text, detail });
         while self.feed.len() > FEED_CAP {
             self.feed.pop_front();
         }
@@ -158,6 +204,17 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             state.turn_started = None;
         }
         EngineEvent::ToolResult { .. } => state.mark_activity(),
+        EngineEvent::ContextGauge { pct, used_tokens, budget_tokens } => {
+            state.ctx = Some((*pct, *used_tokens, *budget_tokens));
+        }
+        // Delivery confirmed: drop the oldest matching entry. Matching by
+        // text, not by index, because the engine may drain several at
+        // once and duplicates of the same steer are legitimate.
+        EngineEvent::Steer { text } => {
+            if let Some(i) = state.queued.iter().position(|q| q == text) {
+                state.queued.remove(i);
+            }
+        }
         EngineEvent::IngotStart { id, work } => {
             let row = state.row_mut(id);
             row.work = preview(work, 60);
@@ -180,12 +237,25 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
         _ => {}
     }
     let (color, text) = feed_entry(&event);
-    state.push_feed(color, text);
+    // An empty entry is a deliberate silence (the gauge renders in the
+    // bottom bar instead); pushing it would burn a feed slot on nothing.
+    if text.is_empty() {
+        return;
+    }
+    // Only tool results have more to show than their one-liner.
+    let detail = match &event {
+        EngineEvent::ToolResult { preview: p, .. } if !p.is_empty() => Some(p.clone()),
+        _ => None,
+    };
+    state.push_feed_detail(color, text, detail);
 }
 
 /// One narrator-style feed line per event (mirrors `StderrNarrator`).
 fn feed_entry(event: &EngineEvent) -> (Color, String) {
     match event {
+        // The gauge already lives in the bottom bar; a feed line per turn
+        // would say the same thing twice and push real events off screen.
+        EngineEvent::ContextGauge { .. } => (palette(tui::COLD), String::new()),
         EngineEvent::TurnStart { turn } => (palette(tui::HOT), format!("⚒ turn {turn}")),
         EngineEvent::ModelCall { model } => (palette(tui::COLD), format!("⚙ {model}")),
         EngineEvent::ModelRouted { routed, .. } => {
@@ -194,15 +264,23 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
         EngineEvent::ToolCallStart { name, preview: p } => {
             (palette(tui::BRIGHT), format!("→ {name}: {}", preview(p, 80)))
         }
-        EngineEvent::ToolResult { name, ok: true, .. } => {
-            (palette(tui::PURE), format!("✓ {name} ok"))
+        EngineEvent::ToolResult { name, ok: true, lines, bytes, ms, .. } => {
+            (palette(tui::PURE), format!("✓ {name} {}", result_counts(*lines, *bytes, *ms)))
         }
-        EngineEvent::ToolResult { name, ok: false, preview: p } => {
-            (palette(tui::WARM), format!("✗ {name}: {}", preview(p, 80)))
+        EngineEvent::ToolResult { name, ok: false, preview: p, lines, bytes, ms } => {
+            // A failure is the one result worth reading inline: the
+            // preview is the error, not the payload it is hiding.
+            let _ = (lines, bytes);
+            (palette(tui::WARM), format!("✗ {name} ({}ms): {}", ms, preview(p, 80)))
         }
         EngineEvent::Tokens { usage } => {
             let msg = match usage.cost {
-                Some(cost) => format!("◦ {} tok (${cost:.4})", usage.total_tokens),
+                // `format_cost` marks a locally-estimated number `(est)`.
+                Some(_) => format!(
+                    "◦ {} tok ({})",
+                    usage.total_tokens,
+                    crate::engine::pricing::format_cost(usage)
+                ),
                 None => format!("◦ {} tok", usage.total_tokens),
             };
             (palette(tui::COLD), msg)
@@ -232,6 +310,20 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
             palette(tui::BRIGHT),
             format!("⟳ api {status} — retry {attempt} in {remaining_secs}s"),
         ),
+        EngineEvent::HookStarted { name, hook_event, status_message } => (
+            palette(tui::COLD),
+            status_message
+                .clone()
+                .unwrap_or_else(|| format!("⚓ {hook_event} hook {name}")),
+        ),
+        EngineEvent::HookFinished { name, code, duration_ms, .. } => {
+            let verdict = match code {
+                0 => "ok",
+                2 => "blocked",
+                _ => "failed",
+            };
+            (palette(tui::COLD), format!("⚓ hook {name} {verdict} ({duration_ms}ms)"))
+        }
     }
 }
 
@@ -331,6 +423,7 @@ impl CostRecord {
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
             cost: self.cost,
+            ..Default::default()
         }
     }
 
@@ -438,6 +531,19 @@ pub(crate) fn handle_key(
     steer: &SteerQueue,
     cancel: &CancelFlag,
 ) -> KeyOutcome {
+    handle_key_at(state, key, steer, cancel, Instant::now())
+}
+
+/// Clock-injected form. The double-press window is the only time-dependent
+/// branch here, and asserting on it by sleeping 800ms in a test is both
+/// slow and flaky.
+pub(crate) fn handle_key_at(
+    state: &mut DashState,
+    key: KeyEvent,
+    steer: &SteerQueue,
+    cancel: &CancelFlag,
+    now: Instant,
+) -> KeyOutcome {
     if key.kind != KeyEventKind::Press {
         return KeyOutcome::Stay;
     }
@@ -447,30 +553,108 @@ pub(crate) fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
-        cancel.store(true, Ordering::SeqCst);
-        return KeyOutcome::Cancel;
+        // Armed and still inside the window: they meant it.
+        if state
+            .pending_cancel
+            .is_some_and(|t| now.saturating_duration_since(t) < DOUBLE_PRESS)
+        {
+            state.pending_cancel = None;
+            cancel.store(true, Ordering::SeqCst);
+            return KeyOutcome::Cancel;
+        }
+        // First press (or a lapsed one): arm and say so. The bottom bar
+        // reads `pending_cancel` to flash "press again to cancel".
+        state.pending_cancel = Some(now);
+        return KeyOutcome::Stay;
     }
+    // Ctrl-O swaps collapsed one-liners for full previews. One toggle,
+    // one hint in the HINT bar — not a per-line "ctrl-o to expand" that
+    // would repeat itself two hundred times down the feed.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
+    {
+        state.pending_cancel = None;
+        state.expanded = !state.expanded;
+        return KeyOutcome::Stay;
+    }
+    // Any other key is evidence the Ctrl-C was a slip; disarm so a later
+    // stray press cannot pair with it across minutes of typing.
+    state.pending_cancel = None;
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') if state.input.is_empty() => KeyOutcome::Detach,
         KeyCode::Esc => {
             state.input.clear();
+            state.history_pos = None;
+            state.draft.clear();
             KeyOutcome::Stay
         }
         KeyCode::Enter => {
             if !state.input.is_empty() {
                 let text = std::mem::take(&mut state.input);
-                if let Ok(mut q) = steer.lock() {
-                    q.push(text);
+                // `ctx` is a local query, not a steer: it prints the
+                // breakdown behind the gauge instead of costing a turn.
+                if text.trim() == "ctx" {
+                    state.push_feed(palette(tui::COLD), ctx_breakdown(state.ctx));
+                    return KeyOutcome::Stay;
                 }
-                state.flash_until = Some(Instant::now() + FLASH);
+                if let Ok(mut q) = steer.lock() {
+                    q.push(text.clone());
+                }
+                // Buffered, not written: the disk is off the keypress path.
+                // The shutdown registry lands it.
+                steer_history::record(&text);
+                // The submitted steer becomes the newest recall entry, and
+                // any older copy of it goes — pressing Up four times should
+                // reach four different steers, not one repeated.
+                state.history.retain(|h| h != &text);
+                state.history.insert(0, text.clone());
+                state.history_pos = None;
+                state.draft.clear();
+                state.queued.push(text);
+            }
+            KeyOutcome::Stay
+        }
+        // Up/Down walk past steers. Only meaningful with history to walk,
+        // so an empty list leaves the arrows inert rather than clearing
+        // the line under the operator.
+        KeyCode::Up if !state.history.is_empty() => {
+            let next = match state.history_pos {
+                // Starting the walk: stash whatever was typed so Down can
+                // put it back.
+                None => {
+                    state.draft = state.input.clone();
+                    0
+                }
+                // At the oldest already: hold there.
+                Some(i) => (i + 1).min(state.history.len() - 1),
+            };
+            state.history_pos = Some(next);
+            state.input = state.history[next].clone();
+            KeyOutcome::Stay
+        }
+        KeyCode::Down if state.history_pos.is_some() => {
+            match state.history_pos {
+                Some(0) | None => {
+                    // Back past the newest: the operator's own line returns.
+                    state.history_pos = None;
+                    state.input = std::mem::take(&mut state.draft);
+                }
+                Some(i) => {
+                    state.history_pos = Some(i - 1);
+                    state.input = state.history[i - 1].clone();
+                }
             }
             KeyOutcome::Stay
         }
         KeyCode::Backspace => {
+            // Editing a recalled steer makes it the draft: the walk is over,
+            // and a later Down must not discard the edit.
+            state.history_pos = None;
             state.input.pop();
             KeyOutcome::Stay
         }
         KeyCode::Char(c) => {
+            state.history_pos = None;
             state.input.push(c);
             KeyOutcome::Stay
         }
@@ -482,7 +666,8 @@ pub(crate) fn handle_key(
 
 pub(crate) fn draw(f: &mut Frame, state: &DashState) {
     let [main, bottom] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(f.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(bottom_height(state))])
+            .areas(f.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(main);
     draw_crucible(f, left, state);
@@ -539,12 +724,16 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &DashState) {
     // Auto-scroll: always show the newest lines that fit.
     let visible = area.height.saturating_sub(2) as usize;
     let skip = state.feed.len().saturating_sub(visible);
-    let lines: Vec<Line> = state
-        .feed
-        .iter()
-        .skip(skip)
-        .map(|l| Line::from(Span::styled(format!("  {}", l.text), Style::default().fg(l.color))))
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    for l in state.feed.iter().skip(skip) {
+        lines.push(Line::from(Span::styled(format!("  {}", l.text), Style::default().fg(l.color))));
+        if !state.expanded {
+            continue;
+        }
+        if let Some(detail) = &l.detail {
+            lines.extend(detail_lines(detail));
+        }
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" forge feed ")
@@ -552,9 +741,134 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &DashState) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Expanded tool output, indented under its one-liner. A preview that
+/// already reads as a unified diff (what `edit_file` returns) is
+/// re-rendered through `render::diff` so the word that actually changed
+/// is highlighted instead of the whole line going red-then-green.
+pub(crate) fn detail_lines(detail: &str) -> Vec<Line<'static>> {
+    if let Some((old, new)) = diff_sides(detail) {
+        return crate::render::diff::diff_lines(&old, &new)
+            .into_iter()
+            .map(diff_line_to_ratatui)
+            .collect();
+    }
+    detail
+        .lines()
+        .map(|t| {
+            Line::from(Span::styled(
+                format!("      {t}"),
+                Style::default().fg(palette(tui::COLD)),
+            ))
+        })
+        .collect()
+}
+
+/// Recover the before/after sides of a unified-diff-shaped preview. Any
+/// line the tool did not mark is context and belongs to both sides.
+/// `None` when nothing is marked — a plain output is not a diff.
+fn diff_sides(detail: &str) -> Option<(String, String)> {
+    let (mut old, mut new) = (String::new(), String::new());
+    let mut marked = false;
+    for line in detail.lines() {
+        // `---`/`+++` are the file headers, not content.
+        if line.starts_with("---") || line.starts_with("+++") {
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'-') => {
+                marked = true;
+                old.push_str(&line[1..]);
+                old.push('\n');
+            }
+            Some(b'+') => {
+                marked = true;
+                new.push_str(&line[1..]);
+                new.push('\n');
+            }
+            _ => {
+                let body = line.strip_prefix(' ').unwrap_or(line);
+                old.push_str(body);
+                old.push('\n');
+                new.push_str(body);
+                new.push('\n');
+            }
+        }
+    }
+    marked.then_some((old, new))
+}
+
+/// A `DiffLine` in slag's palette: removals WARM, additions HOT, context
+/// COLD, and the spans that actually moved rendered BRIGHT and bold so
+/// the eye lands on them first.
+fn diff_line_to_ratatui(line: crate::render::diff::DiffLine) -> Line<'static> {
+    use crate::render::diff::{LineKind, SpanKind};
+    let base = match line.kind {
+        LineKind::Removed => palette(tui::WARM),
+        LineKind::Added => palette(tui::HOT),
+        LineKind::Context => palette(tui::COLD),
+    };
+    let mut spans =
+        vec![Span::styled(format!("      {} ", line.marker()), Style::default().fg(base))];
+    for span in &line.spans {
+        let style = match span.kind {
+            SpanKind::Changed => Style::default()
+                .fg(palette(tui::BRIGHT))
+                .add_modifier(ratatui::style::Modifier::BOLD),
+            SpanKind::Same => Style::default().fg(base),
+        };
+        spans.push(Span::styled(span.text.clone(), style));
+    }
+    Line::from(spans)
+}
+
+/// Gauge colour by fill. Quiet below two thirds, HOT once compaction is
+/// in sight, WARM (red — a crack's colour) once the next turn may prune.
+fn ctx_color(pct: u8) -> crossterm::style::Color {
+    match pct {
+        0..=65 => tui::COLD,
+        66..=84 => tui::HOT,
+        _ => tui::WARM,
+    }
+}
+
+/// The `ctx` steer keyword's answer: what the one-word gauge is hiding.
+/// The budget is already net of the output reserve and compaction
+/// headroom, so "to compaction" is the honest name for the remainder —
+/// not "free window".
+fn ctx_breakdown(ctx: Option<(u8, u64, usize)>) -> String {
+    let Some((pct, used, budget)) = ctx else {
+        return "ctx — no reading yet; the gauge fills on the first turn".to_string();
+    };
+    let left = (budget as u64).saturating_sub(used);
+    format!(
+        "ctx {pct}% — {} of {} tok, {} to compaction",
+        thousands(used),
+        thousands(budget as u64),
+        thousands(left)
+    )
+}
+
+/// `104000` → `104,000`. Group-of-three separators, because the whole
+/// point of the breakdown is reading magnitudes off at a glance.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
     let mut totals = match state.totals.cost {
-        Some(cost) => format!("  Σ {} tok · ${cost:.4}", state.totals.total_tokens),
+        Some(_) => format!(
+            "  Σ {} tok · {}",
+            state.totals.total_tokens,
+            crate::engine::pricing::format_cost(&state.totals)
+        ),
         None => format!("  Σ {} tok", state.totals.total_tokens),
     };
     let mut totals_color = palette(tui::PURE);
@@ -567,18 +881,60 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
         Span::styled(state.input.clone(), Style::default().fg(palette(tui::PURE))),
         Span::styled("▏", Style::default().fg(palette(tui::BRIGHT))),
     ];
-    if state.flash_until.is_some_and(|t| Instant::now() < t) {
+    // An armed Ctrl-C is the loudest thing on screen for its 800ms: the
+    // user just tried to kill a running forge and needs to know whether
+    // it worked. WARM (red) — the same colour a crack gets.
+    if state
+        .pending_cancel
+        .is_some_and(|t| Instant::now().saturating_duration_since(t) < DOUBLE_PRESS)
+    {
         input_spans.push(Span::styled(
-            "  steer queued",
-            Style::default().fg(palette(tui::BRIGHT)),
+            "  press Ctrl-C again to cancel the forge",
+            Style::default().fg(palette(tui::WARM)),
         ));
     }
-    let lines = vec![
-        Line::from(Span::styled(totals, Style::default().fg(totals_color))),
-        Line::from(input_spans),
-        Line::from(Span::styled(format!("  {HINT}"), Style::default().fg(palette(tui::COLD)))),
-    ];
+    let mut top = vec![Span::styled(totals, Style::default().fg(totals_color))];
+    if let Some((pct, _, _)) = state.ctx {
+        top.push(Span::styled(
+            format!("  ctx {pct}%"),
+            Style::default().fg(palette(ctx_color(pct))),
+        ));
+    }
+    let mut lines = vec![Line::from(top)];
+    lines.extend(queued_lines(&state.queued));
+    lines.push(Line::from(input_spans));
+    lines
+        .push(Line::from(Span::styled(format!("  {HINT}"), Style::default().fg(palette(tui::COLD)))));
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The pending-steer list that sits above the input: dim, oldest first,
+/// capped at `QUEUE_SHOWN` with a `+N more` tail. Empty when nothing is
+/// pending, so the bar keeps its usual height on a quiet forge.
+fn queued_lines(queued: &[String]) -> Vec<Line<'static>> {
+    if queued.is_empty() {
+        return Vec::new();
+    }
+    let dim = Style::default().fg(palette(tui::COLD));
+    let mut lines: Vec<Line<'static>> = queued
+        .iter()
+        .take(QUEUE_SHOWN)
+        .map(|q| Line::from(Span::styled(format!("  ⏳ {}", preview(q, 64)), dim)))
+        .collect();
+    if let Some(extra) = queued.len().checked_sub(QUEUE_SHOWN).filter(|n| *n > 0) {
+        lines.push(Line::from(Span::styled(format!("  ⏳ +{extra} more"), dim)));
+    }
+    lines
+}
+
+/// How many rows the queued-steer list is allowed before it collapses
+/// into `+N more`. The bottom bar grows to fit it, so an unbounded list
+/// would eat the crucible and the feed.
+pub(crate) const QUEUE_SHOWN: usize = 3;
+
+/// Bottom-bar height: totals + queued list + input + hint.
+pub(crate) fn bottom_height(state: &DashState) -> u16 {
+    3 + queued_lines(&state.queued).len() as u16
 }
 
 // ---------------------------------------------------------------- terminal
@@ -592,14 +948,16 @@ fn restore_terminal() {
     progress::clear_forge_state();
 }
 
-/// Panic hook that leaves the alternate screen before the default hook
-/// prints, so the backtrace lands on a sane terminal.
-fn install_panic_hook() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        previous(info);
-    }));
+/// Hand the terminal back to the central cleanup registry, which the
+/// panic hook and the shell Ctrl-C handler both drain. Registered last,
+/// so it runs first: a crucible rescue that prints an error into a
+/// dying alternate screen prints into nothing.
+///
+/// Idempotent by construction — `restore_terminal` is a sequence of
+/// "put it back" calls that no-op when the terminal is already sane, so
+/// the normal exit path calling it directly costs nothing.
+fn register_terminal_restore() {
+    crate::shutdown::register(restore_terminal);
 }
 
 /// Crossterm input reader on a dedicated thread (crossterm's async
@@ -638,7 +996,7 @@ pub async fn run(
     cancel: CancelFlag,
 ) -> io::Result<()> {
     tui::set_quiet(true);
-    install_panic_hook();
+    register_terminal_restore();
 
     let setup = (|| -> io::Result<Terminal<CrosstermBackend<io::Stderr>>> {
         enable_raw_mode()?;
@@ -673,6 +1031,11 @@ pub async fn run(
             state.totals = prior.to_usage();
         }
     }
+    // Past steers for the Up arrow, and the flush that lands this run's on
+    // the way out. Registered rather than called at the end of `run`,
+    // because the exit worth protecting is the one that never reaches it.
+    state.history = steer_history::recall();
+    steer_history::install_flush();
 
     let result =
         event_loop(&mut terminal, &mut state, plan_total, &mut rx, &mut keys, &steer, &cancel)
@@ -752,10 +1115,6 @@ async fn event_loop(
                 }
             }
             _ = interval.tick() => {
-                if state.flash_until.is_some_and(|t| Instant::now() >= t) {
-                    state.flash_until = None;
-                    dirty = true;
-                }
                 // Stalled rows change appearance with no event arriving:
                 // keep the "(stalled Ns)" counter ticking on screen.
                 if has_stalled(&state, Instant::now()) {
@@ -813,7 +1172,7 @@ mod tests {
         for ev in [
             EngineEvent::IngotStart { id: "i1".into(), work: "build the dashboard".into() },
             EngineEvent::TurnStart { turn: 1 },
-            EngineEvent::ToolResult { name: "bash".into(), ok: true, preview: "ok".into() },
+            tool_result("bash", true, "ok"),
             EngineEvent::Tokens {
                 usage: Usage { total_tokens: 42, cost: Some(0.01), ..Default::default() },
             },
@@ -881,7 +1240,7 @@ mod tests {
         state.ingots[0].last_activity = old;
         apply_event(
             &mut state,
-            EngineEvent::ToolResult { name: "bash".into(), ok: false, preview: "x".into() },
+            tool_result("bash", false, "x"),
         );
         assert_ne!(state.ingots[0].last_activity, old);
     }
@@ -1029,11 +1388,76 @@ mod tests {
         handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
         assert_eq!(steer.lock().unwrap().as_slice(), ["focus".to_string()]);
         assert!(state.input.is_empty());
-        assert!(state.flash_until.is_some());
+        assert_eq!(state.queued, vec!["focus".to_string()], "mirrors the live queue");
 
         // Enter with an empty buffer queues nothing.
         handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
         assert_eq!(steer.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn up_walks_the_recall_list_and_down_restores_the_draft() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        // Newest first, the order `steer_history::recall` hands back.
+        state.history = vec!["retry the proof".into(), "focus".into()];
+
+        for c in "half-t".chars() {
+            handle_key(&mut state, press(KeyCode::Char(c)), &steer, &cancel);
+        }
+        handle_key(&mut state, press(KeyCode::Up), &steer, &cancel);
+        assert_eq!(state.input, "retry the proof", "newest recalls first");
+        handle_key(&mut state, press(KeyCode::Up), &steer, &cancel);
+        assert_eq!(state.input, "focus");
+        // Past the oldest, Up holds rather than emptying the line.
+        handle_key(&mut state, press(KeyCode::Up), &steer, &cancel);
+        assert_eq!(state.input, "focus");
+
+        handle_key(&mut state, press(KeyCode::Down), &steer, &cancel);
+        assert_eq!(state.input, "retry the proof");
+        handle_key(&mut state, press(KeyCode::Down), &steer, &cancel);
+        assert_eq!(state.input, "half-t", "walking past the newest restores what was typed");
+        // Already at the draft: another Down is a no-op, not a clear.
+        handle_key(&mut state, press(KeyCode::Down), &steer, &cancel);
+        assert_eq!(state.input, "half-t");
+    }
+
+    #[test]
+    fn submitting_a_recalled_steer_resets_the_cursor_and_prepends_it() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        state.history = vec!["focus".into(), "retry".into()];
+
+        handle_key(&mut state, press(KeyCode::Up), &steer, &cancel);
+        handle_key(&mut state, press(KeyCode::Up), &steer, &cancel);
+        assert_eq!(state.input, "retry");
+        handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
+
+        assert_eq!(steer.lock().unwrap().as_slice(), ["retry".to_string()]);
+        assert_eq!(state.history_pos, None, "the cursor resets on submit");
+        assert_eq!(
+            state.history[0], "retry",
+            "a resent steer becomes the newest, without a duplicate below it"
+        );
+        assert_eq!(state.history, vec!["retry".to_string(), "focus".to_string()]);
+
+        // The next Up starts from the newest again, not where the last walk stopped.
+        handle_key(&mut state, press(KeyCode::Up), &steer, &cancel);
+        assert_eq!(state.input, "retry");
+    }
+
+    #[test]
+    fn typing_after_a_recall_keeps_the_recalled_text_as_the_new_draft() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        state.history = vec!["focus".into()];
+
+        handle_key(&mut state, press(KeyCode::Up), &steer, &cancel);
+        handle_key(&mut state, press(KeyCode::Char('!')), &steer, &cancel);
+        assert_eq!(state.input, "focus!");
+        // Editing ends the walk: Down must not throw the edit away.
+        handle_key(&mut state, press(KeyCode::Down), &steer, &cancel);
+        assert_eq!(state.input, "focus!");
     }
 
     #[test]
@@ -1054,12 +1478,202 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_sets_cancel_flag_and_detaches() {
+    fn the_queued_list_caps_at_three_with_a_more_tail() {
+        let none: Vec<String> = Vec::new();
+        assert!(queued_lines(&none).is_empty(), "a quiet forge keeps the bar at 3 rows");
+
+        let two: Vec<String> = vec!["a".into(), "b".into()];
+        assert_eq!(queued_lines(&two).len(), 2, "under the cap, no tail");
+
+        let five: Vec<String> = (0..5).map(|i| format!("steer {i}")).collect();
+        let lines = queued_lines(&five);
+        assert_eq!(lines.len(), QUEUE_SHOWN + 1);
+        let rendered: String =
+            lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains("steer 0") && rendered.contains("steer 2"));
+        assert!(!rendered.contains("steer 3"), "past the cap, collapsed");
+        assert!(rendered.contains("+2 more"), "got: {rendered}");
+    }
+
+    #[test]
+    fn a_delivered_steer_leaves_the_queued_list() {
         let mut state = DashState::default();
         let (steer, cancel) = queue();
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(handle_key(&mut state, key, &steer, &cancel), KeyOutcome::Cancel);
+        for c in "focus".chars() {
+            handle_key(&mut state, press(KeyCode::Char(c)), &steer, &cancel);
+        }
+        handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
+        assert_eq!(state.queued, vec!["focus".to_string()]);
+
+        // The engine drained it and said so: the row goes away, and the
+        // user learns the smith actually has it.
+        apply_event(&mut state, EngineEvent::Steer { text: "focus".into() });
+        assert!(state.queued.is_empty());
+    }
+
+    #[test]
+    fn an_unrelated_steer_confirmation_leaves_the_queue_alone() {
+        let mut state = DashState::default();
+        state.queued = vec!["mine".into()];
+        apply_event(&mut state, EngineEvent::Steer { text: "somebody else's".into() });
+        assert_eq!(state.queued, vec!["mine".to_string()], "only a match dequeues");
+    }
+
+    #[test]
+    fn the_bottom_bar_grows_to_fit_the_queued_list() {
+        let mut state = DashState::default();
+        assert_eq!(bottom_height(&state), 3, "totals + input + hint");
+        state.queued = vec!["a".into()];
+        assert_eq!(bottom_height(&state), 4);
+        state.queued = (0..9).map(|i| i.to_string()).collect();
+        assert_eq!(bottom_height(&state), 3 + QUEUE_SHOWN as u16 + 1, "capped, never unbounded");
+    }
+
+    fn tool_result(name: &str, ok: bool, preview: &str) -> EngineEvent {
+        EngineEvent::ToolResult {
+            name: name.into(),
+            ok,
+            preview: preview.into(),
+            lines: preview.lines().count(),
+            bytes: preview.len(),
+            ms: 300,
+        }
+    }
+
+    #[test]
+    fn a_collapsed_result_says_what_it_is_hiding() {
+        assert_eq!(result_counts(43, 1536, 300), "(43 lines · 1.5kB · 300ms)");
+        // Sub-second reads in ms; "0.0s" would say nothing.
+        assert_eq!(result_counts(1, 12, 4), "(1 line · 12B · 4ms)");
+        assert_eq!(result_counts(9, 100, 2500), "(9 lines · 100B · 2.5s)");
+    }
+
+    #[test]
+    fn ctrl_o_toggles_the_expanded_feed() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(!state.expanded, "collapsed by default");
+        handle_key(&mut state, key, &steer, &cancel);
+        assert!(state.expanded);
+        handle_key(&mut state, key, &steer, &cancel);
+        assert!(!state.expanded, "it is a toggle");
+        assert!(!cancel.load(Ordering::SeqCst), "ctrl-o is not ctrl-c");
+    }
+
+    #[test]
+    fn the_expand_hint_appears_once_in_the_hint_bar() {
+        // Not once per feed line: two hundred results would repeat it.
+        assert_eq!(HINT.matches("Ctrl-O").count(), 1);
+    }
+
+    #[test]
+    fn a_tool_result_keeps_its_preview_as_expandable_detail() {
+        let mut state = DashState::default();
+        apply_event(&mut state, tool_result("read_file", true, "line one\nline two"));
+        let last = state.feed.back().expect("a feed line");
+        assert!(last.text.contains("read_file"));
+        assert!(last.text.contains("2 lines"), "collapsed line carries counts: {}", last.text);
+        assert_eq!(last.detail.as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn a_unified_diff_preview_renders_through_the_word_differ() {
+        let detail = " keep me\n-let total = sum(xs);\n+let count = sum(xs);\n";
+        let lines = detail_lines(detail);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert!(rendered.iter().any(|l| l.contains("- let total")), "got: {rendered:?}");
+        assert!(rendered.iter().any(|l| l.contains("+ let count")), "got: {rendered:?}");
+        // The renamed word is the only bold span on the added line.
+        let added = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("count")))
+            .expect("an added line");
+        let bold: Vec<&str> = added
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(ratatui::style::Modifier::BOLD))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bold, vec!["count"]);
+    }
+
+    #[test]
+    fn plain_output_is_not_mistaken_for_a_diff() {
+        let lines = detail_lines("just some output\nno markers here");
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert_eq!(rendered, vec!["      just some output", "      no markers here"]);
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn a_single_ctrl_c_only_arms_the_cancel() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        let t0 = Instant::now();
+        assert_eq!(handle_key_at(&mut state, ctrl_c(), &steer, &cancel, t0), KeyOutcome::Stay);
+        assert!(!cancel.load(Ordering::SeqCst), "one press must not kill a 20-minute forge");
+        assert!(state.pending_cancel.is_some(), "armed");
+    }
+
+    #[test]
+    fn a_second_ctrl_c_inside_the_window_cancels() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        let t0 = Instant::now();
+        handle_key_at(&mut state, ctrl_c(), &steer, &cancel, t0);
+        let outcome =
+            handle_key_at(&mut state, ctrl_c(), &steer, &cancel, t0 + DOUBLE_PRESS / 2);
+        assert_eq!(outcome, KeyOutcome::Cancel);
         assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_lapsed_arm_starts_over_instead_of_cancelling() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        let t0 = Instant::now();
+        handle_key_at(&mut state, ctrl_c(), &steer, &cancel, t0);
+        // Two strays a full second apart are two accidents, not intent.
+        let outcome =
+            handle_key_at(&mut state, ctrl_c(), &steer, &cancel, t0 + DOUBLE_PRESS * 2);
+        assert_eq!(outcome, KeyOutcome::Stay);
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert!(state.pending_cancel.is_some(), "re-armed by the later press");
+    }
+
+    #[test]
+    fn typing_after_a_stray_ctrl_c_disarms_it() {
+        let mut state = DashState::default();
+        let (steer, cancel) = queue();
+        let t0 = Instant::now();
+        handle_key_at(&mut state, ctrl_c(), &steer, &cancel, t0);
+        handle_key_at(&mut state, press(KeyCode::Char('x')), &steer, &cancel, t0);
+        assert!(state.pending_cancel.is_none());
+        // So the *next* Ctrl-C is a first press again, not a pair.
+        let outcome = handle_key_at(&mut state, ctrl_c(), &steer, &cancel, t0);
+        assert_eq!(outcome, KeyOutcome::Stay);
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_armed_cancel_flashes_the_press_again_hint() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut state = DashState::default();
+        state.pending_cancel = Some(Instant::now());
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let content: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("press Ctrl-C again"), "got: {content}");
     }
 
     #[test]
@@ -1086,7 +1700,7 @@ mod tests {
             },
         );
         state.input = "steer me".into();
-        state.flash_until = Some(Instant::now() + FLASH);
+        state.queued = vec!["steer me".into()];
         terminal.draw(|f| draw(f, &state)).unwrap();
 
         let content: String = terminal
@@ -1100,9 +1714,12 @@ mod tests {
         assert!(content.contains("forging"));
         assert!(content.contains("42 tok"));
         assert!(content.contains("steer me"));
-        assert!(content.contains("steer queued"));
-        // Hint line clips at 80 cols; assert on its head.
-        assert!(content.contains("steer the smith"));
+        // The pending steer persists as its own dim row, not a 1.5s flash.
+        // (⏳ is double-width, so the backend pads a cell after it.)
+        assert!(content.contains("⏳"), "got: {content}");
+        assert_eq!(content.matches("steer me").count(), 2, "queued row + input line");
+        // Hint line clips at 80 cols; assert on a segment that survives.
+        assert!(content.contains("Ctrl-O: expand"), "one expand hint in the bar, not per line");
     }
 
     /// Every tui palette color must survive the crossterm → ratatui hop.
@@ -1215,6 +1832,7 @@ mod tests {
             completion_tokens: 42,
             total_tokens: 142,
             cost: Some(0.05),
+            ..Default::default()
         };
         let rec = CostRecord::from_usage(&usage);
         let back = rec.to_usage();
@@ -1233,6 +1851,45 @@ mod tests {
         assert!(!is_crack(&EngineEvent::IngotDone { id: "i1".into(), ok: true }));
         assert!(is_ingot_event(&EngineEvent::IngotStart { id: "i1".into(), work: "w".into() }));
         assert!(!is_ingot_event(&EngineEvent::TurnStart { turn: 1 }));
+    }
+
+    #[test]
+    fn gauge_updates_the_bar_without_spending_a_feed_line() {
+        let mut state = DashState::default();
+        apply_event(
+            &mut state,
+            EngineEvent::ContextGauge { pct: 48, used_tokens: 96_000, budget_tokens: 200_000 },
+        );
+        assert_eq!(state.ctx, Some((48, 96_000, 200_000)));
+        assert!(state.feed.is_empty(), "the gauge claimed a feed line");
+    }
+
+    #[test]
+    fn gauge_heats_up_as_compaction_nears() {
+        assert_eq!(ctx_color(0), tui::COLD);
+        assert_eq!(ctx_color(65), tui::COLD);
+        assert_eq!(ctx_color(66), tui::HOT);
+        assert_eq!(ctx_color(84), tui::HOT);
+        assert_eq!(ctx_color(85), tui::WARM);
+        assert_eq!(ctx_color(100), tui::WARM);
+    }
+
+    #[test]
+    fn ctx_breakdown_names_the_remainder_and_groups_digits() {
+        let line = ctx_breakdown(Some((48, 96_000, 200_000)));
+        assert_eq!(line, "ctx 48% — 96,000 of 200,000 tok, 104,000 to compaction");
+        // Over budget: the remainder floors at zero rather than wrapping.
+        let over = ctx_breakdown(Some((100, 210_000, 200_000)));
+        assert!(over.ends_with("0 to compaction"), "{over}");
+        assert!(ctx_breakdown(None).contains("no reading yet"));
+    }
+
+    #[test]
+    fn thousands_groups_from_the_right() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     #[test]

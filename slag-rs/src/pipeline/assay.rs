@@ -46,8 +46,26 @@ pub fn show() -> Result<(), SlagError> {
     if let Some(line) = stats::durations_line(&run) {
         println!("\n  {}{}{}", super::fg(tui::COLD), line, super::reset());
     }
+    if let Some(line) = stats::churn_line(&run) {
+        println!("  {}{}{}", super::fg(tui::COLD), line, super::reset());
+    }
     if let Some(line) = stats::tool_errors_line(&run) {
         println!("  {}{}{}", super::fg(tui::WARM), line, super::reset());
+    }
+
+    // Item 35: spend per model and per call site. One session total hides
+    // whether the money went to smithing, judging or duelling.
+    if let Some(rows) = stats::ledger_lines(&run) {
+        let total = run.ledger.total();
+        println!(
+            "\n  {}spend {}{}",
+            super::fg(tui::COLD),
+            crate::engine::pricing::format_cost(&total),
+            super::reset(),
+        );
+        for row in rows {
+            println!("    {}{}{}", super::fg(tui::COLD), row, super::reset());
+        }
     }
 
     if counts.cracked > 0 {

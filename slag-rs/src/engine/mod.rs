@@ -9,10 +9,12 @@ pub mod compact;
 pub mod events;
 pub mod mcp;
 pub mod policy;
+pub mod pricing;
 pub mod prompt;
 pub mod provider;
 pub mod tools;
 pub mod transcript;
+pub mod hooks;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -122,6 +124,41 @@ pub enum FinishReason {
     Other,
 }
 
+/// Which call site spent the tokens. Carried on `ChatRequest` and copied
+/// onto the `Usage` that comes back, so the ledger can split smith spend
+/// from judge, founder and surveyor spend after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Smith,
+    Plan,
+    Judge,
+    Founder,
+    Surveyor,
+    Compact,
+    Duel,
+}
+
+impl Role {
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Smith => "smith",
+            Role::Plan => "plan",
+            Role::Judge => "judge",
+            Role::Founder => "founder",
+            Role::Surveyor => "surveyor",
+            Role::Compact => "compact",
+            Role::Duel => "duel",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -133,6 +170,16 @@ pub struct Usage {
     /// OpenRouter reports spend in credits when `usage: {include: true}`.
     #[serde(default)]
     pub cost: Option<f64>,
+    /// True when `cost` came from the local pricing table rather than the
+    /// provider, so readouts can mark the number as an estimate.
+    #[serde(default)]
+    pub estimated: bool,
+    /// Model that actually ran, and the call site that asked. Together they
+    /// key the cost ledger; a fold across several calls leaves both `None`.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub role: Option<Role>,
 }
 
 impl Usage {
@@ -143,6 +190,9 @@ impl Usage {
         if let Some(c) = other.cost {
             *self.cost.get_or_insert(0.0) += c;
         }
+        // One estimated leg makes the whole sum an estimate. The key fields
+        // stay put: a fold across models has no single model or role.
+        self.estimated |= other.estimated;
     }
 }
 
@@ -161,6 +211,37 @@ pub struct NormalizedResponse {
     pub usage: Usage,
 }
 
+/// How hard one request is allowed to retry. A forge strike is the work
+/// itself and rides the provider-wide budget. A side call — duel judging,
+/// a recipe suggestion, an assay summary — is advisory, so it takes one
+/// swing: retrying it during a capacity event multiplies load across all
+/// `MAX_ANVILS` workers to buy nothing the run needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Attempt budget for this request. `None` defers to the provider's.
+    pub attempts: Option<usize>,
+    /// Whether capacity errors may retry for free in unattended mode.
+    pub persistent: bool,
+}
+
+impl RetryPolicy {
+    /// The provider-wide budget, unattended waiting included.
+    pub const fn full() -> Self {
+        Self { attempts: None, persistent: true }
+    }
+
+    /// One swing, and never wait out a capacity event.
+    pub const fn side() -> Self {
+        Self { attempts: Some(1), persistent: false }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
 /// One model call.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -169,6 +250,11 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
     pub effort: Option<Effort>,
     pub max_tokens: Option<u32>,
+    /// Which call site this is. Rides back on `Usage.role` so the ledger
+    /// can attribute spend without the caller threading a second channel.
+    pub role: Role,
+    /// How hard this one request retries (item 50).
+    pub retry: RetryPolicy,
 }
 
 /// Model provider boundary. Boxed future for dyn compatibility,
@@ -220,7 +306,21 @@ pub enum EngineEvent {
     /// does, so this line always carries news.
     ModelRouted { requested: String, routed: String },
     ToolCallStart { name: String, preview: String },
-    ToolResult { name: String, ok: bool, preview: String },
+    /// `lines`/`bytes` measure the tool's *full* output, not the truncated
+    /// `preview`, so a collapsed one-liner can honestly say how much it is
+    /// hiding; `ms` is the dispatch wall time. All three default, so a
+    /// JSONL line written before they existed still deserializes.
+    ToolResult {
+        name: String,
+        ok: bool,
+        preview: String,
+        #[serde(default)]
+        lines: usize,
+        #[serde(default)]
+        bytes: usize,
+        #[serde(default)]
+        ms: u64,
+    },
     Tokens { usage: Usage },
     Steer { text: String },
     Finish { summary: String },
@@ -241,14 +341,96 @@ pub enum EngineEvent {
     IngotDone { id: String, ok: bool },
     DuelRound { id: String, round: u8 },
     DuelVerdict { id: String, winner: char, margin: u8 },
+    /// How full the smith's context is at a turn boundary. `budget_tokens`
+    /// is already net of the output reserve and the compaction buffer, so
+    /// 100% is the compaction trigger, not the raw model window.
+    ContextGauge { pct: u8, used_tokens: u64, budget_tokens: usize },
+    /// A lifecycle hook started. Paired with `HookFinished`, this is what
+    /// keeps a slow hook from reading as a hung smith.
+    HookStarted { name: String, hook_event: String, status_message: Option<String> },
+    /// A lifecycle hook returned. `code` follows the exit-code protocol:
+    /// 0 injected context, 2 blocked, `-1` never produced a status.
+    HookFinished { name: String, hook_event: String, code: i32, duration_ms: u64 },
 }
 
 /// Steering messages queued by the TUI, drained by the agent loop before
 /// each model call (hermes steer-into-tool-result pattern).
 pub type SteerQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-/// Hard-interrupt flag checked at each turn boundary.
+/// Hard-interrupt flag. Four surfaces set it (dashboard, TUI, signal
+/// handler, tests), so it stays the bare shared bool it has always been;
+/// item 56's reason rides alongside in `Cancellation` rather than
+/// replacing it.
 pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// Why a run stopped (item 56). A user abort is a failure the assay should
+/// report; a steer interrupt is the operator redirecting live work and
+/// must not read as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CancelReason {
+    #[default]
+    UserAbort,
+    SteerInterrupt,
+}
+
+impl CancelReason {
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::SteerInterrupt,
+            _ => Self::UserAbort,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::UserAbort => 0,
+            Self::SteerInterrupt => 1,
+        }
+    }
+
+    /// How the interrupt reads in an event or an assay line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UserAbort => "cancelled by operator",
+            Self::SteerInterrupt => "interrupted to steer",
+        }
+    }
+}
+
+/// A `CancelFlag` with the reason it was raised (item 56). Cloning shares
+/// both, so a handler that raises it and a loop that reads it see the same
+/// state. `flag` is the same `CancelFlag` every existing caller already
+/// holds, so nothing that only needs the boolean has to change.
+#[derive(Debug, Clone, Default)]
+pub struct Cancellation {
+    pub flag: CancelFlag,
+    reason: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl Cancellation {
+    /// Adopt an existing flag — the bridge for the four surfaces that
+    /// already own a `CancelFlag` and cannot be rewritten at once.
+    pub fn from_flag(flag: CancelFlag) -> Self {
+        Self { flag, ..Self::default() }
+    }
+
+    /// Raise the interrupt. The first reason wins: a steer that arrives
+    /// after a ctrl-C must not relabel the abort as a redirect.
+    pub fn raise(&self, reason: CancelReason) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.flag.swap(true, SeqCst) {
+            self.reason.store(reason.code(), SeqCst);
+        }
+    }
+
+    pub fn is_raised(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn reason(&self) -> CancelReason {
+        CancelReason::from_code(self.reason.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
 
 /// Assayer verdict for one duel round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +482,16 @@ pub mod stats {
         pub classes: BTreeMap<&'static str, usize>,
     }
 
+    /// Lines added and removed by one ingot's file writes.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Churn {
+        pub added: usize,
+        pub removed: usize,
+    }
+
+    /// Bucket for writes made outside any ingot attempt.
+    pub const CHURN_UNATTRIBUTED: &str = "-";
+
     /// Snapshot of the run's accounting.
     #[derive(Debug, Clone, Default)]
     pub struct RunStats {
@@ -314,6 +506,13 @@ pub mod stats {
         /// Wall clock since `mark_run_start`.
         pub wall: Option<Duration>,
         pub tool_errors: BTreeMap<String, ToolErrors>,
+        /// Line churn per ingot id. Ingots that never wrote are absent;
+        /// writes outside an ingot (plan passes, duel casts) land under
+        /// `CHURN_UNATTRIBUTED`.
+        pub churn: BTreeMap<String, Churn>,
+        /// Spend split per model and per call site (item 35), so judge and
+        /// duel cost stop hiding inside one session total.
+        pub ledger: super::pricing::CostLedger,
     }
 
     struct Cell {
@@ -322,6 +521,8 @@ pub mod stats {
         tools: Duration,
         run_started: Option<Instant>,
         tool_errors: BTreeMap<String, ToolErrors>,
+        churn: BTreeMap<String, Churn>,
+        ledger: super::pricing::CostLedger,
     }
 
     static CELL: Mutex<Cell> = Mutex::new(Cell {
@@ -330,6 +531,8 @@ pub mod stats {
         tools: Duration::ZERO,
         run_started: None,
         tool_errors: BTreeMap::new(),
+        churn: BTreeMap::new(),
+        ledger: super::pricing::CostLedger::new(),
     });
 
     fn cell() -> std::sync::MutexGuard<'static, Cell> {
@@ -360,6 +563,50 @@ pub mod stats {
         cell().tools += d;
     }
 
+    /// Fold one call's usage into the run ledger (item 35). Keyed by the
+    /// `model`/`role` the provider stamped on it, so a duel cast against
+    /// the alt model and the judge call that scored it land on separate
+    /// rows even though both happen inside one ingot.
+    pub fn record_usage(usage: &super::Usage) {
+        cell().ledger.fold(usage);
+    }
+
+    /// Lines `new` adds and drops relative to `old`, as a multiset delta
+    /// over lines. A rewritten line reads as one added and one removed; an
+    /// appended block as N added and none removed; a block moved without
+    /// edits as neither, which is the honest churn answer. O(n), and no
+    /// LCS table — this runs on every write in the hot path.
+    pub fn line_churn(old: &str, new: &str) -> Churn {
+        let mut tally: BTreeMap<&str, i64> = BTreeMap::new();
+        for line in old.lines() {
+            *tally.entry(line).or_insert(0) -= 1;
+        }
+        for line in new.lines() {
+            *tally.entry(line).or_insert(0) += 1;
+        }
+        let mut churn = Churn::default();
+        for delta in tally.values() {
+            match delta.cmp(&0) {
+                std::cmp::Ordering::Greater => churn.added += *delta as usize,
+                std::cmp::Ordering::Less => churn.removed += delta.unsigned_abs() as usize,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        churn
+    }
+
+    /// Attribute one write's churn to `ingot`. Callers pass the ingot the
+    /// writing anvil is forging, so parallel anvils never cross-credit.
+    pub fn record_churn(ingot: &str, churn: Churn) {
+        if churn.added == 0 && churn.removed == 0 {
+            return;
+        }
+        let mut c = cell();
+        let e = c.churn.entry(ingot.to_string()).or_default();
+        e.added += churn.added;
+        e.removed += churn.removed;
+    }
+
     /// One tool call failed; classify from the error text.
     pub fn record_tool_error(tool: &str, output: &str) {
         let class = classify_error(output);
@@ -377,6 +624,8 @@ pub mod stats {
             tools: c.tools,
             wall: c.run_started.map(|t| t.elapsed()),
             tool_errors: c.tool_errors.clone(),
+            churn: c.churn.clone(),
+            ledger: c.ledger.clone(),
         }
     }
 
@@ -430,6 +679,63 @@ pub mod stats {
         }
         line.push_str(&format!(" · tools {}", fmt_dur(stats.tools)));
         Some(line)
+    }
+
+    /// One `model  role  N tok  $cost` line per ledger row, heaviest
+    /// first, or `None` when the run made no calls (item 35). Judge, duel
+    /// and founder spend each get their own line, which is the point: a
+    /// single session total hides which call site is expensive.
+    pub fn ledger_lines(stats: &RunStats) -> Option<Vec<String>> {
+        let rows = stats.ledger.rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let model_w = rows.iter().map(|r| r.model.len()).max().unwrap_or(0);
+        let role_w = rows.iter().map(|r| r.role.label().len()).max().unwrap_or(0);
+        Some(
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "{:model_w$}  {:role_w$}  {:>9} tok  {}",
+                        r.model,
+                        r.role.label(),
+                        r.usage.total_tokens,
+                        super::pricing::format_cost(&r.usage),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// `churn: +412/-87 (i2 +300/-12, i1 +112/-75)`, or `None` when the
+    /// run wrote nothing. The run total leads because that is the number
+    /// an operator reads first; per-ingot detail follows, heaviest first,
+    /// so a runaway rewriter is named without scanning the whole list.
+    pub fn churn_line(stats: &RunStats) -> Option<String> {
+        if stats.churn.is_empty() {
+            return None;
+        }
+        let (added, removed) = stats
+            .churn
+            .values()
+            .fold((0usize, 0usize), |(a, r), c| (a + c.added, r + c.removed));
+
+        let mut per: Vec<(&String, &Churn)> = stats.churn.iter().collect();
+        per.sort_by(|a, b| {
+            (b.1.added + b.1.removed)
+                .cmp(&(a.1.added + a.1.removed))
+                .then_with(|| a.0.cmp(b.0))
+        });
+        let detail: Vec<String> = per
+            .into_iter()
+            .map(|(id, c)| format!("{id} +{}/-{}", c.added, c.removed))
+            .collect();
+
+        // One ingot's detail would just repeat the total.
+        if detail.len() == 1 {
+            return Some(format!("churn: +{added}/-{removed}"));
+        }
+        Some(format!("churn: +{added}/-{removed} ({})", detail.join(", ")))
     }
 
     /// `tool errors: edit_file 7 (no-match 5), bash 2`, or `None` for a
@@ -496,6 +802,8 @@ pub mod stats {
                 tools: Duration::from_secs(100),
                 wall: Some(Duration::from_secs(252)),
                 tool_errors: BTreeMap::new(),
+                churn: BTreeMap::new(),
+                ..Default::default()
             };
             assert_eq!(
                 durations_line(&stats).unwrap(),
@@ -537,6 +845,113 @@ pub mod stats {
             assert_eq!(fmt_dur(Duration::from_secs(3723)), "1h02m");
         }
 
+        /// Item 88: an appended block is pure addition; a rewritten line
+        /// is one of each; an unchanged file is no churn at all.
+        #[test]
+        fn line_churn_counts_added_and_removed_lines() {
+            assert_eq!(line_churn("a\nb\n", "a\nb\n"), Churn::default());
+            assert_eq!(
+                line_churn("a\nb\n", "a\nb\nc\nd\n"),
+                Churn { added: 2, removed: 0 }
+            );
+            assert_eq!(
+                line_churn("a\nb\nc\n", "a\n"),
+                Churn { added: 0, removed: 2 }
+            );
+            assert_eq!(
+                line_churn("a\nold\nc\n", "a\nnew\nc\n"),
+                Churn { added: 1, removed: 1 }
+            );
+            // A new file: every line is added.
+            assert_eq!(line_churn("", "x\ny\n"), Churn { added: 2, removed: 0 });
+        }
+
+        /// Item 35: one row per (model, role), heaviest first, so judge and
+        /// duel spend read separately from smithing.
+        #[test]
+        fn ledger_lines_split_spend_per_model_and_role_heaviest_first() {
+            let mut stats = RunStats::default();
+            let call = |model: &str, role: super::super::Role, cost: f64, tok: u64| {
+                super::super::Usage {
+                    prompt_tokens: tok,
+                    total_tokens: tok,
+                    cost: Some(cost),
+                    model: Some(model.to_string()),
+                    role: Some(role),
+                    ..Default::default()
+                }
+            };
+            stats.ledger.fold(&call("base/model", super::super::Role::Smith, 1.0, 900));
+            stats.ledger.fold(&call("base/model", super::super::Role::Smith, 0.5, 100));
+            stats.ledger.fold(&call("judge/model", super::super::Role::Judge, 0.25, 40));
+
+            let lines = ledger_lines(&stats).expect("calls were made");
+            assert_eq!(lines.len(), 2, "one line per (model, role) pair");
+            assert!(lines[0].contains("smith"), "got {:?}", lines[0]);
+            assert!(lines[0].contains("1000 tok"), "same-key calls fold: {:?}", lines[0]);
+            assert!(lines[0].contains("$1.5000"), "got {:?}", lines[0]);
+            assert!(lines[1].contains("judge"), "judge spend gets its own row: {:?}", lines[1]);
+            // Columns line up: "base/model" pads out to "judge/model"'s width,
+            // so both rows put the role at the same offset.
+            assert!(lines[0].starts_with("base/model  "), "padded: {:?}", lines[0]);
+            // Both rows put the role at the same offset: the model field is
+            // padded to the widest id, then two spaces. Checked by offset
+            // rather than by `find`, since "judge" also occurs inside
+            // "judge/model".
+            let role_col = "judge/model".len() + 2;
+            assert!(lines[0][role_col..].starts_with("smith"), "role column: {:?}", lines[0]);
+            assert!(lines[1][role_col..].starts_with("judge "), "role column: {:?}", lines[1]);
+        }
+
+        #[test]
+        fn ledger_lines_report_nothing_for_a_run_that_made_no_calls() {
+            assert!(ledger_lines(&RunStats::default()).is_none());
+        }
+
+        /// An estimated leg taints the row, so the readout never claims the
+        /// provider quoted a price it did not.
+        #[test]
+        fn an_estimated_call_marks_its_ledger_row() {
+            let mut stats = RunStats::default();
+            stats.ledger.fold(&super::super::Usage {
+                total_tokens: 10,
+                cost: Some(0.01),
+                estimated: true,
+                model: Some("base/model".into()),
+                role: Some(super::super::Role::Smith),
+                ..Default::default()
+            });
+            let lines = ledger_lines(&stats).unwrap();
+            assert!(lines[0].contains("~$0.0100 (est)"), "got {:?}", lines[0]);
+        }
+
+        #[test]
+        fn churn_line_leads_with_the_run_total_then_heaviest_ingot() {
+            let mut stats = RunStats::default();
+            stats.churn.insert("i1".into(), Churn { added: 112, removed: 75 });
+            stats.churn.insert("i2".into(), Churn { added: 300, removed: 12 });
+            assert_eq!(
+                churn_line(&stats).unwrap(),
+                "churn: +412/-87 (i2 +300/-12, i1 +112/-75)"
+            );
+        }
+
+        #[test]
+        fn churn_line_drops_redundant_detail_and_reports_nothing_for_a_clean_run() {
+            assert_eq!(churn_line(&RunStats::default()), None);
+            let mut one = RunStats::default();
+            one.churn.insert("i1".into(), Churn { added: 9, removed: 1 });
+            assert_eq!(churn_line(&one).unwrap(), "churn: +9/-1");
+        }
+
+        #[test]
+        fn record_churn_ignores_a_no_op_write() {
+            let before = snapshot();
+            record_churn("i-noop", Churn::default());
+            assert!(!snapshot().churn.contains_key("i-noop"));
+            assert_eq!(before.churn.get("i-noop"), None);
+        }
+
         #[test]
         fn global_accumulator_folds_api_retry_tool_and_error_records() {
             // Other tests share the process-global cell, so assert
@@ -558,5 +973,53 @@ pub mod stats {
                     >= edit_before.classes.get("no-match").copied().unwrap_or(0) + 1
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::{CancelReason, Cancellation};
+
+    /// Item 56: the first reason wins. A steer arriving after a ctrl-C
+    /// must not relabel an operator abort as a redirect.
+    #[test]
+    fn the_first_raised_reason_wins() {
+        let c = Cancellation::default();
+        assert!(!c.is_raised());
+        c.raise(CancelReason::UserAbort);
+        c.raise(CancelReason::SteerInterrupt);
+        assert!(c.is_raised());
+        assert_eq!(c.reason(), CancelReason::UserAbort);
+    }
+
+    #[test]
+    fn a_steer_interrupt_reads_differently_from_an_abort() {
+        let c = Cancellation::default();
+        c.raise(CancelReason::SteerInterrupt);
+        assert_eq!(c.reason(), CancelReason::SteerInterrupt);
+        assert_eq!(c.reason().label(), "interrupted to steer");
+        assert_eq!(CancelReason::UserAbort.label(), "cancelled by operator");
+    }
+
+    /// Clones share both the flag and the reason, so the handler that
+    /// raises it and the loop that reads it agree.
+    #[test]
+    fn clones_share_the_flag_and_the_reason() {
+        let c = Cancellation::default();
+        let handle = c.clone();
+        handle.raise(CancelReason::SteerInterrupt);
+        assert!(c.is_raised());
+        assert_eq!(c.reason(), CancelReason::SteerInterrupt);
+        // The bare flag is the same one every existing caller holds.
+        assert!(c.flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The bridge for the four surfaces that already own a `CancelFlag`.
+    #[test]
+    fn an_adopted_flag_is_the_same_flag() {
+        let flag: super::CancelFlag = Default::default();
+        let c = Cancellation::from_flag(flag.clone());
+        c.raise(CancelReason::UserAbort);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

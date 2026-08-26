@@ -56,6 +56,12 @@ pub struct Cli {
     /// (equivalent to SLAG_DUEL=on)
     #[arg(long)]
     pub duel: bool,
+
+    /// Write a Chrome trace-event file beside the JSONL log: one lane per
+    /// anvil, tool calls nested inside their ingot. Load it in
+    /// chrome://tracing or Perfetto to see what ran in parallel.
+    #[arg(long, value_name = "FILE")]
+    pub trace: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -95,6 +101,39 @@ pub enum Command {
 
     /// Self-update to latest release
     Update,
+
+    /// Restore the workspace from an attempt checkpoint, undoing what a
+    /// smith wrote. Bare `slag rewind` takes the most recent attempt.
+    Rewind {
+        /// Ingot id to rewind; requires --heat
+        #[arg(long, value_name = "ID")]
+        ingot: Option<String>,
+        /// Heat of the attempt to rewind; requires --ingot
+        #[arg(long, value_name = "N")]
+        heat: Option<u8>,
+    },
+
+    /// Session spend beside the OpenRouter account balance
+    Cost,
+
+    /// Lifecycle hooks: the event contract and what is configured
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HooksAction {
+    /// Print the events, the exit-code contract, and the configured hooks
+    List,
+}
+
+/// `slag hooks list`. Reads the frozen snapshot, so it shows what this
+/// process would actually fire, not what the file says right now.
+pub fn show_hooks() -> Result<(), crate::error::SlagError> {
+    print!("{}", crate::engine::hooks::describe(&crate::engine::hooks::snapshot()));
+    Ok(())
 }
 
 impl Cli {
@@ -178,6 +217,40 @@ pub fn status_json() -> Result<String, SlagError> {
         "last_event": last_event,
     });
     Ok(obj.to_string())
+}
+
+/// `session $0.42 · account $18.31 remaining` (item 36). Either half can
+/// be unknown — a run that spent nothing yet, or an unreachable balance
+/// endpoint — and the line degrades to whichever half is real rather than
+/// printing a zero that reads as fact.
+pub fn cost_line(session: Option<f64>, credits: Option<crate::engine::provider::Credits>) -> String {
+    let mut parts = Vec::new();
+    match session {
+        Some(spend) => parts.push(format!("session ${spend:.2}")),
+        None => parts.push("session -".to_string()),
+    }
+    if let Some(c) = credits {
+        parts.push(format!("account ${:.2} remaining", c.remaining()));
+    }
+    parts.join(" · ")
+}
+
+/// `slag cost`: this run's spend and the account balance.
+pub async fn show_cost() -> Result<(), SlagError> {
+    let spend = session_costs_spend(Path::new(SESSION_COSTS));
+    // No key: the session half still prints. Reading spend off disk needs
+    // no network and no account.
+    let credits = match crate::config::EngineConfig::load() {
+        Some(cfg) => crate::engine::provider::fetch_credits(&cfg.api_key, &cfg.base_url).await,
+        None => None,
+    };
+    println!("{}", cost_line(spend, credits));
+    if let (Some(c), Some(floor)) = (credits, crate::config::credit_floor()) {
+        if c.remaining() < floor {
+            println!("  balance is under the ${floor:.2} floor — top up before a long run");
+        }
+    }
+    Ok(())
 }
 
 /// Pull a spend figure out of `.slag/session-costs.json` without pinning
@@ -595,9 +668,163 @@ pub fn show_ps() -> Result<(), SlagError> {
     Ok(())
 }
 
+// ─── slag rewind (item 68's operator handle on the checkpoints) ─────────
+
+/// Restore `root` from an attempt checkpoint and describe what moved.
+/// Returns the report rather than printing it, so the outcome is
+/// assertable without capturing stdout.
+///
+/// Bare (both args `None`) means "the most recent attempt", which is the
+/// case that matters after a crack: the operator wants the last smith's
+/// edits gone. Naming an attempt takes `--ingot` *and* `--heat` together;
+/// a half-specified target is refused rather than guessed, because
+/// restoring the wrong heat destroys work with no second undo.
+pub fn rewind_workspace(
+    root: &Path,
+    ingot: Option<&str>,
+    heat: Option<u8>,
+) -> Result<String, SlagError> {
+    match (ingot, heat) {
+        (Some(id), Some(h)) => {
+            let key = crate::anvil::checkpoint::attempt_key(id, h);
+            if !crate::anvil::checkpoint::attempt_exists(root, id, h) {
+                return Ok(format!("no checkpoint for {key}"));
+            }
+            let restored = crate::anvil::checkpoint::rewind_attempt(root, id, h);
+            Ok(format!("rewound {key}: {restored} file(s) restored"))
+        }
+        (None, None) => match crate::anvil::checkpoint::rewind_latest(root) {
+            Some((key, restored)) => {
+                Ok(format!("rewound {key}: {restored} file(s) restored"))
+            }
+            None => Ok("no checkpoint to rewind".into()),
+        },
+        _ => Err(SlagError::Config(
+            "slag rewind needs --ingot and --heat together, or neither".into(),
+        )),
+    }
+}
+
+/// `slag rewind` — print what the rewind restored.
+pub fn show_rewind(ingot: Option<&str>, heat: Option<u8>) -> Result<(), SlagError> {
+    let report = rewind_workspace(Path::new("."), ingot, heat)?;
+    println!("\n  {}⟲{} {report}\n", fg(tui::HOT), reset());
+    Ok(())
+}
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::*;
+    use crate::anvil::checkpoint::Checkpoint;
+
+    /// Stage one attempt that modified `file`, so rewind has something to
+    /// restore. Returns the pre-modification content.
+    fn staged_attempt(root: &Path, id: &str, heat: u8, file: &str) -> &'static str {
+        let path = root.join(file);
+        std::fs::write(&path, b"original\n").unwrap();
+        let cp = Checkpoint::for_attempt(root, id, heat);
+        cp.begin();
+        cp.record(&path);
+        std::fs::write(&path, b"smith wrote this\n").unwrap();
+        "original\n"
+    }
+
+    /// Item 68: bare `slag rewind` restores the most recent attempt and
+    /// names what it undid, so the operator can see the damage reversed.
+    #[test]
+    fn rewind_restores_latest_attempt_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let want = staged_attempt(dir.path(), "i1", 2, "src.txt");
+
+        let report = rewind_workspace(dir.path(), None, None).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.path().join("src.txt")).unwrap(), want);
+        assert!(report.contains("i1-h2"), "{report}");
+        assert!(report.contains('1'), "{report}");
+    }
+
+    /// `--ingot`/`--heat` target one attempt by name rather than by mtime.
+    #[test]
+    fn rewind_targets_a_named_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let want = staged_attempt(dir.path(), "i1", 1, "a.txt");
+        staged_attempt(dir.path(), "i9", 4, "b.txt");
+
+        let report = rewind_workspace(dir.path(), Some("i1"), Some(1)).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), want);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "smith wrote this\n",
+            "the untargeted attempt must stay wound forward"
+        );
+        assert!(report.contains("i1-h1"), "{report}");
+    }
+
+    /// Nothing to rewind is a normal outcome, not an error: a workspace
+    /// that never forged has no manifests, and `slag rewind` must say so
+    /// rather than fail the exit code.
+    #[test]
+    fn rewind_reports_when_no_checkpoint_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = rewind_workspace(dir.path(), None, None).unwrap();
+        assert!(report.to_lowercase().contains("no checkpoint"), "{report}");
+    }
+
+    /// A mistyped id must not read as success. "rewound i9-h1: 0 file(s)
+    /// restored" tells an operator their rewind ran; it did not, and the
+    /// files they wanted back are still forward.
+    #[test]
+    fn rewind_names_a_target_that_was_never_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        staged_attempt(dir.path(), "i1", 1, "a.txt");
+
+        let report = rewind_workspace(dir.path(), Some("i9"), Some(1)).unwrap();
+
+        assert!(report.to_lowercase().contains("no checkpoint"), "{report}");
+        assert!(report.contains("i9-h1"), "{report}");
+        assert!(!report.contains("rewound"), "{report}");
+    }
+
+    /// An `--ingot` with no `--heat` is ambiguous; refuse rather than
+    /// guess a heat and silently restore the wrong attempt.
+    #[test]
+    fn rewind_refuses_a_half_specified_target() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(rewind_workspace(dir.path(), Some("i1"), None).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 36: session spend beside the account balance, degrading to
+    /// whichever half is real rather than printing a zero as fact.
+    #[test]
+    fn cost_line_shows_both_halves_and_survives_either_being_unknown() {
+        let credits = crate::engine::provider::Credits { granted: 20.0, used: 1.69 };
+        assert_eq!(
+            cost_line(Some(0.42), Some(credits)),
+            "session $0.42 · account $18.31 remaining"
+        );
+        // Unreachable balance endpoint: the session half still prints.
+        assert_eq!(cost_line(Some(0.42), None), "session $0.42");
+        // Nothing spent yet reads as unknown, not as $0.00.
+        assert_eq!(
+            cost_line(None, Some(credits)),
+            "session - · account $18.31 remaining"
+        );
+        assert_eq!(cost_line(None, None), "session -");
+    }
+
+    #[test]
+    fn cost_subcommand_parses() {
+        assert!(matches!(
+            Cli::parse_from(["slag", "cost"]).command,
+            Some(Command::Cost)
+        ));
+    }
 
     #[test]
     fn duel_flag_parses_and_defaults_off() {
@@ -607,6 +834,23 @@ mod tests {
 
         let cli = Cli::parse_from(["slag", "build", "it"]);
         assert!(!cli.duel);
+    }
+
+    #[test]
+    fn trace_flag_takes_a_path_and_stays_off_by_default() {
+        let cli = Cli::parse_from(["slag", "--trace", "run.json", "build", "it"]);
+        assert_eq!(cli.trace.as_deref(), Some(Path::new("run.json")));
+        assert_eq!(cli.commission_text().as_deref(), Some("build it"));
+
+        let cli = Cli::parse_from(["slag", "build", "it"]);
+        assert!(cli.trace.is_none(), "tracing costs a file; opt in explicitly");
+    }
+
+    #[test]
+    fn trace_flag_works_on_resume_too() {
+        let cli = Cli::parse_from(["slag", "--trace", "run.json", "resume"]);
+        assert_eq!(cli.trace.as_deref(), Some(Path::new("run.json")));
+        assert!(matches!(cli.command, Some(Command::Resume)));
     }
 
     #[test]

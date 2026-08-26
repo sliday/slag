@@ -4,7 +4,7 @@ use crate::crucible::Crucible;
 use crate::error::SlagError;
 use crate::flux;
 use crate::sexp::parser::parse_crucible;
-use crate::sexp::{Ingot, Status};
+use crate::sexp::Ingot;
 use crate::smith::Smith;
 use crate::tui;
 

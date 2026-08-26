@@ -39,11 +39,26 @@ const BASH_TIMEOUT_DEFAULT: u64 = 120;
 const BG_LOG_DIR: &str = "logs/bg";
 const BASH_TIMEOUT_MAX: u64 = 600;
 const BASH_OUTPUT_CAP_DEFAULT: usize = 30_000;
+/// Where oversized tool output lands, inside the anvil so the smith can
+/// reach it with the same sandboxed `read`/`grep` it uses for source.
+const TOOL_RESULT_DIR: &str = "logs/tool-results";
+/// How `run_shell`'s spill note opens. `grep` recognises its own layer's
+/// note by this prefix rather than by the directory name: a match line
+/// may legitimately quote the path (this file does), and dropping it as
+/// bookkeeping would silently lose a hit.
+const SPILL_NOTE_PREFIX: &str = "[full output ";
+/// How often a running shell checks the interrupt flag (item 56). The
+/// flag is a bare AtomicBool shared with four surfaces, none of which
+/// signal, so a running child is polled rather than notified.
+const CANCEL_POLL_MS: u64 = 100;
 /// Hard ceiling for SLAG_BASH_OUTPUT_CAP.
 const BASH_OUTPUT_CAP_MAX: usize = 200 * 1024;
 const GREP_LINE_CAP: usize = 100;
 const GLOB_FILE_CAP: usize = 100;
 const DIFF_LINE_CAP: usize = 12;
+/// Largest file whose content is kept as an external-change baseline
+/// (item 47). Past it the change is still reported, without a diff body.
+const BASELINE_CAP_CHARS: usize = 64 * 1024;
 /// Files modified within this window never enter the read cache: a
 /// same-size rewrite landing in the same mtime tick would make the stamp
 /// lie (git's "racy clean" rule).
@@ -82,6 +97,10 @@ pub struct ToolBox {
     /// session and its mtime has not moved since. Protects proof-gated
     /// ingots from clobbering parallel-anvil changes with stale edits.
     read_state: Arc<Mutex<HashMap<PathBuf, FileState>>>,
+    /// Last content this session saw for a tracked file (item 47), capped
+    /// per file. Kept beside `read_state` rather than inside it so
+    /// `FileState` stays `Copy`. Feeds the external-change diff.
+    baselines: Arc<Mutex<HashMap<PathBuf, Arc<str>>>>,
     /// Session-wide touch counter feeding `FileState::seq`.
     touch_seq: Arc<AtomicU64>,
     /// Attempt checkpoint recorder (item 68): when set, write_file and
@@ -97,6 +116,11 @@ pub struct ToolBox {
     /// queue so the model hears about it before its next call. `None`
     /// (tests, duel casts) drops the note; the log file still records.
     steer: Option<super::SteerQueue>,
+    /// Hard-interrupt flag (item 56). When set mid-`run_shell`, the child
+    /// process group is killed instead of the wait running to its timeout,
+    /// so ctrl-C ends a ten-minute proof now rather than at the next turn
+    /// boundary. `None` (tests, duel casts) never interrupts.
+    cancel: Option<super::CancelFlag>,
 }
 
 impl ToolBox {
@@ -105,8 +129,10 @@ impl ToolBox {
         let root = root.canonicalize().unwrap_or(root);
         Self {
             root,
+            cancel: None,
             read_cache: Arc::new(Mutex::new(HashMap::new())),
             read_state: Arc::new(Mutex::new(HashMap::new())),
+            baselines: Arc::new(Mutex::new(HashMap::new())),
             touch_seq: Arc::new(AtomicU64::new(0)),
             checkpoint: None,
             policy: Arc::new(super::policy::Policy::default()),
@@ -118,6 +144,27 @@ impl ToolBox {
     pub fn with_policy(mut self, policy: super::policy::Policy) -> Self {
         self.policy = Arc::new(policy);
         self
+    }
+
+    /// Attach the session's cancel flag so a running shell dies with the
+    /// run (item 56) instead of at the next turn boundary.
+    pub fn with_cancel(mut self, cancel: super::CancelFlag) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Resolves once the interrupt is raised; pends forever without a
+    /// flag, so `select!` arms that use it are inert in tests and duel
+    /// casts. Polled rather than notified: the flag is a bare `AtomicBool`
+    /// shared with four surfaces that do not signal.
+    async fn cancelled(&self) {
+        let Some(flag) = self.cancel.clone() else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(CANCEL_POLL_MS)).await;
+        }
     }
 
     /// Attach the agent's steer queue so background bash jobs can inject
@@ -147,8 +194,108 @@ impl ToolBox {
         }
     }
 
+    /// Item 88: credit one successful write's line churn to the ingot this
+    /// ToolBox is forging. The checkpoint carries that identity, so
+    /// parallel anvils never cross-attribute; a ToolBox without one (plan
+    /// passes, duel casts, tests) still counts toward the run total.
+    fn record_churn(&self, old: &str, new: &str) {
+        let ingot = self
+            .checkpoint
+            .as_ref()
+            .map(|c| c.ingot_id())
+            .unwrap_or(super::stats::CHURN_UNATTRIBUTED);
+        super::stats::record_churn(ingot, super::stats::line_churn(old, new));
+    }
+
     fn next_touch(&self) -> u64 {
         self.touch_seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Record the content this session last saw for a tracked file, so an
+    /// external rewrite can be diffed against it. Content over
+    /// `BASELINE_CAP_CHARS` is not kept — the change is still reported,
+    /// just without a diff body.
+    fn stamp_baseline(&self, path: &Path, content: &str) {
+        let mut b = self.baselines.lock().unwrap();
+        if content.len() > BASELINE_CAP_CHARS {
+            b.remove(path);
+        } else {
+            b.insert(path.to_path_buf(), Arc::from(content));
+        }
+    }
+
+    /// Files a tracked path changed under us since this session last saw
+    /// it, as ready-to-inject reminder bodies. Matters with `MAX_ANVILS`
+    /// parallel smiths: one anvil's write is another's surprise.
+    ///
+    /// Reported once — the baseline is re-stamped as the change is
+    /// reported, so a turn loop calling this every turn does not nag. A
+    /// touch that leaves the bytes alone is not a change. A file that
+    /// vanished is evicted from tracking (ENOENT only), never reported.
+    pub async fn external_changes(&self) -> Vec<String> {
+        let tracked: Vec<(PathBuf, FileState)> = {
+            let state = self.read_state.lock().unwrap();
+            let mut v: Vec<(PathBuf, FileState)> =
+                state.iter().map(|(p, s)| (p.clone(), *s)).collect();
+            v.sort_by(|a, b| b.1.seq.cmp(&a.1.seq));
+            v
+        };
+
+        let mut notes = Vec::new();
+        for (path, state) in tracked {
+            let meta = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.read_state.lock().unwrap().remove(&path);
+                    self.baselines.lock().unwrap().remove(&path);
+                    continue;
+                }
+                // A transient stat failure is not evidence of a change.
+                Err(_) => continue,
+            };
+            let Ok(mtime) = meta.modified() else { continue };
+            if mtime == state.mtime {
+                continue;
+            }
+            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            if fnv64(content.as_bytes()) == state.checksum {
+                // Touch-only: re-stamp the mtime so it is not re-checked.
+                self.read_state.lock().unwrap().insert(
+                    path.clone(),
+                    FileState { mtime, checksum: state.checksum, seq: state.seq },
+                );
+                continue;
+            }
+
+            let raw = self.relative(&path);
+            let before = self.baselines.lock().unwrap().get(&path).cloned();
+            let body = match before {
+                Some(old) => line_diff(&raw, &old, &content),
+                None => format!("{raw} changed (no baseline to diff against)"),
+            };
+            notes.push(format!(
+                "{raw} was modified externally — this change was intentional, \
+                 don't revert it:\n{body}"
+            ));
+
+            self.read_state.lock().unwrap().insert(
+                path.clone(),
+                FileState { mtime, checksum: fnv64(content.as_bytes()), seq: state.seq },
+            );
+            self.stamp_baseline(&path, &content);
+        }
+        notes
+    }
+
+    /// Workspace-relative rendering of a tracked path, falling back to the
+    /// absolute path when it sits outside the root.
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Paths read or written this session, most recently touched first.
@@ -173,6 +320,13 @@ impl ToolBox {
                     .unwrap_or(&p)
                     .to_string_lossy()
                     .into_owned();
+                // A token budget buys half as many chars of JSON as of
+                // prose (item 58), so the same budget caps a dense file
+                // tighter rather than smuggling twice the tokens through.
+                // Floored at one char: a budget that halves to zero should
+                // still show the model which file it lost, not an empty
+                // snapshot under a "truncated at 0 chars" note.
+                let cap_chars = (cap_chars / dense_divisor(&display)).max(1);
                 let capped = if content.chars().count() > cap_chars {
                     let head: String = content.chars().take(cap_chars).collect();
                     format!("{head}\n… [truncated at {cap_chars} chars]")
@@ -555,6 +709,7 @@ impl ToolBox {
                     path.clone(),
                     FileState { mtime, checksum: fnv64(content.as_bytes()), seq: self.next_touch() },
                 );
+                self.stamp_baseline(&path, &content);
             }
         }
         let lines: Vec<&str> = content.lines().collect();
@@ -675,6 +830,9 @@ impl ToolBox {
                         path.to_path_buf(),
                         FileState { mtime, checksum: fnv64(bytes), seq: self.next_touch() },
                     );
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    self.stamp_baseline(path, text);
+                }
             }
         }
     }
@@ -686,6 +844,9 @@ impl ToolBox {
         self.ensure_fresh_for_write(&path, raw, "write_file").await?;
         self.checkpoint_record(&path);
         self.invalidate_read_cache(&path);
+        // Pre-write bytes for the churn count; a new file reads as empty,
+        // so every one of its lines counts as added.
+        let before = tokio::fs::read_to_string(&path).await.unwrap_or_default();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -704,6 +865,7 @@ impl ToolBox {
             )));
         }
         self.stamp_write(&path, &back).await;
+        self.record_churn(&before, content);
         Ok(format!("verified: true (checksum {})", &checksum_hex(&back)[..12]))
     }
 
@@ -745,6 +907,7 @@ impl ToolBox {
                 .await
                 .map_err(|e| SlagError::Tool(format!("cannot write {raw}: {e}")))?;
             self.stamp_write(&path, new_content.as_bytes()).await;
+            self.record_churn(&content, &new_content);
             return Ok(format!(
                 "replaced {} occurrence(s) in {raw} (exact)",
                 matches.len()
@@ -831,6 +994,7 @@ impl ToolBox {
             .await
             .map_err(|e| SlagError::Tool(format!("cannot write {raw}: {e}")))?;
         self.stamp_write(&path, new_content.as_bytes()).await;
+        self.record_churn(&content, &new_content);
 
         Ok(diff_summary(raw, strategy, at_line, &removed, &added))
     }
@@ -929,8 +1093,22 @@ impl ToolBox {
         #[cfg(unix)]
         let pgid = child.id();
 
-        let waited =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        // Item 56: race the wait against the interrupt so ctrl-C ends a
+        // ten-minute proof now, not at the next turn boundary.
+        let waited = tokio::select! {
+            r = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()) => r,
+            _ = self.cancelled() => {
+                #[cfg(unix)]
+                if let Some(pgid) = pgid {
+                    let _ = Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("kill -9 -{pgid} 2>/dev/null"))
+                        .output()
+                        .await;
+                }
+                return Err(SlagError::Cancelled);
+            }
+        };
         match waited {
             Ok(Ok(output)) => {
                 let mut merged = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -941,7 +1119,24 @@ impl ToolBox {
                     }
                     merged.push_str(&stderr);
                 }
-                let mut out = truncate_middle(&merged, bash_output_cap());
+                let cap = bash_output_cap();
+                let mut out = truncate_middle(&merged, cap);
+                // Item 19: the middle a cap drops is usually where the
+                // answer is. Keep the whole thing inside the anvil and name
+                // the file, so the smith greps it instead of re-running the
+                // command with narrower flags and burning another turn.
+                if merged.len() > cap {
+                    if let Some(rel) = self.spill_tool_result(&merged).await {
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str(&format!(
+                            "\n{SPILL_NOTE_PREFIX}({} bytes) saved to {rel} — read or grep that \
+                             file for the omitted middle]\n",
+                            merged.len()
+                        ));
+                    }
+                }
                 if !output.status.success() {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
@@ -1108,9 +1303,17 @@ impl ToolBox {
             t = sh_quote(&rel),
         );
         let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT).await?;
+        // `run_shell` appends its own spill note when the raw output blew
+        // the bash cap. That line is not a match — counting it would pad
+        // the tail-cut arithmetic below — and the file it names holds the
+        // pre-cap output, which no later spill can reconstruct. Matched by
+        // its opening, not by the directory name: a real hit may quote the
+        // path, and discarding it as bookkeeping would lose a match.
+        let capped = out.lines().find(|l| l.starts_with(SPILL_NOTE_PREFIX)).map(str::trim);
         let lines: Vec<&str> = out
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.starts_with("(exit "))
+            .filter(|l| !l.starts_with(SPILL_NOTE_PREFIX))
             .map(|l| l.strip_prefix("./").unwrap_or(l))
             // grep -rc prints zero-count files too; rg --count does not.
             .filter(|l| mode != "count" || !l.ends_with(":0"))
@@ -1129,6 +1332,27 @@ impl ToolBox {
                 "\n(truncated: {} more lines)",
                 lines.len() - head_limit
             ));
+            // Item 19: grep drops its tail here, after `run_shell` already
+            // handed back everything under the bash cap — so this cut is
+            // invisible to the spill in `run_shell` and needs its own.
+            // Unless the bash cap fired too: that spill already holds more
+            // than these lines do, so name it instead of writing a second,
+            // smaller file and calling it full.
+            if capped.is_none() {
+                let full = lines.join("\n");
+                if let Some(rel) = self.spill_tool_result(&full).await {
+                    result.push_str(&format!(
+                        "\n[full {} matches saved to {rel} — read or grep that file for the rest]",
+                        lines.len()
+                    ));
+                }
+            }
+        }
+        if let Some(note) = capped {
+            // The head slice usually cuts this note off the end; the smith
+            // still needs the path.
+            result.push('\n');
+            result.push_str(note);
         }
         Ok(result)
     }
@@ -1186,6 +1410,25 @@ impl ToolBox {
         Ok(result)
     }
 
+    /// Write full tool output to `logs/tool-results/<hash>.txt` inside the
+    /// anvil and return the workspace-relative path (item 19).
+    ///
+    /// The name is content-addressed rather than call-id-keyed: `run_shell`
+    /// has no call id at hand, and hashing means a command re-run across
+    /// heats reuses one file instead of growing the anvil every retry.
+    /// Best-effort — a spill that cannot be written costs the preview
+    /// nothing, so a full disk degrades to plain truncation.
+    async fn spill_tool_result(&self, full: &str) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        full.hash(&mut hasher);
+        let name = format!("{:016x}.txt", hasher.finish());
+        let dir = self.root.join(TOOL_RESULT_DIR);
+        tokio::fs::create_dir_all(&dir).await.ok()?;
+        tokio::fs::write(dir.join(&name), full).await.ok()?;
+        Some(format!("{TOOL_RESULT_DIR}/{name}"))
+    }
+
     /// Load a recipe's full RECIPE.md by name. Workspace recipes resolve
     /// through the sandbox as usual; config-dir recipes are trusted local
     /// config and bypass it. A name collision refuses the bare name
@@ -1216,6 +1459,10 @@ impl ToolBox {
                 let body = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(|e| SlagError::Tool(format!("cannot read recipe '{name}': {e}")))?;
+                // Item 78: run the body's !`cmd` spans and ```! blocks so a
+                // recipe can embed live state. Routed back through this
+                // toolbox, so spans inherit every gate `bash` applies.
+                let body = recipes::expand_shell_spans(self, &body).await;
                 // Item 98: surface declared constraints so the session can
                 // honor them (enforcement awaits recipe-bound sessions).
                 let mut meta = Vec::new();
@@ -1227,6 +1474,15 @@ impl ToolBox {
                 }
                 if recipe.context == recipes::RecipeContext::Fork {
                     meta.push("context: fork (not yet wired; runs inline)".to_string());
+                }
+                // Item 60: age the recipe where it is injected, not in the
+                // index — the index string is cached against the manifest
+                // mtime, so a "days ago" baked into it would freeze on the
+                // day the cache was written. This stat is the first one on
+                // this path, not a second read of the index's manifest.
+                if let Some(note) = crate::flux::file_age_days(&path).and_then(crate::flux::age_note)
+                {
+                    meta.push(format!("{note}, verify against current code"));
                 }
                 Ok(if meta.is_empty() {
                     body
@@ -1494,6 +1750,37 @@ fn similarity(a: &str, b: &str) -> f64 {
         prev = cur;
     }
     2.0 * prev[b.len()] as f64 / (a.len() + b.len()) as f64
+}
+
+/// How much tighter a char budget must be for this path's file type
+/// (item 58). JSON-family payloads tokenize at about 2 bytes/token where
+/// prose and code run about 4, so a fixed char cap on them costs twice the
+/// tokens it appears to.
+fn dense_divisor(path: &str) -> usize {
+    let p = path.to_ascii_lowercase();
+    if p.ends_with(".json") || p.ends_with(".jsonl") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Line-level diff of two file versions, capped at `DIFF_LINE_CAP` changed
+/// lines per side. Common head and tail lines are trimmed first so the
+/// snippet points at the change instead of replaying the file.
+fn line_diff(path: &str, old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..]
+        .iter()
+        .rev()
+        .zip(b[head..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let removed: Vec<String> = a[head..a.len() - tail].iter().map(|s| s.to_string()).collect();
+    let added: Vec<String> = b[head..b.len() - tail].iter().map(|s| s.to_string()).collect();
+    diff_summary(path, "external", head + 1, &removed, &added)
 }
 
 fn diff_summary(
@@ -3145,6 +3432,37 @@ mod tests {
         assert!(!out.is_error, "{}", out.output);
         assert!(out.output.contains("Step 1: build."), "{}", out.output);
         assert!(out.output.contains("name: ship"), "full RECIPE.md expected");
+        // Item 60: a recipe written today is current, so no age note.
+        assert!(!out.output.contains("days ago"), "{}", out.output);
+    }
+
+    /// Item 60: a recipe last written weeks ago is annotated where it is
+    /// injected, so the model weighs it against the code rather than
+    /// trusting it as current.
+    #[tokio::test]
+    async fn recipe_view_annotates_a_stale_recipe_with_its_age() {
+        let (dir, tb) = setup();
+        write_recipe(&dir, "ship", "name: ship\ndescription: deploy", "Step 1: build.\n");
+        let path = dir.path().join("recipes").join("ship").join("RECIPE.md");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        let out = tb
+            .dispatch(&call("recipe_view", json!({"name": "ship"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("written 30 days ago"), "{}", out.output);
+        assert!(
+            out.output.contains("verify against current code"),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("Step 1: build."), "body still present");
     }
 
     #[tokio::test]
@@ -4013,6 +4331,226 @@ Collecting\n\
 
     // -- bash truncation ---------------------------------------------------
 
+    /// Item 19: output past the cap is not just cut — the whole thing goes
+    /// to disk inside the anvil and the result names the file, so the
+    /// smith can grep the omitted middle instead of re-running the command
+    /// with narrower flags.
+    #[tokio::test]
+    async fn oversized_bash_output_spills_to_disk_and_names_the_file() {
+        let (dir, tb) = setup();
+        let cap = bash_output_cap();
+        let lines = cap / 10 + 200;
+        let out = tb
+            .dispatch(&call(
+                "bash",
+                json!({"command": format!("seq 1 {lines} | sed 's/^/padding-padding-/'")}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.len() < cap * 2, "result must stay bounded");
+
+        let note = out
+            .output
+            .lines()
+            .find(|l| l.contains("full output"))
+            .unwrap_or_else(|| panic!("no spill note in: {}", out.output));
+        let rel = note
+            .split_whitespace()
+            .find(|w| w.starts_with(TOOL_RESULT_DIR))
+            .unwrap_or_else(|| panic!("note names no path: {note}"));
+
+        let spilled = std::fs::read_to_string(dir.path().join(rel)).expect("spill file readable");
+        assert!(spilled.len() > cap, "the spill holds the full output");
+        // The middle the preview dropped is on disk.
+        assert!(spilled.contains(&format!("padding-padding-{}", lines / 2)));
+    }
+
+    /// Item 56: an interrupt raised while a shell is running kills it now.
+    /// Before this, `sleep 60` ran to completion because cancellation was
+    /// only read at turn boundaries.
+    #[tokio::test]
+    async fn a_running_shell_dies_when_the_interrupt_is_raised() {
+        let (dir, _) = setup();
+        let flag: super::super::CancelFlag = Default::default();
+        let tb = ToolBox::new(dir.path()).with_cancel(flag.clone());
+
+        let raiser = flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            raiser.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = std::time::Instant::now();
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "sleep 60"})))
+            .await;
+        assert!(out.is_error, "an interrupted shell is not a success");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?} — the interrupt did not reach the child",
+            started.elapsed()
+        );
+    }
+
+    /// Without a flag the shell is inert to interrupts, so tests and duel
+    /// casts keep the behavior they had.
+    #[tokio::test]
+    async fn a_shell_without_a_cancel_flag_runs_normally() {
+        let (_dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "echo alive"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("alive"));
+    }
+
+    /// Output that fits writes nothing: a spill file per command would
+    /// fill the anvil with copies of output already in the transcript.
+    #[tokio::test]
+    async fn output_within_the_cap_does_not_spill() {
+        let (dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "echo small"})))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(!out.output.contains("full output"), "{}", out.output);
+        assert!(
+            !dir.path().join(TOOL_RESULT_DIR).exists(),
+            "no spill dir for output that fits"
+        );
+    }
+
+    /// Grep and glob route through `run_shell`, so the spill covers their
+    /// overflow too — one choke point, not three.
+    #[tokio::test]
+    async fn oversized_grep_output_spills_through_the_same_path() {
+        let (dir, tb) = setup();
+        let cap = bash_output_cap();
+        let body: String = (0..cap / 8 + 400)
+            .map(|i| format!("needle-{i}-padding\n"))
+            .collect();
+        std::fs::write(dir.path().join("haystack.txt"), &body).unwrap();
+
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                // Default mode lists filenames, which never overflows;
+                // content mode is where a grep floods the window.
+                json!({"pattern": "needle", "path": ".", "output_mode": "content"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(
+            out.output.contains(TOOL_RESULT_DIR),
+            "grep overflow must name its spill: {}",
+            out.output
+        );
+    }
+
+    /// When a grep blows *both* cuts — the bash cap first, then the line
+    /// limit — only the bash-cap spill holds the true output. Spilling the
+    /// already-cut remains a second time would name a smaller file and
+    /// call it full, so the tail cut reuses the one file that is.
+    #[tokio::test]
+    async fn a_doubly_truncated_grep_names_one_honest_spill() {
+        let (dir, tb) = setup();
+        let cap = bash_output_cap();
+        let body: String = (0..cap / 8 + 400)
+            .map(|i| format!("needle-{i}-padding\n"))
+            .collect();
+        std::fs::write(dir.path().join("haystack.txt"), &body).unwrap();
+
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "needle", "path": ".", "output_mode": "content"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+
+        let files: Vec<_> = std::fs::read_dir(dir.path().join(TOOL_RESULT_DIR))
+            .expect("spill dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1, "one cut, one file — not one per layer");
+
+        let named: Vec<&str> = out
+            .output
+            .lines()
+            .filter(|l| l.contains(TOOL_RESULT_DIR))
+            .collect();
+        assert_eq!(named.len(), 1, "one path named, not two: {named:?}");
+        let rel = named[0]
+            .split_whitespace()
+            .find(|w| w.starts_with(TOOL_RESULT_DIR))
+            .unwrap_or_else(|| panic!("note names no path: {}", named[0]));
+        let spilled = std::fs::read_to_string(dir.path().join(rel)).expect("spill readable");
+        assert!(
+            spilled.len() > body.len() / 2,
+            "the named file must hold the pre-cap output, got {} bytes",
+            spilled.len()
+        );
+
+        // The bash-cap note is not a match line, so it cannot pad the
+        // count the tail cut reports.
+        let reported: usize = out
+            .output
+            .lines()
+            .find_map(|l| l.strip_prefix("(truncated: "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .expect("a tail cut note with a count");
+        assert!(reported > 0, "a tail cut reports what it dropped");
+        assert!(
+            !out.output.contains("full output (") || !out.output.contains("matches saved"),
+            "two spill vocabularies in one result: {}",
+            out.output
+        );
+    }
+
+    /// A match line may legitimately quote the spill directory — this file
+    /// does — so the bookkeeping filter keys on the note's opening, not on
+    /// the path. Dropping such a line would lose a real hit.
+    #[tokio::test]
+    async fn a_match_that_quotes_the_spill_path_is_not_swallowed() {
+        let (dir, tb) = setup();
+        std::fs::write(
+            dir.path().join("src.rs"),
+            format!("const TOOL_RESULT_DIR: &str = \"{TOOL_RESULT_DIR}\";\n"),
+        )
+        .unwrap();
+
+        let out = tb
+            .dispatch(&call(
+                "grep",
+                json!({"pattern": "TOOL_RESULT_DIR", "path": ".", "output_mode": "content"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(
+            out.output.contains("src.rs"),
+            "a hit quoting the spill dir must survive: {}",
+            out.output
+        );
+    }
+
+    /// The filename is content-addressed, so the same output twice reuses
+    /// one file instead of growing the anvil on every retry.
+    #[tokio::test]
+    async fn identical_oversized_output_reuses_one_spill_file() {
+        let (dir, tb) = setup();
+        let cmd = format!("seq 1 {} | sed 's/^/padding-padding-/'", bash_output_cap() / 10 + 200);
+        for _ in 0..2 {
+            let out = tb.dispatch(&call("bash", json!({"command": &cmd}))).await;
+            assert!(!out.is_error, "{}", out.output);
+        }
+        let files: Vec<_> = std::fs::read_dir(dir.path().join(TOOL_RESULT_DIR))
+            .expect("spill dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1, "identical output must share one file");
+    }
+
     #[test]
     fn truncate_middle_keeps_head_and_tail_with_count() {
         let lines: Vec<String> = (1..=1000).map(|i| format!("line-{i:04}")).collect();
@@ -4230,6 +4768,103 @@ Collecting\n\
         assert!(out.is_error, "{}", out.output);
         assert!(out.output.contains("full-read limit"), "{}", out.output);
         assert!(out.output.contains("1500 lines"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn a_dense_file_snapshot_is_capped_tighter_than_prose() {
+        let (dir, tb) = setup();
+        write(&dir, "a.md", &"x".repeat(500));
+        write(&dir, "a.json", &"x".repeat(500));
+        prime(&tb, "a.md").await;
+        prime(&tb, "a.json").await;
+
+        let snaps = tb.recent_file_snapshots(2, 100);
+        let md = snaps.iter().find(|(p, _)| p.ends_with("a.md")).unwrap();
+        let js = snaps.iter().find(|(p, _)| p.ends_with("a.json")).unwrap();
+        assert!(md.1.starts_with(&"x".repeat(100)), "prose keeps the full cap");
+        assert!(
+            js.1.starts_with(&"x".repeat(50)) && !js.1.starts_with(&"x".repeat(51)),
+            "json is halved: {}",
+            &js.1[..60.min(js.1.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dense_cap_never_halves_to_zero_chars() {
+        let (dir, tb) = setup();
+        write(&dir, "a.json", "{\"k\": 1}");
+        prime(&tb, "a.json").await;
+
+        let snaps = tb.recent_file_snapshots(1, 1);
+        assert_eq!(snaps[0].1, "{\n… [truncated at 1 chars]", "{:?}", snaps[0].1);
+    }
+
+    #[tokio::test]
+    async fn external_edit_is_reported_once_with_a_diff() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "one\ntwo\n");
+        prime(&tb, "a.txt").await;
+
+        // Somebody else (a parallel anvil, the operator) rewrites the file.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write(&dir, "a.txt", "one\nTWO\n");
+
+        let notes = tb.external_changes().await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let note = &notes[0];
+        assert!(note.contains("a.txt"), "{note}");
+        assert!(note.contains("modified externally"), "{note}");
+        assert!(note.contains("don't revert it"), "{note}");
+        assert!(note.contains("-two"), "diff shows the old line: {note}");
+        assert!(note.contains("+TWO"), "diff shows the new line: {note}");
+
+        // Reported once: the baseline is re-stamped, so an unchanged file
+        // does not nag on every turn.
+        assert!(tb.external_changes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_touch_that_does_not_change_bytes_is_not_an_external_change() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "same\n");
+        prime(&tb, "a.txt").await;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write(&dir, "a.txt", "same\n"); // mtime moves, bytes identical
+
+        assert!(tb.external_changes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn our_own_edits_are_not_reported_as_external() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "one\ntwo\n");
+        prime(&tb, "a.txt").await;
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "a.txt", "old_string": "two", "new_string": "TWO"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+
+        assert!(
+            tb.external_changes().await.is_empty(),
+            "the smith's own edit re-stamps the baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_file_is_evicted_and_not_reported_forever() {
+        let (dir, tb) = setup();
+        write(&dir, "a.txt", "gone soon\n");
+        prime(&tb, "a.txt").await;
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+
+        assert!(
+            tb.external_changes().await.is_empty(),
+            "ENOENT evicts rather than reporting a phantom diff"
+        );
+        assert!(tb.recent_files(10).is_empty(), "evicted from tracking too");
     }
 
     #[tokio::test]

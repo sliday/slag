@@ -59,9 +59,14 @@ pub fn make_smith_with_spend(
     )
 }
 
-/// Plan smith factory (surveyor/founder passes).
-pub fn make_plan_smith(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
-    Box::new(native::NativeSmith::plan(cfg.clone(), workspace_root(), hooks))
+/// Plan smith factory (surveyor/founder passes). `role` splits the two
+/// phases on the cost ledger, which matters because they share a model.
+pub fn make_plan_smith(
+    cfg: &EngineConfig,
+    hooks: &EngineHooks,
+    role: crate::engine::Role,
+) -> Box<dyn Smith> {
+    Box::new(native::NativeSmith::plan(cfg.clone(), workspace_root(), hooks).with_role(role))
 }
 
 /// Base smith factory (resmelt analysis — low grade, no skill).
@@ -176,7 +181,7 @@ mod tests {
 
         // One borrow feeds all three: no factory may consume the config.
         let forge = make_smith(&cfg, "rust", 1, &hooks);
-        let plan = make_plan_smith(&cfg, &hooks);
+        let plan = make_plan_smith(&cfg, &hooks, crate::engine::Role::Plan);
         let base = make_base_smith(&cfg, &hooks);
         assert_eq!(cfg.model_base, "test/base", "config survives the factories");
 

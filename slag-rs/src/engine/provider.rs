@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use super::{
     CancelFlag, ChatMessage, ChatRequest, EngineEvent, EventTx, FinishReason, NormalizedResponse,
-    Provider, ToolCall, Usage,
+    Provider, RetryPolicy, ToolCall, Usage,
 };
 use crate::error::{ProviderApiError, ProviderErrorCategory, SlagError};
 
@@ -98,9 +98,10 @@ pub struct OpenRouter {
     /// bounded waits, so a Ctrl-C ends a retry wait instead of sleeping it
     /// out and firing more (billable) requests.
     cancel: std::sync::Mutex<Option<CancelFlag>>,
-    /// Per-model context windows resolved from `/models`, cached so one
-    /// client never fetches the (large) model list twice for the same id.
-    windows: std::sync::Mutex<std::collections::HashMap<String, Option<u64>>>,
+    /// The `/models` index: context windows (compaction budget) and prices
+    /// (item 34), resolved together from one fetch and cached so a client
+    /// never pulls the large model list twice.
+    models: tokio::sync::Mutex<Option<std::sync::Arc<ModelsIndex>>>,
 }
 
 impl OpenRouter {
@@ -121,7 +122,7 @@ impl OpenRouter {
             unattended: crate::config::unattended_retry(),
             events: std::sync::Mutex::new(None),
             cancel: std::sync::Mutex::new(None),
-            windows: std::sync::Mutex::new(std::collections::HashMap::new()),
+            models: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -187,12 +188,55 @@ impl OpenRouter {
     /// the model list is unreachable or the id is unknown — window size is
     /// an optimization for the compaction budget, never a blocker.
     pub async fn context_length(&self, model: &str) -> Option<u64> {
-        if let Some(cached) = self.windows.lock().unwrap().get(model) {
-            return *cached;
+        self.models_index().await.window(model)
+    }
+
+    /// The `/models` index, fetched at most once per client. Both the
+    /// window cache and the price table come out of this single request.
+    /// A failed fetch still caches (empty windows, disk-cached prices), so
+    /// an offline run does not re-fetch on every turn.
+    async fn models_index(&self) -> std::sync::Arc<ModelsIndex> {
+        let mut slot = self.models.lock().await;
+        if let Some(index) = slot.as_ref() {
+            return index.clone();
         }
-        let window = fetch_context_length(&self.base_url, model).await;
-        self.windows.lock().unwrap().insert(model.to_string(), window);
-        window
+        let body = fetch_models_body(&self.base_url).await;
+        let mut index = ModelsIndex::parse(body.as_deref());
+        if index.prices.is_empty() {
+            // No live prices: an offline run can still estimate from the
+            // last table we saw.
+            if let Some(cached) = crate::engine::pricing::load_cached() {
+                index.prices = cached;
+            }
+        } else {
+            crate::engine::pricing::store(&index.prices);
+        }
+        let index = std::sync::Arc::new(index);
+        *slot = Some(index.clone());
+        index
+    }
+
+    /// Stamp ledger provenance on the response's usage, fill a missing
+    /// cost from the local price table (item 34), and fold the result into
+    /// the run ledger (item 35). The model key prefers what the provider
+    /// says it ran: with a router like `openrouter/auto` the requested id
+    /// is not a priced model at all.
+    ///
+    /// This is the only success path out of `chat`, which is why the fold
+    /// belongs here. The judge and the summarizer hold a provider directly
+    /// rather than a `ForgeAgent`, so a fold in the agent loop misses them
+    /// and their rows vanish from the assay.
+    async fn attribute(&self, resp: &mut NormalizedResponse, req: &ChatRequest) {
+        let ran = resp.model.clone().unwrap_or_else(|| req.model.clone());
+        resp.usage.role = Some(req.role);
+        resp.usage.model = Some(ran.clone());
+        if resp.usage.cost.is_none() {
+            if let Some(cost) = self.models_index().await.prices.estimate(&ran, &resp.usage) {
+                resp.usage.cost = Some(cost);
+                resp.usage.estimated = true;
+            }
+        }
+        crate::engine::stats::record_usage(&resp.usage);
     }
 
     fn build_body(&self, req: &ChatRequest) -> Value {
@@ -270,6 +314,10 @@ impl OpenRouter {
     /// rate-limit reset timestamp when it sent one (no polling), else
     /// Retry-After, else backoff capped at 5 minutes; a cumulative 6h
     /// ceiling still ends a hopeless wait. `None` = stop retrying.
+    ///
+    /// `policy` is the per-request override (item 50): a side call caps its
+    /// own attempts and opts out of the free unattended wait, so a judge or
+    /// summary request cannot multiply load across every anvil.
     fn plan_retry(
         &self,
         status: Option<u16>,
@@ -278,9 +326,10 @@ impl OpenRouter {
         attempts_made: usize,
         budget_used: usize,
         unattended_waited: Duration,
+        policy: RetryPolicy,
     ) -> Option<RetryPlan> {
         let capacity = matches!(status, Some(429) | Some(529));
-        if self.unattended && capacity {
+        if self.unattended && capacity && policy.persistent {
             // A zero server hint (`Retry-After: 0`) means "the limit is
             // still on" here, not "retry now": treat it as absent so the
             // backoff curve applies, and floor whatever remains so every
@@ -302,7 +351,7 @@ impl OpenRouter {
                 heartbeats: true,
             });
         }
-        if budget_used >= self.max_attempts {
+        if budget_used >= policy.attempts.unwrap_or(self.max_attempts) {
             return None;
         }
         Some(RetryPlan {
@@ -366,7 +415,7 @@ impl OpenRouter {
                         self.rebuild_client();
                     }
                     last_err = format!("request failed: {e}");
-                    match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited) {
+                    match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited, req.retry) {
                         Some(plan) => {
                             next = Some(plan);
                             continue;
@@ -396,13 +445,17 @@ impl OpenRouter {
                     // the agent an empty turn.
                     Err(SlagError::ProviderTransient(why)) => {
                         last_err = format!("empty 200: {why}");
-                        match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited) {
+                        match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited, req.retry) {
                             Some(plan) => {
                                 next = Some(plan);
                                 continue;
                             }
                             None => break,
                         }
+                    }
+                    Ok(mut resp) => {
+                        self.attribute(&mut resp, &req).await;
+                        return Ok(resp);
                     }
                     other => return other,
                 }
@@ -425,6 +478,7 @@ impl OpenRouter {
                     attempts_made,
                     budget_used,
                     unattended_waited,
+                    req.retry,
                 ) {
                     Some(plan) => {
                         next = Some(plan);
@@ -637,6 +691,52 @@ impl Provider for OpenRouter {
     }
 }
 
+/// Account balance from `GET {base}/credits` (item 36). Both fields are
+/// cumulative USD, so what is left is `total_credits - total_usage`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Credits {
+    pub granted: f64,
+    pub used: f64,
+}
+
+impl Credits {
+    pub fn remaining(&self) -> f64 {
+        self.granted - self.used
+    }
+}
+
+/// Parse the `/credits` body. Split out from the fetch so the shape is
+/// testable without a server; `None` on any shape slag does not recognize.
+pub fn parse_credits(body: &str) -> Option<Credits> {
+    let root: Value = serde_json::from_str(body).ok()?;
+    let data = root.get("data").unwrap_or(&root);
+    let num = |k: &str| data.get(k).and_then(|v| v.as_f64());
+    Some(Credits {
+        granted: num("total_credits")?,
+        used: num("total_usage")?,
+    })
+}
+
+/// Account balance, or `None` when the endpoint is unreachable or the key
+/// is refused. A balance readout never blocks a forge.
+pub async fn fetch_credits(api_key: &str, base_url: &str) -> Option<Credits> {
+    let url = format!("{}/credits", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(api_key)
+        .header("HTTP-Referer", "https://slag.dev")
+        .header("X-Title", "slag")
+        .send()
+        .await
+        .ok()?;
+    resp.status().is_success().then_some(())?;
+    parse_credits(&resp.text().await.ok()?)
+}
+
 /// Outcome of a key check. Onboarding treats these differently: a key
 /// OpenRouter refused is worth retyping, an unreachable OpenRouter is not.
 pub enum KeyCheck {
@@ -714,6 +814,64 @@ pub async fn fetch_context_length(base_url: &str, model: &str) -> Option<u64> {
         .find(|m| m.id == model)
         .or_else(|| models.data.iter().find(|m| m.id == bare))
         .and_then(|m| m.context_length)
+}
+
+/// Raw `GET {base}/models` body. The endpoint is public — no auth needed.
+/// `None` on any failure; both the window cache and the price table treat
+/// that as "unknown", never as an error.
+pub async fn fetch_models_body(base_url: &str) -> Option<String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("HTTP-Referer", "https://slag.dev")
+        .header("X-Title", "slag")
+        .send()
+        .await
+        .ok()?;
+    resp.status().is_success().then_some(())?;
+    resp.text().await.ok()
+}
+
+/// Everything one `/models` fetch yields: context windows and prices.
+#[derive(Debug, Default)]
+struct ModelsIndex {
+    windows: std::collections::HashMap<String, u64>,
+    prices: crate::engine::pricing::PricingTable,
+}
+
+impl ModelsIndex {
+    fn parse(body: Option<&str>) -> Self {
+        let Some(body) = body else {
+            return Self::default();
+        };
+        let windows = serde_json::from_str::<ModelsResponse>(body)
+            .map(|m| {
+                m.data
+                    .into_iter()
+                    .filter_map(|e| e.context_length.map(|c| (e.id, c)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            windows,
+            prices: crate::engine::pricing::parse_table(body),
+        }
+    }
+
+    /// A variant suffix falls back to the bare id
+    /// (`qwen/qwen3-coder:free` → `qwen/qwen3-coder`), since variants share
+    /// the base model's window.
+    fn window(&self, model: &str) -> Option<u64> {
+        if let Some(w) = self.windows.get(model) {
+            return Some(*w);
+        }
+        let bare = model.split(':').next().unwrap_or(model);
+        self.windows.get(bare).copied()
+    }
 }
 
 #[derive(Deserialize)]
@@ -951,6 +1109,8 @@ mod tests {
             tools,
             effort,
             max_tokens: None,
+            role: crate::engine::Role::Smith,
+            retry: RetryPolicy::full(),
         }
     }
 
@@ -1639,6 +1799,219 @@ mod tests {
         assert!(err.to_string().contains("gave up after 2"), "message was: {err}");
     }
 
+    /// Item 50: a side call takes one swing. The provider budget says
+    /// eight, but a judge or summary request carries `RetryPolicy::side()`
+    /// and must not multiply load across every anvil during a capacity
+    /// event.
+    #[tokio::test]
+    async fn a_side_policy_request_takes_one_swing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(529))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut req = request(vec![], None);
+        req.retry = RetryPolicy::side();
+        let err = OpenRouter::with_base_url("sk-test", server.uri())
+            .chat(req)
+            .await
+            .expect_err("529 with a one-swing policy");
+        assert!(err.to_string().contains("gave up after 1"), "message was: {err}");
+    }
+
+    /// The same request under the default policy rides the provider-wide
+    /// budget, so the side policy is doing the bounding, not the endpoint.
+    #[tokio::test]
+    async fn a_full_policy_request_rides_the_provider_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(529))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let err = OpenRouter::with_base_url("sk-test", server.uri())
+            .with_max_attempts(3)
+            .chat(request(vec![], None))
+            .await
+            .expect_err("budget of 3 exhausted");
+        assert!(err.to_string().contains("gave up after 3"), "message was: {err}");
+    }
+
+    /// Unattended mode makes capacity errors free — but only for calls
+    /// that asked to be persistent. A side call opts out, so it stops at
+    /// its one swing instead of waiting out the rate limit.
+    #[tokio::test]
+    async fn a_side_policy_call_does_not_wait_out_a_capacity_event_unattended() {
+        let provider = pinned("http://localhost:0").with_unattended(true);
+        assert!(
+            provider
+                .plan_retry(
+                    Some(529),
+                    None,
+                    None,
+                    1,
+                    1,
+                    Duration::ZERO,
+                    RetryPolicy::side()
+                )
+                .is_none(),
+            "a side call must not take the free unattended retry"
+        );
+        assert!(
+            provider
+                .plan_retry(
+                    Some(529),
+                    None,
+                    None,
+                    1,
+                    1,
+                    Duration::ZERO,
+                    RetryPolicy::full()
+                )
+                .is_some_and(|p| p.free),
+            "a full call still gets the free retry"
+        );
+    }
+
+    /// Item 34: OpenRouter omits `usage.cost` behind most proxies. The
+    /// local table fills it in and the number is marked as an estimate, so
+    /// budget caps keep binding without the readout claiming the provider
+    /// said so. Item 35: the same response carries its ledger key.
+    #[tokio::test]
+    async fn a_missing_cost_is_filled_from_the_price_table_and_flagged() {
+        let cfg = tempfile::tempdir().expect("tempdir");
+        // Point the pricing cache at a scratch dir: a real ~/.config/slag
+        // cache would answer before the mock /models ever gets hit.
+        std::env::set_var("SLAG_CONFIG_DIR", cfg.path());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "qwen/qwen3-coder",
+                    "pricing": { "prompt": "0.000001", "completion": "0.000002" },
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "qwen/qwen3-coder",
+                "choices": [{
+                    "message": { "role": "assistant", "content": "forged" },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500 },
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = OpenRouter::with_base_url("sk-test", server.uri())
+            .chat(request(vec![], None))
+            .await
+            .expect("chat ok");
+
+        // 1000 * 1e-6 + 500 * 2e-6 = $0.002
+        let cost = resp.usage.cost.expect("cost estimated from the table");
+        assert!((cost - 0.002).abs() < 1e-9, "got {cost}");
+        assert!(resp.usage.estimated, "a local estimate must say so");
+        assert_eq!(resp.usage.model.as_deref(), Some("qwen/qwen3-coder"));
+        assert_eq!(resp.usage.role, Some(crate::engine::Role::Smith));
+
+        std::env::remove_var("SLAG_CONFIG_DIR");
+    }
+
+    /// A cost the provider actually reported is never overwritten, and is
+    /// never marked as an estimate.
+    #[tokio::test]
+    async fn a_provider_reported_cost_stays_exact() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "qwen/qwen3-coder",
+                "choices": [{
+                    "message": { "role": "assistant", "content": "forged" },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 1000, "completion_tokens": 500,
+                    "total_tokens": 1500, "cost": 0.5,
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = OpenRouter::with_base_url("sk-test", server.uri())
+            .chat(request(vec![], None))
+            .await
+            .expect("chat ok");
+        assert_eq!(resp.usage.cost, Some(0.5));
+        assert!(!resp.usage.estimated);
+    }
+
+    /// Item 35 promises the assay splits judge and duel spend out of the
+    /// session total. The judge and the summarizer call the provider
+    /// straight, never through `ForgeAgent`, so the ledger has to be fed
+    /// where every response comes back or their rows silently go missing.
+    #[tokio::test]
+    async fn every_call_site_reaches_the_ledger_not_just_the_smith() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "ledger/judge-probe",
+                "choices": [{
+                    "message": { "role": "assistant", "content": "scored" },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 700, "completion_tokens": 300,
+                    "total_tokens": 1000, "cost": 0.25,
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let mut req = request(vec![], None);
+        req.role = crate::engine::Role::Judge;
+        OpenRouter::with_base_url("sk-test", server.uri())
+            .chat(req)
+            .await
+            .expect("chat ok");
+
+        // A unique model id keeps this assertion independent of whatever
+        // else the parallel test run folded into the shared ledger.
+        let row = crate::engine::stats::snapshot()
+            .ledger
+            .rows()
+            .into_iter()
+            .find(|r| r.model == "ledger/judge-probe")
+            .expect("a judge call must appear on the ledger");
+        assert_eq!(row.role, crate::engine::Role::Judge);
+        assert!((row.cost() - 0.25).abs() < 1e-9, "got {}", row.cost());
+    }
+
+    #[test]
+    fn parse_credits_reads_the_data_envelope_and_the_bare_shape() {
+        let wrapped = parse_credits(r#"{"data":{"total_credits":20.0,"total_usage":1.69}}"#)
+            .expect("wrapped shape");
+        assert!((wrapped.remaining() - 18.31).abs() < 1e-9, "got {}", wrapped.remaining());
+        // Some proxies drop the envelope.
+        let bare = parse_credits(r#"{"total_credits":5.0,"total_usage":5.0}"#).expect("bare shape");
+        assert_eq!(bare.remaining(), 0.0);
+        // An unrecognized shape reads as "unknown", never as zero balance.
+        assert_eq!(parse_credits(r#"{"data":{"balance":3}}"#), None);
+        assert_eq!(parse_credits("nonsense"), None);
+    }
+
     fn models_body() -> Value {
         json!({
             "data": [
@@ -1920,6 +2293,7 @@ mod tests {
                 1,
                 1,
                 Duration::ZERO,
+                RetryPolicy::full(),
             )
             .expect("free retry");
         assert_eq!(plan.delay, Duration::from_secs(120));
@@ -1928,20 +2302,20 @@ mod tests {
 
         // No reset: Retry-After.
         let plan = provider
-            .plan_retry(Some(429), Some(Duration::from_secs(3)), None, 1, 1, Duration::ZERO)
+            .plan_retry(Some(429), Some(Duration::from_secs(3)), None, 1, 1, Duration::ZERO, RetryPolicy::full())
             .unwrap();
         assert_eq!(plan.delay, Duration::from_secs(3));
 
         // Neither: computed backoff, capped at 5 minutes (+25% jitter).
         let plan = provider
-            .plan_retry(Some(529), None, None, 30, 1, Duration::ZERO)
+            .plan_retry(Some(529), None, None, 30, 1, Duration::ZERO, RetryPolicy::full())
             .unwrap();
         assert!(plan.delay >= Duration::from_secs(300), "{:?}", plan.delay);
         assert!(plan.delay <= Duration::from_secs(375), "{:?}", plan.delay);
 
         // A reset hours away is clamped to the one-hour ceiling.
         let plan = provider
-            .plan_retry(Some(429), None, Some(Duration::from_secs(2 * 3600)), 1, 1, Duration::ZERO)
+            .plan_retry(Some(429), None, Some(Duration::from_secs(2 * 3600)), 1, 1, Duration::ZERO, RetryPolicy::full())
             .unwrap();
         assert_eq!(plan.delay, UNATTENDED_WAIT_CEILING);
     }
@@ -1955,19 +2329,19 @@ mod tests {
         let provider = pinned("http://localhost:0").with_unattended(true).with_max_attempts(1);
 
         let plan = provider
-            .plan_retry(Some(429), Some(Duration::ZERO), None, 1, 1, Duration::ZERO)
+            .plan_retry(Some(429), Some(Duration::ZERO), None, 1, 1, Duration::ZERO, RetryPolicy::full())
             .expect("free retry");
         assert!(plan.delay >= UNATTENDED_MIN_DELAY, "{:?}", plan.delay);
 
         let plan = provider
-            .plan_retry(Some(429), None, Some(Duration::from_millis(1)), 1, 1, Duration::ZERO)
+            .plan_retry(Some(429), None, Some(Duration::from_millis(1)), 1, 1, Duration::ZERO, RetryPolicy::full())
             .expect("free retry");
         assert!(plan.delay >= UNATTENDED_MIN_DELAY, "{:?}", plan.delay);
 
         // The floor keeps the ceiling reachable: at the edge, stop.
         let waited = UNATTENDED_TOTAL_CEILING - Duration::from_millis(500);
         assert!(
-            provider.plan_retry(Some(429), Some(Duration::ZERO), None, 1, 1, waited).is_none(),
+            provider.plan_retry(Some(429), Some(Duration::ZERO), None, 1, 1, waited, RetryPolicy::full()).is_none(),
             "floored delay must trip the cumulative ceiling"
         );
     }
@@ -2005,6 +2379,7 @@ mod tests {
             5,
             1,
             UNATTENDED_TOTAL_CEILING,
+            RetryPolicy::full(),
         );
         assert!(plan.is_none(), "ceiling must end the wait");
     }
@@ -2013,15 +2388,15 @@ mod tests {
     fn plan_retry_bounded_path_respects_the_budget() {
         let provider = pinned("http://localhost:0").with_max_attempts(3);
         let plan = provider
-            .plan_retry(Some(500), None, None, 1, 1, Duration::ZERO)
+            .plan_retry(Some(500), None, None, 1, 1, Duration::ZERO, RetryPolicy::full())
             .expect("budget left");
         assert!(!plan.free && !plan.heartbeats);
-        assert!(provider.plan_retry(Some(500), None, None, 3, 3, Duration::ZERO).is_none());
+        assert!(provider.plan_retry(Some(500), None, None, 3, 3, Duration::ZERO, RetryPolicy::full()).is_none());
         // Without unattended mode a 429 is bounded like everything else.
-        assert!(provider.plan_retry(Some(429), None, None, 3, 3, Duration::ZERO).is_none());
+        assert!(provider.plan_retry(Some(429), None, None, 3, 3, Duration::ZERO, RetryPolicy::full()).is_none());
         // Reset timestamps never stretch a bounded wait.
         let plan = provider
-            .plan_retry(Some(429), None, Some(Duration::from_secs(600)), 1, 1, Duration::ZERO)
+            .plan_retry(Some(429), None, Some(Duration::from_secs(600)), 1, 1, Duration::ZERO, RetryPolicy::full())
             .unwrap();
         assert!(plan.delay < Duration::from_secs(2), "{:?}", plan.delay);
     }

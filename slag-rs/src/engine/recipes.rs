@@ -559,6 +559,186 @@ fn is_identifier(s: &str) -> bool {
         && bytes.all(is_word_byte)
 }
 
+// ---------------------------------------------------------------------------
+// Inline shell spans (item 78)
+// ---------------------------------------------------------------------------
+
+/// Max bytes spliced per span. One `!`cat huge.log`` must not blow the
+/// prompt, so anything longer keeps its head and tail with a marker.
+const SPAN_OUTPUT_CAP: usize = 4096;
+
+/// Per-span shell timeout. Expansion sits in front of a model call, so a
+/// hung span would stall the whole session.
+const SPAN_TIMEOUT_SECS: u64 = 30;
+
+/// What the scanner found: either a command to run or inert text to emit.
+struct Found {
+    /// Offset of the opener in `body`.
+    start: usize,
+    /// Offset to resume scanning from — always past the whole span, so
+    /// spliced output is never rescanned.
+    end: usize,
+    /// Command byte range, or `None` when the span is inert.
+    cmd: Option<(usize, usize)>,
+    /// Emitted verbatim when `cmd` is `None`.
+    literal: &'static str,
+    /// Inline spans drop the trailing newline so the value lands
+    /// mid-sentence; fenced blocks splice verbatim.
+    trim: bool,
+}
+
+/// Run the shell spans in a recipe body and splice their stdout.
+///
+/// Two syntaxes:
+/// - inline `` !`cmd` `` anywhere in the body,
+/// - a fence opened with ```` ```! ```` whose whole body is one script.
+///
+/// A backslash escapes the opener (`` \!` `` → literal `` !` ``), so a
+/// recipe can document the feature without running it. An unterminated
+/// span stays literal.
+///
+/// Every command goes through `ToolBox::bash`, so spans inherit the
+/// destructive-command refusal and the `[policy]` deny/ask rules exactly —
+/// a recipe is not a hole around the policy engine. A span that fails
+/// splices a marked error instead of aborting the recipe; a non-zero exit
+/// arrives as bash's own `(exit N)` note.
+///
+/// The output string is built by hand: literal segments and command stdout
+/// are pushed once and never revisited, so output that itself contains
+/// `` !`...` `` or `$0` lands inert.
+pub async fn expand_shell_spans(tools: &super::ToolBox, body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0usize;
+    while let Some(found) = next_span(body, at) {
+        out.push_str(&body[at..found.start]);
+        match found.cmd {
+            Some((s, e)) => out.push_str(&run_span(tools, &body[s..e], found.trim).await),
+            None => out.push_str(found.literal),
+        }
+        at = found.end;
+    }
+    out.push_str(&body[at..]);
+    out
+}
+
+/// Locate the next span at or after `at`. The earliest opener wins; an
+/// escape starts one byte before the inline span it hides, so it wins the
+/// tie by construction.
+fn next_span(body: &str, at: usize) -> Option<Found> {
+    let hay = &body[at..];
+    let escaped = hay.find("\\!`").map(|i| at + i);
+    let inline = hay.find("!`").map(|i| at + i);
+    let fence = next_fence_open(body, at);
+
+    let start = [escaped, inline, fence].into_iter().flatten().min()?;
+    if escaped == Some(start) {
+        return Some(inert(start, start + 3, "!`"));
+    }
+    if fence == Some(start) {
+        return Some(fence_span(body, start));
+    }
+    let open = start + 2;
+    match body[open..].find('`') {
+        // Unterminated: emit the opener as text and keep scanning past it.
+        None => Some(inert(start, open, "!`")),
+        Some(rel) => Some(Found {
+            start,
+            end: open + rel + 1,
+            cmd: Some((open, open + rel)),
+            literal: "",
+            trim: true,
+        }),
+    }
+}
+
+fn inert(start: usize, end: usize, literal: &'static str) -> Found {
+    Found { start, end, cmd: None, literal, trim: false }
+}
+
+/// Next ```` ```! ```` opener that starts a line and carries nothing else
+/// on it. An info-string spelling (```` ```!foo ````) is not a fence.
+fn next_fence_open(body: &str, at: usize) -> Option<usize> {
+    let mut from = at;
+    while let Some(rel) = body[from..].find("```!") {
+        let start = from + rel;
+        if at_line_start(body, start) && rest_of_line(body, start + 4).trim().is_empty() {
+            return Some(start);
+        }
+        from = start + 4;
+    }
+    None
+}
+
+fn fence_span(body: &str, start: usize) -> Found {
+    // The script begins on the line after the opener.
+    let Some(rel) = body[start..].find('\n') else {
+        return inert(start, start + 4, "```!");
+    };
+    let cmd_start = start + rel + 1;
+    match find_fence_close(body, cmd_start) {
+        Some((close, next)) => Found {
+            start,
+            end: next,
+            cmd: Some((cmd_start, close)),
+            literal: "",
+            trim: false,
+        },
+        // No closing fence: leave the opener as text rather than running
+        // the rest of the file as a script.
+        None => inert(start, start + 4, "```!"),
+    }
+}
+
+/// Find the closing ```` ``` ```` line at or after `from`. Returns the
+/// offset of the fence and the offset just past its line.
+fn find_fence_close(body: &str, from: usize) -> Option<(usize, usize)> {
+    let mut at = from;
+    loop {
+        let pos = at + body[at..].find("```")?;
+        if at_line_start(body, pos) {
+            let after = pos + 3;
+            let line_end = body[after..].find('\n');
+            let rest = match line_end {
+                Some(i) => &body[after..after + i],
+                None => &body[after..],
+            };
+            if rest.trim().is_empty() {
+                let next = line_end.map_or(body.len(), |i| after + i + 1);
+                return Some((pos, next));
+            }
+        }
+        at = pos + 3;
+    }
+}
+
+fn at_line_start(body: &str, pos: usize) -> bool {
+    pos == 0 || body.as_bytes()[pos - 1] == b'\n'
+}
+
+fn rest_of_line(body: &str, from: usize) -> &str {
+    let tail = &body[from..];
+    tail.split('\n').next().unwrap_or("")
+}
+
+/// Run one span through the shared bash gate and shape its output.
+async fn run_span(tools: &super::ToolBox, cmd: &str, trim: bool) -> String {
+    let command = cmd.trim();
+    if command.is_empty() {
+        return String::new();
+    }
+    let args = serde_json::json!({ "command": command, "timeout": SPAN_TIMEOUT_SECS });
+    let out = match tools.bash(&args).await {
+        Ok(out) => out,
+        Err(e) => format!("[slag: span failed: {e}]"),
+    };
+    let capped = super::truncate_middle(&out, SPAN_OUTPUT_CAP);
+    if trim {
+        capped.trim_end_matches('\n').to_string()
+    } else {
+        capped
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,5 +1075,127 @@ mod tests {
         std::fs::write(cfg.path().join(SNAPSHOT_FILE), "{not json").unwrap();
         let idx = index_in(ws.path(), Some(cfg.path()), &tools(&[]));
         assert!(idx.contains("- ship: deploy"), "{idx}");
+    }
+
+    // --- item 78: inline shell spans -------------------------------------
+
+    fn span_box(root: &Path) -> super::super::ToolBox {
+        super::super::ToolBox::new(root)
+    }
+
+    #[tokio::test]
+    async fn inline_span_splices_stdout() {
+        let ws = tempfile::tempdir().unwrap();
+        let out = expand_shell_spans(&span_box(ws.path()), "before !`echo hi` after").await;
+        assert_eq!(out, "before hi after");
+    }
+
+    #[tokio::test]
+    async fn fenced_block_runs_as_one_script() {
+        let ws = tempfile::tempdir().unwrap();
+        let body = "head\n```!\nA=1\necho \"val=$A\"\n```\ntail";
+        let out = expand_shell_spans(&span_box(ws.path()), body).await;
+        assert_eq!(out, "head\nval=1\ntail");
+    }
+
+    #[tokio::test]
+    async fn failing_command_surfaces_exit_code_without_aborting() {
+        let ws = tempfile::tempdir().unwrap();
+        let out =
+            expand_shell_spans(&span_box(ws.path()), "a !`exit 3` b !`echo ok` c").await;
+        assert!(out.contains("(exit 3)"), "{out}");
+        // The rest of the recipe still expands.
+        assert!(out.starts_with("a "), "{out}");
+        assert!(out.contains("ok"), "{out}");
+        assert!(out.ends_with(" c"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn command_output_containing_a_span_lands_inert() {
+        let ws = tempfile::tempdir().unwrap();
+        // stdout carries span-looking text and a placeholder; neither may
+        // re-expand — the scanner never revisits what it has emitted.
+        // `\140` is the backtick, so the command itself holds none.
+        let out = expand_shell_spans(
+            &span_box(ws.path()),
+            "x !`printf '!\\140echo PWNED\\140 $0'` y",
+        )
+        .await;
+        assert_eq!(out, "x !`echo PWNED` $0 y");
+    }
+
+    #[tokio::test]
+    async fn backslash_escapes_a_literal_span() {
+        let ws = tempfile::tempdir().unwrap();
+        let out =
+            expand_shell_spans(&span_box(ws.path()), "write \\!`echo hi` to run one").await;
+        assert_eq!(out, "write !`echo hi` to run one");
+    }
+
+    #[tokio::test]
+    async fn unterminated_span_stays_literal() {
+        let ws = tempfile::tempdir().unwrap();
+        let out = expand_shell_spans(&span_box(ws.path()), "oops !`echo hi").await;
+        assert_eq!(out, "oops !`echo hi");
+        // A bare `!` is untouched too.
+        let plain = expand_shell_spans(&span_box(ws.path()), "hi! there").await;
+        assert_eq!(plain, "hi! there");
+    }
+
+    #[tokio::test]
+    async fn oversized_span_output_is_capped() {
+        let ws = tempfile::tempdir().unwrap();
+        let out = expand_shell_spans(
+            &span_box(ws.path()),
+            "start !`printf 'x%.0s' $(seq 1 20000)` end",
+        )
+        .await;
+        assert!(out.len() < SPAN_OUTPUT_CAP + 200, "len {}", out.len());
+        assert!(out.contains("truncated"), "{out}");
+        assert!(out.starts_with("start "), "{out}");
+        assert!(out.ends_with(" end"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn refused_span_reports_the_gate_and_keeps_going() {
+        let ws = tempfile::tempdir().unwrap();
+        // A `[policy]` deny rule stands in for the shared gate: the span
+        // must go through ToolBox::bash, not around it. Denial happens
+        // before the spawn, so nothing runs.
+        let policy = super::super::super::policy::Policy::from_entries(&[(
+            "deny".into(),
+            "curl:*".into(),
+        )]);
+        let tb = span_box(ws.path()).with_policy(policy);
+        let out = expand_shell_spans(&tb, "a !`curl --version` b !`echo fine` c").await;
+        assert!(out.contains("[slag: span failed"), "{out}");
+        assert!(out.contains("refused by policy rule `curl:*`"), "{out}");
+        assert!(out.contains("fine"), "{out}");
+        assert!(out.ends_with(" c"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn span_inherits_the_bash_only_guards() {
+        let ws = tempfile::tempdir().unwrap();
+        // The sleep guard lives in ToolBox::bash, never in run_shell — a
+        // span that trips it proves the gated path, not a private spawn.
+        let out = expand_shell_spans(&span_box(ws.path()), "a !`sleep 30` b").await;
+        assert!(out.contains("[slag: span failed"), "{out}");
+        assert!(out.contains("spends the ingot's clock"), "{out}");
+        // Same for the destructive-command refusal.
+        let sql = expand_shell_spans(
+            &span_box(ws.path()),
+            "!`psql -c \"DROP TABLE users\"`",
+        )
+        .await;
+        assert!(sql.contains("refused destructive command"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn body_without_spans_is_returned_unchanged() {
+        let ws = tempfile::tempdir().unwrap();
+        let body = "plain text\n```sh\necho not-a-span\n```\ndone";
+        let out = expand_shell_spans(&span_box(ws.path()), body).await;
+        assert_eq!(out, body);
     }
 }

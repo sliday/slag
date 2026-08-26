@@ -53,9 +53,27 @@ pub async fn run(
     // Fire furnace if needed
     fire_furnace(commission)?;
 
+    // Item 36: a long unattended run should not die mid-ingot on an empty
+    // account. Warn, never block: the balance endpoint is best-effort and
+    // an unreachable one must not stop a forge.
+    if let Some(floor) = crate::config::credit_floor() {
+        if let Some(credits) =
+            crate::engine::provider::fetch_credits(&config.api_key, &config.base_url).await
+        {
+            if credits.remaining() < floor {
+                println!(
+                    "  {}! OpenRouter balance ${:.2} is under the ${floor:.2} floor{}",
+                    fg(tui::WARM),
+                    credits.remaining(),
+                    reset(),
+                );
+            }
+        }
+    }
+
     // Phase 1: Survey
     if !std::path::Path::new(crate::config::BLUEPRINT).exists() {
-        let smith = crate::smith::make_plan_smith(config, &hooks);
+        let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
         surveyor::run(smith.as_ref()).await?;
     }
 
@@ -66,7 +84,7 @@ pub async fn run(
         !content.contains("(ingot ")
     };
     if needs_founder {
-        let smith = crate::smith::make_plan_smith(config, &hooks);
+        let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Founder);
         founder::run(smith.as_ref()).await?;
     }
 

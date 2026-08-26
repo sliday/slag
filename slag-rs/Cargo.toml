@@ -17,12 +17,14 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 indicatif = "0.17"
 ratatui = "0.29"
-reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+regex = "1"
+reqwest ={ version = "0.12", features = ["rustls-tls", "json"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shell-words = "1"
+similar = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "sync", "signal"] }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -302,6 +302,7 @@ mod tests {
                 git_branch: None,
                 model: "openrouter/auto".into(),
                 duel: "auto".into(),
+                flux_profile: "bare".into(),
                 crucible_hash: None,
             })
             .unwrap(),

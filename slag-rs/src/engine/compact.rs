@@ -14,11 +14,17 @@ use std::ops::Range;
 use serde_json::Value;
 
 use super::agent::{is_context_overflow, parse_overflow_tokens, CHARS_PER_TOKEN};
-use super::{ChatMessage, ChatRequest, Provider};
+use super::{ChatMessage, ChatRequest, Provider, RetryPolicy, Role};
 use crate::error::SlagError;
 
 const PRUNABLE_MIN_CHARS: usize = 500;
 const KEEP_TAIL: usize = 6;
+/// Bytes per token for JSON-family payloads (item 58): dense punctuation
+/// tokenizes at roughly half the rate of prose and code.
+const DENSE_BYTES_PER_TOKEN: usize = 2;
+/// Flat char-equivalent charged per attached image. Base64 length says
+/// nothing about token cost, so it is not counted.
+const IMAGE_FLAT_CHARS: usize = 1_500 * CHARS_PER_TOKEN;
 const STUB_HEAD_CHARS: usize = 120;
 const STUB_PREFIX: &str = "[pruned old tool result: ";
 /// Summarizer overflow retries: drop oldest rounds and re-ask, then fail.
@@ -70,18 +76,49 @@ last task exactly where it left off, as if the break never happened — do not a
 this summary or the interruption. Exact earlier output, if ever needed, is preserved in \
 slag's JSONL event log.";
 
+/// Bytes per token for a tool result, by the file it came from. Dense
+/// punctuation tokenizes worse: JSON runs about 2 bytes/token where prose
+/// and code run about 4. Callers divide by `CHARS_PER_TOKEN` (4), so a
+/// dense result reports twice its char count and stops slipping past the
+/// budget until it is too late to compact cheaply.
+fn density_weight(path: Option<&str>) -> usize {
+    let dense = path.is_some_and(|p| {
+        let p = p.to_ascii_lowercase();
+        p.ends_with(".json") || p.ends_with(".jsonl")
+    });
+    if dense {
+        CHARS_PER_TOKEN / DENSE_BYTES_PER_TOKEN
+    } else {
+        1
+    }
+}
+
+/// Char-equivalent cost of one message: content and tool-call arguments,
+/// weighted by how densely the content tokenizes, plus a flat cost per
+/// attached image (base64 payloads bear no relation to their token cost,
+/// so counting their chars would swamp the estimate).
+fn message_chars(m: &ChatMessage, path: Option<&str>) -> usize {
+    let args: usize = m
+        .tool_calls
+        .as_ref()
+        .map(|tcs| tcs.iter().map(|t| t.arguments.chars().count()).sum())
+        .unwrap_or(0);
+    let images = m.images.as_ref().map_or(0, |v| v.len() * IMAGE_FLAT_CHARS);
+    m.content.chars().count() * density_weight(path) + args + images
+}
+
 /// Total conversation chars: message content plus assistant tool-call
-/// arguments — both count against the provider's context window.
+/// arguments — both count against the provider's context window. Dense
+/// file types and attached images are weighted (item 58) so the estimate
+/// does not read low on exactly the payloads that overflow a window.
 pub fn convo_chars(messages: &[ChatMessage]) -> usize {
+    let meta = result_meta(messages);
     messages
         .iter()
-        .map(|m| {
-            let args: usize = m
-                .tool_calls
-                .as_ref()
-                .map(|tcs| tcs.iter().map(|t| t.arguments.chars().count()).sum())
-                .unwrap_or(0);
-            m.content.chars().count() + args
+        .zip(&meta)
+        .map(|(m, meta)| {
+            let path = meta.as_ref().and_then(|(_, p)| p.as_deref());
+            message_chars(m, path)
         })
         .sum()
 }
@@ -156,14 +193,13 @@ pub async fn summarize(
     let mut body = format!("{CONTINUATION_PREFIX}\n\n{summary}");
     let reinject = files_not_in_tail(file_context, &tail);
     if !reinject.is_empty() {
-        body.push_str(
-            "\n\n<system-reminder>\nCurrent content of the files most recently worked on, \
-re-read after compaction:\n",
+        let mut note = String::from(
+            "Current content of the files most recently worked on, re-read after compaction:\n",
         );
         for (path, content) in &reinject {
-            body.push_str(&format!("\n## {path}\n{content}\n"));
+            note.push_str(&format!("\n## {path}\n{content}\n"));
         }
-        body.push_str("</system-reminder>");
+        crate::engine::prompt::append_reminder(&mut body, &note);
     }
 
     let mut replacement = Vec::with_capacity(2 + tail.len());
@@ -206,6 +242,8 @@ agent can continue in a fresh context."
         tools: vec![],
         effort: None,
         max_tokens: None,
+        role: Role::Compact,
+        retry: RetryPolicy::side(),
     }
 }
 
@@ -479,6 +517,44 @@ mod tests {
             });
             assert!(paired, "orphan tool result at index {i} (id {id})");
         }
+    }
+
+    #[test]
+    fn json_tool_results_cost_double_their_chars() {
+        let prose = round("t1", "read_file", serde_json::json!({"path": "data.text"}), 400);
+        let dense = round("t2", "read_file", serde_json::json!({"path": "data.json"}), 400);
+        let prose_chars = convo_chars(&prose);
+        let dense_chars = convo_chars(&dense);
+        assert!(
+            dense_chars > prose_chars,
+            "json weighs more: {dense_chars} vs {prose_chars}"
+        );
+        // Same-length paths, so the assistant tool-call arguments match:
+        // the whole difference is the weighted 400-char result body.
+        assert_eq!(dense_chars - prose_chars, 400);
+    }
+
+    #[test]
+    fn jsonl_is_dense_and_the_match_is_case_insensitive() {
+        assert_eq!(density_weight(Some("a.jsonl")), 2);
+        assert_eq!(density_weight(Some("A.JSON")), 2);
+        assert_eq!(density_weight(Some("a.rs")), 1);
+        assert_eq!(density_weight(Some("json.rs")), 1, "extension, not substring");
+        assert_eq!(density_weight(None), 1);
+    }
+
+    #[test]
+    fn images_are_flat_costed_not_counted_by_base64_length() {
+        let mut short = ChatMessage::user("look");
+        short.images = Some(vec!["data:image/png;base64,AAAA".into()]);
+        let mut long = ChatMessage::user("look");
+        long.images = Some(vec![format!("data:image/png;base64,{}", "A".repeat(200_000))]);
+        assert_eq!(
+            convo_chars(std::slice::from_ref(&short)),
+            convo_chars(std::slice::from_ref(&long)),
+            "cost is per image, not per base64 char"
+        );
+        assert!(convo_chars(&[short]) > IMAGE_FLAT_CHARS);
     }
 
     #[test]

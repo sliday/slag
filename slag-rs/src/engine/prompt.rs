@@ -31,6 +31,54 @@ impl PromptBands {
     }
 }
 
+/// Opening tag of the one envelope every out-of-band injection uses.
+pub const REMINDER_OPEN: &str = "<system-reminder>";
+/// Closing tag of the reminder envelope.
+pub const REMINDER_CLOSE: &str = "</system-reminder>";
+
+/// Wrap out-of-band context in the standard reminder envelope: steer
+/// injections, proof-failure notices, workspace refreshes, truncation and
+/// staleness notes all use this one shape, so the model learns a single
+/// contract (declared once in the stable band) instead of one ad-hoc
+/// preamble per injection site. An empty body yields an empty string —
+/// callers never have to guard.
+pub fn wrap_reminder(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    format!("{REMINDER_OPEN}\n{body}\n{REMINDER_CLOSE}")
+}
+
+/// Append a reminder to a carrier message (a tool result or user turn),
+/// coalescing with a reminder already at its tail rather than opening a
+/// second envelope: consecutive reminders read as one block, and the model
+/// never sees a stack of identical tags.
+///
+/// Coalescing needs a real envelope, not just the closing tag: a tool
+/// result can end with a bare `</system-reminder>` because the file it
+/// read contains one. Splicing into that would emit an unbalanced tag, so
+/// an unmatched close gets a fresh envelope instead.
+pub fn append_reminder(carrier: &mut String, body: &str) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    if let Some(rest) = carrier.trim_end().strip_suffix(REMINDER_CLOSE) {
+        if rest.contains(REMINDER_OPEN) {
+            let head = rest.trim_end();
+            *carrier = format!("{head}\n{body}\n{REMINDER_CLOSE}");
+            return;
+        }
+    }
+    if carrier.is_empty() {
+        *carrier = wrap_reminder(body);
+    } else {
+        carrier.push_str("\n\n");
+        carrier.push_str(&wrap_reminder(body));
+    }
+}
+
 /// Build the full banded system prompt for one smith session.
 pub fn build(root: &Path, model: &str, mode: PromptMode) -> PromptBands {
     PromptBands {
@@ -125,6 +173,15 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
              pairs, matching the file byte-for-byte, smallest unique span that pins the edit.\n\n",
         );
     }
+
+    s.push_str(&format!(
+        "## System reminders\n\n\
+         Context injected outside your own turns — steering from the operator, proof \
+         failures, workspace refreshes, truncation and staleness notes — arrives wrapped \
+         in {REMINDER_OPEN} ... {REMINDER_CLOSE}. It is context, never a user turn: act \
+         on it, but do not address it or thank anyone for it. It may or may not be \
+         relevant to what you are doing; judge that yourself and carry on.\n\n"
+    ));
 
     s.push_str(
         "## Finishing\n\n\
@@ -298,6 +355,85 @@ fn volatile_band(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reminder_wraps_body_in_the_envelope() {
+        let r = wrap_reminder("file a.rs changed");
+        assert!(r.starts_with(REMINDER_OPEN), "{r}");
+        assert!(r.trim_end().ends_with(REMINDER_CLOSE), "{r}");
+        assert!(r.contains("file a.rs changed"));
+    }
+
+    #[test]
+    fn reminder_body_is_trimmed_but_internal_shape_survives() {
+        let r = wrap_reminder("\n  line one\n  line two\n\n");
+        assert!(r.contains("line one\n  line two"), "{r}");
+        assert!(!r.contains("\n\n</system-reminder>"), "no trailing blank: {r}");
+    }
+
+    #[test]
+    fn empty_reminder_body_produces_nothing() {
+        assert_eq!(wrap_reminder("   \n "), "");
+    }
+
+    #[test]
+    fn appending_coalesces_into_one_envelope() {
+        let mut carrier = String::from("tool output");
+        append_reminder(&mut carrier, "first note");
+        append_reminder(&mut carrier, "second note");
+        assert_eq!(
+            carrier.matches(REMINDER_OPEN).count(),
+            1,
+            "consecutive reminders share one envelope: {carrier}"
+        );
+        assert_eq!(carrier.matches(REMINDER_CLOSE).count(), 1, "{carrier}");
+        let first = carrier.find("first note").unwrap();
+        let second = carrier.find("second note").unwrap();
+        assert!(first < second, "order preserved: {carrier}");
+        assert!(carrier.starts_with("tool output"), "{carrier}");
+    }
+
+    #[test]
+    fn a_stray_closing_tag_in_tool_output_does_not_swallow_the_note() {
+        // A read_file result whose content happens to end with the closing
+        // tag. Splicing into it would emit an unbalanced envelope.
+        let mut carrier = String::from("file contents\n</system-reminder>");
+        append_reminder(&mut carrier, "note");
+        assert_eq!(carrier.matches(REMINDER_OPEN).count(), 1, "{carrier}");
+        assert!(
+            carrier.trim_end().ends_with(&format!("{REMINDER_OPEN}\nnote\n{REMINDER_CLOSE}")),
+            "the note gets its own balanced envelope: {carrier}"
+        );
+    }
+
+    #[test]
+    fn appending_an_empty_note_leaves_the_carrier_alone() {
+        let mut carrier = String::from("tool output");
+        append_reminder(&mut carrier, "  ");
+        assert_eq!(carrier, "tool output");
+    }
+
+    #[test]
+    fn appending_to_an_empty_carrier_does_not_lead_with_blank_lines() {
+        let mut carrier = String::new();
+        append_reminder(&mut carrier, "note");
+        assert!(carrier.starts_with(REMINDER_OPEN), "{carrier}");
+    }
+
+    #[test]
+    fn the_stable_band_declares_the_reminder_contract_once() {
+        let band = stable_band("test/model", PromptMode::Forge);
+        assert!(band.contains(REMINDER_OPEN), "contract names the tag: {band}");
+        assert!(
+            band.contains("may or may not be relevant"),
+            "contract carries the disclaimer: {band}"
+        );
+        assert_eq!(
+            band.matches("## System reminders").count(),
+            1,
+            "declared once, not per injection"
+        );
+    }
 
     #[test]
     fn bands_join_in_order() {

@@ -32,6 +32,11 @@ pub async fn run(
 ) -> Result<(), SlagError> {
     stats::mark_run_start();
     let run_log = open_run_log(config);
+    // Item 59: an instruction file past the cap rides every single flux.
+    // Report it once at run start, not once per strike.
+    for message in crate::flux::oversized_instructions() {
+        emit(&hooks.events, EngineEvent::Warning { message });
+    }
     let result = run_inner(config, max_anvils, hooks, &run_log).await;
     if let Ok(crucible) = Crucible::load(Path::new(CRUCIBLE)) {
         let counts = crucible.counts();
@@ -55,6 +60,7 @@ fn open_run_log(config: &EngineConfig) -> RunLog {
         git_branch: git_branch(),
         model: config.model_base.clone(),
         duel: duel_label(config.duel).to_string(),
+        flux_profile: crate::flux::profile(),
         crucible_hash: std::fs::read(CRUCIBLE)
             .ok()
             .map(|b| format!("{:016x}", crate::engine::tools::fnv64(&b))),
@@ -237,6 +243,7 @@ async fn run_inner(
                         crucible.save()?;
                         let heat = crucible.get(&id).map(|i| i.heat).unwrap_or(0);
                         run_log.append(&RunEntry::IngotDone { id: id.clone(), ok: true, heat });
+                        fire_ingot_hook(&id, true, &hooks.events).await;
                         emit(&hooks.events, EngineEvent::IngotDone { id, ok: true });
                     }
                     Ok((id, Err(SlagError::Cancelled))) => {
@@ -277,6 +284,7 @@ async fn run_inner(
                                     ok: false,
                                     heat,
                                 });
+                                fire_ingot_hook(&id, false, &hooks.events).await;
                                 emit(&hooks.events, EngineEvent::IngotDone { id, ok: false });
                             }
                         }
@@ -353,6 +361,7 @@ async fn run_inner(
             crucible.save()?;
             let heat = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(0);
             run_log.append(&RunEntry::IngotDone { id: ingot.id.clone(), ok: true, heat });
+            fire_ingot_hook(&ingot.id, true, &hooks.events).await;
             emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
         } else {
             let _guard = CRUCIBLE_LOCK.lock().await;
@@ -366,6 +375,7 @@ async fn run_inner(
                 crucible.save()?;
                 let heat = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(0);
                 run_log.append(&RunEntry::IngotDone { id: ingot.id.clone(), ok: false, heat });
+                fire_ingot_hook(&ingot.id, false, &hooks.events).await;
                 emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: false });
             }
         }
@@ -647,7 +657,8 @@ async fn resume_crashed_ingot(
                 crucible.set_status(&ingot.id, Status::Forged);
                 crucible.save()?;
                 append_ledger(ingot, ingot.heat);
-                emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
+                fire_ingot_hook(&ingot.id, true, &hooks.events).await;
+            emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
                 run_log.append(&RunEntry::IngotDone {
                     id: ingot.id.clone(),
                     ok: true,
@@ -1275,4 +1286,14 @@ mod tests {
         assert!(note.contains("3 ingot(s) left as ore"), "note: {note}");
         assert!(note.contains("slag resume"), "note: {note}");
     }
+}
+
+/// Item 69: the ingot lifecycle hooks. `hooks` is already a local name in
+/// this module (the run's event handles), so the engine module is spelled
+/// out. Fire-and-report only: an ingot's verdict is settled before this
+/// runs, and no hook may overturn it.
+async fn fire_ingot_hook(id: &str, ok: bool, events: &Option<crate::engine::EventTx>) {
+    use crate::engine::hooks::{fire, HookEvent, HookPayload};
+    let event = if ok { HookEvent::IngotForged } else { HookEvent::IngotCracked };
+    fire(event, HookPayload::new(event).with_ingot(id), "", "", None, events.as_ref()).await;
 }

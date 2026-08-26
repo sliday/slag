@@ -36,6 +36,13 @@ pub fn run_cost_cap() -> Option<f64> {
     cost_cap("SLAG_MAX_COST_RUN", "max_cost_per_run")
 }
 
+/// Account-balance floor (`SLAG_CREDIT_FLOOR` env, `credit_floor` file
+/// key). Forge start warns when the OpenRouter balance sits under it, so a
+/// long unattended run does not die mid-ingot on an empty account.
+pub fn credit_floor() -> Option<f64> {
+    cost_cap("SLAG_CREDIT_FLOOR", "credit_floor")
+}
+
 fn cost_cap(env_var: &str, file_key: &str) -> Option<f64> {
     env_nonempty(env_var)
         .or_else(|| {
@@ -510,6 +517,12 @@ fn config_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("slag"))
 }
 
+/// Public view of the config directory, for sibling caches that live
+/// beside `config.toml` (the pricing table, item 34).
+pub fn config_dir_path() -> Option<PathBuf> {
+    config_dir()
+}
+
 fn config_file_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
@@ -588,6 +601,51 @@ pub fn policy_entries() -> Vec<(String, String)> {
         .into_iter()
         .filter_map(|(key, value)| key.strip_prefix("policy.").map(|n| (n.to_string(), value)))
         .collect()
+}
+
+/// Lifecycle hooks from the `[hooks]` table: one `event = "field=value…"`
+/// line each, the event name as key. Keys repeat freely — several hooks
+/// on one event is the normal case — so this returns pairs, not a map,
+/// and `engine::hooks` parses the values.
+///
+/// File-only, no env override: a hook is a local side-effect the operator
+/// wired up, not a per-run knob.
+pub fn hook_entries() -> Vec<(String, String)> {
+    let entries = config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_config_lines(&c))
+        .unwrap_or_default();
+    entries
+        .into_iter()
+        .filter_map(|(key, value)| key.strip_prefix("hooks.").map(|n| (n.to_string(), value)))
+        .collect()
+}
+
+/// Kill switch: `disable_all_hooks = "t"` in the config file, or
+/// `SLAG_DISABLE_HOOKS` in the environment. The env spelling wins so an
+/// operator can silence a misbehaving hook for one run without editing
+/// the file a smith may be about to rewrite.
+pub fn disable_all_hooks() -> bool {
+    if let Some(v) = env_nonempty("SLAG_DISABLE_HOOKS") {
+        return truthy(&v);
+    }
+    config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_config_lines(&c))
+        .unwrap_or_default()
+        .iter()
+        .find(|(k, _)| k == "disable_all_hooks")
+        .is_some_and(|(_, v)| truthy(v))
+}
+
+/// slag spells booleans `t`/`nil` in ingots; config files reach for
+/// `true`/`1`/`yes`. Accept all of them, and treat `nil`/`false`/`0`/`off`
+/// as the explicit no.
+pub fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "t" | "true" | "1" | "yes" | "on"
+    )
 }
 
 fn file_value(entries: &[(String, String)], key: &str) -> Option<String> {

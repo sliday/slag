@@ -150,11 +150,12 @@ pub struct IngotAccum {
     pub tokens: u64,
     pub cost: Option<f64>,
     pub started: Instant,
+    pub ctx: Option<u8>,
 }
 
 impl IngotAccum {
     fn new() -> Self {
-        Self { tokens: 0, cost: None, started: Instant::now() }
+        Self { tokens: 0, cost: None, started: Instant::now(), ctx: None }
     }
 
     fn reset(&mut self) {
@@ -178,9 +179,20 @@ impl IngotAccum {
         if let Some(cost) = self.cost {
             s.push_str(&format!(" · ${cost:.2}"));
         }
+        // A percent on every footer of a short run is noise. The number
+        // only becomes actionable once the next turn may start pruning
+        // history, so it stays hidden until the gauge goes hot.
+        if let Some(pct) = self.ctx.filter(|p| *p >= CTX_LOUD) {
+            s.push_str(&format!(" · ctx {pct}%"));
+        }
         s
     }
 }
+
+/// Context fill at which the headless narrator starts printing the gauge.
+/// Matches the dashboard's COLD→HOT boundary so both surfaces go loud on
+/// the same turn.
+const CTX_LOUD: u8 = 66;
 
 /// `118234` → `118k`; small counts stay exact so a 3-token probe does not
 /// render as `0k`.
@@ -368,6 +380,9 @@ impl RenderState {
         match event {
             // Demoted to live-line metadata: no own lines.
             EngineEvent::TurnStart { .. } | EngineEvent::ModelCall { .. } => {}
+            // The gauge rides the ingot footer rather than claiming a line
+            // of its own; the JSONL sink still records every reading.
+            EngineEvent::ContextGauge { pct, .. } => self.accum.ctx = Some(*pct),
             EngineEvent::ModelRouted { routed, .. } => {
                 if self.last_routed.as_deref() != Some(routed) {
                     self.last_routed = Some(routed.clone());
@@ -387,7 +402,7 @@ impl RenderState {
                     started: Instant::now(),
                 });
             }
-            EngineEvent::ToolResult { name, ok, preview: p } => {
+            EngineEvent::ToolResult { name, ok, preview: p, .. } => {
                 let card = self.build_card(name, *ok, p);
                 self.push_card(card, &mut prints);
                 self.narrate = None;
@@ -453,6 +468,19 @@ impl RenderState {
             EngineEvent::DuelVerdict { id, winner, margin } => {
                 self.flush_streak(&mut prints);
                 prints.push(line(PURE, "⚖", &format!("[{id}] cast {winner} wins by {margin}")));
+            }
+            // A hook's start is JSONL-only: the finish line carries the
+            // verdict and the duration, and printing both would double
+            // every formatter hook in the stream.
+            EngineEvent::HookStarted { .. } => {}
+            EngineEvent::HookFinished { name, code, duration_ms, .. } => {
+                // Successful hooks are background noise; a block or a
+                // failure is news the operator needs.
+                if *code != 0 {
+                    self.flush_streak(&mut prints);
+                    let verdict = if *code == 2 { "blocked" } else { "failed" };
+                    prints.push(line(BRIGHT, "⚓", &format!("hook {name} {verdict} ({duration_ms}ms)")));
+                }
             }
         }
         self.assemble(prints)
@@ -694,6 +722,9 @@ pub enum RunEntry {
         git_branch: Option<String>,
         model: String,
         duel: String,
+        /// Which flux inputs the smith was fed at forge start
+        /// (`flux::profile`), so two runs on one model stay distinguishable.
+        flux_profile: String,
         /// FNV fingerprint of the crucible (PLAN.md) at forge start, so
         /// a lister can tell which runs forged the same plan.
         crucible_hash: Option<String>,
@@ -781,6 +812,9 @@ mod tests {
             name: "edit_file".into(),
             ok: false,
             preview: "no match".into(),
+            lines: 1,
+            bytes: 8,
+            ms: 12,
         })
         .unwrap();
         assert_eq!(v["event"], "tool_result");
@@ -878,7 +912,14 @@ mod tests {
     }
 
     fn result(name: &str, ok: bool, p: &str) -> EngineEvent {
-        EngineEvent::ToolResult { name: name.into(), ok, preview: p.into() }
+        EngineEvent::ToolResult {
+            name: name.into(),
+            ok,
+            preview: p.into(),
+            lines: p.lines().count(),
+            bytes: p.len(),
+            ms: 0,
+        }
     }
 
     fn printed(ops: &[RenderOp]) -> Vec<String> {
@@ -1232,6 +1273,37 @@ mod tests {
     }
 
     #[test]
+    fn gauge_stays_silent_until_compaction_is_in_sight() {
+        let mut state = RenderState::new(false);
+        state.feed(&EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
+
+        // A cool gauge prints nothing of its own and leaves the footer bare.
+        let quiet = printed(&state.feed(&EngineEvent::ContextGauge {
+            pct: 40,
+            used_tokens: 80_000,
+            budget_tokens: 200_000,
+        }));
+        assert!(quiet.is_empty(), "{quiet:?}");
+        let done = printed(&state.feed(&EngineEvent::IngotDone { id: "i1".into(), ok: true }));
+        assert!(!done[0].contains("ctx"), "{}", done[0]);
+
+        // Hot: the footer carries the reading.
+        state.feed(&EngineEvent::IngotStart { id: "i2".into(), work: "w".into() });
+        state.feed(&EngineEvent::ContextGauge {
+            pct: 91,
+            used_tokens: 182_000,
+            budget_tokens: 200_000,
+        });
+        let done = printed(&state.feed(&EngineEvent::IngotDone { id: "i2".into(), ok: true }));
+        assert!(done[0].contains("ctx 91%"), "{}", done[0]);
+
+        // A fresh ingot forgets the previous one's reading.
+        state.feed(&EngineEvent::IngotStart { id: "i3".into(), work: "w".into() });
+        let done = printed(&state.feed(&EngineEvent::IngotDone { id: "i3".into(), ok: true }));
+        assert!(!done[0].contains("ctx"), "{}", done[0]);
+    }
+
+    #[test]
     fn fmt_tokens_scales_readably() {
         assert_eq!(fmt_tokens(0), "0");
         assert_eq!(fmt_tokens(999), "999");
@@ -1368,6 +1440,7 @@ mod tests {
                 git_branch: Some("main".into()),
                 model: "qwen/qwen3-coder".into(),
                 duel: "auto".into(),
+                flux_profile: "blueprint+alloy".into(),
                 crucible_hash: Some("00ff00ff00ff00ff".into()),
             },
         );
@@ -1383,6 +1456,7 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0]["entry"], "run_meta");
         assert_eq!(lines[0]["git_branch"], "main");
+        assert_eq!(lines[0]["flux_profile"], "blueprint+alloy");
         assert_eq!(lines[0]["crucible_hash"], "00ff00ff00ff00ff");
         assert_eq!(lines[1]["entry"], "ingot_done");
         assert_eq!(lines[1]["heat"], 2);

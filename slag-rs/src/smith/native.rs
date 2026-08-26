@@ -9,6 +9,7 @@ use std::sync::Arc;
 use super::{EngineHooks, Smith};
 use crate::config::EngineConfig;
 use crate::engine::agent::{ForgeAgent, SpendAccum};
+use crate::engine::Role;
 use crate::engine::events::{self, StderrNarrator};
 use crate::engine::prompt::{self, PromptMode};
 use crate::engine::provider::OpenRouter;
@@ -32,6 +33,10 @@ pub struct NativeSmith {
     /// this smith shares it, so `SLAG_MAX_COST_INGOT` caps the whole
     /// ingot's spend rather than each session starting from $0.
     ingot_spend: SpendAccum,
+    /// Ledger attribution for this smith's calls (item 35). Forge passes
+    /// are `Smith`; the plan smith carries whichever phase built it, so
+    /// surveyor and founder spend separate even on one model.
+    role: Role,
 }
 
 impl NativeSmith {
@@ -46,7 +51,14 @@ impl NativeSmith {
             model_override: None,
             hooks: hooks.clone(),
             ingot_spend: SpendAccum::default(),
+            role: Role::Smith,
         }
+    }
+
+    /// Attribute this smith's spend to a different ledger row.
+    pub fn with_role(mut self, role: Role) -> Self {
+        self.role = role;
+        self
     }
 
     /// Survey/plan pass on the reasoning model. Mirrors `ClaudeSmith::plan`.
@@ -60,6 +72,7 @@ impl NativeSmith {
             model_override: None,
             hooks: hooks.clone(),
             ingot_spend: SpendAccum::default(),
+            role: Role::Plan,
         }
     }
 
@@ -88,6 +101,7 @@ impl NativeSmith {
                 cancel: hooks.cancel.clone(),
             },
             ingot_spend: SpendAccum::default(),
+            role: Role::Duel,
         }
     }
 
@@ -171,6 +185,7 @@ impl NativeSmith {
             .with_context_window(window)
             .with_effort(effort)
             .with_ingot_spend(self.ingot_spend.clone())
+            .with_role(self.role)
             .with_events(tx);
         if let Some(steer) = &self.hooks.steer {
             agent = agent.with_steer(steer.clone());

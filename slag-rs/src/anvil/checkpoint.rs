@@ -67,6 +67,19 @@ impl Checkpoint {
         Self::new(root, attempt_key(id, heat))
     }
 
+    /// The ingot this attempt belongs to, recovered from the key by
+    /// dropping the `-h<heat>` suffix. Item 88 credits a write's churn to
+    /// this id, so parallel anvils never cross-attribute: each carries its
+    /// own checkpoint. Falls back to the whole key for a key that did not
+    /// come from `attempt_key`.
+    pub fn ingot_id(&self) -> &str {
+        self.key
+            .rsplit_once("-h")
+            .filter(|(_, heat)| !heat.is_empty() && heat.bytes().all(|b| b.is_ascii_digit()))
+            .map(|(id, _)| id)
+            .unwrap_or(&self.key)
+    }
+
     /// Attempt start: drop any stale manifest from a previous run of this
     /// key. Objects stay — they are content-addressed and shared.
     pub fn begin(&self) {
@@ -144,6 +157,14 @@ pub fn rewind_attempt(root: &Path, id: &str, heat: u8) -> usize {
     rewind_attempt_key(root, &attempt_key(id, heat))
 }
 
+/// Whether an attempt was ever checkpointed. A restore count cannot make
+/// the distinction `slag rewind --ingot X --heat N` needs: zero files
+/// back from a real attempt is a no-op the operator can ignore, zero from
+/// a mistyped id is a command that did nothing they asked for.
+pub fn attempt_exists(root: &Path, id: &str, heat: u8) -> bool {
+    manifest_path(root, &attempt_key(id, heat)).exists()
+}
+
 /// Join a manifest-supplied path under root, refusing absolute paths and
 /// any `..` traversal. The manifest lives in the model-writable logs/
 /// tree, so its lines are untrusted input: without this check a planted
@@ -212,8 +233,6 @@ fn rewind_attempt_key(root: &Path, key: &str) -> usize {
 
 /// Rewind the most recently written attempt manifest (the `slag rewind`
 /// default). Returns (attempt key, files restored) when one exists.
-/// Unused until the CLI group wires the `slag rewind` subcommand to it.
-#[allow(dead_code)]
 pub fn rewind_latest(root: &Path) -> Option<(String, usize)> {
     let dir = root.join(CHECKPOINT_DIR);
     let mut newest: Option<(std::time::SystemTime, String)> = None;

@@ -9,7 +9,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,10 +17,12 @@ use tokio::task::JoinHandle;
 use super::compact::{compact, convo_chars, summarize};
 use super::events::preview;
 use super::tools::ToolBox;
+use super::hooks;
 use super::transcript::{self, TranscriptWriter};
 use super::{
-    emit, stats, CancelFlag, ChatMessage, ChatRequest, Effort, EngineEvent, EventTx, FinishReason,
-    NormalizedResponse, Provider, SteerQueue, ToolCall, ToolOutcome, Usage,
+    emit, stats, CancelFlag, CancelReason, Cancellation, ChatMessage, ChatRequest, Effort,
+    EngineEvent, EventTx, FinishReason, NormalizedResponse, Provider, RetryPolicy, Role,
+    SteerQueue, ToolCall, ToolOutcome, Usage,
 };
 use crate::error::SlagError;
 
@@ -125,6 +126,17 @@ fn estimate_tokens(messages: &[ChatMessage], anchor: Option<TokenAnchor>) -> u64
         }
         _ => (convo_chars(messages) / CHARS_PER_TOKEN) as u64,
     }
+}
+
+/// Context fill as a percentage of the compaction trigger. The budget is
+/// already net of the output reserve and compaction headroom, so 100 here
+/// means "the next turn compacts", not "the window is full". Saturates:
+/// an over-budget turn reports 100 rather than wrapping past it.
+fn context_pct(used_tokens: u64, budget_tokens: usize) -> u8 {
+    if budget_tokens == 0 {
+        return 100;
+    }
+    ((used_tokens * 100) / budget_tokens as u64).min(100) as u8
 }
 
 /// Token-driven compaction: when the estimate exceeds the budget, prune
@@ -249,7 +261,7 @@ pub struct ForgeAgent {
     ingot_spend: SpendAccum,
     events: Option<EventTx>,
     steer: Option<SteerQueue>,
-    cancel: Option<CancelFlag>,
+    cancel: Option<Cancellation>,
     /// Root the transcript journal resolves under (default: the run's
     /// working directory, where `logs/` lives). Tests point it at a
     /// tempdir.
@@ -260,6 +272,10 @@ pub struct ForgeAgent {
     /// at the same (ingot, heat) must never hijack a new heat's
     /// conversation.
     resume: bool,
+    /// Ledger attribution for every call this session makes. `Smith` by
+    /// default; the plan-model factory flips it so plan spend separates
+    /// from base spend even when both route to the same model id.
+    role: Role,
 }
 
 impl ForgeAgent {
@@ -279,7 +295,14 @@ impl ForgeAgent {
             cancel: None,
             transcript_root: std::path::PathBuf::from("."),
             resume: false,
+            role: Role::Smith,
         }
+    }
+
+    /// Attribute this session's spend to a different ledger row.
+    pub fn with_role(mut self, role: Role) -> Self {
+        self.role = role;
+        self
     }
 
     /// Opt in to replaying an open transcript at this (ingot, heat).
@@ -352,8 +375,20 @@ impl ForgeAgent {
         self
     }
 
-    pub fn with_cancel(mut self, f: CancelFlag) -> Self {
-        self.cancel = Some(f);
+    /// Adopt a bare flag — the bridge for the surfaces that own one and
+    /// cannot say why they raised it. Reads as `UserAbort`, the
+    /// conservative default: an unexplained stop is reported as a failure.
+    pub fn with_cancel(self, f: CancelFlag) -> Self {
+        self.with_cancellation(Cancellation::from_flag(f))
+    }
+
+    /// Take the flag *and* its reason (item 56), so a steer interrupt can
+    /// skip the error path a ctrl-C takes.
+    pub fn with_cancellation(mut self, c: Cancellation) -> Self {
+        // The toolbox needs the same flag, or a ten-minute bash proof keeps
+        // running after the operator interrupted the session.
+        self.toolbox = self.toolbox.clone().with_cancel(c.flag.clone());
+        self.cancel = Some(c);
         self
     }
 
@@ -428,8 +463,16 @@ impl ForgeAgent {
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
+            // A parallel anvil or the operator may have rewritten a file
+            // this session is tracking; say so before the model reasons
+            // over a stale view of it.
+            let externals = self.toolbox.external_changes().await;
             let steered = applied_steers.len();
             self.apply_steers(&mut messages, applied_steers);
+            if !externals.is_empty() {
+                self.inject_reminders(&mut messages, &externals);
+                record_rewrite(tw, &messages);
+            }
             if applied_steers.len() > steered {
                 // Steers rewrite an existing tool result in place: the
                 // append-only journal can only stay true via a redump.
@@ -438,9 +481,24 @@ impl ForgeAgent {
             if compact_to_tokens(&mut messages, token_budget, &mut anchor) {
                 record_rewrite(tw, &messages);
             }
+            let used = estimate_tokens(&messages, anchor);
+            emit(
+                &self.events,
+                EngineEvent::ContextGauge {
+                    pct: context_pct(used, token_budget),
+                    used_tokens: used,
+                    budget_tokens: token_budget,
+                },
+            );
             emit(&self.events, EngineEvent::TurnStart { turn });
             emit(&self.events, EngineEvent::ModelCall { model: self.model.clone() });
 
+            // Item 55: watermark the committed history before the attempt.
+            // Every retry that re-sends the *same* request rebuilds from
+            // here, so a failed attempt's partial assistant/tool messages
+            // cannot ride along. Retries that deliberately carry the
+            // partial (the continuation nudge) append past the mark.
+            let committed = messages.len();
             let resp = match self
                 .chat_shrinking(&mut messages, true, &mut token_budget, &mut anchor, &mut out_tokens, tw)
                 .await
@@ -481,11 +539,14 @@ impl ForgeAgent {
                         // transcript noise when the cap alone was the issue.
                         escalated = true;
                         out_tokens = Some(out_tokens.unwrap_or(0).max(RAISED_MAX_TOKENS));
+                        messages.truncate(committed);
                         continue;
                     }
                     if nudges < MAX_CONTINUE_NUDGES {
                         // Truncated even at the raised cap: keep the partial
-                        // and nudge a direct resume.
+                        // and nudge a direct resume. This one appends past
+                        // the watermark on purpose — the model needs its own
+                        // partial to continue from.
                         nudges += 1;
                         messages.push(ChatMessage::assistant(resp.content, None));
                         messages.push(ChatMessage::user(CONTINUE_NUDGE));
@@ -625,14 +686,27 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
+        self.cancel.as_ref().is_some_and(|c| c.is_raised())
     }
 
     /// Hard interrupt: checked at each turn boundary, before the model call.
+    ///
+    /// Item 56: the run ends either way, but only an abort reports an
+    /// error. A steer interrupt is the operator redirecting live work, so
+    /// it narrates the reason and leaves the error path alone.
     fn check_cancel(&self) -> Result<(), SlagError> {
         if self.is_cancelled() {
             let e = SlagError::Cancelled;
-            emit(&self.events, EngineEvent::Error { message: e.to_string() });
+            let reason =
+                self.cancel.as_ref().map(Cancellation::reason).unwrap_or_default();
+            match reason {
+                CancelReason::SteerInterrupt => {
+                    emit(&self.events, EngineEvent::Narrate { text: reason.label().into() });
+                }
+                CancelReason::UserAbort => {
+                    emit(&self.events, EngineEvent::Error { message: e.to_string() });
+                }
+            }
             return Err(e);
         }
         Ok(())
@@ -758,13 +832,28 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
     fn apply_steers(&self, messages: &mut Vec<ChatMessage>, applied: &mut Vec<String>) {
         for text in self.drain_steers() {
             emit(&self.events, EngineEvent::Steer { text: text.clone() });
-            match messages.iter_mut().rev().find(|m| m.role == "tool") {
-                Some(m) => {
-                    m.content.push_str(&format!("\n\n{STEER_TAG}\n{text}"));
-                }
-                None => messages.push(ChatMessage::user(format!("{STEER_TAG}\n{text}"))),
-            }
+            self.inject_reminders(messages, &[format!("{STEER_TAG}\n{text}")]);
             applied.push(text);
+        }
+    }
+
+    /// Attach reminder bodies to the conversation using the same carrier
+    /// rule as steers: onto the last tool result when there is one, so the
+    /// model reads them with the tool output, otherwise as a user message.
+    /// `append_reminder` coalesces, so several notes share one envelope.
+    fn inject_reminders(&self, messages: &mut Vec<ChatMessage>, notes: &[String]) {
+        for note in notes {
+            match messages.iter_mut().rev().find(|m| m.role == "tool") {
+                Some(m) => crate::engine::prompt::append_reminder(&mut m.content, note),
+                None => match messages.last_mut().filter(|m| {
+                    m.role == "user"
+                        && m.content.trim_end().ends_with(crate::engine::prompt::REMINDER_CLOSE)
+                }) {
+                    Some(m) => crate::engine::prompt::append_reminder(&mut m.content, note),
+                    None => messages
+                        .push(ChatMessage::user(crate::engine::prompt::wrap_reminder(note))),
+                },
+            }
         }
     }
 
@@ -807,6 +896,9 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             },
             effort: self.effort,
             max_tokens,
+            role: self.role,
+            // A forge strike is the work itself: full provider budget.
+            retry: RetryPolicy::full(),
         }
     }
 
@@ -840,6 +932,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                 .collect();
 
             for (i, handle) in handles {
+                let dispatched = std::time::Instant::now();
                 let outcome = match handle.await {
                     Ok(outcome) => outcome,
                     // A panic inside a tool is a local bug, not a loop killer.
@@ -854,6 +947,12 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                         name: calls[i].name.clone(),
                         ok: !outcome.is_error,
                         preview: preview(&outcome.output, PREVIEW_LEN),
+                        // Measured on the full output: the preview is
+                        // truncated, and the point of the counts is to say
+                        // how much the collapsed line is hiding.
+                        lines: outcome.output.lines().count(),
+                        bytes: outcome.output.len(),
+                        ms: dispatched.elapsed().as_millis() as u64,
                     },
                 );
                 // Item 89: failed tool calls tally per tool with a coarse
@@ -889,8 +988,78 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         // attempt it belongs to.
         let toolbox = self.toolbox.clone().with_attempt(transcript::current());
         let call = call.clone();
-        tokio::spawn(async move { toolbox.dispatch(&call).await })
+        let steer = self.steer.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move { dispatch_hooked(toolbox, call, steer, events).await })
     }
+}
+
+/// One tool call, wrapped in its lifecycle hooks (items 69, 75).
+///
+/// PreToolUse runs first: exit 2 refuses the call outright, and a
+/// structured reply can rewrite the arguments before dispatch. The result
+/// then goes back through PostToolUse or ToolError, whose output is
+/// appended to what the smith reads. With no hooks configured this is a
+/// snapshot read and two empty selects — the cost the common case pays.
+async fn dispatch_hooked(
+    toolbox: ToolBox,
+    mut call: ToolCall,
+    steer: Option<SteerQueue>,
+    events: Option<EventTx>,
+) -> ToolOutcome {
+    let pre = hooks::fire(
+        hooks::HookEvent::PreTool,
+        hooks::HookPayload::new(hooks::HookEvent::PreTool).with_tool(&call.name, &call.arguments),
+        &call.name,
+        &call.arguments,
+        steer.as_ref(),
+        events.as_ref(),
+    )
+    .await;
+
+    if let Some(reason) = pre.blocked {
+        // The refusal is the tool result: the smith reads why and picks
+        // another move, which is the whole point of a guard hook.
+        return ToolOutcome {
+            output: format!("blocked by hook: {reason}"),
+            is_error: true,
+        };
+    }
+    if let Some(rewritten) = pre.rewritten_arguments() {
+        call.arguments = rewritten;
+    }
+
+    let mut outcome = toolbox.dispatch(&call).await;
+
+    let event = if outcome.is_error {
+        hooks::HookEvent::ToolError
+    } else {
+        hooks::HookEvent::PostTool
+    };
+    let post = hooks::fire(
+        event,
+        hooks::HookPayload::new(event)
+            .with_tool(&call.name, &call.arguments)
+            .with_output(&outcome.output),
+        &call.name,
+        &call.arguments,
+        steer.as_ref(),
+        events.as_ref(),
+    )
+    .await;
+
+    // A post hook's exit 2 cannot un-run the call, so its reason joins the
+    // result as context the smith must answer for.
+    let mut appended = pre.context;
+    appended.extend(post.context);
+    if let Some(reason) = post.blocked {
+        appended.push(format!("hook objected: {reason}"));
+        outcome.is_error = true;
+    }
+    if !appended.is_empty() {
+        outcome.output = format!("{}\n\n{}", outcome.output, appended.join("\n"));
+    }
+    outcome
 }
 
 /// Journal one appended message (no-op outside a forge attempt).
@@ -1036,6 +1205,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::Pin;
+    // Only the tests reach past `Cancellation` to the raw atomic now.
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
     /// Scripted provider: pops one response per chat call, records requests.
@@ -1327,6 +1498,68 @@ mod tests {
             .expect_err("must fail, not loop or return a stump");
         assert!(err.to_string().contains("output truncated"), "got: {err}");
         assert_eq!(provider.requests().len(), 5);
+    }
+
+    /// Item 55: the silent escalation retry re-sends the committed history,
+    /// never the failed attempt's partial. The turn watermark is what makes
+    /// that true by construction rather than by luck of statement order.
+    #[tokio::test]
+    async fn an_escalated_retry_re_sends_the_committed_history_not_the_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            resp_text("a partial that must not leak", FinishReason::Length),
+            resp_text("complete", FinishReason::Stop),
+        ]);
+
+        let result = agent(provider.clone(), dir.path())
+            .run("system".into(), "task".into())
+            .await
+            .expect("run ok");
+        assert_eq!(result, "complete");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "one escalated retry");
+        assert_eq!(
+            requests[1].messages.len(),
+            requests[0].messages.len(),
+            "the retry must carry the pre-attempt history, unchanged in length"
+        );
+        assert!(
+            !requests[1]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("a partial that must not leak")),
+            "the discarded partial leaked into the retried request"
+        );
+    }
+
+    /// The nudge path is the deliberate exception: once escalation has been
+    /// spent, the partial is kept on purpose so the model resumes from it.
+    /// The watermark must not undo that.
+    #[tokio::test]
+    async fn the_nudge_path_still_keeps_its_partial_on_purpose() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            resp_text("first partial", FinishReason::Length),
+            resp_text("second partial", FinishReason::Length),
+            resp_text("complete", FinishReason::Stop),
+        ]);
+
+        agent(provider.clone(), dir.path())
+            .run("system".into(), "task".into())
+            .await
+            .expect("run ok");
+
+        let requests = provider.requests();
+        let msgs = &requests[2].messages;
+        assert_eq!(msgs[msgs.len() - 1].content, CONTINUE_NUDGE);
+        assert_eq!(msgs[msgs.len() - 2].content, "second partial");
+        // The escalated attempt's partial was still discarded; only the
+        // post-escalation one is carried.
+        assert!(
+            !msgs.iter().any(|m| m.content == "first partial"),
+            "escalation's partial must not survive alongside the nudged one"
+        );
     }
 
     #[test]
@@ -1656,7 +1889,12 @@ mod tests {
             .find(|m| m.content.contains("focus on tests"))
             .expect("steer message present");
         assert_eq!(steer_msg.role, "user");
-        assert!(steer_msg.content.starts_with(STEER_TAG));
+        assert!(
+            steer_msg.content.starts_with(crate::engine::prompt::REMINDER_OPEN),
+            "steers ride the standard reminder envelope: {}",
+            steer_msg.content
+        );
+        assert!(steer_msg.content.contains(STEER_TAG));
 
         let mut saw_steer_event = false;
         while let Ok(ev) = rx.try_recv() {
@@ -1666,6 +1904,43 @@ mod tests {
             }
         }
         assert!(saw_steer_event, "Steer event emitted");
+    }
+
+    #[tokio::test]
+    async fn an_external_file_change_is_injected_before_the_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+
+        // Turn 1 reads the file. Turn 2 rewrites it through bash, which
+        // does not arm the read-before-edit gate — exactly the shape of a
+        // parallel anvil's write. Turn 3's request must carry the reminder.
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("c1", "read_file", serde_json::json!({"path": "a.txt"}))]),
+            resp_tools(vec![tc(
+                "c2",
+                "bash",
+                serde_json::json!({"command": "sleep 0.02 && printf 'one\\nTWO\\n' > a.txt"}),
+            )]),
+            resp_text("done", FinishReason::Stop),
+        ]);
+
+        agent(provider.clone(), dir.path())
+            .run("system".into(), "task".into())
+            .await
+            .expect("run ok");
+
+        let second = &provider.requests()[2].messages;
+        let note = second
+            .iter()
+            .find(|m| m.content.contains("modified externally"))
+            .expect("external-change reminder present");
+        assert!(
+            note.content.contains(crate::engine::prompt::REMINDER_OPEN),
+            "rides the reminder envelope: {}",
+            note.content
+        );
+        assert!(note.content.contains("-two"), "{}", note.content);
+        assert!(note.content.contains("+TWO"), "{}", note.content);
     }
 
     #[tokio::test]
@@ -1681,8 +1956,18 @@ mod tests {
             .expect("run ok");
 
         let msgs = &provider.requests()[0].messages;
-        let first = msgs.iter().position(|m| m.content.ends_with("\nfirst")).unwrap();
-        let second = msgs.iter().position(|m| m.content.ends_with("\nsecond")).unwrap();
+        let carrier = msgs
+            .iter()
+            .find(|m| m.content.contains("first"))
+            .expect("steer carrier present");
+        assert_eq!(
+            carrier.content.matches(crate::engine::prompt::REMINDER_OPEN).count(),
+            1,
+            "both steers coalesce into one envelope: {}",
+            carrier.content
+        );
+        let first = carrier.content.find("\nfirst").unwrap();
+        let second = carrier.content.find("\nsecond").unwrap();
         assert!(first < second, "steers applied in queue order");
     }
 
@@ -1990,6 +2275,90 @@ mod tests {
         );
     }
 
+    /// Item 56, the clause the reason enum exists for: an operator who
+    /// interrupts to steer is redirecting live work, not hitting a failure.
+    /// The run still stops, but it must not report an error.
+    #[tokio::test]
+    async fn a_steer_interrupt_narrates_instead_of_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Cancellation::default();
+        cancel.raise(CancelReason::SteerInterrupt);
+
+        let err = agent(MockProvider::new(vec![]), dir.path())
+            .with_events(tx)
+            .with_cancellation(cancel)
+            .run("system".into(), "task".into())
+            .await
+            .expect_err("a raised interrupt still ends the run");
+        assert!(matches!(err, SlagError::Cancelled), "got: {err}");
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, EngineEvent::Error { .. })),
+            "a steer must skip the error path: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EngineEvent::Narrate { text } if text.contains(CancelReason::SteerInterrupt.label())
+            )),
+            "the reason must reach the operator: {events:?}"
+        );
+    }
+
+    /// The default reason is unchanged: a ctrl-C is still a failure the
+    /// assay reports, so it keeps the error event.
+    #[tokio::test]
+    async fn an_operator_abort_still_reports_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Cancellation::default();
+        cancel.raise(CancelReason::UserAbort);
+
+        let _ = agent(MockProvider::new(vec![]), dir.path())
+            .with_events(tx)
+            .with_cancellation(cancel)
+            .run("system".into(), "task".into())
+            .await;
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            events.iter().any(|e| matches!(e, EngineEvent::Error { .. })),
+            "an abort still errors: {events:?}"
+        );
+    }
+
+    /// `with_cancel` remains the bridge for the surfaces that only hold a
+    /// bare flag: adopting one reads as an abort, the conservative default.
+    #[tokio::test]
+    async fn a_bare_flag_still_reads_as_an_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let flag: CancelFlag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let _ = agent(MockProvider::new(vec![]), dir.path())
+            .with_events(tx)
+            .with_cancel(flag)
+            .run("system".into(), "task".into())
+            .await;
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            events.iter().any(|e| matches!(e, EngineEvent::Error { .. })),
+            "an adopted flag defaults to abort: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_batch_backfills_every_id_when_cancelled() {
         let dir = tempfile::tempdir().unwrap();
@@ -2234,6 +2603,8 @@ mod tests {
             tools: vec![],
             effort: None,
             max_tokens: None,
+            role: Role::Judge,
+            retry: RetryPolicy::side(),
         };
         tracked.chat(req).await.expect("chat ok");
         assert!((*acc.lock().unwrap() - 0.5).abs() < 1e-9, "judge cost tracked");
@@ -2255,6 +2626,8 @@ mod tests {
             tools: vec![],
             effort: None,
             max_tokens: None,
+            role: Role::Judge,
+            retry: RetryPolicy::side(),
         };
         let err = tracked.chat(req).await.expect_err("run cap must refuse");
         assert!(matches!(err, SlagError::RunBudgetExhausted { .. }), "got: {err}");
