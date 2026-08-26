@@ -452,7 +452,7 @@ pub async fn onboard() -> Result<String, SlagError> {
     if !std::io::stdin().is_terminal() {
         return Err(SlagError::Config(
             "no OpenRouter key. Set OPENROUTER_API_KEY, or run `slag key` on a terminal \
-             to save one. Get a key at https://openrouter.ai/keys"
+             to save one. Get a key at https://openrouter.ai/workspaces/default/keys"
                 .into(),
         ));
     }
@@ -485,7 +485,7 @@ pub async fn verify_and_store(key: &str) -> Result<PathBuf, SlagError> {
         KeyCheck::Rejected(why) => {
             return Err(SlagError::Config(format!(
                 "OpenRouter rejected that key ({why}). \
-                 Copy it again from https://openrouter.ai/keys"
+                 Copy it again from https://openrouter.ai/workspaces/default/keys"
             )))
         }
         KeyCheck::Unreachable(why) => crate::tui::key_unverified(&why),

@@ -156,7 +156,7 @@ pub fn key_intro() {
         reset()
     );
     println!(
-        "  {}get one at{} {}https://openrouter.ai/keys{}",
+        "  {}get one at{} {}https://openrouter.ai/workspaces/default/keys{}",
         fg(COLD),
         reset(),
         fg(BRIGHT),

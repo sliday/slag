@@ -15,7 +15,7 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 
 use super::compact::{compact, convo_chars, summarize};
-use super::events::preview;
+use super::events::{arg_summary, preview};
 use super::tools::ToolBox;
 use super::hooks;
 use super::transcript::{self, TranscriptWriter};
@@ -924,7 +924,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                         &self.events,
                         EngineEvent::ToolCallStart {
                             name: calls[i].name.clone(),
-                            preview: preview(&calls[i].arguments, PREVIEW_LEN),
+                            preview: preview(&arg_summary(&calls[i].name, &calls[i].arguments), PREVIEW_LEN),
                         },
                     );
                     (i, self.spawn_call(&calls[i]))

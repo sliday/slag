@@ -9,7 +9,7 @@
 //! The dashboard never owns the forge. Detaching (Esc/q) leaves the forge
 //! running headless; Ctrl-C sets the shared `CancelFlag` and detaches.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +101,10 @@ pub(crate) struct IngotRow {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FeedLine {
+    /// Stable row handle. A later event amends an earlier row (the turn
+    /// header gains its route, a tool call gains its result), and an index
+    /// would not survive the FEED_CAP pop from the front.
+    pub(crate) id: u64,
     pub(crate) color: Color,
     pub(crate) text: String,
     /// Full tool output, shown only while Ctrl-O has the feed expanded.
@@ -146,6 +150,18 @@ pub(crate) struct DashState {
     /// steps back past the newest entry. Losing a half-typed line to a
     /// stray Up is the failure this field exists to prevent.
     pub(crate) draft: String,
+    /// Next row handle. Monotonic, never reused.
+    pub(crate) next_row: u64,
+    /// The row holding the current turn header, so the route folds into it
+    /// rather than spending a line of its own.
+    pub(crate) turn_row: Option<u64>,
+    /// The route last announced. An unchanged route is not news, so it is
+    /// printed once and then only when it moves.
+    pub(crate) route: Option<String>,
+    /// In-flight tool calls, oldest first per tool name: the row each
+    /// result completes in place. Parallel calls of one tool pair FIFO,
+    /// which is the order the engine dispatches and collects them in.
+    pub(crate) pending_tools: HashMap<String, VecDeque<u64>>,
 }
 
 impl DashState {
@@ -178,10 +194,27 @@ impl DashState {
         self.push_feed_detail(color, text, None);
     }
 
-    fn push_feed_detail(&mut self, color: Color, text: String, detail: Option<String>) {
-        self.feed.push_back(FeedLine { color, text, detail });
+    fn push_feed_detail(&mut self, color: Color, text: String, detail: Option<String>) -> u64 {
+        let id = self.next_row;
+        self.next_row += 1;
+        self.feed.push_back(FeedLine { id, color, text, detail });
         while self.feed.len() > FEED_CAP {
             self.feed.pop_front();
+        }
+        id
+    }
+
+    /// Rewrite a row that is still on screen. Searches from the back
+    /// because every amendment targets a recent row, and returns false
+    /// when the row has already aged out past FEED_CAP -- an amendment
+    /// for a scrolled-off row is a no-op, never a panic.
+    fn amend(&mut self, id: u64, f: impl FnOnce(&mut FeedLine)) -> bool {
+        match self.feed.iter_mut().rev().find(|r| r.id == id) {
+            Some(row) => {
+                f(row);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -199,11 +232,66 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             state.turn = *turn;
             state.turn_started = Some(Instant::now());
             state.turn_tokens = 0;
+            let id = state.push_feed_detail(palette(tui::HOT), format!("⚒ turn {turn}"), None);
+            state.turn_row = Some(id);
+            return;
+        }
+        // A route folds into the open turn header, and only when it is
+        // news: the first one, or a switch. Three rows become one.
+        EngineEvent::ModelRouted { routed, .. } => {
+            let fresh = state.route.as_deref() != Some(routed.as_str());
+            if fresh {
+                state.route = Some(routed.clone());
+                if let Some(id) = state.turn_row {
+                    let routed = routed.clone();
+                    state.amend(id, |row| row.text.push_str(&format!(" · {routed}")));
+                }
+            }
+            return;
+        }
+        // A call opens a row; its result completes that same row.
+        EngineEvent::ToolCallStart { name, preview: p } => {
+            state.mark_activity();
+            let id = state.push_feed_detail(
+                palette(tui::BRIGHT),
+                format!("→ {name}  {}", preview(p, 80)),
+                None,
+            );
+            state.pending_tools.entry(name.clone()).or_default().push_back(id);
+            return;
         }
         EngineEvent::Finish { .. } | EngineEvent::Error { .. } => {
             state.turn_started = None;
         }
-        EngineEvent::ToolResult { .. } => state.mark_activity(),
+        EngineEvent::ToolResult { name, ok, preview: p, lines, bytes, ms } => {
+            state.mark_activity();
+            let (color, text) = feed_entry(&event);
+            let detail = (!p.is_empty()).then(|| p.clone());
+            // Pair oldest-first: the engine dispatches a segment of calls
+            // then collects them in the same order.
+            let pending = state.pending_tools.get_mut(name).and_then(|q| q.pop_front());
+            let completed = match pending {
+                // The call row carries the argument, which the result
+                // event does not; keep it and swap the verdict in.
+                Some(id) => {
+                    let (ok, lines, bytes, ms) = (*ok, *lines, *bytes, *ms);
+                    let p = p.clone();
+                    state.amend(id, |row| {
+                        let arg = row.text.split_once("  ").map(|(_, a)| a.to_string());
+                        row.color = color;
+                        row.text = complete_row(name, arg.as_deref(), ok, &p, lines, bytes, ms);
+                        row.detail = detail.clone();
+                    })
+                }
+                None => false,
+            };
+            // An orphan result (no call row on screen, or it aged out)
+            // still deserves its line rather than vanishing.
+            if !completed {
+                state.push_feed_detail(color, text, detail);
+            }
+            return;
+        }
         EngineEvent::ContextGauge { pct, used_tokens, budget_tokens } => {
             state.ctx = Some((*pct, *used_tokens, *budget_tokens));
         }
@@ -250,6 +338,29 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
     state.push_feed_detail(color, text, detail);
 }
 
+/// The completed form of a tool row: the call's argument kept, the verdict
+/// and counts swapped in. A failure shows its error inline -- that is the
+/// one result worth reading without expanding.
+fn complete_row(
+    name: &str,
+    arg: Option<&str>,
+    ok: bool,
+    err: &str,
+    lines: usize,
+    bytes: usize,
+    ms: u64,
+) -> String {
+    let arg = match arg {
+        Some(a) if !a.is_empty() => format!("  {a}"),
+        _ => String::new(),
+    };
+    if ok {
+        format!("✓ {name}{arg} {}", result_counts(lines, bytes, ms))
+    } else {
+        format!("✗ {name}{arg} ({ms}ms): {}", preview(err, 80))
+    }
+}
+
 /// One narrator-style feed line per event (mirrors `StderrNarrator`).
 fn feed_entry(event: &EngineEvent) -> (Color, String) {
     match event {
@@ -257,9 +368,11 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
         // would say the same thing twice and push real events off screen.
         EngineEvent::ContextGauge { .. } => (palette(tui::COLD), String::new()),
         EngineEvent::TurnStart { turn } => (palette(tui::HOT), format!("⚒ turn {turn}")),
-        EngineEvent::ModelCall { model } => (palette(tui::COLD), format!("⚙ {model}")),
-        EngineEvent::ModelRouted { routed, .. } => {
-            (palette(tui::COLD), format!("⚙ routed to {routed}"))
+        // The model and the route it resolved to fold into the turn
+        // header (see `apply_event`). Printed as their own rows they
+        // repeated verbatim every turn and cost a quarter of the feed.
+        EngineEvent::ModelCall { .. } | EngineEvent::ModelRouted { .. } => {
+            (palette(tui::COLD), String::new())
         }
         EngineEvent::ToolCallStart { name, preview: p } => {
             (palette(tui::BRIGHT), format!("→ {name}: {}", preview(p, 80)))
@@ -1191,6 +1304,115 @@ mod tests {
         assert!((state.totals.cost.unwrap() - 0.012).abs() < 1e-9);
         assert_eq!(state.feed.len(), 6);
         assert!(state.feed.back().unwrap().text.contains("[i1] forged"));
+    }
+
+
+    #[test]
+    fn a_turn_header_carries_its_route_instead_of_two_more_lines() {
+        let mut state = DashState::default();
+        for ev in [
+            EngineEvent::TurnStart { turn: 4 },
+            EngineEvent::ModelCall { model: "openrouter/auto".into() },
+            EngineEvent::ModelRouted {
+                requested: "openrouter/auto".into(),
+                routed: "deepseek/deepseek-v4-flash-0731".into(),
+            },
+        ] {
+            apply_event(&mut state, ev);
+        }
+        assert_eq!(state.feed.len(), 1, "three events collapse to one header row");
+        let row = &state.feed[0].text;
+        assert!(row.contains("turn 4"), "{row}");
+        assert!(row.contains("deepseek-v4-flash-0731"), "{row}");
+    }
+
+    #[test]
+    fn an_unchanged_route_is_not_repeated_on_later_turns() {
+        let mut state = DashState::default();
+        for turn in 1..=3 {
+            apply_event(&mut state, EngineEvent::TurnStart { turn });
+            apply_event(
+                &mut state,
+                EngineEvent::ModelRouted {
+                    requested: "openrouter/auto".into(),
+                    routed: "deepseek/v4".into(),
+                },
+            );
+        }
+        assert_eq!(state.feed.len(), 3, "one row per turn, never three");
+        assert!(state.feed[0].text.contains("deepseek/v4"), "first turn names the route");
+        assert!(
+            !state.feed[2].text.contains("deepseek/v4"),
+            "an unchanged route is not repeated: {}",
+            state.feed[2].text
+        );
+    }
+
+    #[test]
+    fn a_changed_route_is_announced_again() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
+        apply_event(
+            &mut state,
+            EngineEvent::ModelRouted { requested: "a".into(), routed: "deepseek/v4".into() },
+        );
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 2 });
+        apply_event(
+            &mut state,
+            EngineEvent::ModelRouted { requested: "a".into(), routed: "qwen/max".into() },
+        );
+        assert!(state.feed[1].text.contains("qwen/max"), "a switch is news: {}", state.feed[1].text);
+    }
+
+    #[test]
+    fn a_tool_result_completes_its_call_row_in_place() {
+        let mut state = DashState::default();
+        apply_event(
+            &mut state,
+            EngineEvent::ToolCallStart { name: "read_file".into(), preview: "src/main.ts".into() },
+        );
+        assert_eq!(state.feed.len(), 1);
+        apply_event(&mut state, tool_result("read_file", true, "body"));
+        assert_eq!(state.feed.len(), 1, "the result completes the call row, it does not add one");
+        let row = &state.feed[0].text;
+        assert!(row.starts_with("✓"), "completed row carries the result glyph: {row}");
+        assert!(row.contains("src/main.ts"), "the call's argument survives: {row}");
+    }
+
+    #[test]
+    fn parallel_calls_of_one_tool_pair_oldest_first() {
+        let mut state = DashState::default();
+        for path in ["a.ts", "b.ts"] {
+            apply_event(
+                &mut state,
+                EngineEvent::ToolCallStart { name: "read_file".into(), preview: path.into() },
+            );
+        }
+        apply_event(&mut state, tool_result("read_file", true, "first"));
+        assert_eq!(state.feed.len(), 2, "two calls stay two rows");
+        assert!(state.feed[0].text.starts_with("✓"), "oldest call completes first");
+        assert!(state.feed[1].text.starts_with("→"), "the second is still running");
+    }
+
+    #[test]
+    fn a_result_with_no_pending_call_still_gets_its_own_row() {
+        let mut state = DashState::default();
+        apply_event(&mut state, tool_result("bash", true, "out"));
+        assert_eq!(state.feed.len(), 1, "an orphan result is never swallowed");
+        assert!(state.feed[0].text.starts_with("✓"));
+    }
+
+    #[test]
+    fn a_failed_result_completes_its_row_with_the_error() {
+        let mut state = DashState::default();
+        apply_event(
+            &mut state,
+            EngineEvent::ToolCallStart { name: "bash".into(), preview: "npx tsc".into() },
+        );
+        apply_event(&mut state, tool_result("bash", false, "type error"));
+        assert_eq!(state.feed.len(), 1);
+        assert!(state.feed[0].text.starts_with("✗"), "{}", state.feed[0].text);
+        assert!(state.feed[0].text.contains("type error"), "{}", state.feed[0].text);
     }
 
     #[test]

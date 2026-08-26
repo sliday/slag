@@ -24,7 +24,7 @@ slag key
 slag "Build a REST API with auth and rate limiting"
 ```
 
-That third line writes `PRD.md` for you and runs the full pipeline. Get a key at [openrouter.ai/keys](https://openrouter.ai/keys).
+That third line writes `PRD.md` for you and runs the full pipeline. Get a key at [openrouter.ai/keys](https://openrouter.ai/workspaces/default/keys).
 
 Already have the key in your environment? Then skip `slag key` entirely:
 

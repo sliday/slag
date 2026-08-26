@@ -29,6 +29,35 @@ pub fn channel() -> (EventTx, UnboundedReceiver<EngineEvent>) {
 /// Single-line, char-boundary-safe truncation with ellipsis. Collapses
 /// whitespace runs (including newlines) to single spaces so tool previews
 /// stay one-liners in both the narrator and the JSONL stream.
+/// The readable form of a tool call's arguments for one feed line.
+///
+/// The raw JSON spends its first characters on a wrapper that says what
+/// the tool name already said (`read_file: {"path": "src/main.ts"}`), and
+/// a truncated line then breaks mid-escape. Each tool has one argument a
+/// reader actually wants; this pulls it and drops the punctuation. An
+/// unknown tool, or an argument shape that does not parse, keeps the raw
+/// JSON -- a wrong guess would hide the very thing being debugged.
+pub fn arg_summary(name: &str, arguments: &str) -> String {
+    let primary = match name {
+        "bash" => "command",
+        "read_file" | "write_file" | "edit_file" => "path",
+        "glob" | "grep" => "pattern",
+        _ => return arguments.to_string(),
+    };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(arguments) else {
+        return arguments.to_string();
+    };
+    match map.get(primary).and_then(|v| v.as_str()) {
+        Some(v) if !v.is_empty() => match (name, map.get("path").and_then(|p| p.as_str())) {
+            // A grep reads as a pattern somewhere: the path is half the
+            // question, and it is cheap to keep on the same line.
+            ("grep", Some(path)) if !path.is_empty() => format!("{v}  in {path}"),
+            _ => v.to_string(),
+        },
+        _ => arguments.to_string(),
+    }
+}
+
 pub fn preview(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -869,6 +898,32 @@ mod tests {
         drop(tx);
         // Must complete without panicking despite the doomed path.
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn arg_summary_pulls_the_argument_a_reader_wants() {
+        assert_eq!(arg_summary("read_file", r#"{"path": "src/main.ts"}"#), "src/main.ts");
+        assert_eq!(arg_summary("bash", r#"{"command": "npx tsc --noEmit"}"#), "npx tsc --noEmit");
+        assert_eq!(arg_summary("glob", r#"{"pattern": "**/*.rs"}"#), "**/*.rs");
+    }
+
+    #[test]
+    fn arg_summary_keeps_a_greps_path_beside_its_pattern() {
+        assert_eq!(
+            arg_summary("grep", r#"{"pattern": "TODO", "path": "src"}"#),
+            "TODO  in src"
+        );
+    }
+
+    #[test]
+    fn arg_summary_falls_back_to_raw_json_rather_than_guessing() {
+        // An unknown tool, a shape that does not parse, and a missing
+        // field all keep the raw arguments: hiding them would hide the
+        // one thing a reader is debugging.
+        let odd = r#"{"whatever": 1}"#;
+        assert_eq!(arg_summary("mcp__x__y", odd), odd);
+        assert_eq!(arg_summary("read_file", "not json"), "not json");
+        assert_eq!(arg_summary("bash", r#"{"command": ""}"#), r#"{"command": ""}"#);
     }
 
     #[test]
