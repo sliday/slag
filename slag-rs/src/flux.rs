@@ -333,6 +333,58 @@ fn founder_format_rules() -> String {
     )
 }
 
+/// Ask for the acceptance bar: the concrete, inspectable statement a warden
+/// will judge the finished work against.
+///
+/// The whole method rests on this not being an adjective. "Make it great"
+/// gives a critic nothing to lose against, so it calls the work done at
+/// "pretty good for AI". A checklist item, a measurement, or a named
+/// comparison cannot be talked around.
+pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
+    format!(
+        "ROLE: set the acceptance bar for this commission.\n\n\
+         COMMISSION:\n{ore}\n\n\
+         BLUEPRINT:\n{blueprint}\n\n\
+         Write the bar a harsh reviewer will hold the finished work to. It must \
+         be something an agent can OPEN AND INSPECT, never an adjective.\n\n\
+         GOOD BARS: a named comparison the reviewer can look at; a measurement \
+         with a number and a method; a checklist where every line is pass/fail.\n\
+         BAD BARS: \"production ready\", \"high quality\", \"works well\".\n\n\
+         Prefer bars with a mechanical part — a number or a checklist line \
+         survives an argument; an impression does not.\n\n\
+         The bar does not have to be reachable. Its job is to stop a reviewer \
+         calling the work done too early.\n\n\
+         OUTPUT: markdown. One sentence naming the bar, then the checklist. No \
+         preamble."
+    )
+}
+
+/// The warden's brief: inspect the real artifact, compare it with the bar,
+/// and report a structured verdict.
+///
+/// It is told nothing about how the work was done. A critic handed the
+/// builder's account grades the account.
+pub fn warden_prompt(ore: &str, bar: &str) -> String {
+    format!(
+        "ROLE: independent reviewer. You did NOT build this and you owe its \
+         author nothing.\n\n\
+         THE GOAL:\n{ore}\n\n\
+         THE BAR:\n{bar}\n\n\
+         Inspect the REAL artifact in this directory. Run the build. Run the \
+         tests. Open the files that matter. Where the work is visual or \
+         interactive, look at it rather than reasoning about the source. A \
+         review written from a summary is a review of the summary.\n\n\
+         Then judge the goal, not the tasks. Passing tests and present files \
+         are not the goal; the goal is what the commission asked for.\n\n\
+         Name ONE gap: the biggest that still matters. A list of twenty small \
+         notes produces twenty small edits and no real improvement.\n\n\
+         Report EXACTLY these three lines, last, and nothing after them:\n\
+         VERDICT: pass or fail\n\
+         GAP: one sentence, empty when it passes\n\
+         EVIDENCE: what you actually inspected — a path, a number, an observation"
+    )
+}
+
 pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
     format!(
         "ROLE: Master Founder. Cast ingots from blueprint.\n\n\

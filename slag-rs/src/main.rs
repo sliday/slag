@@ -90,7 +90,9 @@ async fn main() {
         Some(Command::Ps) => cli::show_ps(),
         Some(Command::Update) => update::self_update().await,
         Some(Command::Key { key }) => run_key(key).await,
-        Some(Command::Resume) => forge(None, cli.anvils, cli.tui, cli.trace.clone()).await,
+        Some(Command::Resume) => {
+            forge(None, cli.anvils, cli.tui, cli.trace.clone(), cli.temper).await
+        }
         Some(Command::Rewind { ingot, heat }) => cli::show_rewind(ingot.as_deref(), heat),
         Some(Command::Hooks { action: cli::HooksAction::List }) => cli::show_hooks(),
         None => {
@@ -117,7 +119,8 @@ async fn main() {
                 Ok(())
             } else {
                 let commission = cli.commission_text();
-                forge(commission.as_deref(), cli.anvils, cli.tui, cli.trace.clone()).await
+                forge(commission.as_deref(), cli.anvils, cli.tui, cli.trace.clone(), cli.temper)
+                    .await
             }
         }
     };
@@ -166,6 +169,7 @@ async fn forge(
     anvils: usize,
     tui_flag: bool,
     trace: Option<std::path::PathBuf>,
+    temper: usize,
 ) -> Result<(), error::SlagError> {
     // Two forges rewriting one crucible corrupt each other; refuse the
     // second before any project file is touched. Dead pids were already
@@ -204,7 +208,7 @@ async fn forge(
         });
     }
 
-    let result = run_pipeline(commission, &config, anvils, tui_flag, trace).await;
+    let result = run_pipeline(commission, &config, anvils, tui_flag, trace, temper).await;
 
     if let Some(path) = session {
         let _ = std::fs::remove_file(path);
@@ -304,6 +308,7 @@ async fn run_pipeline(
     anvils: usize,
     tui_flag: bool,
     trace: Option<std::path::PathBuf>,
+    temper: usize,
 ) -> Result<(), error::SlagError> {
     connect_mcp().await;
 
@@ -311,7 +316,8 @@ async fn run_pipeline(
         // `--trace` without `--tui` is the useful headless case: no
         // dashboard holds the channel, so the trace sink takes it.
         let (hooks, sink) = render::trace::attach(EngineHooks::default(), trace);
-        let result = pipeline::run(commission, config, anvils, hooks).await;
+        let result =
+            pipeline::run(commission, config, anvils, hooks, temper).await;
         if let Some(sink) = sink {
             let _ = sink.await;
         }
@@ -341,7 +347,8 @@ async fn run_pipeline(
         let dash = tokio::spawn(dashboard::run(rx, steer.clone(), cancel.clone()));
 
         let result =
-            pipeline::run(commission.as_deref(), config, anvils, hooks.clone()).await;
+            pipeline::run(commission.as_deref(), config, anvils, hooks.clone(), temper)
+                .await;
 
         // Surface pipeline-level failures (crucible parse, ForgeFailed, IO)
         // in the dashboard feed; otherwise the run ends with no visible

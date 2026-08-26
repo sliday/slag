@@ -30,6 +30,13 @@ pub struct Cli {
     #[arg(long)]
     pub tui: bool,
 
+    /// Judge the finished artifact against the goal, and forge again on a
+    /// loss. A fresh critic that built nothing opens the real thing,
+    /// compares it with the bar in BAR.md, and turns the biggest gap into
+    /// the next ingots. 0 (default) leaves the goal unjudged.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub temper: usize,
+
     /// Commission a project whose whole description is one word. Without
     /// it a lone bare word is refused as a mistyped subcommand, since that
     /// is what it nearly always is.

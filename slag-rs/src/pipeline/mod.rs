@@ -4,6 +4,7 @@ pub mod forge;
 pub mod duel;
 pub mod resmelt;
 pub mod assay;
+pub mod warden;
 
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 
@@ -42,11 +43,14 @@ pub(crate) fn bold() -> String {
 }
 
 /// Run the full 4-phase pipeline.
+/// `temper_rounds` of 0 is the pre-warden behaviour exactly: forge, assay,
+/// done, and nobody asks whether the commission was met.
 pub async fn run(
     commission: Option<&str>,
     config: &EngineConfig,
     max_anvils: usize,
     hooks: EngineHooks,
+    temper_rounds: usize,
 ) -> Result<(), SlagError> {
     tui::show_banner();
 
@@ -113,19 +117,100 @@ pub async fn run(
         }
     }
 
-    // Phase 3: Forge
-    tui::header("FORGE");
-    let crucible = Crucible::load(crucible_path)?;
-    let counts = crucible.counts();
-    if !tui::is_quiet() {
-        print!("  ");
-        tui::ingot_status_line(&counts);
-        println!();
+    // Phase 3: Forge, and Phase 4: Temper.
+    //
+    // The forge proves tasks; `:proof` answers "did this artifact appear".
+    // Nothing proved the *goal*, and the summary that claimed it was written
+    // by the smith that did the work. The warden closes that: a critic that
+    // built nothing opens the real artifact, compares it with the bar, and
+    // on a loss names one gap. The gap becomes an addendum, the addendum
+    // casts ingots, and the forge runs again -- both halves of that loop
+    // already existed.
+    let mut forged;
+    let mut round = 0usize;
+    loop {
+        tui::header("FORGE");
+        let crucible = Crucible::load(crucible_path)?;
+        let counts = crucible.counts();
+        if !tui::is_quiet() {
+            print!("  ");
+            tui::ingot_status_line(&counts);
+            println!();
+        }
+
+        forged = forge::run(config, max_anvils, &hooks).await;
+
+        round += 1;
+        // A cracked or cancelled forge has no artifact worth judging, and
+        // asking costs a model call to be told what the counts already say.
+        if temper_rounds == 0 || round > temper_rounds || forged.is_err() {
+            break;
+        }
+
+        let verdict = match warden::judge_artifact(config, &hooks, round).await {
+            Ok(v) => v,
+            // A warden that cannot run must not fail the forge: the work is
+            // built either way, and an unjudged run is worth more than a
+            // lost one. Say so and stop tempering.
+            Err(e) => {
+                crate::engine::emit(
+                    &hooks.events,
+                    crate::engine::EngineEvent::Warning {
+                        message: format!("warden could not judge the goal: {e}"),
+                    },
+                );
+                break;
+            }
+        };
+        if verdict.fulfilled {
+            crate::engine::emit(
+                &hooks.events,
+                crate::engine::EngineEvent::Narrate {
+                    text: format!("warden round {round}: goal met — {}", verdict.evidence),
+                },
+            );
+            break;
+        }
+        crate::engine::emit(
+            &hooks.events,
+            crate::engine::EngineEvent::Warning {
+                message: format!("warden round {round}: {}", verdict.gap),
+            },
+        );
+        if round >= temper_rounds {
+            break;
+        }
+        // The gap becomes the next range of issues. `fire_furnace` appends
+        // it as an addendum and `founder::extend` casts ingots for it --
+        // the same path a human's second commission takes.
+        let gap = verdict.gap.clone();
+        if fire_furnace(Some(&gap))? != Ore::Extended {
+            // The same gap twice means the last round changed nothing the
+            // warden could see. Looping again would burn the budget on a
+            // round already proven not to move.
+            crate::engine::emit(
+                &hooks.events,
+                crate::engine::EngineEvent::Warning {
+                    message: "warden repeated its gap — stopping rather than re-forging it"
+                        .to_string(),
+                },
+            );
+            break;
+        }
+        let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Founder);
+        if founder::extend(smith.as_ref()).await? == 0 {
+            crate::engine::emit(
+                &hooks.events,
+                crate::engine::EngineEvent::Warning {
+                    message: "the gap cast no ingots — nothing left this loop can build"
+                        .to_string(),
+                },
+            );
+            break;
+        }
     }
 
-    let forged = forge::run(config, max_anvils, &hooks).await;
-
-    // Phase 4: Assay. It runs on failure too — a run that cracked an ingot
+    // Phase 5: Assay. It runs on failure too — a run that cracked an ingot
     // is exactly when the user needs the counts and the cracked list, and
     // returning early left them with one line of "forge failed".
     if !matches!(forged, Err(SlagError::Cancelled)) {
