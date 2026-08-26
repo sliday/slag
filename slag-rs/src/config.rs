@@ -509,6 +509,29 @@ fn read_key_line() -> Result<String, SlagError> {
     Ok(key)
 }
 
+/// Serializes every test that mutates process env. Env is per-process and
+/// tests run in parallel, so without this one test's `SLAG_CONFIG_DIR`
+/// leaks into another's.
+///
+/// It also guards a subtler failure: a test that leaves the variable unset
+/// reads the developer's real `~/.config/slag`. `tolerates_null_content_
+/// and_missing_usage` did exactly that -- it passed on a machine that had
+/// never run slag and failed on one that had, because the pricing cache
+/// written by a real forge gave a costless response a cost.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A config dir of its own, for a test that must not read the real one.
+/// Returns the guard and the tempdir; both must stay alive for the test.
+#[cfg(test)]
+pub(crate) fn isolated_config_dir(
+) -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+    (guard, dir)
+}
+
 /// Config directory: $SLAG_CONFIG_DIR override (tests), else ~/.config/slag.
 fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("SLAG_CONFIG_DIR") {
@@ -661,7 +684,7 @@ mod tests {
     use std::sync::Mutex;
 
     /// Env vars are process-global; serialize every test that touches them.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::config::ENV_LOCK;
 
     const ENGINE_VARS: &[&str] = &[
         "OPENROUTER_API_KEY",

@@ -61,11 +61,17 @@ pub async fn run(
             crate::engine::provider::fetch_credits(&config.api_key, &config.base_url).await
         {
             if credits.remaining() < floor {
-                println!(
-                    "  {}! OpenRouter balance ${:.2} is under the ${floor:.2} floor{}",
-                    fg(tui::WARM),
-                    credits.remaining(),
-                    reset(),
+                // Same rule as the addendum notice: an unguarded print
+                // corrupts the dashboard, so this goes through the stream
+                // and the stream renders it wherever the user is looking.
+                crate::engine::emit(
+                    &hooks.events,
+                    crate::engine::EngineEvent::Warning {
+                        message: format!(
+                            "OpenRouter balance ${:.2} is under the ${floor:.2} floor",
+                            credits.remaining()
+                        ),
+                    },
                 );
             }
         }
@@ -94,10 +100,15 @@ pub async fn run(
         if added == 0 {
             // The model read the addendum and found nothing to build.
             // Saying so beats a silent finish that looks like a no-op.
-            println!(
-                "  {}! the addendum cast no ingots — nothing in it needs building{}",
-                fg(tui::WARM),
-                reset()
+            // It rides the event stream rather than stdout: a bare
+            // `println!` under --tui writes into the alternate screen and
+            // lands glued to whatever row is being drawn.
+            crate::engine::emit(
+                &hooks.events,
+                crate::engine::EngineEvent::Warning {
+                    message: "the addendum cast no ingots — nothing in it needs building"
+                        .to_string(),
+                },
             );
         }
     }

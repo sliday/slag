@@ -179,6 +179,26 @@ pub(crate) struct DashState {
 }
 
 impl DashState {
+    /// Fill the crucible from PLAN.md's ingots, with the status each one
+    /// already carries. Events still drive every later change; this only
+    /// decides what the pane shows before the first one arrives.
+    pub(crate) fn seed_from_plan(&mut self, plan: &str) {
+        for ingot in crate::crucible::parse_ingot_lines(plan) {
+            let status = match ingot.status {
+                crate::sexp::Status::Forged => IngotStatus::Forged,
+                crate::sexp::Status::Cracked => IngotStatus::Cracked,
+                // Molten means a previous run died mid-ingot. It is not
+                // forging now -- nothing is -- so it reads as pending
+                // until an event says otherwise.
+                crate::sexp::Status::Ore | crate::sexp::Status::Molten => IngotStatus::Forging,
+            };
+            let row = self.row_mut(&ingot.id);
+            row.work = preview(&ingot.work, 60);
+            row.heat = ingot.heat;
+            row.status = status;
+        }
+    }
+
     fn row_mut(&mut self, id: &str) -> &mut IngotRow {
         if let Some(i) = self.ingots.iter().position(|r| r.id == id) {
             return &mut self.ingots[i];
@@ -1302,6 +1322,12 @@ pub async fn run(
     let plan_total =
         plan.lines().filter(|l| l.trim_start().starts_with("(ingot ")).count();
     let mut state = DashState::default();
+    // Seed the crucible from the plan rather than waiting for events. The
+    // pane is a view of PLAN.md, but rows only ever appeared when an
+    // ingot started forging, so a run with nothing left to forge -- a
+    // finished project, or an addendum that needs no work -- showed an
+    // empty crucible beside a feed full of activity.
+    state.seed_from_plan(&plan);
     if persistable(&run_id) {
         if let Some(prior) = load_session_cost(&run_id) {
             state.totals = prior.to_usage();
@@ -1740,6 +1766,45 @@ mod tests {
         assert!(HINT.contains("steer"));
         assert!(HINT_DONE.contains("commission"), "{HINT_DONE}");
         assert!(!HINT_DONE.contains("steer the"), "no smith left to steer: {HINT_DONE}");
+    }
+
+    #[test]
+    fn the_crucible_shows_the_plan_before_any_event_arrives() {
+        // A finished project forges nothing, so no ingot event ever fires
+        // and the pane used to sit empty beside a busy feed.
+        let mut state = DashState::default();
+        state.seed_from_plan(
+            "(ingot :id \"i1\" :status forged :solo t :grade 1 :heat 0 :max 5 :proof \"true\" :work \"render core\")\n\
+             (ingot :id \"i2\" :status cracked :solo t :grade 1 :heat 2 :max 5 :proof \"true\" :work \"audio\")\n\
+             (ingot :id \"i3\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"true\" :work \"netcode\")",
+        );
+        assert_eq!(state.ingots.len(), 3);
+        assert_eq!(state.ingots[0].status, IngotStatus::Forged);
+        assert_eq!(state.ingots[0].work, "render core");
+        assert_eq!(state.ingots[1].status, IngotStatus::Cracked);
+        assert_eq!(state.ingots[1].heat, 2);
+        assert_eq!(
+            state.ingots.iter().filter(|r| r.status == IngotStatus::Forged).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn seeding_leaves_later_events_in_charge() {
+        let mut state = DashState::default();
+        state.seed_from_plan(
+            "(ingot :id \"i1\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"true\" :work \"netcode\")",
+        );
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i1".into(), ok: true });
+        assert_eq!(state.ingots.len(), 1, "the event updates the seeded row, it does not add one");
+        assert_eq!(state.ingots[0].status, IngotStatus::Forged);
+    }
+
+    #[test]
+    fn an_empty_plan_seeds_nothing() {
+        let mut state = DashState::default();
+        state.seed_from_plan("");
+        assert!(state.ingots.is_empty());
     }
 
     #[test]

@@ -1424,6 +1424,10 @@ mod tests {
 
     #[tokio::test]
     async fn tolerates_null_content_and_missing_usage() {
+        // Isolate the config dir: the mock serves no /models, so the price
+        // lookup falls back to the on-disk cache, and the real one would
+        // hand a costless response a cost.
+        let (_env, _dir) = crate::config::isolated_config_dir();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
