@@ -6,6 +6,7 @@ mod dashboard;
 mod engine;
 mod error;
 mod flux;
+mod insights;
 mod migrations;
 mod pipeline;
 mod progress;
@@ -74,6 +75,7 @@ async fn main() {
         }
         Some(Command::Status { json: false }) => show_status(),
         Some(Command::Runs) => cli::show_runs(),
+        Some(Command::Insights { refresh }) => insights::run(Path::new("."), refresh),
         Some(Command::Ps) => cli::show_ps(),
         Some(Command::Update) => update::self_update().await,
         Some(Command::Key { key }) => run_key(key).await,

@@ -734,7 +734,10 @@ async fn resume_session(
         provider.set_cancel_flag(cancel.clone());
     }
     let window = provider.context_length(&model).await;
-    let mut agent = ForgeAgent::new(provider, ToolBox::new("."), &model)
+    let toolbox = ToolBox::new(".")
+        .with_policy(crate::engine::policy::Policy::from_config())
+        .with_steer(hooks.steer.clone());
+    let mut agent = ForgeAgent::new(provider, toolbox, &model)
         .with_context_window(window)
         .with_resume(true)
         .with_effort(config.effort.or(Some(Effort::from_grade(ingot.grade))));

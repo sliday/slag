@@ -576,6 +576,20 @@ pub fn mcp_servers() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Policy rules from the `[policy]` table: `deny` / `ask` / `allow`
+/// lines, values passed through raw for `engine::policy` to parse.
+/// File-only, no env override, same posture as `mcp_servers`.
+pub fn policy_entries() -> Vec<(String, String)> {
+    let entries = config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_config_lines(&c))
+        .unwrap_or_default();
+    entries
+        .into_iter()
+        .filter_map(|(key, value)| key.strip_prefix("policy.").map(|n| (n.to_string(), value)))
+        .collect()
+}
+
 fn file_value(entries: &[(String, String)], key: &str) -> Option<String> {
     entries
         .iter()
@@ -679,6 +693,30 @@ mod tests {
         let config = EngineConfig::load().expect("key stored in file");
         assert_eq!(config.api_key, "sk-or-x");
         assert_eq!(config.model_base, "m");
+
+        clear_engine_env();
+    }
+
+    #[test]
+    fn policy_entries_read_the_policy_table_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "model_base = m\n\n[policy]\ndeny = \"git push:*, curl:*\"\nask = 'cargo publish:*'\n",
+        )
+        .unwrap();
+
+        let entries = policy_entries();
+        assert_eq!(
+            entries,
+            vec![
+                ("deny".to_string(), "git push:*, curl:*".to_string()),
+                ("ask".to_string(), "cargo publish:*".to_string()),
+            ]
+        );
 
         clear_engine_env();
     }

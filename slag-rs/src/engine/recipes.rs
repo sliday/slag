@@ -21,6 +21,29 @@ pub struct Recipe {
     pub path: PathBuf,
     /// Tool names this recipe needs; hidden from the index when any is missing.
     pub requires_tools: Vec<String>,
+    /// Tools the recipe wants the session limited to (item 98). Advisory:
+    /// surfaced by recipe_view; per-recipe enforcement awaits recipe-bound
+    /// sessions.
+    pub allowed_tools: Vec<String>,
+    /// Model the recipe prefers to run on (advisory, surfaced).
+    pub model: Option<String>,
+    /// Where the recipe should run: inline in the current session
+    /// (default) or forked into a sub-smith.
+    pub context: RecipeContext,
+    /// Path globs gating index visibility (item 98): a recipe naming
+    /// `paths` is hidden until the workspace contains a matching file,
+    /// cutting index tokens for stacks the project does not use.
+    pub paths: Vec<String>,
+}
+
+/// Recipe execution context (item 98). Fork execution is not wired yet
+/// (NativeSmith's recipe binding is still reserved); the value parses and
+/// surfaces so recipes can declare intent today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecipeContext {
+    #[default]
+    Inline,
+    Fork,
 }
 
 /// Discover all recipes: workspace first, then config dir, each sorted by
@@ -76,6 +99,10 @@ fn collect(dir: &Path, out: &mut Vec<Recipe>) {
             description: fm.description,
             path,
             requires_tools: fm.requires_tools,
+            allowed_tools: fm.allowed_tools,
+            model: fm.model,
+            context: fm.context,
+            paths: fm.paths,
         });
     }
     batch.sort_by(|a, b| a.name.cmp(&b.name));
@@ -87,11 +114,25 @@ struct Frontmatter {
     name: Option<String>,
     description: String,
     requires_tools: Vec<String>,
+    allowed_tools: Vec<String>,
+    model: Option<String>,
+    context: RecipeContext,
+    paths: Vec<String>,
+}
+
+/// Which key a dash list under a bare `key:` line continues.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListKey {
+    None,
+    Requires,
+    Allowed,
+    Paths,
 }
 
 /// Hand-rolled YAML-ish frontmatter parse: `---` fenced block at the top,
-/// `key: value` lines. `requires_tools` accepts a comma list, an inline
-/// `[a, b]` list, or a dash list on following lines. No yaml dependency.
+/// `key: value` lines. The list keys (`requires_tools`, `allowed_tools`,
+/// `paths`) each accept a comma list, an inline `[a, b]` list, or a dash
+/// list on following lines. No yaml dependency.
 fn parse_frontmatter(content: &str) -> Frontmatter {
     let mut fm = Frontmatter::default();
     let mut lines = content.lines().peekable();
@@ -101,42 +142,47 @@ fn parse_frontmatter(content: &str) -> Frontmatter {
     if lines.next().map(str::trim) != Some("---") {
         return fm;
     }
-    let mut in_tools_list = false;
+    let mut open_list = ListKey::None;
     for line in lines {
         let t = line.trim();
         if t == "---" {
             break;
         }
-        if in_tools_list {
+        if open_list != ListKey::None {
             if let Some(item) = t.strip_prefix('-') {
-                let item = item.trim();
+                let item = item.trim().trim_matches(|c| c == '"' || c == '\'');
                 if !item.is_empty() {
-                    fm.requires_tools.push(item.to_string());
+                    list_bucket(&mut fm, open_list).push(item.to_string());
                 }
                 continue;
             }
-            in_tools_list = false;
+            open_list = ListKey::None;
         }
         let Some((key, value)) = t.split_once(':') else {
             continue;
         };
         let (key, value) = (key.trim(), value.trim());
+        let list_key = match key {
+            "requires_tools" => ListKey::Requires,
+            "allowed_tools" => ListKey::Allowed,
+            "paths" => ListKey::Paths,
+            _ => ListKey::None,
+        };
+        if list_key != ListKey::None {
+            if value.is_empty() {
+                open_list = list_key;
+            } else {
+                *list_bucket(&mut fm, list_key) = parse_inline_list(value);
+            }
+            continue;
+        }
         match key {
             "name" if !value.is_empty() => fm.name = Some(value.to_string()),
             "description" => fm.description = value.to_string(),
-            "requires_tools" => {
-                if value.is_empty() {
-                    in_tools_list = true;
-                } else {
-                    let inner = value
-                        .strip_prefix('[')
-                        .and_then(|v| v.strip_suffix(']'))
-                        .unwrap_or(value);
-                    fm.requires_tools = inner
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
+            "model" if !value.is_empty() => fm.model = Some(value.to_string()),
+            "context" => {
+                if value.eq_ignore_ascii_case("fork") {
+                    fm.context = RecipeContext::Fork;
                 }
             }
             _ => {}
@@ -145,12 +191,33 @@ fn parse_frontmatter(content: &str) -> Frontmatter {
     fm
 }
 
+fn list_bucket(fm: &mut Frontmatter, key: ListKey) -> &mut Vec<String> {
+    match key {
+        ListKey::Requires | ListKey::None => &mut fm.requires_tools,
+        ListKey::Allowed => &mut fm.allowed_tools,
+        ListKey::Paths => &mut fm.paths,
+    }
+}
+
+/// `[a, b]` or `a, b` → items.
+fn parse_inline_list(value: &str) -> Vec<String> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    inner
+        .split(',')
+        .map(|item| item.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
 /// Prompt-band budget: the index never grows past these caps, however
 /// many (or however verbose) the installed recipes are.
 const INDEX_MAX_RECIPES: usize = 50;
 const INDEX_MAX_DESC_CHARS: usize = 200;
 
-fn render_index(recipes: &[Recipe], available_tools: &[String]) -> String {
+fn render_index(recipes: &[Recipe], available_tools: &[String], root: &Path) -> String {
     let mut lines = Vec::new();
     for r in recipes {
         if lines.len() >= INDEX_MAX_RECIPES {
@@ -161,6 +228,11 @@ fn render_index(recipes: &[Recipe], available_tools: &[String]) -> String {
             .iter()
             .all(|t| available_tools.iter().any(|a| a == t))
         {
+            continue;
+        }
+        // Paths gating (item 98): hidden until the workspace holds a
+        // matching file.
+        if !r.paths.is_empty() && !paths_match_workspace(root, &r.paths) {
             continue;
         }
         let collides = recipes.iter().filter(|o| o.name == r.name).count() > 1;
@@ -177,6 +249,85 @@ fn render_index(recipes: &[Recipe], available_tools: &[String]) -> String {
         return "## Recipes\n(none installed)".to_string();
     }
     format!("## Recipes\n{}", lines.join("\n"))
+}
+
+/// True when any file under `root` matches any of `patterns`. Bounded
+/// walk: skips VCS/build dirs, depth-limited, entry-capped — the gate is
+/// a heuristic for index visibility, not an exhaustive search.
+fn paths_match_workspace(root: &Path, patterns: &[String]) -> bool {
+    let mut budget = 2000usize;
+    walk_match(root, root, patterns, 6, &mut budget)
+}
+
+fn walk_match(root: &Path, dir: &Path, patterns: &[String], depth: u8, budget: &mut usize) -> bool {
+    if depth == 0 || *budget == 0 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".venv" | "dist") {
+                continue;
+            }
+            if walk_match(root, &path, patterns, depth - 1, budget) {
+                return true;
+            }
+            continue;
+        }
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        for pat in patterns {
+            // A pattern without '/' matches the basename anywhere
+            // (rg -g convention); one with '/' matches the relative path.
+            let hay: &str = if pat.contains('/') { &rel } else { &name };
+            if glob_match(pat, hay) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Minimal glob: `*` matches within a path segment, `**` crosses
+/// segments, `?` matches one char. Hand-rolled, no glob dependency.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn inner(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => {
+                let crosses = p.get(1) == Some(&'*');
+                let rest = if crosses { &p[2..] } else { &p[1..] };
+                // `**/` also matches zero directories.
+                let rest = if crosses && rest.first() == Some(&'/') && inner(&rest[1..], t) {
+                    return true;
+                } else {
+                    rest
+                };
+                for i in 0..=t.len() {
+                    if inner(rest, &t[i..]) {
+                        return true;
+                    }
+                    if i < t.len() && !crosses && t[i] == '/' {
+                        return false;
+                    }
+                }
+                false
+            }
+            Some('?') => !t.is_empty() && t[0] != '/' && inner(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && inner(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    inner(&p, &t)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,21 +390,30 @@ fn index_in(root: &Path, config_dir: Option<&Path>, available_tools: &[String]) 
     let manifest = build_manifest(root, config_dir);
     let snap_path = config_dir.map(|d| d.join(SNAPSHOT_FILE));
 
-    if let Some(sp) = &snap_path {
-        if let Some(snap) = read_snapshot(sp) {
-            if snap.manifest == manifest && snap.tools.as_slice() == available_tools {
-                return snap.index;
+    let recipes = discover_in(root, config_dir);
+    // A paths-gated recipe's visibility depends on workspace files the
+    // manifest does not cover, so the snapshot cannot be trusted; recompute
+    // every call while any such recipe exists (rare, and gating exists to
+    // shrink the index anyway).
+    let paths_gated = recipes.iter().any(|r| !r.paths.is_empty());
+
+    if !paths_gated {
+        if let Some(sp) = &snap_path {
+            if let Some(snap) = read_snapshot(sp) {
+                if snap.manifest == manifest && snap.tools.as_slice() == available_tools {
+                    return snap.index;
+                }
             }
         }
     }
 
-    let recipes = discover_in(root, config_dir);
-    let index = render_index(&recipes, available_tools);
+    let index = render_index(&recipes, available_tools, root);
 
     // Best-effort cache write; skipped when no recipes exist at all so an
-    // empty run never plants a cache file.
+    // empty run never plants a cache file, and when paths gating makes the
+    // cached string untrustworthy.
     if let Some(sp) = &snap_path {
-        if !manifest.is_empty() {
+        if !manifest.is_empty() && !paths_gated {
             let snap = Snapshot {
                 tools: available_tools.to_vec(),
                 manifest,
@@ -416,6 +576,63 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_parses_item_98_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write_recipe(
+            dir.path(),
+            "web",
+            "name: web\ndescription: d\nallowed_tools: [read_file, bash]\nmodel: openrouter/auto\ncontext: fork\npaths:\n  - \"*.css\"\n  - src/**/*.html",
+            "body",
+        );
+        let r = &discover_in(dir.path(), None)[0];
+        assert_eq!(r.allowed_tools, tools(&["read_file", "bash"]));
+        assert_eq!(r.model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(r.context, RecipeContext::Fork);
+        assert_eq!(r.paths, tools(&["*.css", "src/**/*.html"]));
+        // Absent fields keep today's defaults (backward compatible).
+        write_recipe(dir.path(), "plain", "name: plain\ndescription: d", "b");
+        let plain = discover_in(dir.path(), None)
+            .into_iter()
+            .find(|r| r.name == "plain")
+            .unwrap();
+        assert!(plain.allowed_tools.is_empty());
+        assert!(plain.model.is_none());
+        assert_eq!(plain.context, RecipeContext::Inline);
+        assert!(plain.paths.is_empty());
+    }
+
+    #[test]
+    fn paths_gating_hides_until_matching_files_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        write_recipe(
+            dir.path(),
+            "css",
+            "name: css\ndescription: styles\npaths: [\"*.css\"]",
+            "b",
+        );
+        let recipes = discover_in(dir.path(), None);
+        // No .css file anywhere: hidden.
+        let idx = render_index(&recipes, &tools(&[]), dir.path());
+        assert!(!idx.contains("css:"), "{idx}");
+        // A matching file appears (nested): visible.
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/site.css"), "x").unwrap();
+        let idx = render_index(&recipes, &tools(&[]), dir.path());
+        assert!(idx.contains("css: styles"), "{idx}");
+    }
+
+    #[test]
+    fn glob_match_covers_star_doublestar_and_question() {
+        assert!(glob_match("*.css", "site.css"));
+        assert!(!glob_match("*.css", "site.scss.map"));
+        assert!(glob_match("src/**/*.html", "src/a/b/page.html"));
+        assert!(glob_match("src/**/*.html", "src/page.html"));
+        assert!(!glob_match("src/*.html", "src/a/page.html"));
+        assert!(glob_match("f?o.rs", "foo.rs"));
+        assert!(!glob_match("f?o.rs", "f/o.rs"));
+    }
+
+    #[test]
     fn frontmatter_parses_comma_list() {
         let fm = parse_frontmatter(
             "---\nname: ship\ndescription: Deploy the site\nrequires_tools: bash, grep\n---\nBody\n",
@@ -484,7 +701,7 @@ mod tests {
         let found = discover_in(ws.path(), Some(cfg.path()));
         assert_eq!(found.len(), 2, "collision keeps BOTH entries");
 
-        let idx = render_index(&found, &tools(&[]));
+        let idx = render_index(&found, &tools(&[]), ws.path());
         assert_eq!(idx.matches("[name collision]").count(), 2, "{idx}");
         assert!(idx.contains("- dup: workspace one [name collision]"), "{idx}");
         assert!(idx.contains("- dup: config one [name collision]"), "{idx}");
@@ -502,25 +719,30 @@ mod tests {
         write_recipe(ws.path(), "plain", "name: plain\ndescription: no needs", "");
 
         let found = discover_in(ws.path(), None);
-        let idx = render_index(&found, &tools(&["bash", "grep"]));
+        let idx = render_index(&found, &tools(&["bash", "grep"]), ws.path());
         assert!(idx.contains("- plain: no needs"), "{idx}");
         assert!(!idx.contains("web"), "{idx}");
 
-        let idx = render_index(&found, &tools(&["bash", "browser"]));
+        let idx = render_index(&found, &tools(&["bash", "browser"]), ws.path());
         assert!(idx.contains("- web: needs browser"), "{idx}");
     }
 
     #[test]
     fn index_caps_recipe_count_and_description_length() {
+        let dir = tempfile::tempdir().unwrap();
         let recipes: Vec<Recipe> = (0..60)
             .map(|i| Recipe {
                 name: format!("r{i:02}"),
                 description: "d".repeat(300),
                 path: PathBuf::from("RECIPE.md"),
                 requires_tools: vec![],
+                allowed_tools: vec![],
+                model: None,
+                context: RecipeContext::Inline,
+                paths: vec![],
             })
             .collect();
-        let idx = render_index(&recipes, &tools(&[]));
+        let idx = render_index(&recipes, &tools(&[]), dir.path());
         let entries: Vec<&str> = idx.lines().filter(|l| l.starts_with("- ")).collect();
         assert_eq!(entries.len(), INDEX_MAX_RECIPES);
         for e in entries {

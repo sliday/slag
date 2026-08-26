@@ -79,6 +79,14 @@ pub enum Command {
     /// List past runs from the event logs in logs/
     Runs,
 
+    /// Offline analytics over the logs/ heap: ingots forged/cracked,
+    /// heats, spend, tool errors, duel margins. Needs no key or network.
+    Insights {
+        /// Recompute the per-log facet cache in logs/facets/
+        #[arg(long)]
+        refresh: bool,
+    },
+
     /// List live forges registered on this machine
     Ps,
 

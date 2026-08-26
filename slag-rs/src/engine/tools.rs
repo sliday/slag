@@ -35,6 +35,8 @@ const READ_LIMIT_DEFAULT: usize = 2000;
 /// the caller is told to use offset/limit instead.
 const READ_SIZE_MAX: u64 = 256 * 1024;
 const BASH_TIMEOUT_DEFAULT: u64 = 120;
+/// Background bash logs (item 97), relative to the anvil root.
+const BG_LOG_DIR: &str = "logs/bg";
 const BASH_TIMEOUT_MAX: u64 = 600;
 const BASH_OUTPUT_CAP_DEFAULT: usize = 30_000;
 /// Hard ceiling for SLAG_BASH_OUTPUT_CAP.
@@ -87,6 +89,14 @@ pub struct ToolBox {
     /// heat can rewind the workspace. `None` (plan passes, tests, duel
     /// casts) records nothing.
     checkpoint: Option<Arc<crate::anvil::checkpoint::Checkpoint>>,
+    /// Config-driven command policy (item 95). Default: empty (checks
+    /// nothing). Real runs attach `[policy]` rules via `with_policy`.
+    policy: Arc<super::policy::Policy>,
+    /// Completion-note channel for background bash (item 97): when set,
+    /// a waiter pushes "background job exited" into the agent's steer
+    /// queue so the model hears about it before its next call. `None`
+    /// (tests, duel casts) drops the note; the log file still records.
+    steer: Option<super::SteerQueue>,
 }
 
 impl ToolBox {
@@ -99,7 +109,22 @@ impl ToolBox {
             read_state: Arc::new(Mutex::new(HashMap::new())),
             touch_seq: Arc::new(AtomicU64::new(0)),
             checkpoint: None,
+            policy: Arc::new(super::policy::Policy::default()),
+            steer: None,
         }
+    }
+
+    /// Attach a command policy; `bash` refuses commands it denies.
+    pub fn with_policy(mut self, policy: super::policy::Policy) -> Self {
+        self.policy = Arc::new(policy);
+        self
+    }
+
+    /// Attach the agent's steer queue so background bash jobs can inject
+    /// completion notes (item 97). `None` drops the notes.
+    pub fn with_steer(mut self, steer: Option<super::SteerQueue>) -> Self {
+        self.steer = steer;
+        self
     }
 
     /// Bind this toolbox (or a per-dispatch clone) to an attempt so its
@@ -205,6 +230,9 @@ impl ToolBox {
                 "Replace old_string with new_string in a file. old_string must match exactly once; \
                  fuzzy whitespace/indentation fallbacks apply when exact match fails. \
                  Set replace_all to replace every exact occurrence. \
+                 Use the smallest old_string that is clearly unique — 2-4 adjacent \
+                 lines usually suffice; when a match is not unique, add adjacent \
+                 context lines or set replace_all. \
                  read_file output is LINENUM|CONTENT — never include that line-number prefix \
                  in old_string or new_string. \
                  This tool will error if the file has not been read this session, or if its \
@@ -230,6 +258,10 @@ impl ToolBox {
                  Never wait by sleeping: a leading 'sleep N' with N >= 2 is refused. \
                  Run the check itself and raise timeout when it is slow, or poll it \
                  in an 'until' loop. \
+                 Long-lived commands (dev servers, watchers, builds you need not \
+                 block on) run with run_in_background=true: the call returns at \
+                 once, output streams to logs/bg/<id>.log, a completion note \
+                 arrives when the job exits, and timeout does not apply. \
                  Git safety protocol: never use --no-verify; if a pre-commit hook fails, \
                  the commit did NOT happen, so fix the issue and commit again (never amend \
                  after a hook failure — amend would destroy the previous commit); stage \
@@ -240,7 +272,8 @@ impl ToolBox {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"}
+                        "timeout": {"type": "integer", "description": "Timeout in seconds (default 120); ignored for background jobs"},
+                        "run_in_background": {"type": "boolean", "description": "Run detached; output streams to logs/bg/<id>.log (default false)"}
                     },
                     "required": ["command"]
                 }),
@@ -306,18 +339,27 @@ impl ToolBox {
         ]
     }
 
-    /// (path, is_writer) for path-touching tools; None for
-    /// bash/grep/recipe_view/finish (no scheduling constraint).
-    /// The agent dispatcher uses this for reader-writer scheduling.
+    /// (path, is_writer) for path-touching tools; provably read-only
+    /// bash classifies as a reader (item 96) so it can join concurrent
+    /// reader batches; None for everything else (no scheduling
+    /// constraint). The agent dispatcher uses this for reader-writer
+    /// scheduling — a misclassified writer would race real writers, so
+    /// the bash classifier defaults to None on any doubt.
     pub fn path_access(call: &ToolCall) -> Option<(String, bool)> {
-        let is_writer = match call.name.as_str() {
-            "read_file" => false,
-            "write_file" | "edit_file" => true,
-            _ => return None,
-        };
         let args: Value = serde_json::from_str(&call.arguments).ok()?;
-        let path = args.get("path")?.as_str()?.to_string();
-        Some((path, is_writer))
+        match call.name.as_str() {
+            "read_file" => Some((args.get("path")?.as_str()?.to_string(), false)),
+            "write_file" | "edit_file" => {
+                Some((args.get("path")?.as_str()?.to_string(), true))
+            }
+            "bash" => {
+                let command = args.get("command")?.as_str()?;
+                // The scheduler groups readers without consulting the
+                // path; a read-only command has no single path anyway.
+                read_only_bash(command).then(|| (String::new(), false))
+            }
+            _ => None,
+        }
     }
 
     pub async fn dispatch(&self, call: &ToolCall) -> ToolOutcome {
@@ -360,7 +402,7 @@ impl ToolBox {
             match comp {
                 Component::ParentDir => {
                     if !normal.pop() {
-                        return Err(SlagError::Tool(format!("path escapes workspace: {raw}")));
+                        return Err(SlagError::Tool(format!("path escapes workspace: {raw}{}", self.path_hint(raw))));
                     }
                 }
                 Component::CurDir => {}
@@ -368,7 +410,7 @@ impl ToolBox {
             }
         }
         if !normal.starts_with(&self.root) {
-            return Err(SlagError::Tool(format!("path escapes workspace: {raw}")));
+            return Err(SlagError::Tool(format!("path escapes workspace: {raw}{}", self.path_hint(raw))));
         }
 
         // Symlink check: split off not-yet-existing tail components
@@ -393,9 +435,53 @@ impl ToolBox {
             real.push(name);
         }
         if !real.starts_with(&self.root) {
-            return Err(SlagError::Tool(format!("path escapes workspace: {raw}")));
+            return Err(SlagError::Tool(format!("path escapes workspace: {raw}{}", self.path_hint(raw))));
         }
         Ok(real)
+    }
+
+    /// "Did you mean" hint for failed path lookups: names the workspace
+    /// root and probes it for files sharing the missing path's basename
+    /// (bounded walk; heavy build/VCS dirs and symlinked dirs skipped).
+    fn path_hint(&self, raw: &str) -> String {
+        let hint = format!(" (workspace root: {})", self.root.display());
+        let base = match Path::new(raw).file_name() {
+            Some(b) => b.to_os_string(),
+            None => return hint,
+        };
+        let mut found: Vec<String> = Vec::new();
+        let mut queue = vec![self.root.clone()];
+        let mut visited = 0usize;
+        'walk: while let Some(dir) = queue.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > 4000 || found.len() >= 3 {
+                    break 'walk;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    if !matches!(
+                        entry.file_name().to_str(),
+                        Some(".git" | "target" | "node_modules" | ".venv")
+                    ) {
+                        queue.push(entry.path());
+                    }
+                } else if entry.file_name() == base {
+                    if let Ok(rel) = entry.path().strip_prefix(&self.root) {
+                        found.push(rel.display().to_string());
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            hint
+        } else {
+            format!("{hint}; did you mean: {}?", found.join(", "))
+        }
     }
 
     async fn read_file(&self, args: &Value) -> Result<String, SlagError> {
@@ -459,7 +545,7 @@ impl ToolBox {
 
         let content = tokio::fs::read_to_string(&path)
             .await
-            .map_err(|e| SlagError::Tool(format!("cannot read {raw}: {e}")))?;
+            .map_err(|e| SlagError::Tool(format!("cannot read {raw}: {e}{}", self.path_hint(raw))))?;
         // Any successful read (partial or full) arms the read-before-edit
         // gate: read_to_string always reads the whole file, so the checksum
         // covers the full content even when only a slice is returned.
@@ -772,13 +858,43 @@ impl ToolBox {
             }
             None => None,
         };
+        // Command policy (item 95): config-driven deny/ask rules from the
+        // `[policy]` table. Deny > ask > allow; unattended runs treat ask
+        // as a refusal that names the fix.
+        match self.policy.check(command) {
+            super::policy::Decision::Deny { rule } => {
+                return Err(SlagError::Tool(format!(
+                    "refused by policy rule `{rule}`; adjust the [policy] \
+                     table in slag's config to permit it"
+                )));
+            }
+            super::policy::Decision::Ask { rule } => {
+                return Err(SlagError::Tool(format!(
+                    "policy rule `{rule}` requires approval; slag runs \
+                     unattended, so add a narrower allow rule to the \
+                     [policy] table (or drop the ask rule) to permit it"
+                )));
+            }
+            super::policy::Decision::Allowed => {}
+        }
+        // Background bash (item 97). The gates above (destructive,
+        // policy) still apply; the sleep guard below does not — a
+        // detached sleep blocks nothing.
+        if args
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return self.spawn_background(command).await;
+        }
         // Sleep guard: a leading blocking sleep is refused with the remedy.
         if let Some(pattern) = blocked_sleep(command) {
             return Err(SlagError::Tool(format!(
                 "refused: {pattern}. A leading sleep spends the ingot's clock \
                  and learns nothing. Run the check itself and raise `timeout` \
-                 when it is slow, or poll through the checker's own retry \
-                 (curl --retry 5 --retry-connrefused) or \
+                 when it is slow, run the long command you are waiting on \
+                 with run_in_background=true, or poll through the checker's \
+                 own retry (curl --retry 5 --retry-connrefused) or \
                  `until <check>; do sleep 1; done`. Pacing under \
                  {SLEEP_GUARD_MIN_SECS}s still passes."
             )));
@@ -852,6 +968,72 @@ impl ToolBox {
                 )))
             }
         }
+    }
+
+    /// Detached background bash (item 97). The command runs in its own
+    /// process group with stdout+stderr streamed to `logs/bg/<id>.log`;
+    /// the call returns immediately with the id and log path. A waiter
+    /// task reaps the child and, when a steer queue is attached, injects
+    /// a completion note the agent hears at its next model call. No
+    /// timeout applies and the job is not killed when the agent ends.
+    async fn spawn_background(&self, command: &str) -> Result<String, SlagError> {
+        static BG_SEQ: AtomicU64 = AtomicU64::new(1);
+        let id = format!("bg-{}", BG_SEQ.fetch_add(1, Ordering::Relaxed));
+        let rel = format!("{BG_LOG_DIR}/{id}.log");
+        let log_path = self.root.join(&rel);
+        if let Some(parent) = log_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| SlagError::Tool(format!("cannot create {BG_LOG_DIR}: {e}")))?;
+        }
+        let log = std::fs::File::create(&log_path)
+            .map_err(|e| SlagError::Tool(format!("cannot create {rel}: {e}")))?;
+        let err = log
+            .try_clone()
+            .map_err(|e| SlagError::Tool(format!("cannot clone {rel} handle: {e}")))?;
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc")
+            .arg(command)
+            .current_dir(&self.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err));
+        // Own process group and no kill_on_drop: the job outlives this
+        // call and keeps running even if the agent loop ends first.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SlagError::Tool(format!("failed to spawn background shell: {e}")))?;
+        let pid = child.id();
+
+        let steer = self.steer.clone();
+        let note_id = id.clone();
+        let note_rel = rel.clone();
+        tokio::spawn(async move {
+            // Always await: this reaps the child even with no steer queue.
+            let status = child.wait().await;
+            let Some(steer) = steer else { return };
+            let text = match status {
+                Ok(s) if s.success() => {
+                    format!("background job {note_id} exited ok; output: {note_rel}")
+                }
+                Ok(s) => format!(
+                    "background job {note_id} exited with status {}; output: {note_rel}",
+                    s.code().unwrap_or(-1)
+                ),
+                Err(e) => format!("background job {note_id} wait failed: {e}"),
+            };
+            steer.lock().unwrap_or_else(|p| p.into_inner()).push(text);
+        });
+
+        Ok(format!(
+            "background job {id} started{}; output streams to {rel}. \
+             Check progress by reading that file; a completion note arrives \
+             automatically when the job exits.",
+            pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+        ))
     }
 
     /// Search file contents with rg (grep fallback). Three output modes:
@@ -1031,9 +1213,26 @@ impl ToolBox {
                 } else {
                     recipe.path.clone()
                 };
-                tokio::fs::read_to_string(&path)
+                let body = tokio::fs::read_to_string(&path)
                     .await
-                    .map_err(|e| SlagError::Tool(format!("cannot read recipe '{name}': {e}")))
+                    .map_err(|e| SlagError::Tool(format!("cannot read recipe '{name}': {e}")))?;
+                // Item 98: surface declared constraints so the session can
+                // honor them (enforcement awaits recipe-bound sessions).
+                let mut meta = Vec::new();
+                if !recipe.allowed_tools.is_empty() {
+                    meta.push(format!("allowed_tools: {}", recipe.allowed_tools.join(", ")));
+                }
+                if let Some(model) = &recipe.model {
+                    meta.push(format!("preferred model: {model}"));
+                }
+                if recipe.context == recipes::RecipeContext::Fork {
+                    meta.push("context: fork (not yet wired; runs inline)".to_string());
+                }
+                Ok(if meta.is_empty() {
+                    body
+                } else {
+                    format!("[recipe meta — {}]\n{body}", meta.join("; "))
+                })
             }
             n => {
                 let paths: Vec<String> =
@@ -1493,6 +1692,86 @@ fn split_segments(command: &str) -> Vec<&str> {
 }
 
 // ---------------------------------------------------------------------------
+// Read-only bash classifier (item 96), trimmed from Claude Code's
+// readOnlyValidation. Only commands *provably* free of writes and
+// execution escapes classify; everything else returns false and stays
+// unscheduled. Hand-rolled, no regex dep (house convention).
+// ---------------------------------------------------------------------------
+
+/// True when every compound segment of `command` is a known read-only
+/// invocation. Conservative: redirections, command substitution,
+/// wrappers, and unknown commands all fail the classification.
+fn read_only_bash(command: &str) -> bool {
+    // Substitution runs arbitrary commands; `>` redirection writes.
+    // (`<` input redirection would be fine, but a lone `>` check cannot
+    // tell `2>&1` from `> f` without a real parser — reject them all.)
+    if command.contains('`') || command.contains("$(") || command.contains('>') {
+        return false;
+    }
+    let mut any = false;
+    for seg in command.split(|c| matches!(c, ';' | '|' | '&' | '\n')) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if !read_only_segment(seg) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+fn read_only_segment(seg: &str) -> bool {
+    let toks: Vec<&str> = seg.split_whitespace().collect();
+    // Env assignments are inert; any other wrapper (sudo, xargs, env …)
+    // hides the real command — fail the classification.
+    let mut tokens: &[&str] = &toks;
+    while tokens.first().is_some_and(|t| is_env_assignment(t)) {
+        tokens = &tokens[1..];
+    }
+    let Some((first, rest)) = tokens.split_first() else {
+        return false;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    match base {
+        // No write or exec pathway through any of their flags.
+        "ls" | "cat" | "head" | "tail" | "wc" | "pwd" | "file" | "stat" | "du" | "df"
+        | "which" | "whoami" | "date" | "basename" | "dirname" | "realpath" | "readlink"
+        | "echo" | "printf" | "true" | "sort" | "uniq" | "cut" | "tr" | "diff" | "grep" => true,
+        // rg: `--pre` executes an arbitrary preprocessor.
+        "rg" => !rest.iter().any(|t| *t == "--pre" || t.starts_with("--pre=")),
+        // find/fd: exec escapes and find's -delete write.
+        "find" => !rest.iter().any(|t| {
+            matches!(*t, "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fprint"
+                | "-fprintf" | "-fls")
+        }),
+        "fd" => !rest.iter().any(|t| {
+            matches!(*t, "-x" | "--exec" | "-X" | "--exec-batch")
+                || t.starts_with("--exec=")
+                || t.starts_with("--exec-batch=")
+        }),
+        // jq -f reads its program from a file the classifier cannot see.
+        "jq" => !rest.iter().any(|t| *t == "-f" || *t == "--from-file"
+            || t.starts_with("--from-file=")),
+        // git: read-only subcommands only, and only when nothing odd
+        // precedes the subcommand (a `-C`/`-c` prefix drops concurrency,
+        // never correctness).
+        "git" => matches!(
+            rest.first(),
+            Some(&"status") | Some(&"diff") | Some(&"log") | Some(&"show")
+                | Some(&"blame") | Some(&"rev-parse") | Some(&"branch")
+        ) && (rest.first() != Some(&"branch")
+            || !rest.iter().any(|t| {
+                matches!(*t, "-d" | "-D" | "-m" | "-M" | "-c" | "-C" | "-f" | "--force"
+                    | "--delete" | "--move" | "--copy" | "--set-upstream-to" | "-u"
+                    | "--unset-upstream" | "--edit-description")
+            })),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Destructive-command deny table, ported (hand-rolled, no regex dep) from
 // Claude Code's BashTool/destructiveCommandWarning.ts. Slag refuses these
 // outright instead of warning; SLAG_ALLOW_DESTRUCTIVE=1 relaxes the gate
@@ -1706,8 +1985,8 @@ fn sh_quote(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Sleep guard, ported from Claude Code's BashTool detectBlockedSleepPattern.
 // A leading blocking `sleep N` spends the ingot's clock and a tool round-trip
-// to learn nothing. Slag has no background bash yet, so the refusal points at
-// `timeout`, retry flags, and poll loops instead of run_in_background.
+// to learn nothing. The refusal points at `timeout`, retry flags, poll loops,
+// and run_in_background (item 97) for the command being waited on.
 // ---------------------------------------------------------------------------
 
 /// Shorter sleeps are deliberate pacing (rate limits, debounce) and pass.
@@ -2279,6 +2558,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_refuses_policy_denied_commands() {
+        let (_dir, tb) = setup();
+        let entries = vec![("deny".to_string(), "curl:*".to_string())];
+        let tb = tb.with_policy(super::super::policy::Policy::from_entries(&entries));
+        let out = tb
+            .dispatch(&call("bash", json!({"command": "echo hi && curl https://x.dev"})))
+            .await;
+        assert!(out.is_error);
+        assert!(out.output.contains("policy rule `curl:*`"), "{}", out.output);
+        // Un-denied commands still run.
+        let ok = tb.dispatch(&call("bash", json!({"command": "echo hi"}))).await;
+        assert!(!ok.is_error, "{}", ok.output);
+    }
+
+    /// Poll the steer queue for the background completion note.
+    async fn wait_for_note(queue: &crate::engine::SteerQueue) -> Option<String> {
+        for _ in 0..100 {
+            let note = queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .first()
+                .cloned();
+            if note.is_some() {
+                return note;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn background_bash_returns_immediately_and_notes_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = crate::engine::SteerQueue::default();
+        let tb = ToolBox::new(dir.path()).with_steer(Some(queue.clone()));
+        let out = tb
+            .dispatch(&call(
+                "bash",
+                json!({"command": "echo out; echo err 1>&2", "run_in_background": true}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("logs/bg/"), "{}", out.output);
+        assert!(out.output.contains("background job"), "{}", out.output);
+
+        let note = wait_for_note(&queue).await.expect("completion note");
+        assert!(note.contains("exited ok"), "{note}");
+        assert!(note.contains("logs/bg/"), "{note}");
+
+        // stdout and stderr both landed in the log file.
+        let bg = dir.path().join("logs/bg");
+        let entries: Vec<_> = std::fs::read_dir(&bg).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1, "one log per job");
+        let content = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(content.contains("out"), "{content}");
+        assert!(content.contains("err"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn background_bash_skips_sleep_guard_and_reports_failure_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = crate::engine::SteerQueue::default();
+        let tb = ToolBox::new(dir.path()).with_steer(Some(queue.clone()));
+        // Foreground refuses this leading sleep; a detached job blocks
+        // nothing, so it passes — and the exit status reaches the note.
+        let out = tb
+            .dispatch(&call(
+                "bash",
+                json!({"command": "sleep 2 && exit 3", "run_in_background": true}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        let note = wait_for_note(&queue).await.expect("completion note");
+        assert!(note.contains("status 3"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn background_bash_still_gated_by_policy_and_steerless_jobs_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![("deny".to_string(), "curl:*".to_string())];
+        let tb = ToolBox::new(dir.path())
+            .with_policy(super::super::policy::Policy::from_entries(&entries));
+        let denied = tb
+            .dispatch(&call(
+                "bash",
+                json!({"command": "curl https://x.dev", "run_in_background": true}),
+            ))
+            .await;
+        assert!(denied.is_error, "{}", denied.output);
+        assert!(denied.output.contains("policy"), "{}", denied.output);
+
+        // No steer queue attached: the job still runs and logs.
+        let ok = tb
+            .dispatch(&call(
+                "bash",
+                json!({"command": "echo quiet", "run_in_background": true}),
+            ))
+            .await;
+        assert!(!ok.is_error, "{}", ok.output);
+        let bg = dir.path().join("logs/bg");
+        for _ in 0..100 {
+            let logged = std::fs::read_dir(&bg)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    std::fs::read_to_string(e.path())
+                        .is_ok_and(|c| c.contains("quiet"))
+                });
+            if logged {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("steerless background job never wrote its log");
+    }
+
+    #[test]
+    fn bash_spec_documents_run_in_background() {
+        let bash = ToolBox::specs()
+            .into_iter()
+            .find(|s| s.name == "bash")
+            .unwrap();
+        assert!(
+            bash.description.contains("run_in_background=true"),
+            "{}",
+            bash.description
+        );
+        assert!(bash.description.contains("logs/bg/"), "{}", bash.description);
+        assert_eq!(
+            bash.parameters["properties"]["run_in_background"]["type"],
+            "boolean"
+        );
+    }
+
+    #[tokio::test]
     async fn bash_timeout_kills() {
         let (_dir, tb) = setup();
         // Blocks forever without a leading sleep, which the sleep guard refuses.
@@ -2570,12 +2986,57 @@ mod tests {
             json!({"path": "c.txt", "old_string": "a", "new_string": "b"}),
         );
         assert_eq!(ToolBox::path_access(&c), Some(("c.txt".into(), true)));
-        for name in ["bash", "grep", "recipe_view", "finish"] {
+        for name in ["grep", "recipe_view", "finish"] {
             let c = call(
                 name,
                 json!({"command": "x", "pattern": "y", "summary": "z", "path": "p", "name": "n"}),
             );
             assert_eq!(ToolBox::path_access(&c), None);
+        }
+        // Provably read-only bash classifies as a reader (item 96);
+        // anything unproven stays unscheduled.
+        let c = call("bash", json!({"command": "git status && ls src"}));
+        assert_eq!(ToolBox::path_access(&c), Some((String::new(), false)));
+        let c = call("bash", json!({"command": "cargo build"}));
+        assert_eq!(ToolBox::path_access(&c), None);
+    }
+
+    #[test]
+    fn read_only_bash_classifier_is_conservative() {
+        // Safe commands, alone and compounded.
+        for cmd in [
+            "ls -la src",
+            "cat Cargo.toml",
+            "rg 'fn main' src",
+            "fd '.rs' src",
+            "git status",
+            "git diff --stat",
+            "git log --oneline -5",
+            "grep -rn foo src | head -3",
+            "find . -name '*.rs'",
+            "FOO=1 ls",
+        ] {
+            assert!(read_only_bash(cmd), "should classify read-only: {cmd}");
+        }
+        // Escapes, writes, wrappers, unknowns: all fall back to unproven.
+        for cmd in [
+            "find . -name '*.rs' -exec touch {} +",
+            "find . -delete",
+            "fd '.rs' -x touch",
+            "rg foo --pre cat",
+            "jq -f prog.jq data.json",
+            "git branch -D main",
+            "git push",
+            "ls > files.txt",
+            "cat f `date`",
+            "cat $(date)",
+            "sudo ls",
+            "xargs ls",
+            "cargo build",
+            "ls && cargo build",
+            "",
+        ] {
+            assert!(!read_only_bash(cmd), "must stay unproven: {cmd}");
         }
     }
 
@@ -2595,6 +3056,58 @@ mod tests {
                 "finish"
             ]
         );
+    }
+
+    #[test]
+    fn edit_file_spec_carries_minimal_uniqueness_hint() {
+        let spec = ToolBox::specs()
+            .into_iter()
+            .find(|s| s.name == "edit_file")
+            .unwrap();
+        assert!(
+            spec.description.contains("smallest old_string"),
+            "{}",
+            spec.description
+        );
+        assert!(
+            spec.description.contains("add adjacent"),
+            "{}",
+            spec.description
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_path_error_suggests_same_basename_under_root() {
+        let (dir, tb) = setup();
+        std::fs::create_dir_all(dir.path().join("src").join("engine")).unwrap();
+        std::fs::write(dir.path().join("src/engine/tools.rs"), "x\n").unwrap();
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": "engine/tools.rs"})))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("did you mean"), "{}", out.output);
+        assert!(out.output.contains("src/engine/tools.rs"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn missing_path_error_names_root_without_false_suggestions() {
+        let (_dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": "no_such_file.txt"})))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("workspace root:"), "{}", out.output);
+        assert!(!out.output.contains("did you mean"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn escape_error_names_workspace_root() {
+        let (_dir, tb) = setup();
+        let out = tb
+            .dispatch(&call("read_file", json!({"path": "../outside.txt"})))
+            .await;
+        assert!(out.is_error, "{}", out.output);
+        assert!(out.output.contains("workspace root:"), "{}", out.output);
     }
 
     #[test]
@@ -2632,6 +3145,24 @@ mod tests {
         assert!(!out.is_error, "{}", out.output);
         assert!(out.output.contains("Step 1: build."), "{}", out.output);
         assert!(out.output.contains("name: ship"), "full RECIPE.md expected");
+    }
+
+    #[tokio::test]
+    async fn recipe_view_surfaces_item_98_meta() {
+        let (dir, tb) = setup();
+        let d = dir.path().join("recipes").join("web");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("RECIPE.md"),
+            "---\nname: web\ndescription: d\nallowed_tools: [bash]\nmodel: m1\ncontext: fork\n---\nBody",
+        )
+        .unwrap();
+        let out = tb.dispatch(&call("recipe_view", json!({"name": "web"}))).await;
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("allowed_tools: bash"), "{}", out.output);
+        assert!(out.output.contains("preferred model: m1"), "{}", out.output);
+        assert!(out.output.contains("context: fork"), "{}", out.output);
+        assert!(out.output.contains("Body"), "{}", out.output);
     }
 
     #[tokio::test]

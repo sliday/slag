@@ -1537,11 +1537,14 @@ mod tests {
             tc("1", "read_file", serde_json::json!({"path": "a"})),
             tc("2", "read_file", serde_json::json!({"path": "b"})),
             tc("3", "write_file", serde_json::json!({"path": "c", "content": ""})),
-            tc("4", "bash", serde_json::json!({"command": "ls"})),
-            tc("5", "read_file", serde_json::json!({"path": "d"})),
+            // Unproven bash stays isolated; read-only bash (item 96)
+            // joins the reader batch after it.
+            tc("4", "bash", serde_json::json!({"command": "cargo build"})),
+            tc("5", "bash", serde_json::json!({"command": "ls"})),
+            tc("6", "read_file", serde_json::json!({"path": "d"})),
         ];
         let segments = plan_segments(&calls);
-        assert_eq!(segments, vec![vec![0, 1], vec![2], vec![3], vec![4]]);
+        assert_eq!(segments, vec![vec![0, 1], vec![2], vec![3], vec![4, 5]]);
     }
 
     #[tokio::test]

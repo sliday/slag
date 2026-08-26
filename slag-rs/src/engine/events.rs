@@ -681,8 +681,10 @@ pub fn print_line(text: impl Into<String>) {
 // needs no sidecar files. Distinct from the per-session engine-*.jsonl
 // event streams: this is the run's ledger, not its firehose.
 
-/// One typed line in the run log.
-#[derive(Debug, Clone, serde::Serialize)]
+/// One typed line in the run log. Deserialize so `slag insights` can
+/// read the ledgers back; unknown future fields are tolerated per-line
+/// by the crash-tolerant reader.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
 pub enum RunEntry {
     /// First line of every run log.

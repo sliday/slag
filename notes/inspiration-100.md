@@ -3,13 +3,13 @@
 Source: 8-beat sweep of /Users/stas/Playground/Claude Code src (140 raw ideas, curated to 100).
 Status legend: [ ] todo · [~] in flight · [x] done
 
-Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive casts + site in v2.3.0. Wave 3 (15 items: compaction v3, provider resilience, founder briefing, observability) in v2.4.0. ~45/100 through v2.4.0. Wave 4 (15 items: transcripts + crash-resume + rewind checkpoints, status --json, runs/ps, OSC progress, cost persistence) in v2.5.0 — ~60/100 shipped. Wave 5 assessed 2026-08-18 — recommended order for future sessions by value-per-risk:
+Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive casts + site in v2.3.0. Wave 3 (15 items: compaction v3, provider resilience, founder briefing, observability) in v2.4.0. ~45/100 through v2.4.0. Wave 4 (15 items: transcripts + crash-resume + rewind checkpoints, status --json, runs/ps, OSC progress, cost persistence) in v2.5.0 — ~60/100 shipped. Wave 5 (policy engine, read-only bash classifier, full background bash, recipe frontmatter, insights, #80 reconciled) shipped 2026-08-26 — ~66/100. Assessed 2026-08-18 order, all landed:
 1. ~~#99 MCP stdio client~~ shipped 2026-08-21
-2. #95 command policy engine (the real bash guard rail beyond wave-1 deny list)
-3. ~~#97-S sleep-guard subset only~~ shipped 2026-08-20 (full background-bash later)
-4. #100 slag insights (isolated, zero-risk learning loop)
-5. #96 read-only bash classifier (speed win; misclassification risk needs care)
-6. #98 recipe fork-context (powerful but rides better after #99)
+2. ~~#95 command policy engine~~ shipped 2026-08-26
+3. ~~#97-S sleep-guard subset~~ shipped 2026-08-20; ~~full background bash~~ shipped 2026-08-26
+4. ~~#100 slag insights~~ shipped 2026-08-26
+5. ~~#96 read-only bash classifier~~ shipped 2026-08-26
+6. ~~#98 recipe frontmatter growth~~ shipped 2026-08-26 (fork execution deferred, see item)
 
 
 ## Wave 1
@@ -92,27 +92,34 @@ Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive
 - [ ] **25. Standardize a <system-reminder> envelope for all injections** (M)
   engine/prompt.rs + agent.rs: one wrap_reminder() helper for steer injections, proof-failure notices, workspace refreshes, truncation/staleness notes, with the 'may or may not be relevant' disclaimer; declare the contract once in the stable band; coalesce consecutive reminders. Merges the tool-result advisory and injected-context variants.
   _evidence: Claude Code src/constants/prompts.ts:131-134,186-197; src/utils/messages.ts:3098; src/utils/api.ts:460-472_
-- [ ] **26. Add a git safety protocol to the bash spec** (S)
+- [x] **26. Add a git safety protocol to the bash spec** (S)
   engine/tools.rs bash spec / engine/prompt.rs: never --no-verify; never amend after a pre-commit hook failure (the commit did NOT happen — amend destroys the previous commit); stage specific files over `git add -A`; heredoc commit messages; no -i flags. Anvils commit in worktrees, so a botched amend poisons the merge in anvil/worktree.rs.
   _evidence: Claude Code src/tools/BashTool/prompt.ts:88-140_
-- [ ] **27. Add the minimal-uniqueness hint for old_string** (S)
+  _shipped: tools.rs bash spec (landed with the wave-2 backlog batch, commit 97456f7; checkbox flipped now): never --no-verify; after a pre-commit hook failure the commit did NOT happen, so fix and commit again (never amend); stage specific files over 'git add -A'; heredoc commit messages; no interactive -i flags._
+- [x] **27. Add the minimal-uniqueness hint for old_string** (S)
   engine/tools.rs edit_file description: 'use the smallest old_string that is clearly unique — 2-4 adjacent lines usually suffice' plus the not-unique failure note (add context or replace_all). Fewer whitespace-drift mismatches feeding the fuzzy ladder.
   _evidence: Claude Code src/tools/FileEditTool/prompt.ts (minimalUniquenessHint)_
-- [ ] **28. Return precise warnings for empty files and past-EOF offsets** (S)
+  _shipped: tools.rs edit_file spec: 'use the smallest old_string that is clearly unique — 2-4 adjacent lines usually suffice; when a match is not unique, add adjacent context lines or set replace_all'; spec test edit_file_spec_carries_minimal_uniqueness_hint._
+- [x] **28. Return precise warnings for empty files and past-EOF offsets** (S)
   engine/tools.rs read_file: on empty content return the 'file exists but contents are empty' reminder; on offset past EOF return 'file has M lines' so the model corrects its next call instead of guessing.
   _evidence: Claude Code src/tools/FileReadTool/FileReadTool.ts:703-708_
-- [ ] **29. Teach parallel-vs-sequential command batching in the bash spec** (S)
+  _shipped: tools.rs read_file (landed with the v1.2.0 native engine, commit 09cebbf; checkbox flipped now): empty content returns '(empty file)'; an offset past EOF returns '(file has M lines; offset N is past the end)'; oversized files also report their line count beside the size-limit refusal._
+- [x] **29. Teach parallel-vs-sequential command batching in the bash spec** (S)
   engine/tools.rs bash spec: independent commands -> multiple tool calls in ONE message; dependent -> chain with '&&'; ';' only when earlier failures don't matter; no newline-separated commands. agent.rs already dispatches parallel tool calls — this wording makes the dispatcher get used.
   _evidence: Claude Code src/tools/BashTool/prompt.ts (multipleCommandsSubitems)_
-- [ ] **30. Add anti-gold-plating code-style rules to the smith prompt** (S)
+  _shipped: tools.rs bash spec (wave-2 batch, commit 97456f7; checkbox flipped now): independent commands as multiple bash calls in ONE message (agent.rs dispatches tool calls in parallel), dependent commands chained with '&&', ';' only when earlier failures don't matter, never newline-separated._
+- [x] **30. Add anti-gold-plating code-style rules to the smith prompt** (S)
   engine/prompt.rs stable band: no features/refactors/comments beyond the ask; validate only at system boundaries; 'three similar lines beat a premature abstraction'; don't remove existing comments. Smaller diffs mean faster duel judging and fewer proof-adjacent regressions.
   _evidence: Claude Code src/constants/prompts.ts:200-214_
-- [ ] **31. Append 'did you mean' path suggestions on file-not-found** (S)
+  _shipped: engine/prompt.rs stable band '### No gold-plating' (wave-2 batch, commit 97456f7; checkbox flipped now): only what the ingot asks, validate inputs only at system boundaries, 'three similar lines beat a premature abstraction', never remove existing comments; guarded by test stable_band_carries_anti_gold_plating_rules._
+- [x] **31. Append 'did you mean' path suggestions on file-not-found** (S)
   engine/tools.rs resolve()/read_file errors: on 'cannot read' or 'escapes workspace', append the anvil root and probe for the same basename/relative tail under the root (single walkdir pass) as a hint. Cuts a whole retry turn per wrong-path guess.
   _evidence: Claude Code src/utils/file.ts:213,228-263; src/tools/GlobTool/GlobTool.ts:109-119_
-- [ ] **32. Raise the retry budget and make it env-overridable** (S)
+  _shipped: tools.rs path_hint(): resolve() escape errors and read_file cannot-read errors append the workspace root plus up to three same-basename matches from a bounded walk (skips .git/target/node_modules/.venv and symlinked dirs, ~4000-entry cap) as 'did you mean: …'. Three tests cover the suggestion, the no-false-suggestion case, and root naming on escape errors._
+- [x] **32. Raise the retry budget and make it env-overridable** (S)
   engine/provider.rs: MAX_ATTEMPTS=3 becomes config/env driven (SLAG_MAX_RETRIES, default ~8-10) now that backoff is exponential; three attempts over 1.25s is far too brittle for overnight forge runs.
   _evidence: Claude Code src/services/api/withRetry.ts:52,789-797_
+  _shipped: provider.rs (landed with the narrator batch, commit 51cd886; checkbox flipped now): SLAG_MAX_RETRIES overrides DEFAULT_MAX_ATTEMPTS=8 on the exponential 500ms→32s curve; unattended 429/529 retries ride past the budget under a 6h ceiling; tests configured_retry_budget_bounds_the_attempts + plan_retry_bounded_path_respects_the_budget._
 - [ ] **33. Emit structured api_retry heartbeat events** (M)
   engine/events.rs: add EngineEvent::ApiRetry{attempt,max,delay_ms,status}; provider.rs takes an optional EventTx to emit before each sleep; dashboard.rs renders a countdown on the anvil row instead of a silent hang.
   _evidence: Claude Code src/services/api/withRetry.ts:466-511; src/QueryEngine.ts:943-955_
@@ -125,9 +132,10 @@ Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive
 - [ ] **36. Show OpenRouter credit balance beside session spend** (S)
   Add `slag cost` (cli.rs): current run ledger plus OpenRouter GET /api/v1/credits via provider.rs's HTTP client — 'session $0.42 · account $18.31 remaining'; warn at forge start when balance < configured floor.
   _evidence: Claude Code src/commands/usage/usage.tsx; src/commands/extra-usage/extra-usage-core.ts:33-51_
-- [ ] **37. Add an <env> block with model identity and knowledge cutoff** (S)
+- [x] **37. Add an <env> block with model identity and knowledge cutoff** (S)
   engine/prompt.rs workspace_snapshot(): <env> sub-block with platform/shell/OS via std::env + os_info, 'You are powered by <OpenRouter slug>', and a small cutoff table for routed model families. Stable within a session, so cache-safe in the context band.
   _evidence: Claude Code src/constants/prompts.ts:606-756_
+  _shipped: engine/prompt.rs workspace snapshot <env> block (wave-2 batch, commit 97456f7; checkbox flipped now): platform/shell/OS, 'You are powered by <model>', a knowledge-cutoff table for the routed families, and a verify-don't-guess line for anything newer; stable within a session, so cache-safe._
 - [ ] **38. Register central cleanup handlers plus a panic hook** (S)
   New shutdown.rs: static registry of boxed cleanups (flush JSONL sink, save crucible under CRUCIBLE_LOCK, restore ratatui terminal) invoked from a ctrl-c handler and a panic hook in main.rs so a panic never leaves the terminal in raw mode or drops buffered events.
   _evidence: Claude Code src/utils/cleanupRegistry.ts; src/utils/gracefulShutdown.ts_
@@ -260,8 +268,9 @@ Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive
 - [ ] **79. Emit a `slag status --json` contract for external consumers** (M)
   cli.rs: read the live JSONL event log plus persisted session costs and print one JSON object: run id, ingots by status, spend, tokens, context %, active anvils. Lets tmux statuslines, CI, and the website poll a forge without scraping the TUI.
   _evidence: Claude Code src/components/StatusLine.tsx:46-98_
-- [ ] **80. Make JSONL readers crash-tolerant: skip bad lines and truncated tails** (S)
+- [x] **80. Make JSONL readers crash-tolerant: skip bad lines and truncated tails** (S)
   engine/transcript.rs and any logs/ reader: parse per-line with serde, warn once and skip malformed lines, treat a non-newline-terminated last line as a partial write to drop — mirrors the guard crucible.rs already has for ingot lines.
+  _shipped: engine/transcript.rs `read_jsonl_tolerant<T>()` (landed with the wave-4 transcript work; checkbox flipped now): per-line serde parse, malformed lines skipped with one warning per file, a last line without a trailing newline dropped as a partial write. Consumers: transcript resume + anvil/checkpoint.rs manifests + `slag insights`. The remaining logs/ surfaces are tolerant by construction — cli.rs status/runs use no-parse `"key":value` scanners, session files self-heal (parse failure = prune)._
   _evidence: Claude Code src/history.ts:106-143; src/utils/sessionStoragePortable.ts:735_
 - [ ] **81. Append run metadata as typed entries in the run JSONL** (S)
   events.rs sink gains a metadata entry type: forge start appends {run_id, git_branch, model, flux_profile, crucible_hash}; assay appends the final verdict — one self-describing log file per run, no sidecar files for the runs lister.
@@ -308,23 +317,28 @@ Progress: wave 1 (items 1-16) + item 18 in v2.2.0. Wave 2 (~12 items) + adaptive
 
 ## Wave 5
 
-- [ ] **95. Build a command policy engine: split compounds, strip wrappers, prefix rules** (L)
+- [x] **95. Build a command policy engine: split compounds, strip wrappers, prefix rules** (L)
   New engine/policy.rs consumed by tools.rs bash: config-driven allow/deny lists in slag.toml (deny = ["git push:*", "curl:*"]), compound-split (&&, ;, |) so every subcommand must pass, iterative wrapper/env-prefix stripping, fail-closed on backticks/$( ) command substitution, deny > ask > allow precedence. Real guard rail beyond the path sandbox.
+  _shipped: engine/policy.rs (hand-rolled, no regex): `[policy]` table via config.rs policy_entries() (deny/ask/allow, TOML-array or comma-list values), token-wise prefix rules with `:*` wildcard, compound-split on `&&`/`;`/`|`/`&`/newlines, iterative wrapper/env/numeric-prefix stripping incl. sh -c payloads, fail-closed on backtick/`$(` substitution while a policy exists, deny > ask > allow (ask refuses with add-an-allow-rule guidance — slag runs unattended). Wired in tools.rs bash() via ToolBox::with_policy; forge.rs + smith/native.rs attach Policy::from_config(). Empty policy checks nothing._
   _evidence: Claude Code src/tools/BashTool/bashPermissions.ts:524-566; utils/permissions/shellRuleMatching.ts; dangerousPatterns.ts_
-- [ ] **96. Classify provably read-only bash for concurrent scheduling** (L)
+- [x] **96. Classify provably read-only bash for concurrent scheduling** (L)
   engine/tools.rs path_access returns None for bash today, forcing every bash call to be treated as unscheduled. A trimmed classifier (ls/cat/rg/fd/git status/diff/log with safe-flag tables, excluding execution escapes like -exec and jq -f) lets agent.rs run read-only bash concurrently with readers and lets duels share a repo view safely.
+  _shipped: tools.rs read_only_bash() + path_access "bash" arm: safe-command table (ls/cat/head/tail/wc/grep/diff/sort/…, rg minus --pre, find minus -exec/-execdir/-ok/-delete, fd minus -x/-X, jq minus -f, git status/diff/log/show/blame/rev-parse/branch minus mutating branch flags), env-assignment prefixes allowed, every compound segment must pass, fail-closed on backtick/`$(`/`>` and on any wrapper or unknown command. agent.rs plan_segments now batches read-only bash with readers (test updated)._
   _evidence: Claude Code src/tools/BashTool/readOnlyValidation.ts:35-90,1509_
-- [~] **97. Support background bash with run_in_background and sleep guards** (L)
+- [x] **97. Support background bash with run_in_background and sleep guards** (L)
   engine/tools.rs + agent.rs: run_in_background arg spawns the process group detached with stdout redirected to logs/bg/<id>.log, returns id+path immediately, injects a completion note via the existing steer channel. The S-size subset — reject `sleep >2s` with 'background it instead' guidance — is worth doing alone.
   _shipped (S subset): tools.rs `blocked_sleep()` refuses a leading integer `sleep N` with N>=2 and names the remedy (raise `timeout`, curl --retry, `until` loop). Float durations, sub-2s pacing, `sleep 5 &`, and sleeps inside pipelines/loops/subshells pass. The bash spec teaches the rule. run_in_background still pending._
+  _shipped (full): tools.rs bash gains `run_in_background` — destructive/policy gates still apply, sleep guard skipped (a detached sleep blocks nothing); spawn_background() runs `sh -lc` in its own process group (no kill_on_drop, no timeout) with stdout+stderr streamed to logs/bg/<id>.log and returns id+path immediately; a waiter task reaps the child and pushes "background job <id> exited …" into the agent's SteerQueue (ToolBox::with_steer, wired from hooks.steer in forge.rs + smith/native.rs — casts stay steerless). Spec teaches it; sleep refusal names it as remedy._
   _evidence: Claude Code src/tools/BashTool/BashTool.tsx:241,525-530,610_
-- [ ] **98. Grow recipe frontmatter: allowed-tools, model, fork context, paths gating** (L)
+- [x] **98. Grow recipe frontmatter: allowed-tools, model, fork context, paths gating** (L)
   recipes.rs Recipe struct gains allowed_tools, model, context (inline|fork), paths. `context: fork` spawns a sub-smith via smith/native.rs with only the recipe as its brief (forge.rs already runs parallel smiths); `paths` globs hide recipes until matching files are touched, cutting index tokens.
+  _shipped: recipes.rs Recipe gains allowed_tools, model, context (inline|fork enum), paths — all three list keys share the comma/inline/dash-list grammar, quotes trimmed. paths gating live in render_index: a paths-bearing recipe hides until a workspace file matches (hand-rolled glob: `*` in-segment, `**` crossing, `?`; bare patterns match basenames; bounded walk skipping .git/target/node_modules); the snapshot cache is bypassed while any recipe is paths-gated. recipe_view prepends a `[recipe meta — …]` header naming allowed_tools/model/context. Out of scope: fork execution + allowed_tools enforcement — no recipe-bound session hook exists yet (NativeSmith.skill still reserved)._
   _evidence: Claude Code skills/loadSkillsDir.ts:185-263; types/command.ts_
 - [x] **99. Add a minimal MCP stdio client to import external tools** (L)
   engine/tools.rs adds an mcp.rs adapter: spawn configured stdio servers (config.rs [mcp] table), initialize + tools/list at startup, expose each as a slag tool with mcp__server__tool naming; recipes' requires_tools works unchanged. Scope to stdio-only, no OAuth/HTTP transports.
   _shipped: engine/mcp.rs (newline-delimited JSON-RPC over the child's stdio), `[mcp]` table via section-aware parse_config_lines, `ToolBox::all_specs()` = natives + MCP, dispatch routes the `mcp__` prefix, prompt.rs feeds MCP names to the recipe gate, main.rs connects before the pipeline and prints what came up. Failed servers warn and are skipped._
   _evidence: Claude Code services/mcp/client.ts; services/mcp/config.ts_
-- [ ] **100. Build `slag insights`: offline analytics over run logs with cached facets** (L)
+- [x] **100. Build `slag insights`: offline analytics over run logs with cached facets** (L)
   New cli.rs subcommand over logs/*.jsonl: deterministic stats (ingots forged/cracked, heats per ingot, cost per ingot, duel margins, tool errors) plus optional cheap-model facet extraction per run cached as logs/facets/<run>.json. Turns the slag heap into a learning loop across projects.
+  _shipped: src/insights.rs + `slag insights [--refresh]` (cli.rs/main.rs; needs no key or network): aggregates logs/run-*.jsonl ledgers (RunEntry gains Deserialize) for forged/cracked, per-ingot heats, and assay verdicts, and every other logs/*.jsonl engine stream for cost, prompt/completion tokens, per-tool error counts, and duel_verdict margins (n/a when none logged); per-log facets cache at logs/facets/<stem>.json — schema-stamped, reused while at least as new as the log, --refresh recomputes. Parsing rides item 80's tolerant reader, so garbled lines never sink the report. Scope call: facets stay deterministic — no cheap-model extraction, keeping the command offline and zero-spend._
   _evidence: Claude Code src/commands/insights.ts:260-273,430,941-970_
