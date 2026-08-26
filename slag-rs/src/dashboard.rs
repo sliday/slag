@@ -152,6 +152,10 @@ pub(crate) struct DashState {
     pub(crate) draft: String,
     /// Next row handle. Monotonic, never reused.
     pub(crate) next_row: u64,
+    /// The ingot being forged, named in each turn header. Turn numbers
+    /// restart per ingot, so a bare `turn 1` landing under `turn 5` reads
+    /// as a broken counter; the id is what makes the reset legible.
+    pub(crate) ingot: Option<String>,
     /// The row holding the current turn header, so the route folds into it
     /// rather than spending a line of its own.
     pub(crate) turn_row: Option<u64>,
@@ -232,7 +236,11 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             state.turn = *turn;
             state.turn_started = Some(Instant::now());
             state.turn_tokens = 0;
-            let id = state.push_feed_detail(palette(tui::HOT), format!("⚒ turn {turn}"), None);
+            let head = match &state.ingot {
+                Some(ingot) => format!("⚒ [{ingot}] turn {turn}"),
+                None => format!("⚒ turn {turn}"),
+            };
+            let id = state.push_feed_detail(palette(tui::HOT), head, None);
             state.turn_row = Some(id);
             return;
         }
@@ -304,6 +312,7 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             }
         }
         EngineEvent::IngotStart { id, work } => {
+            state.ingot = Some(id.clone());
             let row = state.row_mut(id);
             row.work = preview(work, 60);
             row.heat = 0;
@@ -401,7 +410,7 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
         EngineEvent::Steer { text } => {
             (palette(tui::BRIGHT), format!("↪ steer: {}", preview(text, 80)))
         }
-        EngineEvent::Finish { summary } => (palette(tui::PURE), format!("■ {}", preview(summary, 120))),
+        EngineEvent::Finish { summary } => (palette(tui::PURE), format!("■ {}", preview(summary, 400))),
         EngineEvent::Error { message } => (palette(tui::WARM), format!("✗ {}", preview(message, 120))),
         EngineEvent::Narrate { text } => (palette(tui::COLD), format!("◈ {}", preview(text, 110))),
         EngineEvent::Warning { message } => {
@@ -833,19 +842,72 @@ fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Break one feed row to the pane width, on char boundaries.
+///
+/// The feed clipped every row at the border, which cost most on the one
+/// row worth reading in full: a finish summary is the turn's conclusion,
+/// and it was landing half off-screen. Continuations are indented so a
+/// wrapped row still reads as one row.
+pub(crate) fn wrap_row(text: &str, width: usize) -> Vec<String> {
+    if width < 8 {
+        // Too narrow to wrap usefully; the pane is already unusable and a
+        // one-char-per-line column would be worse than a clip.
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let candidate = if line.is_empty() { word.chars().count() } else { line.chars().count() + 1 + word.chars().count() };
+        if candidate > width && !line.is_empty() {
+            out.push(std::mem::take(&mut line));
+        }
+        // A single word longer than the pane still has to break somewhere.
+        if word.chars().count() > width {
+            let mut chunk = String::new();
+            for c in word.chars() {
+                if chunk.chars().count() == width {
+                    out.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(c);
+            }
+            line = chunk;
+            continue;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
 fn draw_feed(f: &mut Frame, area: Rect, state: &DashState) {
-    // Auto-scroll: always show the newest lines that fit.
-    let visible = area.height.saturating_sub(2) as usize;
-    let skip = state.feed.len().saturating_sub(visible);
+    // Render first, then scroll: a wrapped row and an expanded detail both
+    // spend more than one line, so counting feed rows would scroll past
+    // the newest output exactly when there is most of it to read.
+    let inner = area.width.saturating_sub(4) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    for l in state.feed.iter().skip(skip) {
-        lines.push(Line::from(Span::styled(format!("  {}", l.text), Style::default().fg(l.color))));
+    for l in state.feed.iter() {
+        for (i, chunk) in wrap_row(&l.text, inner).into_iter().enumerate() {
+            let indent = if i == 0 { "  " } else { "    " };
+            lines.push(Line::from(Span::styled(
+                format!("{indent}{chunk}"),
+                Style::default().fg(l.color),
+            )));
+        }
         if !state.expanded {
             continue;
         }
         if let Some(detail) = &l.detail {
             lines.extend(detail_lines(detail));
         }
+    }
+    let visible = area.height.saturating_sub(2) as usize;
+    if lines.len() > visible {
+        lines.drain(..lines.len() - visible);
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1413,6 +1475,52 @@ mod tests {
         assert_eq!(state.feed.len(), 1);
         assert!(state.feed[0].text.starts_with("✗"), "{}", state.feed[0].text);
         assert!(state.feed[0].text.contains("type error"), "{}", state.feed[0].text);
+    }
+
+    #[test]
+    fn a_long_row_wraps_instead_of_falling_off_the_pane() {
+        let row = "■ Built render core. Added shadowMapSize and toneMappingExposure to config.ts";
+        let out = wrap_row(row, 30);
+        assert!(out.len() > 1, "a row past the pane width wraps");
+        assert!(out.iter().all(|l| l.chars().count() <= 30), "no chunk exceeds the width: {out:?}");
+        assert_eq!(out.join(" "), row, "wrapping loses nothing");
+    }
+
+    #[test]
+    fn wrap_row_breaks_a_word_longer_than_the_pane() {
+        let out = wrap_row("/a/very/long/path/with/no/spaces/at/all/in/it.ts", 12);
+        assert!(out.iter().all(|l| l.chars().count() <= 12), "{out:?}");
+        assert_eq!(out.concat(), "/a/very/long/path/with/no/spaces/at/all/in/it.ts");
+    }
+
+    #[test]
+    fn wrap_row_respects_char_boundaries() {
+        // Multibyte must never split mid-character.
+        let out = wrap_row("héllo wörld ünïcode ✓ forged", 10);
+        assert!(out.iter().all(|l| l.chars().count() <= 10), "{out:?}");
+        assert_eq!(out.join(" "), "héllo wörld ünïcode ✓ forged");
+    }
+
+    #[test]
+    fn a_pane_too_narrow_to_wrap_returns_the_row_whole() {
+        assert_eq!(wrap_row("some text", 3), vec!["some text".to_string()]);
+    }
+
+    #[test]
+    fn a_turn_header_names_its_ingot_so_a_reset_counter_reads_right() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i3".into(), work: "arena".into() });
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
+        let head = &state.feed.back().unwrap().text;
+        assert!(head.contains("[i3]"), "the ingot is named: {head}");
+        assert!(head.contains("turn 1"), "{head}");
+    }
+
+    #[test]
+    fn a_turn_before_any_ingot_keeps_a_bare_header() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
+        assert_eq!(state.feed.back().unwrap().text, "⚒ turn 1");
     }
 
     #[test]
