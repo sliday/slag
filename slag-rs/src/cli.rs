@@ -30,6 +30,12 @@ pub struct Cli {
     #[arg(long)]
     pub tui: bool,
 
+    /// Commission a project whose whole description is one word. Without
+    /// it a lone bare word is refused as a mistyped subcommand, since that
+    /// is what it nearly always is.
+    #[arg(long)]
+    pub force: bool,
+
     /// Max parallel anvil workers
     #[arg(long, default_value_t = crate::config::MAX_ANVILS)]
     pub anvils: usize,
@@ -144,6 +150,49 @@ impl Cli {
             Some(self.commission.join(" "))
         }
     }
+
+    /// A lone bare word is a mistyped subcommand far more often than it is
+    /// a project brief, and the cost of guessing wrong is real: it appends
+    /// an addendum to PRD.md and pays for a survey and a founding pass.
+    /// `slag finalize` did exactly that. Multi-word commissions -- every
+    /// real brief -- are untouched.
+    pub fn suspect_verb(&self) -> Option<&str> {
+        let [only] = self.commission.as_slice() else { return None };
+        let word = only.trim();
+        (!word.is_empty() && !word.contains(char::is_whitespace)).then_some(word)
+    }
+}
+
+/// The subcommands slag answers to, for the message a suspect verb earns.
+pub const SUBCOMMANDS: &[&str] =
+    &["key", "status", "runs", "insights", "ps", "resume", "update", "rewind", "cost", "hooks"];
+
+/// The closest subcommand to a typo, when one is close enough to name.
+/// Two edits covers the ordinary slips -- a dropped letter, a doubled one,
+/// a transposition -- without inventing a suggestion for an unrelated word.
+pub fn nearest_subcommand(word: &str) -> Option<&'static str> {
+    let w = word.to_ascii_lowercase();
+    SUBCOMMANDS
+        .iter()
+        .map(|c| (*c, edit_distance(&w, c)))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 // ─── slag status --json (machine-readable contract) ─────────────────────
@@ -1078,5 +1127,54 @@ mod tests {
     fn own_pid_is_alive_and_garbage_pid_is_not() {
         assert!(pid_alive(std::process::id()));
         assert!(!pid_alive(u32::MAX - 1));
+    }
+}
+
+#[cfg(test)]
+mod verb_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("slag").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn a_lone_bare_word_is_treated_as_a_mistyped_subcommand() {
+        // `slag finalize` appended an addendum to PRD.md and paid for a
+        // survey, because a trailing var-arg swallows anything clap cannot
+        // match to a subcommand.
+        assert_eq!(parse(&["finalize"]).suspect_verb(), Some("finalize"));
+    }
+
+    #[test]
+    fn a_real_commission_is_never_suspect() {
+        assert_eq!(parse(&["build a shooter in three.js"]).suspect_verb(), None);
+        assert_eq!(parse(&["build", "a", "shooter"]).suspect_verb(), None);
+        assert_eq!(parse(&[]).suspect_verb(), None);
+    }
+
+    #[test]
+    fn force_is_the_way_to_commission_a_one_word_project() {
+        // The flag has to precede the word: `commission` is a trailing
+        // var-arg, so anything after the first positional is swallowed
+        // into the brief rather than parsed as a flag.
+        let cli = parse(&["--force", "tetris"]);
+        assert!(cli.force);
+        assert_eq!(cli.commission_text().as_deref(), Some("tetris"));
+        assert_eq!(parse(&["tetris", "--force"]).commission_text().as_deref(), Some("tetris --force"));
+    }
+
+    #[test]
+    fn a_near_miss_earns_a_suggestion() {
+        assert_eq!(nearest_subcommand("insight"), Some("insights"));
+        assert_eq!(nearest_subcommand("statu"), Some("status"));
+        assert_eq!(nearest_subcommand("updat"), Some("update"));
+    }
+
+    #[test]
+    fn an_unrelated_word_gets_no_invented_suggestion() {
+        assert_eq!(nearest_subcommand("finalize"), None);
+        assert_eq!(nearest_subcommand("shooter"), None);
     }
 }

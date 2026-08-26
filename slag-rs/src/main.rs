@@ -94,8 +94,31 @@ async fn main() {
         Some(Command::Rewind { ingot, heat }) => cli::show_rewind(ingot.as_deref(), heat),
         Some(Command::Hooks { action: cli::HooksAction::List }) => cli::show_hooks(),
         None => {
-            let commission = cli.commission_text();
-            forge(commission.as_deref(), cli.anvils, cli.tui, cli.trace.clone()).await
+            // A lone bare word reaches here because `commission` is a
+            // trailing var-arg: clap has no subcommand to match, so the
+            // typo becomes a project brief. Stop before that costs an
+            // addendum and a planning pass.
+            if let Some(word) = cli.suspect_verb().filter(|_| !cli.force) {
+                tui::show_banner();
+                println!(
+                    "  {}! `slag {word}` is not a subcommand{}",
+                    fg(tui::WARM),
+                    reset()
+                );
+                if let Some(near) = cli::nearest_subcommand(word) {
+                    println!("    did you mean `slag {near}`?");
+                }
+                println!("    subcommands: {}", cli::SUBCOMMANDS.join(", "));
+                println!(
+                    "    to commission a project by this name: {}slag --force {word}{}",
+                    fg(tui::COLD),
+                    reset()
+                );
+                Ok(())
+            } else {
+                let commission = cli.commission_text();
+                forge(commission.as_deref(), cli.anvils, cli.tui, cli.trace.clone()).await
+            }
         }
     };
 
