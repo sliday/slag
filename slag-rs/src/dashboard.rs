@@ -797,7 +797,40 @@ pub(crate) fn draw(f: &mut Frame, state: &DashState) {
     draw_bottom(f, bottom, state);
 }
 
-fn ingot_line(row: &IngotRow, now: Instant) -> Line<'_> {
+/// The crucible's name for an ingot: what it *is*, not what it is doing.
+///
+/// The glyph and colour already carry the status, so a column of `forged`
+/// down the pane repeats what a reader can see and hides the one thing
+/// that tells the rows apart. Plans tend to open every task with a `GOAL:`
+/// or `TASK:` label, which is boilerplate once it is on every row, so it
+/// comes off. Truncation lands on a word boundary: a title cut mid-word
+/// reads as corruption rather than as an abbreviation.
+fn ingot_title(work: &str, width: usize) -> String {
+    let mut t = work.trim();
+    for label in ["GOAL:", "TASK:", "INGOT:", "WORK:"] {
+        if t.len() >= label.len() && t[..label.len()].eq_ignore_ascii_case(label) {
+            t = t[label.len()..].trim_start();
+            break;
+        }
+    }
+    if t.chars().count() <= width {
+        return t.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    // Reserve one column for the ellipsis, then back off to a word break
+    // when one is near enough to be worth losing a word for.
+    let budget = width - 1;
+    let head: String = t.chars().take(budget).collect();
+    let cut = match head.rfind(' ') {
+        Some(i) if i >= budget.saturating_sub(14) && i > 0 => i,
+        _ => head.len(),
+    };
+    format!("{}…", head[..cut].trim_end())
+}
+
+fn ingot_line(row: &IngotRow, now: Instant, width: usize) -> Line<'_> {
     let (glyph, mut word, mut color) = match &row.status {
         IngotStatus::Forging => {
             ("⚒", "forging".to_string(), palette(tui::heat_color(row.heat)))
@@ -811,10 +844,12 @@ fn ingot_line(row: &IngotRow, now: Instant) -> Line<'_> {
             ("⚖", format!("cast {winner} +{margin}"), palette(tui::BRIGHT))
         }
     };
+    let mut stalled = false;
     if row.status == IngotStatus::Forging {
         let silent = now.saturating_duration_since(row.last_activity);
         if silent >= STALL_WARN {
-            word.push_str(&format!(" (stalled {}s)", silent.as_secs()));
+            stalled = true;
+            word = format!("stalled {}s", silent.as_secs());
             color = if silent >= STALL_DEAD {
                 palette(tui::WARM)
             } else {
@@ -822,19 +857,58 @@ fn ingot_line(row: &IngotRow, now: Instant) -> Line<'_> {
             };
         }
     }
-    Line::from(vec![
+    // A status word earns its place only when it says something the glyph
+    // does not. `forged` under a ✓ does not; a stall, a duel round, a
+    // verdict, or a retry count does.
+    let note = match &row.status {
+        _ if stalled => Some(word),
+        IngotStatus::Duel(_) | IngotStatus::Verdict { .. } => Some(word),
+        IngotStatus::Forging if row.heat > 0 => Some(format!("heat {}", row.heat)),
+        _ => None,
+    };
+    // Fixed columns: glyph, space, `[id] `, and the note with its
+    // separator. Whatever is left belongs to the title.
+    let spent = 2 + row.id.chars().count() + 3
+        + note.as_ref().map_or(0, |n| n.chars().count() + 3);
+    let title = ingot_title(&row.work, width.saturating_sub(spent));
+    let mut spans = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(format!("[{}] ", row.id), Style::default().fg(palette(tui::PURE))),
-        Span::styled(word, Style::default().fg(color)),
-    ])
+    ];
+    // An ingot announced but not yet described still needs a name; its
+    // status is the only one it has.
+    if title.is_empty() {
+        spans.push(Span::styled(
+            note.clone().unwrap_or_else(|| status_word(&row.status)),
+            Style::default().fg(color),
+        ));
+        return Line::from(spans);
+    }
+    spans.push(Span::styled(title, Style::default().fg(palette(tui::PURE))));
+    if let Some(n) = note {
+        spans.push(Span::styled(format!(" · {n}"), Style::default().fg(color)));
+    }
+    Line::from(spans)
+}
+
+/// The bare status word, for a row that has no work text to show instead.
+fn status_word(status: &IngotStatus) -> String {
+    match status {
+        IngotStatus::Forging => "forging".to_string(),
+        IngotStatus::Forged => "forged".to_string(),
+        IngotStatus::Cracked => "cracked".to_string(),
+        IngotStatus::Duel(r) => format!("duel r{r}"),
+        IngotStatus::Verdict { winner, margin } => format!("cast {winner} +{margin}"),
+    }
 }
 
 fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
+    let inner = area.width.saturating_sub(2) as usize;
     let visible = area.height.saturating_sub(2) as usize;
     let skip = state.ingots.len().saturating_sub(visible);
     let now = Instant::now();
     let lines: Vec<Line> =
-        state.ingots.iter().skip(skip).map(|row| ingot_line(row, now)).collect();
+        state.ingots.iter().skip(skip).map(|row| ingot_line(row, now, inner)).collect();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" crucible ")
@@ -1524,6 +1598,68 @@ mod tests {
     }
 
     #[test]
+    fn a_crucible_row_is_named_by_its_work_not_by_forged() {
+        let mut state = DashState::default();
+        apply_event(
+            &mut state,
+            EngineEvent::IngotStart {
+                id: "i1".into(),
+                work: "Procedurally generate a modular arena".into(),
+            },
+        );
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i1".into(), ok: true });
+        let line = ingot_line(&state.ingots[0], Instant::now(), 50);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Procedurally generate"), "the work names the row: {text}");
+        assert!(!text.contains("forged"), "the glyph already says forged: {text}");
+    }
+
+    #[test]
+    fn a_stalled_row_keeps_its_title_and_gains_the_stall() {
+        let mut state = DashState::default();
+        apply_event(
+            &mut state,
+            EngineEvent::IngotStart { id: "i10".into(), work: "WebAudio engine".into() },
+        );
+        state.ingots[0].last_activity = Instant::now() - STALL_WARN - Duration::from_secs(1);
+        let line = ingot_line(&state.ingots[0], Instant::now(), 50);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("WebAudio engine"), "{text}");
+        assert!(text.contains("stalled"), "a stall is news the glyph cannot carry: {text}");
+    }
+
+    #[test]
+    fn a_row_with_no_work_yet_falls_back_to_its_status() {
+        let row = IngotRow {
+            id: "i2".into(),
+            work: String::new(),
+            heat: 0,
+            status: IngotStatus::Forged,
+            last_activity: Instant::now(),
+        };
+        let line = ingot_line(&row, Instant::now(), 50);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("forged"), "an unnamed row still says something: {text}");
+    }
+
+    #[test]
+    fn ingot_title_drops_the_plan_label_and_breaks_on_a_word() {
+        assert_eq!(ingot_title("GOAL: Build the arena", 40), "Build the arena");
+        assert_eq!(ingot_title("task: lower case label", 40), "lower case label");
+        let t = ingot_title("Procedurally generate a modular arena with walls", 24);
+        assert!(t.chars().count() <= 24, "{t}");
+        assert!(t.ends_with('…'), "{t}");
+        assert!(!t.contains("  "), "{t}");
+        assert!(t.starts_with("Procedurally"), "{t}");
+    }
+
+    #[test]
+    fn ingot_title_survives_a_pane_with_no_room() {
+        assert_eq!(ingot_title("anything at all", 1), "…");
+        assert_eq!(ingot_title("", 20), "");
+    }
+
+    #[test]
     fn heat_and_duel_events_update_rows() {
         let mut state = DashState::default();
         apply_event(&mut state, EngineEvent::IngotStart { id: "i2".into(), work: "w".into() });
@@ -1587,17 +1723,17 @@ mod tests {
         };
 
         // Fresh: heat color, no stall suffix.
-        let fresh = ingot_line(row, base);
+        let fresh = ingot_line(row, base, 50);
         assert!(!text_of(&fresh).contains("stalled"));
 
         // 20s of silence: yellow, "(stalled 20s)".
-        let warn = ingot_line(row, base + Duration::from_secs(20));
-        assert!(text_of(&warn).contains("(stalled 20s)"));
+        let warn = ingot_line(row, base + Duration::from_secs(20), 50);
+        assert!(text_of(&warn).contains("stalled 20s"), "{}", text_of(&warn));
         assert_eq!(warn.spans[0].style.fg, Some(palette(tui::BRIGHT)));
 
         // 90s of silence: red.
-        let dead = ingot_line(row, base + Duration::from_secs(90));
-        assert!(text_of(&dead).contains("(stalled 90s)"));
+        let dead = ingot_line(row, base + Duration::from_secs(90), 50);
+        assert!(text_of(&dead).contains("stalled 90s"), "{}", text_of(&dead));
         assert_eq!(dead.spans[0].style.fg, Some(palette(tui::WARM)));
     }
 
@@ -1607,10 +1743,13 @@ mod tests {
         apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "w".into() });
         apply_event(&mut state, EngineEvent::IngotDone { id: "i1".into(), ok: true });
         let row = &state.ingots[0];
-        let line = ingot_line(row, row.last_activity + Duration::from_secs(90));
+        let line = ingot_line(row, row.last_activity + Duration::from_secs(90), 50);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(!text.contains("stalled"), "forged row must never show a stall");
-        assert!(text.contains("forged"));
+        // The row is named by its work; `forged` is carried by the glyph
+        // and its colour, so assert the signal itself rather than a word.
+        assert_eq!(line.spans[0].content.as_ref(), "✓ ");
+        assert_eq!(line.spans[0].style.fg, Some(palette(tui::PURE)));
     }
 
     #[test]
@@ -2041,7 +2180,9 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(content.contains("[i1]"));
-        assert!(content.contains("forging"));
+        // The crucible names a row by its work, not by a column of status
+        // words that repeat what the glyph already says.
+        assert!(content.contains("forge"));
         assert!(content.contains("42 tok"));
         assert!(content.contains("steer me"));
         // The pending steer persists as its own dim row, not a 1.5s flash.
