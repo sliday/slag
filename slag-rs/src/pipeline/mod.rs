@@ -51,7 +51,7 @@ pub async fn run(
     tui::show_banner();
 
     // Fire furnace if needed
-    fire_furnace(commission)?;
+    let ore = fire_furnace(commission)?;
 
     // Item 36: a long unattended run should not die mid-ingot on an empty
     // account. Warn, never block: the balance endpoint is best-effort and
@@ -71,8 +71,10 @@ pub async fn run(
         }
     }
 
-    // Phase 1: Survey
-    if !std::path::Path::new(crate::config::BLUEPRINT).exists() {
+    // Phase 1: Survey. An extended ore re-surveys: the blueprint the
+    // founder reads must describe the project the addendum asked for, not
+    // the one before it.
+    if ore == Ore::Extended || !std::path::Path::new(crate::config::BLUEPRINT).exists() {
         let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
         surveyor::run(smith.as_ref()).await?;
     }
@@ -86,6 +88,18 @@ pub async fn run(
     if needs_founder {
         let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Founder);
         founder::run(smith.as_ref()).await?;
+    } else if ore == Ore::Extended {
+        let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Founder);
+        let added = founder::extend(smith.as_ref()).await?;
+        if added == 0 {
+            // The model read the addendum and found nothing to build.
+            // Saying so beats a silent finish that looks like a no-op.
+            println!(
+                "  {}! the addendum cast no ingots — nothing in it needs building{}",
+                fg(tui::WARM),
+                reset()
+            );
+        }
     }
 
     // Phase 3: Forge
@@ -110,11 +124,45 @@ pub async fn run(
 }
 
 /// Initialize project structure (fire the furnace)
-fn fire_furnace(commission: Option<&str>) -> Result<(), SlagError> {
+/// What `fire_furnace` did with the commission it was handed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Ore {
+    /// The project already existed and no new commission came with it.
+    Unchanged,
+    /// A fresh project: PRD.md written from the commission.
+    Fired,
+    /// A live project got a second commission, appended to the ore. The
+    /// blueprint and the crucible both need to catch up.
+    Extended,
+}
+
+fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     let ore_path = std::path::Path::new(crate::config::ORE_FILE);
 
     if ore_path.exists() {
-        return Ok(());
+        // A commission for a project that already has ore used to be
+        // dropped on the floor: no error, no warning, and a run that
+        // looked like it did nothing. Append it instead, and let the
+        // survey and the founder work out what it adds.
+        let Some(commission) = commission.filter(|c| !c.trim().is_empty()) else {
+            return Ok(Ore::Unchanged);
+        };
+        let existing = std::fs::read_to_string(ore_path).unwrap_or_default();
+        if existing.contains(commission.trim()) {
+            // Re-running the same commission is not a new request; it is
+            // usually a repeated command. Say so rather than re-planning.
+            return Ok(Ore::Unchanged);
+        }
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(ore_path)?;
+        writeln!(
+            f,
+            "\n## Addendum — {}\n\n{}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M"),
+            commission.trim()
+        )?;
+        tui::status_line("+", tui::HOT, "Ore extended");
+        return Ok(Ore::Extended);
     }
 
     let commission = commission.ok_or(SlagError::NoOre)?;
@@ -183,5 +231,79 @@ fn fire_furnace(commission: Option<&str>) -> Result<(), SlagError> {
         .output();
 
     tui::status_line("█", tui::HOT, "Furnace hot");
-    Ok(())
+    Ok(Ore::Fired)
+}
+
+#[cfg(test)]
+mod ore_tests {
+    use super::*;
+
+    fn in_dir<T>(f: impl FnOnce() -> T) -> T {
+        // fire_furnace works on relative paths, so each case needs its own
+        // directory. The lock keeps concurrent tests from sharing a cwd.
+        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prior = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let out = f();
+        std::env::set_current_dir(prior).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_commission_for_a_live_project_extends_the_ore() {
+        // The bug: this returned Ok and dropped the commission, so the run
+        // surveyed nothing, founded nothing, and looked like a no-op.
+        in_dir(|| {
+            std::fs::write(crate::config::ORE_FILE, "# Commission\n\nBuild a shooter.\n").unwrap();
+            let ore = fire_furnace(Some("add a leaderboard")).unwrap();
+            assert_eq!(ore, Ore::Extended);
+            let prd = std::fs::read_to_string(crate::config::ORE_FILE).unwrap();
+            assert!(prd.contains("Build a shooter."), "the original ore survives: {prd}");
+            assert!(prd.contains("## Addendum"), "{prd}");
+            assert!(prd.contains("add a leaderboard"), "{prd}");
+        });
+    }
+
+    #[test]
+    fn no_commission_on_a_live_project_changes_nothing() {
+        in_dir(|| {
+            std::fs::write(crate::config::ORE_FILE, "# Commission\n\nBuild a shooter.\n").unwrap();
+            assert_eq!(fire_furnace(None).unwrap(), Ore::Unchanged);
+            assert_eq!(fire_furnace(Some("   ")).unwrap(), Ore::Unchanged);
+            let prd = std::fs::read_to_string(crate::config::ORE_FILE).unwrap();
+            assert!(!prd.contains("Addendum"), "an empty commission is not a request: {prd}");
+        });
+    }
+
+    #[test]
+    fn re_running_the_same_commission_is_not_a_new_request() {
+        // Pressing Up+Enter, or re-running a shell command, must not stack
+        // duplicate addenda and re-plan the same work.
+        in_dir(|| {
+            std::fs::write(crate::config::ORE_FILE, "# Commission\n\nBuild a shooter.\n").unwrap();
+            assert_eq!(fire_furnace(Some("add a leaderboard")).unwrap(), Ore::Extended);
+            assert_eq!(fire_furnace(Some("add a leaderboard")).unwrap(), Ore::Unchanged);
+            let prd = std::fs::read_to_string(crate::config::ORE_FILE).unwrap();
+            assert_eq!(prd.matches("add a leaderboard").count(), 1, "{prd}");
+        });
+    }
+
+    #[test]
+    fn a_cold_directory_still_fires_the_furnace() {
+        in_dir(|| {
+            assert_eq!(fire_furnace(Some("Build a shooter")).unwrap(), Ore::Fired);
+            let prd = std::fs::read_to_string(crate::config::ORE_FILE).unwrap();
+            assert!(prd.contains("Build a shooter"), "{prd}");
+            assert!(!prd.contains("Addendum"), "a first commission is the ore, not an addendum");
+        });
+    }
+
+    #[test]
+    fn a_cold_directory_with_no_commission_still_asks_for_one() {
+        in_dir(|| {
+            assert!(matches!(fire_furnace(None), Err(SlagError::NoOre)));
+        });
+    }
 }

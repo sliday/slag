@@ -101,6 +101,31 @@ impl Crucible {
         tokio::fs::rename(&tmp, &self.path).await
     }
 
+    /// Add newly cast ingots to an existing crucible, renumbering them
+    /// past the highest id already in use.
+    ///
+    /// A second commission on a live project must not cost the record of
+    /// the first: `Crucible::new` replaces the file wholesale, so founding
+    /// again over a finished plan would erase every forged ingot. Ingots
+    /// carry no references to each other, so renumbering is safe; ids are
+    /// unique handles, not links.
+    pub fn append(&mut self, ingots: Vec<Ingot>) -> usize {
+        let mut next = self
+            .ingots
+            .iter()
+            .filter_map(|i| i.id.trim_start_matches('i').parse::<usize>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let added = ingots.len();
+        for mut ingot in ingots {
+            ingot.id = format!("i{next}");
+            next += 1;
+            self.ingots.push(ingot);
+        }
+        added
+    }
+
     /// Find ingot by id
     pub fn get(&self, id: &str) -> Option<&Ingot> {
         self.ingots.iter().find(|i| i.id == id)
@@ -219,6 +244,40 @@ pub fn parse_ingot_lines(raw: &str) -> Vec<Ingot> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn append_keeps_every_forged_ingot_and_renumbers_the_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("PLAN.md");
+        let done = parse_ingot_lines(
+            "(ingot :id \"i1\" :status forged :solo t :grade 1 :heat 0 :max 5 :proof \"true\" :work \"first\")\n\
+             (ingot :id \"i2\" :status forged :solo t :grade 1 :heat 0 :max 5 :proof \"true\" :work \"second\")",
+        );
+        assert_eq!(done.len(), 2);
+        let mut c = Crucible::new(&path, done);
+        // The founder always numbers from i1; collisions are the whole risk.
+        let fresh = parse_ingot_lines(
+            "(ingot :id \"i1\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"true\" :work \"third\")",
+        );
+        let added = c.append(fresh);
+        assert_eq!(added, 1);
+        assert_eq!(c.ingots.len(), 3, "the forged pair survives the append");
+        let ids: Vec<&str> = c.ingots.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["i1", "i2", "i3"], "new work lands past the highest id");
+        assert_eq!(c.ingots[2].work, "third");
+        assert_eq!(c.counts().forged, 2, "appending does not disturb what is done");
+    }
+
+    #[test]
+    fn append_to_an_empty_crucible_starts_at_i1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Crucible::new(&dir.path().join("PLAN.md"), Vec::new());
+        c.append(parse_ingot_lines(
+            "(ingot :id \"i7\" :status ore :solo t :grade 1 :heat 0 :max 5 :proof \"true\" :work \"only\")",
+        ));
+        assert_eq!(c.ingots[0].id, "i1");
+    }
+
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;

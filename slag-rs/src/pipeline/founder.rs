@@ -6,6 +6,68 @@ use crate::smith::{self, Smith};
 use crate::tui;
 
 /// Phase 2: Read blueprint and produce S-expression ingots in PLAN.md
+/// Cast ingots for a second commission and merge them into the live
+/// crucible, returning how many were added.
+///
+/// Distinct from `run`, which founds a project from nothing and replaces
+/// PLAN.md. Here the plan already exists and most of it may be forged, so
+/// the model is asked for the delta only and the result is appended.
+pub async fn extend(smith: &dyn Smith) -> Result<usize, SlagError> {
+    tui::header("FOUNDER · extending mold");
+
+    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
+    let blueprint =
+        std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "No blueprint".into());
+    let addendum = latest_addendum(&ore);
+
+    let crucible_path = std::path::PathBuf::from(CRUCIBLE);
+    let mut crucible = Crucible::load(&crucible_path)?;
+    let done = crucible
+        .ingots
+        .iter()
+        .map(|i| format!("- [{}] {} ({:?})", i.id, i.work, i.status))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = with_briefing_rules(&flux::founder_addendum_prompt(&addendum, &blueprint, &done));
+    log_to_file("FOUNDER_ADDENDUM_PROMPT", &prompt);
+
+    let spinner = tui::spinner("casting...");
+    let raw = smith.invoke(&prompt).await.map_err(|e| {
+        spinner.finish_and_clear();
+        SlagError::FounderFailed(e.to_string())
+    })?;
+    spinner.finish_and_clear();
+    log_to_file("FOUNDER_ADDENDUM_RAW", &raw);
+
+    let ingots = crucible::parse_ingot_lines(&raw);
+    // No ingots is a legitimate answer here, unlike a cold found: the
+    // addendum may ask for nothing that needs building.
+    if ingots.is_empty() {
+        return Ok(0);
+    }
+    let added = crucible.append(ingots);
+    crucible.save()?;
+    tui::status_line("+", tui::HOT, &format!("{added} ingots added"));
+    Ok(added)
+}
+
+/// The text under the newest `## Addendum` heading, or the whole ore when
+/// there is none. The founder is asked about the newest request, not the
+/// entire history of them.
+fn latest_addendum(ore: &str) -> String {
+    match ore.rfind("## Addendum") {
+        Some(i) => {
+            let rest = &ore[i..];
+            match rest.find('\n') {
+                Some(nl) => rest[nl + 1..].trim().to_string(),
+                None => rest.trim().to_string(),
+            }
+        }
+        None => ore.trim().to_string(),
+    }
+}
+
 pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     tui::header("FOUNDER · casting mold");
 
@@ -114,6 +176,19 @@ fn log_to_file(label: &str, content: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn latest_addendum_reads_the_newest_request_only() {
+        let ore = "# Commission\n\nBuild a shooter.\n\n## Addendum — 2026-08-26 10:00\n\nAdd sound.\n\n## Addendum — 2026-08-27 11:00\n\nAdd a leaderboard.\n";
+        assert_eq!(latest_addendum(ore), "Add a leaderboard.");
+    }
+
+    #[test]
+    fn latest_addendum_falls_back_to_the_whole_ore() {
+        let ore = "# Commission\n\nBuild a shooter.";
+        assert_eq!(latest_addendum(ore), "# Commission\n\nBuild a shooter.");
+    }
+
     use super::*;
 
     #[test]

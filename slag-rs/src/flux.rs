@@ -268,12 +268,34 @@ pub fn surveyor_prompt(ore: &str) -> String {
 }
 
 /// Build the founder prompt
-pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
+/// The founder prompt for a second commission on a live project.
+///
+/// A plain re-found would re-plan the whole blueprint and cast ingots for
+/// work that is already forged. This one names what is built and asks for
+/// the delta only. Ids are renumbered on append, so the model is told not
+/// to worry about collisions.
+pub fn founder_addendum_prompt(addendum: &str, blueprint: &str, done: &str) -> String {
     format!(
-        "ROLE: Master Founder. Cast ingots from blueprint.\n\n\
-        COMMISSION:\n{ore}\n\n\
-        BLUEPRINT:\n{blueprint}\n\n\
-        OUTPUT: S-expressions only. One per line. No prose.\n\n\
+        "ROLE: Master Founder. A live project has a NEW REQUEST. Cast ingots \
+         for that request ONLY.\n\n\
+         NEW REQUEST:\n{addendum}\n\n\
+         BLUEPRINT (existing project):\n{blueprint}\n\n\
+         ALREADY BUILT — never re-cast these:\n{done}\n\n\
+         RULES:\n\
+         - Cast ingots for the NEW REQUEST only. Work already built is done.\n\
+         - If the new request needs nothing built, output nothing at all.\n\
+         - Number from i1; the system renumbers on merge.\n\n\
+         {}",
+        founder_format_rules()
+    )
+}
+
+/// The output contract every founder prompt shares: template, fields,
+/// casts heuristics, proof shapes, rules. One copy, because a second one
+/// drifts and only the drifted branch gets debugged.
+fn founder_format_rules() -> String {
+    format!(
+        "OUTPUT: S-expressions only. One per line. No prose.\n\n\
         TEMPLATE:\n\
         (ingot :id \"i1\" :status ore :solo t :grade 1 :skill default :heat 0 :max 5 :proof \"SHELL\" :work \"Task\")\n\n\
         FIELDS:\n\
@@ -308,6 +330,16 @@ pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
         - Match :skill to task type\n\
         - Every :proof must be executable shell\n\n\
         OUTPUT ONLY S-EXPRESSIONS:"
+    )
+}
+
+pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
+    format!(
+        "ROLE: Master Founder. Cast ingots from blueprint.\n\n\
+        COMMISSION:\n{ore}\n\n\
+        BLUEPRINT:\n{blueprint}\n\n\
+        {}",
+        founder_format_rules()
     )
 }
 
