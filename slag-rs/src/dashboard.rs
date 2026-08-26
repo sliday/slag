@@ -52,6 +52,12 @@ const STALL_DEAD: Duration = Duration::from_secs(60);
 const HINT: &str =
     "type+Enter: steer · ↑: past steers · Ctrl-O: expand results · Esc/q (empty input): quit · Ctrl-C: cancel";
 
+/// Once the engine channel closes there is no smith to steer, so the bar
+/// stops offering it. The input is not dead, though: it takes the next
+/// commission, which is the whole reason the dashboard stays up.
+const HINT_DONE: &str =
+    "type+Enter: forge a new commission · ↑: past steers · Ctrl-O: expand results · Esc/q (empty input): quit";
+
 /// `(43 lines · 1.2kB · 0.3s)` — what a collapsed tool result is hiding.
 /// Sub-second durations read in ms; a `0.0s` says nothing.
 pub(crate) fn result_counts(lines: usize, bytes: usize, ms: u64) -> String {
@@ -152,6 +158,10 @@ pub(crate) struct DashState {
     pub(crate) draft: String,
     /// Next row handle. Monotonic, never reused.
     pub(crate) next_row: u64,
+    /// The engine channel has closed: no smith is reading the steer queue
+    /// any more. Enter stops queueing steers nobody drains and starts
+    /// taking the next commission instead.
+    pub(crate) finished: bool,
     /// The ingot being forged, named in each turn header. Turn numbers
     /// restart per ingot, so a bare `turn 1` landing under `turn 5` reads
     /// as a broken counter; the id is what makes the reset legible.
@@ -636,13 +646,17 @@ fn save_session_cost(run_id: &str, record: &CostRecord) {
     let _ = save_session_cost_at(Path::new(SESSION_COSTS), run_id, record);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyOutcome {
     Stay,
     /// Leave the dashboard; the forge continues headless.
     Detach,
     /// CancelFlag set; leave the dashboard.
     Cancel,
+    /// The run is over and the operator typed a new commission. The
+    /// dashboard hands it back so the caller can forge again instead of
+    /// making a finished screen a full stop.
+    Commission(String),
 }
 
 /// Fold one key press into the state. Pure except for the steer queue
@@ -718,6 +732,16 @@ pub(crate) fn handle_key_at(
                 if text.trim() == "ctx" {
                     state.push_feed(palette(tui::COLD), ctx_breakdown(state.ctx));
                     return KeyOutcome::Stay;
+                }
+                // No smith, no steer. Before this, Enter pushed into a
+                // queue with no reader and the keystroke vanished.
+                if state.finished {
+                    steer_history::record(&text);
+                    state.history.retain(|h| h != &text);
+                    state.history.insert(0, text.clone());
+                    state.history_pos = None;
+                    state.draft.clear();
+                    return KeyOutcome::Commission(text);
                 }
                 if let Ok(mut q) = steer.lock() {
                     q.push(text.clone());
@@ -1153,7 +1177,10 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
     lines.extend(queued_lines(&state.queued));
     lines.push(Line::from(input_spans));
     lines
-        .push(Line::from(Span::styled(format!("  {HINT}"), Style::default().fg(palette(tui::COLD)))));
+        .push(Line::from(Span::styled(
+            format!("  {}", if state.finished { HINT_DONE } else { HINT }),
+            Style::default().fg(palette(tui::COLD)),
+        )));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1243,7 +1270,7 @@ pub async fn run(
     mut rx: UnboundedReceiver<EngineEvent>,
     steer: SteerQueue,
     cancel: CancelFlag,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     tui::set_quiet(true);
     register_terminal_restore();
 
@@ -1307,7 +1334,7 @@ async fn event_loop(
     keys: &mut UnboundedReceiver<Event>,
     steer: &SteerQueue,
     cancel: &CancelFlag,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     let mut interval = tokio::time::interval(FRAME);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -1344,9 +1371,10 @@ async fn event_loop(
                     }
                     None => {
                         engine_done = true;
+                        state.finished = true;
                         state.push_feed(
                             palette(tui::BRIGHT),
-                            "■ forge finished — press q/Esc to exit".into(),
+                            "■ forge finished — type a new commission, or q/Esc to exit".into(),
                         );
                         dirty = true;
                     }
@@ -1356,11 +1384,12 @@ async fn event_loop(
                 match key {
                     Some(Event::Key(k)) => match handle_key(state, k, steer, cancel) {
                         KeyOutcome::Stay => dirty = true,
-                        KeyOutcome::Detach | KeyOutcome::Cancel => return Ok(()),
+                        KeyOutcome::Detach | KeyOutcome::Cancel => return Ok(None),
+                        KeyOutcome::Commission(next) => return Ok(Some(next)),
                     },
                     Some(Event::Resize(..)) => dirty = true,
                     Some(_) => {}
-                    None => return Ok(()), // input thread died; leave cleanly
+                    None => return Ok(None), // input thread died; leave cleanly
                 }
             }
             _ = interval.tick() => {
@@ -1657,6 +1686,60 @@ mod tests {
     fn ingot_title_survives_a_pane_with_no_room() {
         assert_eq!(ingot_title("anything at all", 1), "…");
         assert_eq!(ingot_title("", 20), "");
+    }
+
+    #[test]
+    fn a_steer_after_the_forge_ends_becomes_the_next_commission() {
+        // The bug: Enter pushed into a SteerQueue with no reader once the
+        // engine channel closed, so the keystroke vanished and a finished
+        // screen was a full stop.
+        let (steer, cancel) = queue();
+        let mut state = DashState::default();
+        state.finished = true;
+        state.input = "now add multiplayer".into();
+        let out = handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
+        assert_eq!(out, KeyOutcome::Commission("now add multiplayer".to_string()));
+        assert!(
+            steer.lock().unwrap().is_empty(),
+            "a finished run must not queue a steer nobody drains"
+        );
+        assert!(state.input.is_empty(), "the input clears for the next forge");
+    }
+
+    #[test]
+    fn a_steer_during_a_live_forge_still_steers() {
+        let (steer, cancel) = queue();
+        let mut state = DashState::default();
+        state.input = "focus the tests".into();
+        let out = handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
+        assert_eq!(out, KeyOutcome::Stay, "a live run steers, it does not re-commission");
+        assert_eq!(steer.lock().unwrap().as_slice(), ["focus the tests".to_string()]);
+    }
+
+    #[test]
+    fn a_new_commission_joins_the_steer_history() {
+        let (steer, cancel) = queue();
+        let mut state = DashState::default();
+        state.finished = true;
+        state.input = "add a leaderboard".into();
+        handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
+        assert_eq!(state.history.first().map(String::as_str), Some("add a leaderboard"));
+    }
+
+    #[test]
+    fn an_empty_input_never_commissions_anything() {
+        let (steer, cancel) = queue();
+        let mut state = DashState::default();
+        state.finished = true;
+        let out = handle_key(&mut state, press(KeyCode::Enter), &steer, &cancel);
+        assert_eq!(out, KeyOutcome::Stay, "Enter on an empty box is not a commission");
+    }
+
+    #[test]
+    fn the_hint_stops_offering_a_steer_once_there_is_no_smith() {
+        assert!(HINT.contains("steer"));
+        assert!(HINT_DONE.contains("commission"), "{HINT_DONE}");
+        assert!(!HINT_DONE.contains("steer the"), "no smith left to steer: {HINT_DONE}");
     }
 
     #[test]

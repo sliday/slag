@@ -295,44 +295,70 @@ async fn run_pipeline(
         return result;
     }
 
-    let (tx, rx) = engine::events::channel();
+    // One pass per commission. A finished forge is not a full stop: the
+    // dashboard hands back whatever the operator typed at the end, and
+    // that becomes the next commission. The steer queue and cancel flag
+    // outlive a pass; the event channel does not, because closing it is
+    // how the dashboard learns a forge is over.
     let steer = engine::SteerQueue::default();
     let cancel = engine::CancelFlag::default();
-    let hooks = EngineHooks {
-        events: Some(tx),
-        steer: Some(steer.clone()),
-        cancel: Some(cancel.clone()),
+    let mut commission: Option<String> = commission.map(str::to_string);
+    let result = loop {
+        let (tx, rx) = engine::events::channel();
+        let hooks = EngineHooks {
+            events: Some(tx),
+            steer: Some(steer.clone()),
+            cancel: Some(cancel.clone()),
+        };
+        // Tee before the dashboard: the trace needs the same stream, and
+        // the dashboard must not lose an event to get it.
+        let (hooks, trace_sink) = render::trace::attach(hooks, trace.clone());
+
+        tui::set_quiet(true);
+        let dash = tokio::spawn(dashboard::run(rx, steer.clone(), cancel.clone()));
+
+        let result =
+            pipeline::run(commission.as_deref(), config, anvils, hooks.clone()).await;
+
+        // Surface pipeline-level failures (crucible parse, ForgeFailed, IO)
+        // in the dashboard feed; otherwise the run ends with no visible
+        // signal and the app looks hung.
+        if let Err(e) = &result {
+            engine::emit(
+                &hooks.events,
+                engine::EngineEvent::Error { message: format!("pipeline stopped: {e}") },
+            );
+        }
+
+        // Drop every EventTx so the dashboard drains its channel; it stays
+        // up for review until the user detaches (q/Esc) or commissions
+        // another forge, then restores the terminal and un-quiets the
+        // stream tui itself.
+        drop(hooks);
+        let next = dash.await.ok().and_then(|r| r.ok()).flatten();
+        // The tee closes with the hooks; wait for the trace's closing
+        // bracket before returning, or a fast exit truncates the file.
+        if let Some(sink) = trace_sink {
+            let _ = sink.await;
+        }
+        tui::set_quiet(false);
+
+        match next {
+            // A fresh commission re-enters the pipeline from the top:
+            // survey, found, forge. The prior run's report is printed
+            // first so the screen it replaces is not lost.
+            Some(next) => {
+                // The alternate screen took this run's ASSAY with it, and
+                // the next forge is about to reuse the screen. Print the
+                // report now or it is lost between passes.
+                if !matches!(result, Err(error::SlagError::Cancelled)) {
+                    let _ = pipeline::assay::show();
+                }
+                commission = Some(next);
+            }
+            None => break result,
+        }
     };
-    // Tee before the dashboard: the trace needs the same stream, and the
-    // dashboard must not lose an event to get it.
-    let (hooks, trace_sink) = render::trace::attach(hooks, trace);
-
-    tui::set_quiet(true);
-    let dash = tokio::spawn(dashboard::run(rx, steer, cancel));
-
-    let result = pipeline::run(commission, config, anvils, hooks.clone()).await;
-
-    // Surface pipeline-level failures (crucible parse, ForgeFailed, IO)
-    // in the dashboard feed; otherwise the run ends with no visible
-    // signal and the app looks hung.
-    if let Err(e) = &result {
-        engine::emit(
-            &hooks.events,
-            engine::EngineEvent::Error { message: format!("pipeline stopped: {e}") },
-        );
-    }
-
-    // Drop every EventTx so the dashboard drains its channel; it stays up
-    // for review until the user detaches (q/Esc), then restores the
-    // terminal and un-quiets the stream tui itself.
-    drop(hooks);
-    let _ = dash.await;
-    // The tee closes with the hooks; wait for the trace's closing bracket
-    // before returning, or a fast exit truncates the file.
-    if let Some(sink) = trace_sink {
-        let _ = sink.await;
-    }
-    tui::set_quiet(false);
 
     // The alternate screen took the in-dashboard ASSAY output with it;
     // reprint the final report on the real terminal. A cracked run needs
