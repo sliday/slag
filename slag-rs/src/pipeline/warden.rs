@@ -15,6 +15,22 @@ use crate::smith::EngineHooks;
 use crate::error::SlagError;
 use crate::tui;
 
+/// How many warden rounds this run was armed with. Ambient like
+/// `tui::quiet` because it is one run-level integer read deep in the forge:
+/// threading it through four signatures to reach a single `if` costs more
+/// clarity than it buys.
+static ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Arm the goal checks for this run. 0 leaves every warden asleep.
+pub fn set_rounds(n: usize) {
+    ROUNDS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether goal checking is armed.
+pub fn armed() -> bool {
+    ROUNDS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 /// Where the derived acceptance bar lives, once, for every warden to read.
 pub const BAR_FILE: &str = "BAR.md";
 
@@ -104,7 +120,7 @@ pub async fn bar(cfg: &EngineConfig, hooks: &EngineHooks) -> Result<String, Slag
     let blueprint = std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "No blueprint".into());
 
     tui::header("WARDEN · setting the bar");
-    let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Judge);
+    let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Warden);
     let raw = smith
         .invoke(&crate::flux::bar_prompt(&ore, &blueprint))
         .await
@@ -153,7 +169,7 @@ pub async fn judge_artifact(
     let bar = bar(cfg, hooks).await?;
 
     tui::header(&format!("WARDEN · round {round}"));
-    let smith = crate::smith::make_smith(cfg, "default", crate::config::HIGH_GRADE, hooks);
+    let smith = crate::smith::make_warden(cfg, hooks);
     let raw = smith
         .invoke(&crate::flux::warden_prompt(&ore, &bar))
         .await
@@ -161,6 +177,31 @@ pub async fn judge_artifact(
     let verdict = parse_verdict(&raw);
     record(round, &verdict);
     Ok(verdict)
+}
+
+/// Judge one ingot against its own bar.
+///
+/// The run-level warden asks whether the commission was met; this asks the
+/// same question of a sub-goal, and the answer rides the ladder the forge
+/// already has. A loss returns the gap as a plain failure string, so it
+/// feeds the next heat exactly as a failed proof does -- and when the heats
+/// run out, the ingot cracks into re-smelt, which splits it into sub-ingots
+/// that get judged the same way. Same check at every depth.
+pub async fn judge_ingot(
+    cfg: &EngineConfig,
+    hooks: &EngineHooks,
+    ingot: &crate::sexp::Ingot,
+) -> Verdict {
+    let smith = crate::smith::make_warden(cfg, hooks);
+    match smith.invoke(&crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar)).await {
+        Ok(raw) => parse_verdict(&raw),
+        // A warden that cannot run must not fail an ingot whose proof
+        // passed. Judging is an extra gate, never a new way to lose work.
+        Err(e) => {
+            let _ = e;
+            Verdict { fulfilled: true, gap: String::new(), evidence: "warden unavailable".into() }
+        }
+    }
 }
 
 /// Append the verdict to the ledger. `PROGRESS.md` is the window into a long

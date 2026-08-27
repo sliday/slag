@@ -220,13 +220,17 @@ async fn run_inner(
                 let task_hooks = hooks.clone();
                 let n_casts = effective_casts(config, &ingot);
                 let duel_cfg = (n_casts >= 2).then(|| (config.clone(), n_casts));
+                // The warden needs a config on every path, not only the
+                // duelling one, so the anvil carries its own clone.
+                let task_config = config.clone();
                 set.spawn(async move {
                     emit(
                         &task_hooks.events,
                         EngineEvent::IngotStart { id: ingot.id.clone(), work: ingot.work.clone() },
                     );
                     let duel = duel_cfg.as_ref().map(|(cfg, n)| (cfg, *n));
-                    let result = forge_ingot(&ingot, smith.as_ref(), duel, &task_hooks).await;
+                    let result =
+                        forge_ingot(&ingot, smith.as_ref(), duel, &task_hooks, &task_config).await;
                     (ingot.id.clone(), result)
                 });
             }
@@ -338,7 +342,7 @@ async fn run_inner(
         );
 
         // Sequential ingots never duel (plan section 10: file-overlap risk).
-        let struck = strike_ingot(&ingot, smith.as_ref(), hooks).await;
+        let struck = strike_ingot(&ingot, smith.as_ref(), hooks, config).await;
         if let Err(SlagError::Cancelled) = struck {
             let _guard = CRUCIBLE_LOCK.lock().await;
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
@@ -397,6 +401,7 @@ async fn forge_ingot(
     smith: &dyn Smith,
     duel_cfg: Option<(&EngineConfig, u8)>,
     hooks: &EngineHooks,
+    config: &EngineConfig,
 ) -> Result<(), SlagError> {
     if let Some((cfg, n_casts)) = duel_cfg {
         // Casts are rebuilt every round; one shared accumulator keeps the
@@ -504,9 +509,9 @@ async fn forge_ingot(
             hooks,
             cast_spend.clone(),
         );
-        return strike_ingot(&fallback, fallback_smith.as_ref(), hooks).await;
+        return strike_ingot(&fallback, fallback_smith.as_ref(), hooks, cfg).await;
     }
-    strike_ingot(ingot, smith, hooks).await
+    strike_ingot(ingot, smith, hooks, config).await
 }
 
 /// Heats left after `spent` of a `max` budget.
@@ -831,6 +836,7 @@ async fn strike_ingot(
     ingot: &Ingot,
     smith: &dyn Smith,
     hooks: &EngineHooks,
+    config: &EngineConfig,
 ) -> Result<(), SlagError> {
     let mut slag: Option<String> = None;
     let quiet = tui::is_quiet();
@@ -993,6 +999,25 @@ async fn strike_ingot(
                 }
             }
 
+            // The sub-goal gate. `proof` has only shown that something
+            // appeared; the bar asks whether this ingot's goal was met, and
+            // a loss returns like any other failure -- feeding the gap to
+            // the next heat, and cracking into re-smelt/SPLIT when the
+            // heats run out. That is the recursion: a sub-goal too big to
+            // meet becomes sub-ingots judged the same way.
+            if crate::pipeline::warden::armed() && !ingot.bar.is_empty() {
+                let verdict =
+                    crate::pipeline::warden::judge_ingot(config, hooks, ingot).await;
+                if !verdict.fulfilled {
+                    slag = Some(format!("Bar not met [{}]: {}", ingot.id, verdict.gap));
+                    if !quiet {
+                        println!("{}✗{} short of the bar", super::fg(tui::WARM), super::reset());
+                    }
+                    rewind_failed_heat(&ckpt, ingot, heat, hooks);
+                    continue;
+                }
+            }
+
             if !quiet {
                 println!("{}{}█{}", super::bold(), super::fg(tui::PURE), super::reset());
             }
@@ -1099,6 +1124,7 @@ mod tests {
             max: 5,
             smelt: 0,
             proof: "cargo test".into(),
+            bar: String::new(),
             work: "refactor the scheduler".into(),
             duel: None,
             casts: None,

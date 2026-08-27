@@ -83,6 +83,12 @@ pub struct Ingot {
     pub max: u8,
     pub smelt: u8,
     pub proof: String,
+    /// The sub-goal's acceptance bar: what "done" means for THIS ingot,
+    /// stated so a reviewer can inspect it. Distinct from `proof`, which is
+    /// the cheap mechanical gate run every heat -- `test -f` proves a file
+    /// appeared, never that the ingot's goal was met. Empty when the plan
+    /// predates the field, in which case the ingot is judged by proof alone.
+    pub bar: String,
     pub work: String,
     /// Twin-cast duel override: `:duel t` forces, `:duel nil` blocks,
     /// absent (None) defers to the configured Auto policy.

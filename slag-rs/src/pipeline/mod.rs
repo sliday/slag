@@ -54,6 +54,8 @@ pub async fn run(
 ) -> Result<(), SlagError> {
     tui::show_banner();
 
+    warden::set_rounds(temper_rounds);
+
     // Fire furnace if needed
     let ore = fire_furnace(commission)?;
 

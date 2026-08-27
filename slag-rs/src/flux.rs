@@ -308,6 +308,10 @@ fn founder_format_rules() -> String {
         - :max = attempts (5 simple, 8+ complex)\n\
         - :smelt = 0 (re-smelt count; system manages this)\n\
         - :proof = shell verification command\n\
+        - :bar = what DONE means for this ingot, stated so a reviewer can \
+        inspect it. The proof shows something appeared; the bar says whether \
+        the ingot's goal was met. Name the observable behaviour, not the file: \
+        \"running `calc \\\"2+3*4\\\"` prints 14\" beats \"calc.js exists\".\n\
         - :duel = t (force multi-cast duel) | nil (block it) | omit for auto (grade-gated)\n\
         - :casts = 1|2|3 parallel smiths forging the ingot; omit for auto\n\n\
         CASTS HEURISTICS (set :casts per ingot):\n\
@@ -328,7 +332,8 @@ fn founder_format_rules() -> String {
         - :solo nil for dependent tasks (sequential)\n\
         - Prefer grade 1-2, split complex work\n\
         - Match :skill to task type\n\
-        - Every :proof must be executable shell\n\n\
+        - Every :proof must be executable shell\n\
+        - Every :bar states an inspectable outcome, never an adjective\n\n\
         OUTPUT ONLY S-EXPRESSIONS:"
     )
 }
@@ -366,6 +371,31 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          - You are the EXPERT. Decide the bar yourself.\n\
          - NO QUESTIONS, NO PREAMBLE, NO SUMMARY.\n\
          - Output ONLY the bar markdown. Do not describe what you wrote."
+    )
+}
+
+/// The warden's brief for one ingot: did this sub-goal actually land?
+///
+/// Same shape as the run-level brief, one level down. That sameness is the
+/// point -- a goal, a bar, a judge that built nothing, and one gap back --
+/// so the check reads identically whether the node is the commission or a
+/// task inside it.
+pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
+    format!(
+        "ROLE: independent reviewer. You did NOT build this and you owe its \
+         author nothing.\n\n\
+         THE SUB-GOAL:\n{work}\n\n\
+         ITS BAR:\n{bar}\n\n\
+         Inspect what is actually on disk. Run it. A passing test and a \
+         present file are not the sub-goal; the sub-goal is what the work \
+         above describes.\n\n\
+         Judge only this sub-goal. Work outside it is not your concern, and \
+         a gap you name that belongs to another ingot wastes a heat here.\n\n\
+         Name ONE gap: the biggest that still matters for THIS sub-goal.\n\n\
+         Report EXACTLY these three lines, last, and nothing after them:\n\
+         VERDICT: pass or fail\n\
+         GAP: one sentence, empty when it passes\n\
+         EVIDENCE: what you actually inspected"
     )
 }
 
@@ -475,6 +505,7 @@ mod tests {
             max: 5,
             smelt: 0,
             proof: "true".into(),
+            bar: String::new(),
             work: "Do the thing".into(),
             duel: None,
             casts: None,

@@ -69,6 +69,22 @@ pub fn make_plan_smith(
     Box::new(native::NativeSmith::plan(cfg.clone(), workspace_root(), hooks).with_role(role))
 }
 
+/// Warden factory: a forge-mode smith, because a critic has to RUN the
+/// artifact, carrying its own ledger role so goal checks are visible spend
+/// rather than an unexplained bump in forge cost.
+pub fn make_warden(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
+    Box::new(
+        native::NativeSmith::forge(
+            cfg.clone(),
+            "default",
+            crate::config::HIGH_GRADE,
+            workspace_root(),
+            hooks,
+        )
+        .with_role(crate::engine::Role::Warden),
+    )
+}
+
 /// Base smith factory (resmelt analysis — low grade, no skill).
 /// Runs in plan mode: resmelt is an analysis-only pass whose text output is
 /// parsed as REWRITE/SPLIT/IMPOSSIBLE s-expressions, so it must not get

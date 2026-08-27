@@ -137,6 +137,10 @@ pub enum Role {
     Surveyor,
     Compact,
     Duel,
+    /// The goal critic. Its own role so the ledger says what the goal
+    /// checks cost: billed as a smith, they hide inside forge spend, and
+    /// a user cannot decide whether tempering is worth it.
+    Warden,
 }
 
 impl Role {
@@ -149,6 +153,7 @@ impl Role {
             Role::Surveyor => "surveyor",
             Role::Compact => "compact",
             Role::Duel => "duel",
+            Role::Warden => "warden",
         }
     }
 }

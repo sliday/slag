@@ -637,6 +637,7 @@ mod tests {
             max: 5,
             smelt: 0,
             proof: proof.into(),
+            bar: String::new(),
             work: "duel task".into(),
             duel,
             casts: None,

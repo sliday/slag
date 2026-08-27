@@ -17,6 +17,12 @@ pub fn write_ingot(ingot: &Ingot) -> String {
         ingot.work,
     );
 
+    // The sub-goal bar, when the plan carries one. Optional so a crucible
+    // written before the field round-trips byte-for-byte.
+    if !ingot.bar.is_empty() {
+        s.push_str(&format!(" :bar \"{}\"", ingot.bar));
+    }
+
     // Optional duel override: absent stays absent (Auto policy).
     if let Some(duel) = ingot.duel {
         s.push_str(&format!(" :duel {}", if duel { "t" } else { "nil" }));
@@ -43,6 +49,20 @@ pub fn write_ingot(ingot: &Ingot) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bar_round_trips_and_its_absence_leaves_the_line_unchanged() {
+        use crate::sexp::parser::parse_ingot;
+        let with_bar = r#"(ingot :id "i1" :status ore :solo t :grade 1 :skill default :heat 0 :max 5 :smelt 0 :proof "true" :bar "the CLI prints 14" :work "w")"#;
+        let back = write_ingot(&parse_ingot(with_bar).expect("parses"));
+        assert!(back.contains(r#":bar "the CLI prints 14""#), "{back}");
+
+        // A crucible written before the field must not grow one.
+        let without = r#"(ingot :id "i1" :status ore :solo t :grade 1 :skill default :heat 0 :max 5 :smelt 0 :proof "true" :work "w")"#;
+        let back = write_ingot(&parse_ingot(without).expect("parses"));
+        assert!(!back.contains(":bar"), "{back}");
+    }
+
     use super::*;
     use crate::sexp::{Skill, Status};
 
@@ -58,6 +78,7 @@ mod tests {
             max: 5,
             smelt: 0,
             proof: "test -f index.html".into(),
+            bar: String::new(),
             work: "Create HTML structure".into(),
             duel: None,
             casts: None,
@@ -85,6 +106,7 @@ mod tests {
             max: 8,
             smelt: 1,
             proof: "npm test".into(),
+            bar: String::new(),
             work: "Deploy app".into(),
             duel: None,
             casts: None,
@@ -108,6 +130,7 @@ mod tests {
             max: 5,
             smelt: 0,
             proof: "true".into(),
+            bar: String::new(),
             work: "design the API".into(),
             duel: None,
             casts: None,
@@ -131,6 +154,7 @@ mod tests {
             max: 5,
             smelt: 0,
             proof: "true".into(),
+            bar: String::new(),
             work: "test".into(),
             duel: None,
             casts: None,
