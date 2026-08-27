@@ -148,14 +148,16 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
     if let Some(slag_msg) = slag {
         flux.push_str(&format!(
             "!!! CRACKED - PREVIOUS ATTEMPT FAILED !!!\n{slag_msg}\n!!! ANALYZE AND FIX !!!\n\n\
-            End with exactly: CMD: <shell command to verify>\n"
+            Finish with the verification command in the finish tool's `cmd` field.\n"
         ));
     } else {
         flux.push_str("=== INSTRUCTIONS ===\n");
         flux.push_str("1. Forge this ingot completely\n");
         flux.push_str("2. Create/modify all necessary files\n");
         flux.push_str("3. Add useful patterns to AGENTS.md\n");
-        flux.push_str("4. End with exactly: CMD: <shell command to verify>\n\n");
+        flux.push_str(
+            "4. Finish with the verification command in the finish tool's `cmd` field\n\n",
+        );
 
         if ingot.is_complex() {
             flux.push_str("◉ COMPLEX - think through edge cases\n");
@@ -621,7 +623,7 @@ mod tests {
     #[test]
     fn first_heat_flux_states_cmd_contract() {
         let flux = prepare_flux(&sample_ingot(), None);
-        assert!(flux.contains("CMD: <shell command to verify>"));
+        assert!(flux.contains("`cmd` field"), "the ingot flux names the field, not a prose line");
     }
 
     /// Item 59: every instruction file that enters the prompt says where it
@@ -752,7 +754,7 @@ mod tests {
         let flux = prepare_flux(&sample_ingot(), Some("CMD failed (exit 1): boom"));
         assert!(flux.contains("CRACKED"));
         assert!(
-            flux.contains("CMD: <shell command to verify>"),
+            flux.contains("`cmd` field"),
             "retry flux must keep the CMD contract"
         );
     }

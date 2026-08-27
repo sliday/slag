@@ -188,11 +188,12 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
 
     s.push_str(
         "## Finishing\n\n\
-         When the work is verified, call the finish tool with a short summary of what \
-         changed and how it was verified. If the task specifies an output contract \
-         (for example a `CMD: <shell command>` line), that contract line must be the \
-         LAST line of your finish summary, alone on its own line, starting at column \
-         zero — never inline inside a sentence. Do not keep working after finish.",
+         When the work is verified, call the finish tool. Put the human summary in \
+         `summary` and the verification command in `cmd` — its own field, not a line \
+         inside the prose. The `cmd` is the single shell command that exits 0 when \
+         your work is correct; the strike is graded by running it, so a finish \
+         without one fails even if the work is right. Do not keep working after \
+         finish.",
     );
 
     s

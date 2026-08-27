@@ -485,7 +485,8 @@ impl ToolBox {
                 json!({
                     "type": "object",
                     "properties": {
-                        "summary": {"type": "string", "description": "Summary of the completed work"}
+                        "summary": {"type": "string", "description": "Summary of the completed work. Prose for a human. Do not put the verification command in here."},
+                        "cmd": {"type": "string", "description": "The verification command the task's output contract asks for (what used to be the CMD: line). A single shell command that exits 0 when the work is correct. Put it HERE, as this field — not inside the summary."}
                     },
                     "required": ["summary"]
                 }),
@@ -534,7 +535,23 @@ impl ToolBox {
             "grep" => self.grep(&args).await,
             "glob" => self.glob(&args).await,
             "recipe_view" => self.recipe_view(&args).await,
-            "finish" => Ok(req_str(&args, "finish", "summary")?.to_string()),
+            // The verification command gets its own field rather than
+            // riding inside the summary prose. Asking one free-text channel
+            // to carry both a human summary and an exact machine-parsed
+            // line at column zero is a capture error waiting to happen: the
+            // strong habit (write a good summary) swallows the weak
+            // instruction (append this exact line), and the strike fails
+            // with "no CMD" having done the work correctly. A schema field
+            // cannot be swallowed by prose. The canonical line is
+            // synthesised here so everything downstream is unchanged, and a
+            // model that still writes CMD: into the summary keeps working.
+            "finish" => {
+                let summary = req_str(&args, "finish", "summary")?.to_string();
+                match args.get("cmd").and_then(Value::as_str).map(str::trim) {
+                    Some(cmd) if !cmd.is_empty() => Ok(format!("{summary}\nCMD: {cmd}")),
+                    _ => Ok(summary),
+                }
+            }
             other if super::mcp::handles(other) => super::mcp::call(other, &args).await,
             other => Err(SlagError::Tool(format!("unknown tool: {other}"))),
         }
@@ -2522,6 +2539,52 @@ fn progress_verb(line: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn finish_carries_the_verification_command_in_its_own_field() {
+        // The strike gate greps the response for a CMD: line. Asking the
+        // model to bury that line in prose is what produced "no CMD" on
+        // heats that had done the work.
+        let dir = tempfile::tempdir().unwrap();
+        let tb = ToolBox::new(dir.path());
+        let out = tb
+            .dispatch(&call(
+                "finish",
+                json!({"summary": "Built the calculator.", "cmd": "node calc.js '2+2'"}),
+            ))
+            .await;
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(
+            crate::proof::extract_cmd(&out.output).as_deref(),
+            Some("node calc.js '2+2'"),
+            "the gate reads the field: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_without_a_command_is_still_valid() {
+        // Not every task carries an output contract.
+        let dir = tempfile::tempdir().unwrap();
+        let tb = ToolBox::new(dir.path());
+        let out = tb.dispatch(&call("finish", json!({"summary": "Nothing to verify."}))).await;
+        assert!(!out.is_error);
+        assert_eq!(out.output, "Nothing to verify.");
+        assert!(crate::proof::extract_cmd(&out.output).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_command_written_into_the_summary_still_works() {
+        // The old contract, kept: a model that ignores the field is not
+        // punished for it.
+        let dir = tempfile::tempdir().unwrap();
+        let tb = ToolBox::new(dir.path());
+        let out = tb
+            .dispatch(&call("finish", json!({"summary": "Done.\nCMD: npm test"})))
+            .await;
+        assert_eq!(crate::proof::extract_cmd(&out.output).as_deref(), Some("npm test"));
+    }
+
     use super::*;
 
     fn call(name: &str, args: Value) -> ToolCall {
