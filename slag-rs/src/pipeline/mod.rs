@@ -91,6 +91,18 @@ pub async fn run(
         surveyor::run(smith.as_ref()).await?;
     }
 
+    // A blueprint that cannot deliver the commission is a whole forge
+    // wasted, and this is the cheapest moment to notice. Judged whether or
+    // not the surveyor just ran: a thin blueprint left by an earlier run is
+    // exactly the case worth catching, and gating the check on "we just
+    // wrote this" made it unreachable in the common case. One corrective
+    // pass, not a loop -- a surveyor that cannot cover the gap when told
+    // exactly what it is will not cover it on an identical third try.
+    if let Some(gap) = checkpoint(config, &hooks, "BLUEPRINT", crate::config::BLUEPRINT).await {
+        let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
+        surveyor::run_with_guidance(smith.as_ref(), Some(&gap)).await?;
+    }
+
     // Phase 2: Found
     let crucible_path = std::path::Path::new(crate::config::CRUCIBLE);
     let needs_founder = !crucible_path.exists() || {
@@ -100,6 +112,12 @@ pub async fn run(
     if needs_founder {
         let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Founder);
         founder::run(smith.as_ref()).await?;
+        // Same question one level down: forged, do these ingots add up to
+        // the commission? A missing capability costs nothing to fix here
+        // and a full forge to fix later.
+        if let Some(gap) = checkpoint(config, &hooks, "PLAN", crate::config::CRUCIBLE).await {
+            founder::run_with_guidance(smith.as_ref(), Some(&gap)).await?;
+        }
     } else if ore == Ore::Extended {
         let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Founder);
         let added = founder::extend(smith.as_ref()).await?;
@@ -240,6 +258,32 @@ pub async fn run(
 }
 
 /// Initialize project structure (fire the furnace)
+/// Run a pre-forge goal check, returning the gap when the document does
+/// not cover the bar. `None` means it passed, the check is disarmed, or the
+/// warden could not run -- all three mean "carry on", because a check that
+/// exists to save a wasted forge must never cause one.
+async fn checkpoint(
+    config: &EngineConfig,
+    hooks: &EngineHooks,
+    kind: &str,
+    path: &str,
+) -> Option<String> {
+    if !warden::armed() {
+        return None;
+    }
+    let verdict = warden::judge_plan_doc(config, hooks, kind, path).await.ok()?;
+    if verdict.fulfilled {
+        return None;
+    }
+    crate::engine::emit(
+        &hooks.events,
+        crate::engine::EngineEvent::Warning {
+            message: format!("warden rejected the {kind}: {}", verdict.gap),
+        },
+    );
+    Some(verdict.gap)
+}
+
 /// What `fire_furnace` did with the commission it was handed.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Ore {

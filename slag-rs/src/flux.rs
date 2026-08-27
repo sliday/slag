@@ -248,6 +248,25 @@ pub fn prepare_resmelt_flux(ingot: &Ingot, failure_logs: &str) -> String {
 }
 
 /// Build the surveyor prompt
+/// Does this look like a document the model was asked to write, or like a
+/// sentence about having written one?
+///
+/// A tool-using smith ends its turn on a finish summary, so `invoke` can
+/// return "Completed survey and produced thorough Blueprint…" where a
+/// blueprint was expected. Written to disk unchecked, that replaces a real
+/// document with a sentence -- and the phases downstream read it as the
+/// plan. Cheap to detect: a document has structure and length; a summary
+/// has neither.
+pub fn looks_like_a_document(raw: &str) -> bool {
+    let body: Vec<&str> = raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if body.len() < 4 {
+        return false;
+    }
+    body.iter().any(|l| {
+        l.starts_with('#') || l.starts_with("- ") || l.starts_with("* ") || l.starts_with("1.")
+    })
+}
+
 pub fn surveyor_prompt(ore: &str) -> String {
     format!(
         "ROLE: Master Surveyor. Analyze this commission as domain expert.\n\n\
@@ -374,6 +393,35 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
     )
 }
 
+/// Judge a plan document against the goal, before anything is forged.
+///
+/// The cheapest check in the pipeline and the only one that saves money
+/// rather than spending it: a blueprint that cannot deliver the commission,
+/// or a plan whose ingots do not add up to it, is a whole forge wasted.
+/// `kind` names what is being judged; `doc` is the document itself.
+pub fn plan_warden_prompt(kind: &str, ore: &str, bar: &str, doc: &str) -> String {
+    format!(
+        "ROLE: independent reviewer. You did NOT write this and you owe its \
+         author nothing.\n\n\
+         THE GOAL:\n{ore}\n\n\
+         THE BAR the finished work must clear:\n{bar}\n\n\
+         THE {kind} under review:\n{doc}\n\n\
+         Question: if this {kind} were carried out exactly as written, would \
+         the result clear the bar?\n\n\
+         Judge coverage, not style. Look for what the bar demands and this \
+         {kind} never mentions -- a missing capability is the failure that \
+         matters here, and it is far cheaper to find now than after a forge.\n\n\
+         Do not ask for more detail for its own sake. A terse {kind} that \
+         covers the bar passes.\n\n\
+         Name ONE gap: the biggest thing the bar needs and this {kind} \
+         does not deliver.\n\n\
+         Report EXACTLY these three lines, last, and nothing after them:\n\
+         VERDICT: pass or fail\n\
+         GAP: one sentence, empty when it passes\n\
+         EVIDENCE: the bar item that goes uncovered"
+    )
+}
+
 /// The warden's brief for one ingot: did this sub-goal actually land?
 ///
 /// Same shape as the run-level brief, one level down. That sameness is the
@@ -491,6 +539,24 @@ fn git_diff_stat() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_finish_summary_is_not_a_document() {
+        // What the surveyor actually returned, and wrote over a blueprint.
+        assert!(!looks_like_a_document(
+            "Completed survey and produced thorough Blueprint for Node CLI calculator covering architecture, components, risks, forging sequence, and acceptance criteria."
+        ));
+        assert!(!looks_like_a_document(""));
+        assert!(!looks_like_a_document("# Blueprint\n\nIt is done."));
+    }
+
+    #[test]
+    fn a_real_document_passes() {
+        assert!(looks_like_a_document(
+            "# Blueprint\n\n## 1. OVERVIEW\nA calculator.\n\n## 2. COMPONENTS\n- calc.js\n- parser\n"
+        ));
+    }
+
     use super::*;
     use crate::sexp::{Skill, Status};
 

@@ -69,6 +69,14 @@ fn latest_addendum(ore: &str) -> String {
 }
 
 pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
+    run_with_guidance(smith, None).await
+}
+
+/// Cast again, told what the last plan failed to cover.
+pub async fn run_with_guidance(
+    smith: &dyn Smith,
+    guidance: Option<&str>,
+) -> Result<(), SlagError> {
     tui::header("FOUNDER · casting mold");
 
     let ore = std::fs::read_to_string(ORE_FILE)
@@ -76,7 +84,13 @@ pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     let blueprint = std::fs::read_to_string(BLUEPRINT)
         .unwrap_or_else(|_| "No blueprint".into());
 
-    let prompt = with_briefing_rules(&flux::founder_prompt(&ore, &blueprint));
+    let mut prompt = with_briefing_rules(&flux::founder_prompt(&ore, &blueprint));
+    if let Some(gap) = guidance {
+        prompt.push_str(&format!(
+            "\n\nA reviewer rejected the previous plan for this reason. The new \
+             ingots must cover it:\n{gap}"
+        ));
+    }
     log_to_file("FOUNDER_PROMPT", &prompt);
 
     let spinner = tui::spinner("casting...");

@@ -179,6 +179,43 @@ pub async fn judge_artifact(
     Ok(verdict)
 }
 
+/// Judge a plan document -- the blueprint, or the crucible -- against the
+/// bar before the forge runs.
+///
+/// Plan-mode on purpose: there is no artifact to execute yet, so this is a
+/// reading job, and a reading job should not pay for a forge-mode session.
+pub async fn judge_plan_doc(
+    cfg: &EngineConfig,
+    hooks: &EngineHooks,
+    kind: &str,
+    doc_path: &str,
+) -> Result<Verdict, SlagError> {
+    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
+    let doc = std::fs::read_to_string(doc_path).unwrap_or_default();
+    if doc.trim().is_empty() {
+        return Ok(Verdict {
+            fulfilled: true,
+            gap: String::new(),
+            evidence: format!("{doc_path} is empty; nothing to judge"),
+        });
+    }
+    let bar = bar(cfg, hooks).await?;
+
+    tui::header(&format!("WARDEN · {kind}"));
+    let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Warden);
+    match smith.invoke(&crate::flux::plan_warden_prompt(kind, &ore, &bar, &doc)).await {
+        Ok(raw) => Ok(parse_verdict(&raw)),
+        // A pre-forge check that cannot run must not stop the forge. It
+        // exists to save a wasted run, never to become a new way to lose
+        // one.
+        Err(_) => Ok(Verdict {
+            fulfilled: true,
+            gap: String::new(),
+            evidence: "warden unavailable".into(),
+        }),
+    }
+}
+
 /// Judge one ingot against its own bar.
 ///
 /// The run-level warden asks whether the commission was met; this asks the
