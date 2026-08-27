@@ -102,10 +102,13 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
         PromptMode::Plan => {
             s.push_str("## Mode: survey (read-only)\n\n");
             s.push_str(
-                "This is a survey pass. Read and search the workspace, then produce a plan: \
-                 ordered steps, files to touch, risks, and how the proof will be satisfied. \
-                 Do NOT edit files. Do NOT run mutating commands. Output the plan as your \
-                 final text, then call the finish tool with a one-line summary.\n\n",
+                "This is a survey pass. Read and search the workspace, then produce the \
+                 document you were asked for. Do NOT edit files. Do NOT run mutating \
+                 commands.\n\n\
+                 You have no finish tool here. End your turn by writing the document \
+                 itself as your message — that text IS the deliverable, and a turn that \
+                 ends without it produces nothing. Do not describe what you would write; \
+                 write it.\n\n",
             );
         }
         PromptMode::Forge => {

@@ -272,6 +272,8 @@ pub struct ForgeAgent {
     /// at the same (ingot, heat) must never hijack a new heat's
     /// conversation.
     resume: bool,
+    /// Withhold the `finish` tool, forcing the turn to end with text.
+    no_finish: bool,
     /// Ledger attribution for every call this session makes. `Smith` by
     /// default; the plan-model factory flips it so plan spend separates
     /// from base spend even when both route to the same model id.
@@ -295,8 +297,23 @@ impl ForgeAgent {
             cancel: None,
             transcript_root: std::path::PathBuf::from("."),
             resume: false,
+            no_finish: false,
             role: Role::Smith,
         }
+    }
+
+    /// Withhold the `finish` tool.
+    ///
+    /// A pass whose output IS a document must end its turn with that
+    /// document as text, because the loop returns the text verbatim when no
+    /// tool was called. Offered a `finish` tool, models take it -- reading,
+    /// then finishing, never writing the document at all -- and the caller
+    /// receives a sentence about a blueprint where the blueprint should be.
+    /// Removing the tool makes that outcome impossible rather than merely
+    /// discouraged by a prompt line the model is free to ignore.
+    pub fn without_finish(mut self) -> Self {
+        self.no_finish = true;
+        self
     }
 
     /// Attribute this session's spend to a different ledger row.
@@ -890,7 +907,11 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             model: self.model.clone(),
             messages,
             tools: if with_tools {
-                ToolBox::all_specs()
+                let mut specs = ToolBox::all_specs();
+                if self.no_finish {
+                    specs.retain(|t| t.name != "finish");
+                }
+                specs
             } else {
                 Vec::new()
             },
@@ -1200,6 +1221,27 @@ fn mtok_rate_from(v: Option<&str>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_plan_pass_is_offered_no_finish_tool() {
+        // The document-eating bug in one assertion: offered a finish tool,
+        // a survey pass reads, finishes, and never writes the document, so
+        // the caller gets a sentence about a blueprint. Withholding the
+        // tool makes that impossible rather than discouraged.
+        let dir = tempfile::tempdir().unwrap();
+        let mk = || agent(MockProvider::new(vec![]), dir.path());
+        let names = |a: &ForgeAgent| -> Vec<String> {
+            a.request(Vec::new(), true, None).tools.iter().map(|t| t.name.clone()).collect()
+        };
+        assert!(names(&mk()).iter().any(|n| n == "finish"), "a forge pass keeps finish");
+        let planner = mk().without_finish();
+        assert!(!names(&planner).iter().any(|n| n == "finish"), "a plan pass has none");
+        assert!(
+            names(&planner).iter().any(|n| n == "read_file"),
+            "withholding finish must not disarm the rest of the toolbox"
+        );
+    }
+
     use super::*;
     use crate::engine::NormalizedResponse;
     use std::collections::VecDeque;

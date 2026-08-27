@@ -187,6 +187,13 @@ impl NativeSmith {
             .with_ingot_spend(self.ingot_spend.clone())
             .with_role(self.role)
             .with_events(tx);
+        // A survey pass delivers a document, and the loop returns the
+        // model's text verbatim only when no tool was called. Left with a
+        // `finish` tool the model reads, finishes, and never writes the
+        // document -- so the tool is withheld rather than argued with.
+        if self.mode == PromptMode::Plan {
+            agent = agent.without_finish();
+        }
         if let Some(steer) = &self.hooks.steer {
             agent = agent.with_steer(steer.clone());
         }
