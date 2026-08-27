@@ -128,6 +128,9 @@ pub async fn run(
     // already existed.
     let mut forged;
     let mut round = 0usize;
+    // The warden's last word, carried past the assay. A run that prints
+    // FORGED over an unmet goal launders the doubt it was asked to remove.
+    let mut goal_gap: Option<String> = None;
     loop {
         tui::header("FORGE");
         let crucible = Crucible::load(crucible_path)?;
@@ -163,6 +166,7 @@ pub async fn run(
             }
         };
         if verdict.fulfilled {
+            goal_gap = None;
             crate::engine::emit(
                 &hooks.events,
                 crate::engine::EngineEvent::Narrate {
@@ -171,6 +175,7 @@ pub async fn run(
             );
             break;
         }
+        goal_gap = Some(verdict.gap.clone());
         crate::engine::emit(
             &hooks.events,
             crate::engine::EngineEvent::Warning {
@@ -215,6 +220,19 @@ pub async fn run(
     // returning early left them with one line of "forge failed".
     if !matches!(forged, Err(SlagError::Cancelled)) {
         let _ = assay::show();
+    }
+    // The tasks can all pass while the commission goes unmet -- that gap is
+    // the whole reason the warden exists, so it decides the run's verdict
+    // and its exit code. A forge error still wins: a cracked ingot is the
+    // more specific failure.
+    if let (Some(gap), Ok(())) = (goal_gap, &forged) {
+        tui::header("GOAL NOT MET");
+        if !tui::is_quiet() {
+            println!("  {}{gap}{}\n", fg(tui::WARM), reset());
+            println!("  the tasks passed; the commission did not.");
+            println!("  raise --temper to forge the gap, or read {}.\n", crate::config::LEDGER);
+        }
+        return Err(SlagError::GoalNotMet(gap));
     }
     forged
 }

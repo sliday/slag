@@ -109,9 +109,33 @@ pub async fn bar(cfg: &EngineConfig, hooks: &EngineHooks) -> Result<String, Slag
         .invoke(&crate::flux::bar_prompt(&ore, &blueprint))
         .await
         .map_err(|e| SlagError::SurveyFailed(e.to_string()))?;
+    // A model that explores with tools ends its turn on a finish summary
+    // rather than the document, and "acceptance bar established" is exactly
+    // the adjective this whole mechanism exists to avoid. Judging against
+    // it would look like a goal check while being none, so an unusable bar
+    // is refused rather than quietly used.
+    if !is_usable(&raw) {
+        return Err(SlagError::SurveyFailed(
+            "the bar came back as a summary, not a checklist — nothing inspectable to judge against"
+                .to_string(),
+        ));
+    }
     let _ = std::fs::write(path, &raw);
     tui::status_line("=", tui::COLD, "Bar set");
     Ok(raw)
+}
+
+/// A bar is usable when a reviewer could actually work from it: more than a
+/// sentence, and carrying at least one line that names a condition.
+fn is_usable(bar: &str) -> bool {
+    let lines = bar.lines().filter(|l| !l.trim().is_empty()).count();
+    let has_items = bar
+        .lines()
+        .any(|l| {
+            let t = l.trim_start();
+            t.starts_with("- [") || t.starts_with("- ") || t.starts_with("* ")
+        });
+    lines >= 3 && has_items
 }
 
 /// Judge the built artifact against the bar.
@@ -159,6 +183,22 @@ fn record(round: usize, v: &Verdict) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_line_bar_is_refused() {
+        // What a tool-using model actually returned: its finish summary.
+        // Judged against, it would pass anything.
+        assert!(!is_usable("Acceptance bar established for the calculator with pass/fail checklist."));
+        assert!(!is_usable(""));
+        assert!(!is_usable("## THE BAR\nIt should be good."));
+    }
+
+    #[test]
+    fn a_checklist_bar_is_usable() {
+        assert!(is_usable(
+            "## THE BAR\nMatches a POSIX calculator.\n\n## CHECKLIST\n- [ ] `calc '2+3'` prints 5\n- [ ] divide by zero exits non-zero"
+        ));
+    }
 
     #[test]
     fn a_hedged_verdict_is_not_a_pass() {

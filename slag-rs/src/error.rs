@@ -93,6 +93,13 @@ pub enum SlagError {
     #[error("no ingots produced by founder")]
     NoIngots,
 
+    /// The forge finished and the warden judged the commission unmet. The
+    /// tasks passed; the goal did not. Reported as a failure on purpose:
+    /// a run that prints FORGED over an unmet goal is worse than one that
+    /// never checked, because it launders the doubt.
+    #[error("goal not met: {0}")]
+    GoalNotMet(String),
+
     #[error("crucible parse error: {0}")]
     CrucibleParse(String),
 

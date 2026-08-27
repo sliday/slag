@@ -345,17 +345,27 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
         "ROLE: set the acceptance bar for this commission.\n\n\
          COMMISSION:\n{ore}\n\n\
          BLUEPRINT:\n{blueprint}\n\n\
-         Write the bar a harsh reviewer will hold the finished work to. It must \
-         be something an agent can OPEN AND INSPECT, never an adjective.\n\n\
-         GOOD BARS: a named comparison the reviewer can look at; a measurement \
-         with a number and a method; a checklist where every line is pass/fail.\n\
-         BAD BARS: \"production ready\", \"high quality\", \"works well\".\n\n\
-         Prefer bars with a mechanical part — a number or a checklist line \
-         survives an argument; an impression does not.\n\n\
+         Write the bar a harsh reviewer will hold the finished work to. Every \
+         line must be something an agent can OPEN AND INSPECT, never an \
+         adjective. \"Production ready\" gives a reviewer nothing to lose \
+         against, so it calls the work done at \"pretty good for AI\".\n\n\
+         Prefer lines with a mechanical part -- a number, a command and its \
+         expected output, a named file that must exist and what must be in it. \
+         A measurement survives an argument; an impression does not.\n\n\
          The bar does not have to be reachable. Its job is to stop a reviewer \
          calling the work done too early.\n\n\
-         OUTPUT: markdown. One sentence naming the bar, then the checklist. No \
-         preamble."
+         Produce EXACTLY this document:\n\n\
+         ## THE BAR\nOne sentence naming what the finished work is measured \
+         against.\n\n\
+         ## CHECKLIST\n\
+         A markdown checklist. Every line starts `- [ ] ` and states one \
+         inspectable condition, with the command or file that settles it.\n\n\
+         ## HOW TO INSPECT\n\
+         The commands a reviewer runs to check the list, in order.\n\n\
+         RULES:\n\
+         - You are the EXPERT. Decide the bar yourself.\n\
+         - NO QUESTIONS, NO PREAMBLE, NO SUMMARY.\n\
+         - Output ONLY the bar markdown. Do not describe what you wrote."
     )
 }
 
