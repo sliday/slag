@@ -85,6 +85,38 @@ pub fn make_warden(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith> {
     )
 }
 
+/// Invoke a smith that is supposed to return a *document*, retrying once
+/// when it returns a sentence about one instead.
+///
+/// A smith that reaches for a tool ends its turn on a finish summary, so
+/// `invoke` hands back "Completed survey and produced thorough Blueprint…"
+/// where the blueprint was expected. Every caller that writes the result to
+/// a file, or parses it, hits this: the surveyor overwrote BLUEPRINT.md
+/// with one line, the founder died on NoIngots, and the bar silently
+/// disabled goal checking for a whole run. It is non-deterministic --
+/// whether the model explores decides it -- so it survives testing and
+/// appears in production.
+///
+/// `accept` decides what counts as the document. The retry says so plainly
+/// rather than re-sending an identical prompt and hoping.
+pub async fn invoke_document(
+    smith: &dyn Smith,
+    prompt: &str,
+    reminder: &str,
+    accept: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let raw = smith.invoke(prompt).await.map_err(|e| e.to_string())?;
+    if accept(&raw) {
+        return Ok(raw);
+    }
+    let retry = format!("{prompt}\n\n{reminder}");
+    let second = smith.invoke(&retry).await.map_err(|e| e.to_string())?;
+    if accept(&second) {
+        return Ok(second);
+    }
+    Err("the smith answered with a summary instead of the document, twice".to_string())
+}
+
 /// Base smith factory (resmelt analysis — low grade, no skill).
 /// Runs in plan mode: resmelt is an analysis-only pass whose text output is
 /// parsed as REWRITE/SPLIT/IMPOSSIBLE s-expressions, so it must not get

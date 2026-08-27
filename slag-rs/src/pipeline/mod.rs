@@ -151,6 +151,10 @@ pub async fn run(
     // The warden's last word, carried past the assay. A run that prints
     // FORGED over an unmet goal launders the doubt it was asked to remove.
     let mut goal_gap: Option<String> = None;
+    // Whether any warden ever returned a verdict. Armed-but-unjudged is a
+    // third outcome, distinct from met and unmet, and the one most likely
+    // to be misread as success.
+    let mut goal_judged = false;
     loop {
         tui::header("FORGE");
         let crucible = Crucible::load(crucible_path)?;
@@ -185,6 +189,7 @@ pub async fn run(
                 break;
             }
         };
+        goal_judged = true;
         if verdict.fulfilled {
             goal_gap = None;
             crate::engine::emit(
@@ -245,6 +250,26 @@ pub async fn run(
     // the whole reason the warden exists, so it decides the run's verdict
     // and its exit code. A forge error still wins: a cracked ingot is the
     // more specific failure.
+    // Asked to check the goal and unable to: say so. Reporting FORGED for
+    // a run whose every check silently failed is worse than never checking,
+    // because it converts an unknown into a claim.
+    if temper_rounds > 0 && !goal_judged && forged.is_ok() {
+        crate::engine::emit(
+            &hooks.events,
+            crate::engine::EngineEvent::Warning {
+                message: "goal UNVERIFIED: tempering was requested but no verdict was reached"
+                    .to_string(),
+            },
+        );
+        if !tui::is_quiet() {
+            println!(
+                "\n  {}! goal unverified — tempering ran but reached no verdict{}",
+                fg(tui::WARM),
+                reset()
+            );
+            println!("    the tasks passed; whether the commission did is unknown.\n");
+        }
+    }
     if let (Some(gap), Ok(())) = (goal_gap, &forged) {
         tui::header("GOAL NOT MET");
         if !tui::is_quiet() {
@@ -271,7 +296,21 @@ async fn checkpoint(
     if !warden::armed() {
         return None;
     }
-    let verdict = warden::judge_plan_doc(config, hooks, kind, path).await.ok()?;
+    let verdict = match warden::judge_plan_doc(config, hooks, kind, path).await {
+        Ok(v) => v,
+        // Never silent. A checkpoint that cannot run used to disappear,
+        // and a run with every check disabled still printed FORGED --
+        // which is the laundering this whole mechanism exists to stop.
+        Err(e) => {
+            crate::engine::emit(
+                &hooks.events,
+                crate::engine::EngineEvent::Warning {
+                    message: format!("the {kind} could not be judged: {e}"),
+                },
+            );
+            return None;
+        }
+    };
     if verdict.fulfilled {
         return None;
     }

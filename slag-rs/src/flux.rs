@@ -282,7 +282,9 @@ pub fn surveyor_prompt(ore: &str) -> String {
         RULES:\n\
         - You are the EXPERT. Make ALL decisions yourself.\n\
         - NO QUESTIONS. If uncertain, choose the best option.\n\
-        - NO PREAMBLE. Output ONLY the blueprint markdown."
+        - NO PREAMBLE.\n\n\
+        {}",
+        DOCUMENT_OUTPUT_RULE
     )
 }
 
@@ -353,7 +355,9 @@ fn founder_format_rules() -> String {
         - Match :skill to task type\n\
         - Every :proof must be executable shell\n\
         - Every :bar states an inspectable outcome, never an adjective\n\n\
-        OUTPUT ONLY S-EXPRESSIONS:"
+        OUTPUT ONLY S-EXPRESSIONS. The lines themselves are your answer; if \n\
+        you end the turn with the finish tool, the ingot lines must BE the \n\
+        finish summary, and the \u{2264}120-word limit does not apply."
     )
 }
 
@@ -388,8 +392,9 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          The commands a reviewer runs to check the list, in order.\n\n\
          RULES:\n\
          - You are the EXPERT. Decide the bar yourself.\n\
-         - NO QUESTIONS, NO PREAMBLE, NO SUMMARY.\n\
-         - Output ONLY the bar markdown. Do not describe what you wrote."
+         - NO QUESTIONS, NO PREAMBLE.\n\n\
+         {}",
+        DOCUMENT_OUTPUT_RULE
     )
 }
 
@@ -472,6 +477,40 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          EVIDENCE: what you actually inspected — a path, a number, an observation"
     )
 }
+
+/// The output rule every document-producing prompt carries.
+///
+/// The stable band tells every smith "finish summary ≤120 words" (item 14),
+/// which is right for a forge and wrong here: a smith that explores with
+/// tools ends its turn on `finish`, and that instruction then caps the very
+/// document we asked for. The result was a one-line blueprint, a one-line
+/// bar, and a founder that cast no ingots -- all non-deterministic, since
+/// only a smith that reached for a tool hits it. Rather than fight the
+/// harness, tell it the cap does not apply to this call.
+pub const DOCUMENT_OUTPUT_RULE: &str = "\
+    OUTPUT RULE: the document itself is your answer. If you end this turn \
+    with the finish tool, the ENTIRE document must be the finish summary. \
+    The \"finish summary \u{2264}120 words\" limit in your standing rules does NOT \
+    apply to this task -- a summary of the document is worthless here, and a \
+    description of what you wrote will be discarded.";
+
+/// Said again, plainly, when a smith answered with a sentence about the
+/// document instead of the document.
+pub const DOCUMENT_ONLY_REMINDER: &str = "\
+    Your previous reply described the document instead of writing it, and a \
+    description is discarded. Do not explore further -- you already have what \
+    you need. Reply with the DOCUMENT ITSELF, in full. If you end the turn \
+    with the finish tool, the whole document must be the finish summary; the \
+    \u{2264}120-word limit does not apply here.";
+
+/// Said again, plainly, when a founder answered with a sentence about
+/// ingots instead of ingots. Tool use is what causes it: the turn ends on
+/// a finish summary, and a summary parses to nothing.
+pub const SEXP_ONLY_REMINDER: &str = "\
+    Your previous reply described the ingots instead of casting them, and a \
+    description parses to nothing. Reply with the s-expression lines \
+    THEMSELVES as your message text, starting with `(ingot `. Do not call \
+    tools. Do not summarise. Do not explain. Lines only.";
 
 pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
     format!(

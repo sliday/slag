@@ -40,7 +40,17 @@ pub async fn extend(smith: &dyn Smith) -> Result<usize, SlagError> {
     spinner.finish_and_clear();
     log_to_file("FOUNDER_ADDENDUM_RAW", &raw);
 
-    let ingots = crucible::parse_ingot_lines(&raw);
+    let mut ingots = crucible::parse_ingot_lines(&raw);
+    if ingots.is_empty() {
+        // Same summary-instead-of-ingots trap as the cold found. Here an
+        // empty answer is legitimate, so this only rules out the case
+        // where the model had ingots to give and described them instead.
+        let retry = format!("{prompt}\n\n{}", flux::SEXP_ONLY_REMINDER);
+        if let Ok(raw) = smith.invoke(&retry).await {
+            log_to_file("FOUNDER_ADDENDUM_RAW_RETRY", &raw);
+            ingots = crucible::parse_ingot_lines(&raw);
+        }
+    }
     // No ingots is a legitimate answer here, unlike a cold found: the
     // addendum may ask for nothing that needs building.
     if ingots.is_empty() {
@@ -105,7 +115,18 @@ pub async fn run_with_guidance(
     // Self-iterate if questions
     let raw = smith::self_iterate(smith, raw, MAX_ITERATE).await?;
 
-    let ingots = crucible::parse_ingot_lines(&raw);
+    // A smith that reached for a tool ends its turn on a finish summary,
+    // so `raw` can be "Cast 1 ingot for calc.js…" where the ingots
+    // themselves were expected. Nothing parses, and the run dies on
+    // NoIngots -- at random, depending on whether the model happened to
+    // explore. Ask once more, plainly, before giving up on the run.
+    let mut ingots = crucible::parse_ingot_lines(&raw);
+    if ingots.is_empty() {
+        let retry = format!("{prompt}\n\n{}", flux::SEXP_ONLY_REMINDER);
+        let raw = smith.invoke(&retry).await.map_err(|e| SlagError::FounderFailed(e.to_string()))?;
+        log_to_file("FOUNDER_RAW_RETRY", &raw);
+        ingots = crucible::parse_ingot_lines(&raw);
+    }
     if ingots.is_empty() {
         return Err(SlagError::NoIngots);
     }

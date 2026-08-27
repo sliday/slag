@@ -121,21 +121,19 @@ pub async fn bar(cfg: &EngineConfig, hooks: &EngineHooks) -> Result<String, Slag
 
     tui::header("WARDEN · setting the bar");
     let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Warden);
-    let raw = smith
-        .invoke(&crate::flux::bar_prompt(&ore, &blueprint))
-        .await
-        .map_err(|e| SlagError::SurveyFailed(e.to_string()))?;
     // A model that explores with tools ends its turn on a finish summary
     // rather than the document, and "acceptance bar established" is exactly
-    // the adjective this whole mechanism exists to avoid. Judging against
-    // it would look like a goal check while being none, so an unusable bar
-    // is refused rather than quietly used.
-    if !is_usable(&raw) {
-        return Err(SlagError::SurveyFailed(
-            "the bar came back as a summary, not a checklist — nothing inspectable to judge against"
-                .to_string(),
-        ));
-    }
+    // the adjective this whole mechanism exists to avoid. Ask again plainly
+    // before giving up: refusing outright disabled every goal check for a
+    // whole run and let it report success unjudged.
+    let raw = crate::smith::invoke_document(
+        smith.as_ref(),
+        &crate::flux::bar_prompt(&ore, &blueprint),
+        crate::flux::DOCUMENT_ONLY_REMINDER,
+        is_usable,
+    )
+    .await
+    .map_err(SlagError::SurveyFailed)?;
     let _ = std::fs::write(path, &raw);
     tui::status_line("=", tui::COLD, "Bar set");
     Ok(raw)

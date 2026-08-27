@@ -31,9 +31,21 @@ pub async fn run_with_guidance(
     log_to_file("SURVEY_PROMPT", &prompt);
 
     let spinner = tui::spinner("surveying...");
-    let raw = smith.invoke(&prompt).await.map_err(|e| {
+    // A smith that reached for a tool ends on a finish summary, so this can
+    // come back as "Completed survey and created the blueprint" where the
+    // blueprint was expected. Ask once more, plainly, before failing: the
+    // guard below stops that sentence reaching disk, but on a cold project
+    // there is no blueprint to fall back on and the run dies instead.
+    let raw = crate::smith::invoke_document(
+        smith,
+        &prompt,
+        flux::DOCUMENT_ONLY_REMINDER,
+        flux::looks_like_a_document,
+    )
+    .await
+    .map_err(|e| {
         spinner.finish_and_clear();
-        SlagError::SurveyFailed(e.to_string())
+        SlagError::SurveyFailed(e)
     })?;
     spinner.finish_and_clear();
 
