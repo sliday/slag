@@ -49,27 +49,16 @@ const STALL_WARN: Duration = Duration::from_secs(15);
 /// … and red after this long.
 const STALL_DEAD: Duration = Duration::from_secs(60);
 
-const HINT: &str =
-    "type+Enter: steer · ↑: past steers · Ctrl-O: expand results · Esc/q (empty input): quit · Ctrl-C: cancel";
+const HINT: &str = "⏎ steer · ↑ history · ^O expand · q detach · ^C ^C cancel";
 
 /// Once the engine channel closes there is no smith to steer, so the bar
 /// stops offering it. The input is not dead, though: it takes the next
 /// commission, which is the whole reason the dashboard stays up.
-const HINT_DONE: &str =
-    "type+Enter: forge a new commission · ↑: past steers · Ctrl-O: expand results · Esc/q (empty input): quit";
+const HINT_DONE: &str = "⏎ new commission · ↑ history · ^O expand · q quit";
 
-/// `(43 lines · 1.2kB · 0.3s)` — what a collapsed tool result is hiding.
-/// Sub-second durations read in ms; a `0.0s` says nothing.
-pub(crate) fn result_counts(lines: usize, bytes: usize, ms: u64) -> String {
-    let size = if bytes < 1024 {
-        format!("{bytes}B")
-    } else {
-        format!("{:.1}kB", bytes as f64 / 1024.0)
-    };
-    let took = if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", ms as f64 / 1000.0) };
-    let unit = if lines == 1 { "line" } else { "lines" };
-    format!("({lines} {unit} · {size} · {took})")
-}
+/// What the empty input says it is for.
+const PLACEHOLDER: &str = "steer the smith";
+const PLACEHOLDER_DONE: &str = "describe the next commission";
 
 /// tui.rs palette (crossterm) → ratatui, same values. Runs through the
 /// same truecolor downgrade so the dashboard and the stream view never
@@ -87,6 +76,8 @@ fn palette(c: crossterm::style::Color) -> Color {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IngotStatus {
+    /// In the plan, not on an anvil yet.
+    Queued,
     Forging,
     Forged,
     Cracked,
@@ -116,6 +107,9 @@ pub(crate) struct FeedLine {
     /// Full tool output, shown only while Ctrl-O has the feed expanded.
     /// `None` for everything that is already its whole self on one line.
     pub(crate) detail: Option<String>,
+    /// Whether the row may wrap. A summary or a verdict is read in full; a
+    /// tool row is a list entry, clipped to one line so the list scans.
+    pub(crate) wrap: bool,
 }
 
 #[derive(Debug, Default)]
@@ -169,6 +163,16 @@ pub(crate) struct DashState {
     /// The row holding the current turn header, so the route folds into it
     /// rather than spending a line of its own.
     pub(crate) turn_row: Option<u64>,
+    /// The tape's clock during a replay; `None` reads the wall clock. Every
+    /// elapsed figure on screen (turn timer, stall tint) goes through
+    /// `now`, so a replayed frame is the same frame every time.
+    pub(crate) clock: Option<Instant>,
+    /// The commission, one line, for the header bar.
+    pub(crate) commission: Option<String>,
+    /// When this view started, for the run clock in the header.
+    pub(crate) started: Option<Instant>,
+    /// The warden's last word on the goal: met, not met, or not judged.
+    pub(crate) goal: Option<bool>,
     /// The route last announced. An unchanged route is not news, so it is
     /// printed once and then only when it moves.
     pub(crate) route: Option<String>,
@@ -179,6 +183,10 @@ pub(crate) struct DashState {
 }
 
 impl DashState {
+    pub(crate) fn now(&self) -> Instant {
+        self.clock.unwrap_or_else(Instant::now)
+    }
+
     /// Fill the crucible from PLAN.md's ingots, with the status each one
     /// already carries. Events still drive every later change; this only
     /// decides what the pane shows before the first one arrives.
@@ -190,7 +198,31 @@ impl DashState {
                 // Molten means a previous run died mid-ingot. It is not
                 // forging now -- nothing is -- so it reads as pending
                 // until an event says otherwise.
-                crate::sexp::Status::Ore | crate::sexp::Status::Molten => IngotStatus::Forging,
+                crate::sexp::Status::Ore | crate::sexp::Status::Molten => IngotStatus::Queued,
+            };
+            let row = self.row_mut(&ingot.id);
+            row.work = preview(&ingot.work, 60);
+            row.heat = ingot.heat;
+            row.status = status;
+        }
+    }
+
+    /// Take in a newer PLAN.md mid-run: rows for ingots the view has not
+    /// seen yet (a freshly cast mold, an addendum, a re-smelt's split), and
+    /// work text for rows that only had an id. A row an event already
+    /// drives keeps its status: events are fresher than a file.
+    pub(crate) fn absorb_plan(&mut self, plan: &str) {
+        for ingot in crate::crucible::parse_ingot_lines(plan) {
+            if let Some(row) = self.ingots.iter_mut().find(|r| r.id == ingot.id) {
+                if row.work.is_empty() {
+                    row.work = preview(&ingot.work, 60);
+                }
+                continue;
+            }
+            let status = match ingot.status {
+                crate::sexp::Status::Forged => IngotStatus::Forged,
+                crate::sexp::Status::Cracked => IngotStatus::Cracked,
+                crate::sexp::Status::Ore | crate::sexp::Status::Molten => IngotStatus::Queued,
             };
             let row = self.row_mut(&ingot.id);
             row.work = preview(&ingot.work, 60);
@@ -203,12 +235,13 @@ impl DashState {
         if let Some(i) = self.ingots.iter().position(|r| r.id == id) {
             return &mut self.ingots[i];
         }
+        let now = self.now();
         self.ingots.push(IngotRow {
             id: id.to_string(),
             work: String::new(),
             heat: 0,
             status: IngotStatus::Forging,
-            last_activity: Instant::now(),
+            last_activity: now,
         });
         self.ingots.last_mut().unwrap()
     }
@@ -216,7 +249,7 @@ impl DashState {
     /// Refresh the activity clock on every row still forging. Token and
     /// tool events carry no ingot id, so liveness is per-forge, not per-row.
     fn mark_activity(&mut self) {
-        let now = Instant::now();
+        let now = self.now();
         for row in &mut self.ingots {
             if row.status == IngotStatus::Forging {
                 row.last_activity = now;
@@ -231,7 +264,8 @@ impl DashState {
     fn push_feed_detail(&mut self, color: Color, text: String, detail: Option<String>) -> u64 {
         let id = self.next_row;
         self.next_row += 1;
-        self.feed.push_back(FeedLine { id, color, text, detail });
+        let wrap = !text.starts_with(['→', '✓', '▣']) && !is_tool_failure(&text);
+        self.feed.push_back(FeedLine { id, color, text, detail, wrap });
         while self.feed.len() > FEED_CAP {
             self.feed.pop_front();
         }
@@ -253,24 +287,71 @@ impl DashState {
     }
 }
 
+/// The one ingot on an anvil, when there is exactly one: the only case in
+/// which a turn or a token can be pinned to an ingot with certainty. The
+/// last ingot *started* is not it: in a parallel batch it outlives its
+/// siblings' turns and would take credit for them.
+fn sole_forging(state: &DashState) -> Option<&str> {
+    let mut forging = state
+        .ingots
+        .iter()
+        .filter(|r| matches!(r.status, IngotStatus::Forging | IngotStatus::Duel(_)));
+    let first = forging.next()?;
+    forging.next().is_none().then_some(first.id.as_str())
+}
+
+fn forging_count(state: &DashState) -> usize {
+    state
+        .ingots
+        .iter()
+        .filter(|r| matches!(r.status, IngotStatus::Forging | IngotStatus::Duel(_)))
+        .count()
+}
+
+/// Cut a row to `max` characters without touching its spacing: the verb
+/// column is padded, and `preview` would collapse the padding.
+fn clip_cells(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// A failed tool row (`✗ verb  subject — error`) as opposed to a failed
+/// ingot or an error message: it carries the verb column.
+fn is_tool_failure(text: &str) -> bool {
+    text.starts_with("✗ ") && text.contains(" — ") && !text.contains(" cracked")
+}
+
 /// Fold one engine event into the dashboard state. Pure state mutation —
 /// no terminal involved, so tests drive it directly.
 pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
     match &event {
+        // Spend lives in the header and the turn's status line; a row per
+        // model call would push the work itself off the pane.
         EngineEvent::Tokens { usage } => {
             state.totals.add(usage);
             state.turn_tokens += usage.total_tokens;
             state.mark_activity();
+            return;
         }
         EngineEvent::TurnStart { turn } => {
             state.turn = *turn;
-            state.turn_started = Some(Instant::now());
+            state.turn_started = Some(state.now());
             state.turn_tokens = 0;
-            let head = match &state.ingot {
-                Some(ingot) => format!("⚒ [{ingot}] turn {turn}"),
+            // With several anvils hot, turns from different smiths
+            // interleave and no event says whose turn this is; a header
+            // naming one ingot would be a guess, and a bare number noise.
+            if forging_count(state) > 1 {
+                state.turn_row = None;
+                return;
+            }
+            let head = match sole_forging(state) {
+                Some(ingot) => format!("⚒ {ingot} · turn {turn}"),
                 None => format!("⚒ turn {turn}"),
             };
-            let id = state.push_feed_detail(palette(tui::HOT), head, None);
+            let id = state.push_feed_detail(palette(tui::COLD), head, None);
             state.turn_row = Some(id);
             return;
         }
@@ -290,9 +371,10 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
         // A call opens a row; its result completes that same row.
         EngineEvent::ToolCallStart { name, preview: p } => {
             state.mark_activity();
+            let (verb, arg) = crate::engine::events::tool_label(name, p);
             let id = state.push_feed_detail(
                 palette(tui::BRIGHT),
-                format!("→ {name}  {}", preview(p, 80)),
+                format!("→ {verb:<6}  {}", preview(arg.as_deref().unwrap_or(""), 120)),
                 None,
             );
             state.pending_tools.entry(name.clone()).or_default().push_back(id);
@@ -308,6 +390,13 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             // Pair oldest-first: the engine dispatches a segment of calls
             // then collects them in the same order.
             let pending = state.pending_tools.get_mut(name).and_then(|q| q.pop_front());
+            // `finish` adds nothing a row could say: its summary follows.
+            if name == "finish" && *ok {
+                if let Some(id) = pending {
+                    state.feed.retain(|r| r.id != id);
+                }
+                return;
+            }
             let completed = match pending {
                 // The call row carries the argument, which the result
                 // event does not; keep it and swap the verdict in.
@@ -315,7 +404,7 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
                     let (ok, lines, bytes, ms) = (*ok, *lines, *bytes, *ms);
                     let p = p.clone();
                     state.amend(id, |row| {
-                        let arg = row.text.split_once("  ").map(|(_, a)| a.to_string());
+                        let arg = row.text.split_once("  ").map(|(_, a)| a.trim().to_string());
                         row.color = color;
                         row.text = complete_row(name, arg.as_deref(), ok, &p, lines, bytes, ms);
                         row.detail = detail.clone();
@@ -330,6 +419,11 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             }
             return;
         }
+        EngineEvent::Warning { message: text } | EngineEvent::Narrate { text }
+            if crate::render::echo::warden_word(text).is_some() =>
+        {
+            state.goal = crate::render::echo::warden_word(text).map(|w| w.starts_with("goal met"));
+        }
         EngineEvent::ContextGauge { pct, used_tokens, budget_tokens } => {
             state.ctx = Some((*pct, *used_tokens, *budget_tokens));
         }
@@ -343,11 +437,13 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
         }
         EngineEvent::IngotStart { id, work } => {
             state.ingot = Some(id.clone());
+            state.route = None;
+            let now = state.now();
             let row = state.row_mut(id);
             row.work = preview(work, 60);
             row.heat = 0;
             row.status = IngotStatus::Forging;
-            row.last_activity = Instant::now();
+            row.last_activity = now;
         }
         EngineEvent::HeatTick { id, heat } => state.row_mut(id).heat = *heat,
         EngineEvent::IngotDone { id, ok } => {
@@ -378,35 +474,46 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
 }
 
 /// The completed form of a tool row: the call's argument kept, the verdict
-/// and counts swapped in. A failure shows its error inline -- that is the
-/// one result worth reading without expanding.
+/// swapped in. A success is quiet and says only what it is hiding; a
+/// failure shows its error inline, the one result worth reading unexpanded.
 fn complete_row(
     name: &str,
     arg: Option<&str>,
     ok: bool,
     err: &str,
     lines: usize,
-    bytes: usize,
+    _bytes: usize,
     ms: u64,
 ) -> String {
+    let (verb, _) = crate::engine::events::tool_label(name, "");
     let arg = match arg {
         Some(a) if !a.is_empty() => format!("  {a}"),
         _ => String::new(),
     };
     if ok {
-        format!("✓ {name}{arg} {}", result_counts(lines, bytes, ms))
+        let mut meta = Vec::new();
+        if lines > 1 {
+            meta.push(format!("{lines} lines"));
+        }
+        if ms >= 1000 {
+            meta.push(format!("{:.1}s", ms as f64 / 1000.0));
+        }
+        let meta = if meta.is_empty() { String::new() } else { format!("  · {}", meta.join(" · ")) };
+        format!("✓ {verb:<6}{arg}{meta}")
     } else {
-        format!("✗ {name}{arg} ({ms}ms): {}", preview(err, 80))
+        let gist = crate::engine::events::tool_error(name, err);
+        format!("✗ {verb:<6}{arg} — {}", preview(&gist, 100))
     }
 }
 
-/// One narrator-style feed line per event (mirrors `StderrNarrator`).
+/// One narrator-style feed line per event, in the stream view's words.
+/// An empty text is a deliberate silence.
 fn feed_entry(event: &EngineEvent) -> (Color, String) {
     match event {
         // The gauge already lives in the bottom bar; a feed line per turn
         // would say the same thing twice and push real events off screen.
         EngineEvent::ContextGauge { .. } => (palette(tui::COLD), String::new()),
-        EngineEvent::TurnStart { turn } => (palette(tui::HOT), format!("⚒ turn {turn}")),
+        EngineEvent::TurnStart { turn } => (palette(tui::COLD), format!("⚒ turn {turn}")),
         // The model and the route it resolved to fold into the turn
         // header (see `apply_event`). Printed as their own rows they
         // repeated verbatim every turn and cost a quarter of the feed.
@@ -414,53 +521,51 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
             (palette(tui::COLD), String::new())
         }
         EngineEvent::ToolCallStart { name, preview: p } => {
-            (palette(tui::BRIGHT), format!("→ {name}: {}", preview(p, 80)))
+            let (verb, arg) = crate::engine::events::tool_label(name, p);
+            (palette(tui::BRIGHT), format!("→ {verb:<6}  {}", preview(arg.as_deref().unwrap_or(""), 120)))
         }
-        EngineEvent::ToolResult { name, ok: true, lines, bytes, ms, .. } => {
-            (palette(tui::PURE), format!("✓ {name} {}", result_counts(*lines, *bytes, *ms)))
+        EngineEvent::ToolResult { name, ok, preview: p, lines, bytes, ms } => {
+            let color = if *ok { palette(tui::COLD) } else { palette(tui::WARM) };
+            (color, complete_row(name, None, *ok, p, *lines, *bytes, *ms))
         }
-        EngineEvent::ToolResult { name, ok: false, preview: p, lines, bytes, ms } => {
-            // A failure is the one result worth reading inline: the
-            // preview is the error, not the payload it is hiding.
-            let _ = (lines, bytes);
-            (palette(tui::WARM), format!("✗ {name} ({}ms): {}", ms, preview(p, 80)))
-        }
-        EngineEvent::Tokens { usage } => {
-            let msg = match usage.cost {
-                // `format_cost` marks a locally-estimated number `(est)`.
-                Some(_) => format!(
-                    "◦ {} tok ({})",
-                    usage.total_tokens,
-                    crate::engine::pricing::format_cost(usage)
-                ),
-                None => format!("◦ {} tok", usage.total_tokens),
-            };
-            (palette(tui::COLD), msg)
-        }
+        EngineEvent::Tokens { .. } => (palette(tui::COLD), String::new()),
         EngineEvent::Steer { text } => {
-            (palette(tui::BRIGHT), format!("↪ steer: {}", preview(text, 80)))
+            (palette(tui::BRIGHT), format!("↪ steer  {}", preview(text, 200)))
         }
-        EngineEvent::Finish { summary } => (palette(tui::PURE), format!("■ {}", preview(summary, 400))),
-        EngineEvent::Error { message } => (palette(tui::WARM), format!("✗ {}", preview(message, 120))),
-        EngineEvent::Narrate { text } => (palette(tui::COLD), format!("◈ {}", preview(text, 110))),
-        EngineEvent::Warning { message } => {
-            (palette(tui::BRIGHT), format!("⚠ {}", preview(message, 110)))
+        EngineEvent::Finish { summary } => match crate::engine::events::verdict_gist(summary) {
+            Some((true, text)) => (palette(tui::PURE), format!("⚖ judged pass — {text}")),
+            Some((false, text)) => (palette(tui::WARM), format!("⚖ judged fail — {text}")),
+            None => (
+                palette(tui::PURE),
+                format!("■ {}", crate::engine::events::finish_gist(summary).unwrap_or_else(|| preview(summary, 400))),
+            ),
+        },
+        EngineEvent::Error { message } => (palette(tui::WARM), format!("✗ {}", preview(message, 200))),
+        EngineEvent::Narrate { text } => match crate::render::echo::warden_word(text) {
+            Some(word) => warden_row(text, word),
+            None => (palette(tui::COLD), format!("◈ {}", preview(text, 200))),
+        },
+        EngineEvent::Warning { message } => warning_row(message),
+        EngineEvent::IngotStart { id, work } => (
+            palette(tui::HOT),
+            format!("▣ {id} · {}", preview(&crate::render::echo::title(work), 120)),
+        ),
+        // The first heat is the ingot's start; only a re-heat is news.
+        EngineEvent::HeatTick { id, heat } if *heat >= 2 => {
+            (palette(tui::BRIGHT), format!("↻ {id} heat {heat}"))
         }
-        EngineEvent::IngotStart { id, work } => {
-            (palette(tui::HOT), format!("🧱 [{id}] {}", preview(work, 60)))
-        }
-        EngineEvent::HeatTick { id, heat } => (palette(tui::WARM), format!("🔥 [{id}] heat {heat}")),
-        EngineEvent::IngotDone { id, ok: true } => (palette(tui::PURE), format!("✅ [{id}] forged")),
-        EngineEvent::IngotDone { id, ok: false } => (palette(tui::WARM), format!("❌ [{id}] cracked")),
+        EngineEvent::HeatTick { .. } => (palette(tui::COLD), String::new()),
+        EngineEvent::IngotDone { id, ok: true } => (palette(tui::PURE), format!("✓ {id} forged")),
+        EngineEvent::IngotDone { id, ok: false } => (palette(tui::WARM), format!("✗ {id} cracked")),
         EngineEvent::DuelRound { id, round } => {
-            (palette(tui::BRIGHT), format!("⚔ [{id}] duel round {round}"))
+            (palette(tui::BRIGHT), format!("⚔ {id} duel round {round}"))
         }
         EngineEvent::DuelVerdict { id, winner, margin } => {
-            (palette(tui::PURE), format!("⚖ [{id}] cast {winner} wins by {margin}"))
+            (palette(tui::PURE), format!("⚖ {id} cast {winner} wins by {margin}"))
         }
         EngineEvent::ApiRetry { attempt, status, remaining_secs } => (
             palette(tui::BRIGHT),
-            format!("⟳ api {status} — retry {attempt} in {remaining_secs}s"),
+            format!("⟳ api {status} · retry {attempt} · {remaining_secs}s left"),
         ),
         EngineEvent::HookStarted { name, hook_event, status_message } => (
             palette(tui::COLD),
@@ -479,20 +584,59 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
     }
 }
 
-/// The bottom bar's live spinner status: `⚒ Forging… (12s · 4.1k tok ·
-/// 38 tok/s · esc to interrupt)`. `Some` only while a turn is running and
-/// at least one ingot is still forging — otherwise the bar shows plain
-/// totals.
+/// The warden's word on the goal, as one feed row.
+fn warden_row(message: &str, word: &str) -> (Color, String) {
+    let round = message
+        .strip_prefix("warden round ")
+        .and_then(|r| r.split(':').next())
+        .unwrap_or("?");
+    if word.starts_with("goal met") {
+        (palette(tui::PURE), format!("✓ warden · round {round} · {word}"))
+    } else {
+        (palette(tui::WARM), format!("✗ warden · round {round} · goal not met — {word}"))
+    }
+}
+
+/// A warning, read for what it is (see `engine::events::warning_lines`).
+fn warning_row(message: &str) -> (Color, String) {
+    if let Some(word) = crate::render::echo::warden_word(message) {
+        return warden_row(message, word);
+    }
+    if crate::render::tape::rewound(message).is_some() {
+        // Housekeeping after every failed heat; the ↻ row already said it.
+        return (palette(tui::COLD), String::new());
+    }
+    if let Some(rest) = message.strip_prefix("warden rejected the ") {
+        let (doc, gap) = rest.split_once(": ").unwrap_or((rest, ""));
+        return (
+            palette(tui::BRIGHT),
+            format!("! warden sent back the {} — {}", doc.to_lowercase(), preview(gap, 200)),
+        );
+    }
+    (palette(tui::BRIGHT), format!("! {}", preview(message, 200)))
+}
+
+/// The bottom bar's live status while a turn runs:
+/// `⚒ Forging… i2 · 12s · 4.1k tok · 342 tok/s`. `Some` only while a turn
+/// is running and at least one ingot is still forging; otherwise the bar
+/// says where the run stands instead.
 pub(crate) fn forge_status(state: &DashState, now: Instant) -> Option<String> {
     let started = state.turn_started?;
     if !state.ingots.iter().any(|r| r.status == IngotStatus::Forging) {
         return None;
     }
-    Some(crate::progress::spinner_status(
-        tui::forge_verb(state.turn),
-        now.saturating_duration_since(started),
-        state.turn_tokens,
-    ))
+    let elapsed = now.saturating_duration_since(started);
+    let mut s = format!("⚒ {}…", tui::forge_verb(state.turn));
+    match (forging_count(state), sole_forging(state)) {
+        (_, Some(ingot)) => s.push_str(&format!(" {ingot} ·")),
+        (n, None) if n > 1 => s.push_str(&format!(" {n} anvils ·")),
+        _ => {}
+    }
+    s.push_str(&format!(" {}s · {} tok", elapsed.as_secs(), tui::tokens(state.turn_tokens)));
+    if let Some(rate) = crate::progress::token_rate(state.turn_tokens, elapsed) {
+        s.push_str(&format!(" · {rate} tok/s"));
+    }
+    Some(s)
 }
 
 /// True when any forging row has crossed the stall threshold.
@@ -522,6 +666,7 @@ pub(crate) fn dash_counts(state: &DashState) -> (CrucibleCounts, Option<String>)
     let mut active = None;
     for row in &state.ingots {
         match row.status {
+            IngotStatus::Queued => counts.ore += 1,
             IngotStatus::Forged => counts.forged += 1,
             IngotStatus::Cracked => counts.cracked += 1,
             IngotStatus::Forging | IngotStatus::Duel(_) | IngotStatus::Verdict { .. } => {
@@ -831,14 +976,99 @@ pub(crate) fn handle_key_at(
 // ---------------------------------------------------------------- rendering
 
 pub(crate) fn draw(f: &mut Frame, state: &DashState) {
-    let [main, bottom] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(bottom_height(state))])
-            .areas(f.area());
+    let [top, main, bottom] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(bottom_height(state)),
+    ])
+    .areas(f.area());
+    draw_header(f, top, state);
+    // The crucible gets the room its titles need and no more; below 60
+    // columns it gives way entirely, since a feed squeezed beside it is
+    // worth less than a feed alone.
+    let w = main.width;
+    let crucible = if w < 60 { 0 } else { (w * 38 / 100).clamp(28, 56) };
     let [left, right] =
-        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(main);
-    draw_crucible(f, left, state);
+        Layout::horizontal([Constraint::Length(crucible), Constraint::Min(10)]).areas(main);
+    if crucible > 0 {
+        draw_crucible(f, left, state);
+    }
     draw_feed(f, right, state);
     draw_bottom(f, bottom, state);
+}
+
+/// One row on top: the wordmark, the commission, and where the run stands.
+/// `░▒▓█ SLAG  wc-lite CLI with tests …        forging i2 · 3:12 · 41k tok · $0.06`
+fn draw_header(f: &mut Frame, area: Rect, state: &DashState) {
+    let width = area.width as usize;
+    let mut spans = vec![Span::raw(" ")];
+    for (glyph, c) in [("░", tui::COLD), ("▒", tui::WARM), ("▓", tui::HOT), ("█", tui::BRIGHT)] {
+        spans.push(Span::styled(glyph, Style::default().fg(palette(c))));
+    }
+    spans.push(Span::styled(
+        " SLAG ",
+        Style::default().fg(palette(tui::PURE)).add_modifier(ratatui::style::Modifier::BOLD),
+    ));
+    let now = state.now();
+    let mut right: Vec<String> = vec![run_phase(state)];
+    if let Some(start) = state.started {
+        right.push(tui::clock(now.saturating_duration_since(start)));
+    }
+    if state.totals.total_tokens > 0 {
+        right.push(format!("{} tok", tui::tokens(state.totals.total_tokens)));
+    }
+    if let Some(c) = state.totals.cost {
+        right.push(tui::money(c));
+    }
+    let right = format!("{} ", right.join(" · "));
+    let used = 11 + right.chars().count();
+    if let Some(c) = &state.commission {
+        let room = width.saturating_sub(used + 2);
+        if room >= 12 {
+            spans.push(Span::styled(
+                format!(" {}", preview(c, room)),
+                Style::default().fg(palette(tui::COLD)),
+            ));
+        }
+    }
+    let left_w: usize = spans.iter().map(|s| s.width()).sum();
+    let pad = width.saturating_sub(left_w + right.chars().count());
+    spans.push(Span::raw(" ".repeat(pad)));
+    let failed = state.ingots.iter().any(|r| r.status == IngotStatus::Cracked) || state.goal == Some(false);
+    let phase_color = match (state.finished, failed) {
+        (true, true) => palette(tui::WARM),
+        (true, false) => palette(tui::PURE),
+        _ => palette(tui::HOT),
+    };
+    spans.push(Span::styled(right, Style::default().fg(phase_color)));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// `forging i1 i2`, `planning`, `finished`: the run in two words.
+fn run_phase(state: &DashState) -> String {
+    if state.finished {
+        let cracked = state.ingots.iter().filter(|r| r.status == IngotStatus::Cracked).count();
+        return match (cracked, state.goal) {
+            (n, _) if n > 0 => format!("finished · {n} cracked"),
+            (_, Some(false)) => "finished · goal not met".into(),
+            (_, Some(true)) => "finished · goal met".into(),
+            _ => "finished".into(),
+        };
+    }
+    let forging: Vec<&str> = state
+        .ingots
+        .iter()
+        .filter(|r| matches!(r.status, IngotStatus::Forging | IngotStatus::Duel(_)))
+        .map(|r| r.id.as_str())
+        .collect();
+    if !forging.is_empty() {
+        let shown: Vec<&str> = forging.iter().take(3).copied().collect();
+        return format!("forging {}", shown.join(" "));
+    }
+    if state.turn_started.is_some() || state.turn > 0 {
+        return "planning".into();
+    }
+    "waiting".into()
 }
 
 /// The crucible's name for an ingot: what it *is*, not what it is doing.
@@ -850,13 +1080,8 @@ pub(crate) fn draw(f: &mut Frame, state: &DashState) {
 /// comes off. Truncation lands on a word boundary: a title cut mid-word
 /// reads as corruption rather than as an abbreviation.
 fn ingot_title(work: &str, width: usize) -> String {
-    let mut t = work.trim();
-    for label in ["GOAL:", "TASK:", "INGOT:", "WORK:"] {
-        if t.len() >= label.len() && t[..label.len()].eq_ignore_ascii_case(label) {
-            t = t[label.len()..].trim_start();
-            break;
-        }
-    }
+    let named = crate::render::echo::title(work);
+    let t = named.trim();
     if t.chars().count() <= width {
         return t.to_string();
     }
@@ -874,8 +1099,12 @@ fn ingot_title(work: &str, width: usize) -> String {
     format!("{}…", head[..cut].trim_end())
 }
 
+/// One crucible row: `⚒ i2  counting core with no I/O       2/5`. The
+/// glyph carries the status; the right column carries the heat once there
+/// has been a retry, or whatever else is news (a stall, a duel).
 fn ingot_line(row: &IngotRow, now: Instant, width: usize) -> Line<'_> {
     let (glyph, mut word, mut color) = match &row.status {
+        IngotStatus::Queued => ("·", "queued".to_string(), palette(tui::COLD)),
         IngotStatus::Forging => {
             ("⚒", "forging".to_string(), palette(tui::heat_color(row.heat)))
         }
@@ -907,17 +1136,24 @@ fn ingot_line(row: &IngotRow, now: Instant, width: usize) -> Line<'_> {
     let note = match &row.status {
         _ if stalled => Some(word),
         IngotStatus::Duel(_) | IngotStatus::Verdict { .. } => Some(word),
-        IngotStatus::Forging if row.heat > 0 => Some(format!("heat {}", row.heat)),
+        IngotStatus::Forging | IngotStatus::Forged | IngotStatus::Cracked if row.heat > 1 => {
+            Some(format!("heat {}", row.heat))
+        }
         _ => None,
     };
-    // Fixed columns: glyph, space, `[id] `, and the note with its
-    // separator. Whatever is left belongs to the title.
-    let spent = 2 + row.id.chars().count() + 3
-        + note.as_ref().map_or(0, |n| n.chars().count() + 3);
-    let title = ingot_title(&row.work, width.saturating_sub(spent));
+    // Fixed columns: glyph, space, id, two spaces, and the note with a
+    // space before it. Whatever is left belongs to the title.
+    let id_w = row.id.chars().count();
+    let note_w = note.as_ref().map_or(0, |n| n.chars().count() + 1);
+    let room = width.saturating_sub(2 + id_w + 2 + note_w);
+    let title = ingot_title(&row.work, room);
+    let id_color = match row.status {
+        IngotStatus::Queued => palette(tui::COLD),
+        _ => palette(tui::PURE),
+    };
     let mut spans = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
-        Span::styled(format!("[{}] ", row.id), Style::default().fg(palette(tui::PURE))),
+        Span::styled(format!("{}  ", row.id), Style::default().fg(id_color)),
     ];
     // An ingot announced but not yet described still needs a name; its
     // status is the only one it has.
@@ -928,9 +1164,16 @@ fn ingot_line(row: &IngotRow, now: Instant, width: usize) -> Line<'_> {
         ));
         return Line::from(spans);
     }
-    spans.push(Span::styled(title, Style::default().fg(palette(tui::PURE))));
+    let title_w = title.chars().count();
+    let title_color = match row.status {
+        IngotStatus::Queued => palette(tui::COLD),
+        IngotStatus::Cracked => palette(tui::WARM),
+        _ => palette(tui::PURE),
+    };
+    spans.push(Span::styled(title, Style::default().fg(title_color)));
     if let Some(n) = note {
-        spans.push(Span::styled(format!(" · {n}"), Style::default().fg(color)));
+        let pad = width.saturating_sub(2 + id_w + 2 + title_w + n.chars().count()).max(1);
+        spans.push(Span::styled(format!("{}{n}", " ".repeat(pad)), Style::default().fg(color)));
     }
     Line::from(spans)
 }
@@ -938,6 +1181,7 @@ fn ingot_line(row: &IngotRow, now: Instant, width: usize) -> Line<'_> {
 /// The bare status word, for a row that has no work text to show instead.
 fn status_word(status: &IngotStatus) -> String {
     match status {
+        IngotStatus::Queued => "queued".to_string(),
         IngotStatus::Forging => "forging".to_string(),
         IngotStatus::Forged => "forged".to_string(),
         IngotStatus::Cracked => "cracked".to_string(),
@@ -946,18 +1190,85 @@ fn status_word(status: &IngotStatus) -> String {
     }
 }
 
-fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
-    let inner = area.width.saturating_sub(2) as usize;
-    let visible = area.height.saturating_sub(2) as usize;
-    let skip = state.ingots.len().saturating_sub(visible);
-    let now = Instant::now();
-    let lines: Vec<Line> =
-        state.ingots.iter().skip(skip).map(|row| ingot_line(row, now, inner)).collect();
-    let block = Block::default()
+fn pane(title: Line<'static>) -> Block<'static> {
+    Block::default()
         .borders(Borders::ALL)
-        .title(" crucible ")
-        .border_style(Style::default().fg(palette(tui::COLD)));
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(title)
+        .border_style(Style::default().fg(palette(tui::COLD)))
+}
+
+fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
+    let inner_w = area.width.saturating_sub(4) as usize;
+    let rows_room = area.height.saturating_sub(2) as usize;
+    let (counts, _) = dash_counts(state);
+    let mut title = vec![
+        Span::styled(" crucible ", Style::default().fg(palette(tui::PURE))),
+    ];
+    if counts.total > 0 {
+        title.push(Span::styled(
+            format!("{}/{} ", counts.forged, counts.total),
+            Style::default().fg(palette(tui::COLD)),
+        ));
+    }
+    if counts.cracked > 0 {
+        title.push(Span::styled(
+            format!("· {} cracked ", counts.cracked),
+            Style::default().fg(palette(tui::WARM)),
+        ));
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    if state.ingots.is_empty() {
+        let empty = if state.finished { "no ingots were cast" } else { "cast after the survey" };
+        lines.push(Line::from(Span::styled(
+            preview(empty, inner_w),
+            Style::default().fg(palette(tui::COLD)),
+        )));
+    } else {
+        // The bar takes the pane's last row when there is room for it and
+        // at least one ingot above it.
+        let bar_rows = if rows_room >= 3 { 2 } else { 0 };
+        let visible = rows_room.saturating_sub(bar_rows);
+        let skip = state.ingots.len().saturating_sub(visible);
+        let now = state.now();
+        lines.extend(state.ingots.iter().skip(skip).map(|row| ingot_line(row, now, inner_w)));
+        if bar_rows > 0 {
+            while lines.len() < visible {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(""));
+            lines.push(bar_line(&counts, inner_w));
+        }
+    }
+    let block = pane(Line::from(title)).padding(ratatui::widgets::Padding::horizontal(1));
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The fire bar in ratatui spans: forged cells warm up along the bar,
+/// cracked cells end the fill in WARM, the rest stays COLD.
+fn bar_line(counts: &CrucibleCounts, width: usize) -> Line<'static> {
+    let pct = counts.forged * 100 / counts.total.max(1);
+    let label = format!(" {pct}%");
+    let cells = width.saturating_sub(label.len()).max(4);
+    let total = counts.total.max(1);
+    let filled = ((counts.forged * cells + total / 2) / total).min(cells);
+    let cracked = ((counts.cracked * cells + total / 2) / total).min(cells - filled);
+    let mut spans = Vec::new();
+    for i in 0..filled {
+        let c = match i * 3 / cells.max(1) {
+            0 => tui::WARM,
+            1 => tui::HOT,
+            _ => tui::BRIGHT,
+        };
+        spans.push(Span::styled("█", Style::default().fg(palette(c))));
+    }
+    spans.push(Span::styled("▓".repeat(cracked), Style::default().fg(palette(tui::WARM))));
+    spans.push(Span::styled(
+        "░".repeat(cells - filled - cracked),
+        Style::default().fg(palette(tui::COLD)),
+    ));
+    spans.push(Span::styled(label, Style::default().fg(palette(tui::PURE))));
+    Line::from(spans)
 }
 
 /// Break one feed row to the pane width, on char boundaries.
@@ -1002,6 +1313,10 @@ pub(crate) fn wrap_row(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// A summary row wraps to at most this many lines while the feed is
+/// collapsed; Ctrl-O shows it whole.
+const SUMMARY_LINES: usize = 4;
+
 fn draw_feed(f: &mut Frame, area: Rect, state: &DashState) {
     // Render first, then scroll: a wrapped row and an expanded detail both
     // spend more than one line, so counting feed rows would scroll past
@@ -1009,8 +1324,19 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &DashState) {
     let inner = area.width.saturating_sub(4) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for l in state.feed.iter() {
-        for (i, chunk) in wrap_row(&l.text, inner).into_iter().enumerate() {
-            let indent = if i == 0 { "  " } else { "    " };
+        let mut chunks = if l.wrap || state.expanded {
+            wrap_row(&l.text, inner.saturating_sub(2))
+        } else {
+            vec![clip_cells(&l.text, inner)]
+        };
+        if !state.expanded && chunks.len() > SUMMARY_LINES {
+            chunks.truncate(SUMMARY_LINES);
+            if let Some(last) = chunks.last_mut() {
+                *last = preview(&format!("{last} …"), inner.saturating_sub(4));
+            }
+        }
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let indent = if i == 0 { "" } else { "  " };
             lines.push(Line::from(Span::styled(
                 format!("{indent}{chunk}"),
                 Style::default().fg(l.color),
@@ -1023,14 +1349,19 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &DashState) {
             lines.extend(detail_lines(detail));
         }
     }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "waiting for the first turn",
+            Style::default().fg(palette(tui::COLD)),
+        )));
+    }
     let visible = area.height.saturating_sub(2) as usize;
     if lines.len() > visible {
         lines.drain(..lines.len() - visible);
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" forge feed ")
-        .border_style(Style::default().fg(palette(tui::COLD)));
+    let title = if state.expanded { " feed · expanded " } else { " feed " };
+    let block = pane(Line::from(Span::styled(title, Style::default().fg(palette(tui::PURE)))))
+        .padding(ratatui::widgets::Padding::horizontal(1));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -1156,51 +1487,89 @@ fn thousands(n: u64) -> String {
 }
 
 fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
-    let mut totals = match state.totals.cost {
-        Some(_) => format!(
-            "  Σ {} tok · {}",
-            state.totals.total_tokens,
-            crate::engine::pricing::format_cost(&state.totals)
+    let width = area.width as usize;
+    let now = state.now();
+    // Row 1: what is running now, or where the run stands.
+    let (status, status_color) = match forge_status(state, now) {
+        Some(s) => {
+            let frame = (now.saturating_duration_since(state.started.unwrap_or(now)).as_millis()
+                / 250) as usize;
+            (format!(" {} {}", tui::spinner_frame(frame), s.trim_start_matches("⚒ ")), palette(tui::HOT))
+        }
+        None if state.finished => {
+            let (counts, _) = dash_counts(state);
+            let mut verdict = if counts.cracked > 0 {
+                format!(" ✗ {} of {} forged · {} cracked", counts.forged, counts.total, counts.cracked)
+            } else if state.goal == Some(false) {
+                format!(" ✗ {} of {} forged · goal not met", counts.forged, counts.total)
+            } else {
+                format!(" █ {} of {} forged", counts.forged, counts.total)
+            };
+            if state.goal == Some(true) {
+                verdict.push_str(" · goal met");
+            }
+            let failed = counts.cracked > 0 || state.goal == Some(false);
+            let color = if failed { palette(tui::WARM) } else { palette(tui::PURE) };
+            (verdict, color)
+        }
+        None if state.turn_started.is_some() => (
+            format!(" {} {}…", tui::spinner_frame(0), tui::forge_verb(state.turn)),
+            palette(tui::HOT),
         ),
-        None => format!("  Σ {} tok", state.totals.total_tokens),
+        // Ingots on the anvil with no turn open: the forge is running a
+        // proof or a judge between turns, which is still work.
+        None if forging_count(state) > 0 => {
+            let ids: Vec<&str> = state
+                .ingots
+                .iter()
+                .filter(|r| r.status == IngotStatus::Forging)
+                .map(|r| r.id.as_str())
+                .collect();
+            (format!(" ⚒ checking {}", ids.join(" ")), palette(tui::HOT))
+        }
+        None if !state.finished && (state.turn > 0 || !state.feed.is_empty()) => {
+            (" · between turns".to_string(), palette(tui::COLD))
+        }
+        None => (" · waiting for the first turn".to_string(), palette(tui::COLD)),
     };
-    let mut totals_color = palette(tui::PURE);
-    if let Some(status) = forge_status(state, Instant::now()) {
-        totals = format!("  {status}");
-        totals_color = palette(tui::HOT);
-    }
-    let mut input_spans = vec![
-        Span::styled("  > ", Style::default().fg(palette(tui::HOT))),
-        Span::styled(state.input.clone(), Style::default().fg(palette(tui::PURE))),
-        Span::styled("▏", Style::default().fg(palette(tui::BRIGHT))),
-    ];
-    // An armed Ctrl-C is the loudest thing on screen for its 800ms: the
-    // user just tried to kill a running forge and needs to know whether
-    // it worked. WARM (red) — the same colour a crack gets.
-    if state
-        .pending_cancel
-        .is_some_and(|t| Instant::now().saturating_duration_since(t) < DOUBLE_PRESS)
-    {
-        input_spans.push(Span::styled(
-            "  press Ctrl-C again to cancel the forge",
-            Style::default().fg(palette(tui::WARM)),
-        ));
-    }
-    let mut top = vec![Span::styled(totals, Style::default().fg(totals_color))];
+    let mut top = vec![Span::styled(status.clone(), Style::default().fg(status_color))];
     if let Some((pct, _, _)) = state.ctx {
-        top.push(Span::styled(
-            format!("  ctx {pct}%"),
-            Style::default().fg(palette(ctx_color(pct))),
-        ));
+        let ctx = format!("ctx {pct}% ");
+        let pad = width.saturating_sub(status.chars().count() + ctx.len());
+        top.push(Span::raw(" ".repeat(pad)));
+        top.push(Span::styled(ctx, Style::default().fg(palette(ctx_color(pct)))));
     }
     let mut lines = vec![Line::from(top)];
     lines.extend(queued_lines(&state.queued));
-    lines.push(Line::from(input_spans));
-    lines
-        .push(Line::from(Span::styled(
-            format!("  {}", if state.finished { HINT_DONE } else { HINT }),
+
+    // Row 3: the input, with a placeholder saying what it is for.
+    let mut input_spans = vec![Span::styled(" › ", Style::default().fg(palette(tui::HOT)))];
+    if state.input.is_empty() {
+        input_spans.push(Span::styled("▏", Style::default().fg(palette(tui::BRIGHT))));
+        input_spans.push(Span::styled(
+            if state.finished { PLACEHOLDER_DONE } else { PLACEHOLDER },
             Style::default().fg(palette(tui::COLD)),
-        )));
+        ));
+    } else {
+        input_spans.push(Span::styled(state.input.clone(), Style::default().fg(palette(tui::PURE))));
+        input_spans.push(Span::styled("▏", Style::default().fg(palette(tui::BRIGHT))));
+    }
+    lines.push(Line::from(input_spans));
+
+    // Row 4: the keys. An armed Ctrl-C replaces them: for its 800ms it is
+    // the only thing worth reading, in a crack's colour.
+    let armed = state
+        .pending_cancel
+        .is_some_and(|t| state.now().saturating_duration_since(t) < DOUBLE_PRESS);
+    let hint = if armed {
+        Span::styled(" press ^C again to cancel the forge", Style::default().fg(palette(tui::WARM)))
+    } else {
+        Span::styled(
+            format!(" {}", preview(if state.finished { HINT_DONE } else { HINT }, width.saturating_sub(2))),
+            Style::default().fg(palette(tui::COLD)),
+        )
+    };
+    lines.push(Line::from(hint));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1321,7 +1690,13 @@ pub async fn run(
     let run_id = run_id_for_plan(&plan);
     let plan_total =
         plan.lines().filter(|l| l.trim_start().starts_with("(ingot ")).count();
-    let mut state = DashState::default();
+    let mut state = DashState {
+        started: Some(Instant::now()),
+        commission: std::fs::read_to_string(crate::config::ORE_FILE)
+            .ok()
+            .and_then(|prd| commission_line(&prd)),
+        ..Default::default()
+    };
     // Seed the crucible from the plan rather than waiting for events. The
     // pane is a view of PLAN.md, but rows only ever appeared when an
     // ingot started forging, so a run with nothing left to forge -- a
@@ -1351,6 +1726,120 @@ pub async fn run(
     result
 }
 
+/// The commission as one line: PRD.md's last non-empty line, which is
+/// where `fire_furnace` writes it.
+pub(crate) fn commission_line(prd: &str) -> Option<String> {
+    prd.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+}
+
+/// PLAN.md, re-read when its modification time moves. Checked on the draw
+/// tick, so a stat call every 33ms and a read only when the file changed.
+#[derive(Default)]
+struct PlanWatch {
+    seen: Option<std::time::SystemTime>,
+}
+
+impl PlanWatch {
+    fn changed(&mut self) -> Option<String> {
+        let modified = std::fs::metadata(CRUCIBLE).and_then(|m| m.modified()).ok()?;
+        if self.seen == Some(modified) {
+            return None;
+        }
+        self.seen = Some(modified);
+        std::fs::read_to_string(CRUCIBLE).ok()
+    }
+}
+
+/// The engine is gone: no smith reads the steer queue, and the input
+/// takes the next commission instead. Shared by the live loop (channel
+/// closed) and a replay (tape ran out), so both end on the same frame.
+pub(crate) fn mark_finished(state: &mut DashState) {
+    state.finished = true;
+    state.push_feed(
+        palette(tui::BRIGHT),
+        "■ forge finished".into(),
+    );
+}
+
+// ---------------------------------------------------------------- replay
+
+/// A dashboard state for playing a tape: seeded from the tape's first
+/// plan, on the tape's clock, with no disk reads and no saved spend.
+pub(crate) fn replay_state(commission: Option<&str>, start: Instant) -> DashState {
+    DashState {
+        clock: Some(start),
+        started: Some(start),
+        commission: commission.and_then(commission_line),
+        ..Default::default()
+    }
+}
+
+/// Render one frame into a `w`×`h` grid and return it as plain text rows,
+/// trailing blanks trimmed. Deterministic: the same state draws the same
+/// rows, which is what lets a replay frame stand in a test.
+pub(crate) fn render_text(state: &DashState, w: u16, h: u16) -> Vec<String> {
+    use ratatui::backend::TestBackend;
+    let Ok(mut terminal) = Terminal::new(TestBackend::new(w.max(1), h.max(1))) else {
+        return Vec::new();
+    };
+    let _ = terminal.draw(|f| draw(f, state));
+    let buf = terminal.backend().buffer();
+    let mut rows = Vec::with_capacity(h as usize);
+    for y in 0..buf.area.height {
+        let mut row = String::new();
+        let mut skip = 0usize;
+        for x in 0..buf.area.width {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let sym = buf[(x, y)].symbol();
+            // A wide glyph owns the next cell too; the backend pads it
+            // with a blank that would double every emoji's width.
+            skip = unicode_cells(sym).saturating_sub(1);
+            row.push_str(sym);
+        }
+        rows.push(row.trim_end().to_string());
+    }
+    rows
+}
+
+fn unicode_cells(s: &str) -> usize {
+    ratatui::text::Span::raw(s).width().max(1)
+}
+
+/// Enter the alternate screen for a replay. Same setup as a live attach,
+/// minus the steer history and the saved spend.
+pub(crate) fn replay_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stderr>>> {
+    register_terminal_restore();
+    enable_raw_mode()?;
+    crossterm::execute!(io::stderr(), EnterAlternateScreen)?;
+    Terminal::new(CrosstermBackend::new(io::stderr()))
+}
+
+/// Draw one replay frame, synchronized where the terminal allows it.
+pub(crate) fn replay_draw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    state: &DashState,
+) -> io::Result<()> {
+    let sync = tui::sync_updates_enabled();
+    if sync {
+        let _ = crossterm::execute!(io::stderr(), crossterm::terminal::BeginSynchronizedUpdate);
+    }
+    let drawn = terminal.draw(|f| draw(f, state)).map(|_| ());
+    if sync {
+        let _ = crossterm::execute!(io::stderr(), crossterm::terminal::EndSynchronizedUpdate);
+    }
+    drawn
+}
+
+pub(crate) fn replay_restore() {
+    restore_terminal();
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
@@ -1362,6 +1851,7 @@ async fn event_loop(
     cancel: &CancelFlag,
 ) -> io::Result<Option<String>> {
     let mut interval = tokio::time::interval(FRAME);
+    let mut plan_watch = PlanWatch::default();
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut engine_done = false;
@@ -1397,11 +1887,7 @@ async fn event_loop(
                     }
                     None => {
                         engine_done = true;
-                        state.finished = true;
-                        state.push_feed(
-                            palette(tui::BRIGHT),
-                            "■ forge finished — type a new commission, or q/Esc to exit".into(),
-                        );
+                        mark_finished(state);
                         dirty = true;
                     }
                 }
@@ -1419,6 +1905,11 @@ async fn event_loop(
                 }
             }
             _ = interval.tick() => {
+                // A mold cast mid-run reaches no event; the file says it.
+                if let Some(plan) = plan_watch.changed() {
+                    state.absorb_plan(&plan);
+                    dirty = true;
+                }
                 // Stalled rows change appearance with no event arriving:
                 // keep the "(stalled Ns)" counter ticking on screen.
                 if has_stalled(&state, Instant::now()) {
@@ -1493,8 +1984,10 @@ mod tests {
         assert_eq!(state.ingots[0].status, IngotStatus::Forged);
         assert_eq!(state.totals.total_tokens, 50);
         assert!((state.totals.cost.unwrap() - 0.012).abs() < 1e-9);
-        assert_eq!(state.feed.len(), 6);
-        assert!(state.feed.back().unwrap().text.contains("[i1] forged"));
+        // Token events fold into the totals without a row of their own:
+        // the ingot, its turn, the tool, and the verdict.
+        assert_eq!(state.feed.len(), 4);
+        assert!(state.feed.back().unwrap().text.contains("i1 forged"));
     }
 
 
@@ -1641,8 +2134,18 @@ mod tests {
         apply_event(&mut state, EngineEvent::IngotStart { id: "i3".into(), work: "arena".into() });
         apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
         let head = &state.feed.back().unwrap().text;
-        assert!(head.contains("[i3]"), "the ingot is named: {head}");
-        assert!(head.contains("turn 1"), "{head}");
+        assert!(head.contains("i3 · turn 1"), "the ingot is named: {head}");
+    }
+
+    #[test]
+    fn a_turn_is_credited_to_the_ingot_still_forging_not_the_last_started() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "a".into() });
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i2".into(), work: "b".into() });
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i2".into(), ok: true });
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 4 });
+        let head = &state.feed.back().unwrap().text;
+        assert!(head.contains("i1 · turn 4"), "{head}");
     }
 
     #[test]
@@ -1931,14 +2434,15 @@ mod tests {
 
         let t0 = state.turn_started.unwrap();
         let line = forge_status(&state, t0 + Duration::from_secs(12)).unwrap();
-        assert_eq!(line, "⚒ Forging… (12s · 4.1k tok · 342 tok/s · esc to interrupt)");
+        // Esc detaches, it does not interrupt; the line no longer says so.
+        assert_eq!(line, "⚒ Forging… i1 · 12s · 4.1k tok · 342 tok/s");
 
         // A new turn re-zeros the token fold and rotates the verb.
         apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
         assert_eq!(state.turn_tokens, 0);
         let t1 = state.turn_started.unwrap();
         let line = forge_status(&state, t1 + Duration::from_secs(2)).unwrap();
-        assert!(line.starts_with("⚒ Smelting… (2s · 0 tok"), "{line}");
+        assert!(line.starts_with("⚒ Smelting… i1 · 2s · 0 tok"), "{line}");
         assert!(!line.contains("tok/s"), "rate guarded below 5s/2000 tok: {line}");
     }
 
@@ -1974,8 +2478,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(content.contains("⚒ Forging…"), "spinner status must render");
-        assert!(content.contains("esc to interrupt"));
+        assert!(content.contains("Forging…"), "spinner status must render");
+        assert!(!content.contains("esc to interrupt"), "Esc detaches; the bar must not promise more");
     }
 
     #[test]
@@ -2158,14 +2662,6 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_result_says_what_it_is_hiding() {
-        assert_eq!(result_counts(43, 1536, 300), "(43 lines · 1.5kB · 300ms)");
-        // Sub-second reads in ms; "0.0s" would say nothing.
-        assert_eq!(result_counts(1, 12, 4), "(1 line · 12B · 4ms)");
-        assert_eq!(result_counts(9, 100, 2500), "(9 lines · 100B · 2.5s)");
-    }
-
-    #[test]
     fn ctrl_o_toggles_the_expanded_feed() {
         let mut state = DashState::default();
         let (steer, cancel) = queue();
@@ -2181,7 +2677,7 @@ mod tests {
     #[test]
     fn the_expand_hint_appears_once_in_the_hint_bar() {
         // Not once per feed line: two hundred results would repeat it.
-        assert_eq!(HINT.matches("Ctrl-O").count(), 1);
+        assert_eq!(HINT.matches("^O").count(), 1);
     }
 
     #[test]
@@ -2189,7 +2685,7 @@ mod tests {
         let mut state = DashState::default();
         apply_event(&mut state, tool_result("read_file", true, "line one\nline two"));
         let last = state.feed.back().expect("a feed line");
-        assert!(last.text.contains("read_file"));
+        assert!(last.text.contains("read"), "{}", last.text);
         assert!(last.text.contains("2 lines"), "collapsed line carries counts: {}", last.text);
         assert_eq!(last.detail.as_deref(), Some("line one\nline two"));
     }
@@ -2290,7 +2786,7 @@ mod tests {
         terminal.draw(|f| draw(f, &state)).unwrap();
         let content: String =
             terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(content.contains("press Ctrl-C again"), "got: {content}");
+        assert!(content.contains("press ^C again"), "got: {content}");
     }
 
     #[test]
@@ -2327,7 +2823,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(content.contains("[i1]"));
+        assert!(content.contains("i1"));
         // The crucible names a row by its work, not by a column of status
         // words that repeat what the glyph already says.
         assert!(content.contains("forge"));
@@ -2338,7 +2834,7 @@ mod tests {
         assert!(content.contains("⏳"), "got: {content}");
         assert_eq!(content.matches("steer me").count(), 2, "queued row + input line");
         // Hint line clips at 80 cols; assert on a segment that survives.
-        assert!(content.contains("Ctrl-O: expand"), "one expand hint in the bar, not per line");
+        assert!(content.contains("^O expand"), "one expand hint in the bar, not per line");
     }
 
     /// Every tui palette color must survive the crossterm → ratatui hop.

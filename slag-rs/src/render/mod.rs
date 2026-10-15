@@ -6,4 +6,7 @@
 //! testable as plain data.
 
 pub mod diff;
+pub mod echo;
+pub mod stream;
+pub mod tape;
 pub mod trace;
