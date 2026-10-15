@@ -567,11 +567,17 @@ fn show_status() -> Result<(), error::SlagError> {
             reset(),
             tui::dim(&format!("forges the {} left", counts.ore + counts.molten))
         );
-    } else if counts.cracked > 0 {
+    } else if let Some(first) = crucible.ingots.iter().find(|i| i.status == sexp::Status::Cracked) {
+        // The same next command the assay gives: the failing proof's own
+        // output, not a direction to go looking for it.
         println!(
-            "  {}  {}",
+            "  {}  {}less {}/*_ASSAY_{}_*.log{}  {}",
             label("next"),
-            tui::dim(&format!("read why they cracked in {}/, or commission a fix", config::LOG_DIR))
+            fg(tui::HOT),
+            config::LOG_DIR,
+            first.id,
+            reset(),
+            tui::dim("the failing proof's own output")
         );
     } else {
         println!("  {}  {}", label("next"), tui::dim("every ingot forged; commission the next change"));

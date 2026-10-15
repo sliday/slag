@@ -110,15 +110,35 @@ pub fn set_width(cols: usize) {
 }
 
 /// Columns one printed line may use: the terminal's width minus the last
-/// column, which triggers autowrap on most terminals. 100 without one.
+/// column, which triggers autowrap on most terminals.
+///
+/// Only a real terminal on both streams has a width to ask about. Piped
+/// into a file, crossterm still answers with the controlling terminal's
+/// size (the window the command was typed in), and the log came out
+/// padded to 240 columns. A pipe gets `$COLUMNS` when set, else 80.
 pub fn width() -> usize {
     let pinned = WIDTH.load(Ordering::Relaxed);
     let cols = if pinned > 0 {
         pinned
+    } else if on_terminal() {
+        crossterm::terminal::size().map(|(w, _)| w as usize).ok().filter(|w| *w > 0).unwrap_or(80)
     } else {
-        crossterm::terminal::size().map(|(w, _)| w as usize).ok().filter(|w| *w > 0).unwrap_or(101)
+        piped_width(std::env::var("COLUMNS").ok().as_deref())
     };
     cols.saturating_sub(1).max(20)
+}
+
+/// Both output streams are a terminal: widths and right-aligned columns
+/// mean something. Checked once; the answer cannot change mid-run.
+fn on_terminal() -> bool {
+    static YES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *YES.get_or_init(|| std::io::stdout().is_terminal() && std::io::stderr().is_terminal())
+}
+
+/// The width a pipe is laid out for: `$COLUMNS` when it is a number, 80
+/// otherwise.
+fn piped_width(columns: Option<&str>) -> usize {
+    columns.and_then(|c| c.trim().parse().ok()).filter(|c: &usize| *c >= 20).unwrap_or(80)
 }
 
 /// Clip plain text to `max` columns, ending in `…` when it had to cut.
@@ -181,10 +201,16 @@ pub fn visible_len(s: &str) -> usize {
 
 /// `left` and `right` on one line, `right` flush to `width`. When both do
 /// not fit, `right` goes: the left side is the entry, the right its meta.
+///
+/// Off a terminal there is no right edge worth aligning to: a log gets the
+/// meta two spaces after the entry, not a run of padding.
 pub fn spread(left: &str, right: &str, width: usize) -> String {
     let (l, r) = (visible_len(left), visible_len(right));
     if r == 0 || l + 2 + r > width {
         return left.to_string();
+    }
+    if !on_terminal() && WIDTH.load(Ordering::Relaxed) == 0 {
+        return format!("{left}  {right}");
     }
     format!("{left}{}{right}", " ".repeat(width - l - r))
 }
@@ -1069,6 +1095,15 @@ mod tests {
         assert!(!sync_output_capable(None, Some("xterm-256color"), Multiplexer::None));
         assert!(!sync_output_capable(Some("ghostty"), None, Multiplexer::Tmux), "tmux excluded");
         assert!(!sync_output_capable(Some("kitty"), None, Multiplexer::Screen), "screen excluded");
+    }
+
+    /// A pipe never takes the controlling terminal's width.
+    #[test]
+    fn a_pipe_is_laid_out_for_columns_or_80() {
+        assert_eq!(piped_width(None), 80);
+        assert_eq!(piped_width(Some("132")), 132);
+        assert_eq!(piped_width(Some("wide")), 80);
+        assert_eq!(piped_width(Some("3")), 80);
     }
 
     /// A Cyrillic or CJK commission used to slice mid-codepoint and abort

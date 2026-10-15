@@ -107,6 +107,10 @@ pub struct Echo {
     /// A provider refusal that stopped the run. No assay follows it: there
     /// is no verdict to report on a run that could not call its model.
     fatal: Option<String>,
+    /// The last outcome of each ingot's proof, for the assay's evidence.
+    proofs: std::collections::BTreeMap<String, Proof>,
+    /// The highest warden round that returned a verdict.
+    warden_rounds: u32,
     /// Whether this echo prints that refusal itself. Live, `main` owns the
     /// line; a replay has no `main` to print it, so the echo does.
     owns_fatal: bool,
@@ -135,6 +139,8 @@ impl Echo {
             goal_met: false,
             assay_done: false,
             fatal: None,
+            proofs: std::collections::BTreeMap::new(),
+            warden_rounds: 0,
             owns_fatal: false,
         }
     }
@@ -323,12 +329,14 @@ impl Echo {
                 self.phase = Phase::Assay;
             }
             EngineEvent::Warning { message } => {
+                self.note_round(message);
                 if let Some(gap) = warden_word(message) {
                     self.goal_gap = Some(gap.to_string());
                     self.goal_met = false;
                 }
             }
             EngineEvent::Narrate { text } => {
+                self.note_round(text);
                 if warden_word(text).is_some_and(|w| w.starts_with("goal met")) {
                     self.goal_gap = None;
                     self.goal_met = true;
@@ -392,6 +400,17 @@ impl Echo {
         }
     }
 
+    /// `warden round 2: …` → remember that round 2 ran.
+    fn note_round(&mut self, msg: &str) {
+        let round = msg
+            .strip_prefix("warden round ")
+            .and_then(|r| r.split(':').next())
+            .and_then(|n| n.trim().parse::<u32>().ok());
+        if let Some(n) = round {
+            self.warden_rounds = self.warden_rounds.max(n);
+        }
+    }
+
     fn take_resolved(&mut self, id: &str, heat: u8) -> bool {
         match self.resolved.iter().position(|(i, h)| i == id && *h == heat) {
             Some(at) => {
@@ -411,6 +430,7 @@ impl Echo {
         if self.anvils.iter().any(|a| a.id == p.id && a.heat == 0) {
             return;
         }
+        self.proofs.insert(p.id.clone(), p.clone());
         if p.ok {
             if let Some(a) = self.anvils.iter_mut().find(|a| a.id == p.id) {
                 a.proof = p.cmd.clone();
@@ -637,84 +657,171 @@ impl Echo {
         }
     }
 
-    /// The report card: the verdict first, then what it cost.
+    /// The report card. The verdict comes first and is the only claim on
+    /// it: no bar, since a full bar over a failed goal reads as success.
+    /// Then why and what to do next, then the evidence: what ran and how
+    /// it exited, what git says changed, where the work is, what it cost.
     fn assay(&mut self, at: Instant, out: &mut Vec<String>) {
         self.assay_done = true;
         self.phase = Phase::Assay;
         let counts = self.counts();
+        let stats = self.stats.clone().unwrap_or_default();
+        let w = self.width;
         out.push(String::new());
-        out.push(tui::rule_line("ASSAY", &tui::clock(self.elapsed(at)), self.width));
+        out.push(tui::rule_line("ASSAY", &tui::clock(self.elapsed(at)), w));
 
-        let (glyph, color, word) = if counts.cracked > 0 {
-            ("✗", WARM, "CRACKED")
+        // The verdict: one word, one clause.
+        let left = counts.ore + counts.molten;
+        let (glyph, color, word, says) = if counts.cracked > 0 {
+            let n = counts.cracked;
+            ("✗", WARM, "CRACKED", format!("{n} of {} ingots failed every heat; {} forged", counts.total, counts.forged))
         } else if self.goal_gap.is_some() {
-            ("✗", WARM, "GOAL NOT MET")
-        } else if counts.forged < counts.total {
-            ("!", BRIGHT, "PAUSED")
+            ("✗", WARM, "GOAL NOT MET", "every task passed its proof; the warden rejected the result".to_string())
+        } else if left > 0 {
+            ("!", BRIGHT, "PAUSED", format!("{} of {} forged; {left} still queued", counts.forged, counts.total))
+        } else if self.goal_met {
+            ("█", PURE, "FORGED", format!("all {} ingots passed their proofs; the warden accepted the goal", counts.total))
         } else {
-            ("█", PURE, "FORGED")
+            ("█", PURE, "FORGED", format!("all {} ingots passed their proofs", counts.total))
         };
-        let mut facts = vec![format!("{}/{} ingots", counts.forged, counts.total)];
-        if self.retries > 0 {
-            facts.push(format!("{} {}", self.retries, if self.retries == 1 { "retry" } else { "retries" }));
-        }
-        facts.push(tui::clock(self.elapsed(at)));
-        if let Some(c) = self.cost {
-            facts.push(tui::money(c));
-        }
-        if self.goal_met {
-            facts.push("goal met".to_string());
-        }
-        out.push(format!(
-            "  {} {}   {}",
-            paint(color, glyph),
-            paint(color, &format!("{}{word}{}", bold_on(), bold_off())),
-            dim(&facts.join(" · "))
-        ));
-        out.push(tui::temper_text(&counts, self.width));
+        let head = format!("  {} {}  ", paint(color, glyph), paint(color, &format!("{}{word}{}", bold_on(), bold_off())));
+        let room = w.saturating_sub(tui::visible_len(&head));
+        out.push(format!("{head}{}", tui::clip(&says, room)));
 
+        // Why, when it failed: the gap, or each cracked ingot's last reason.
         if let Some(gap) = &self.goal_gap {
-            out.extend(wrap_labelled("gap", gap, self.width, 3).into_iter().map(|l| paint(WARM, &l)));
+            out.extend(wrap_indented(gap, w, 4, 3).into_iter().map(|l| paint(WARM, &l)));
+        }
+        let cracked: Vec<&Ingot> = self.plan.iter().filter(|i| i.status == Status::Cracked).collect();
+        for ingot in &cracked {
+            let why = self
+                .proofs
+                .get(&ingot.id)
+                .and_then(|p| p.why.clone())
+                .unwrap_or_else(|| "every heat failed its proof".to_string());
+            let name = tui::clip(&title(&ingot.work), (w / 3).max(12));
+            // `    ✗ id  name  — why`: twelve fixed columns besides the three.
+            let room = w.saturating_sub(12 + ingot.id.len() + name.chars().count());
             out.push(format!(
-                "          {}",
-                dim(&tui::clip(
-                    "the tasks passed; the commission did not. raise --temper to forge the gap.",
-                    self.width.saturating_sub(10)
-                ))
+                "    {} {}  {}  {}",
+                paint(WARM, "✗"),
+                paint(WARM, &ingot.id),
+                name,
+                dim(&format!("— {}", tui::clip(&why, room.max(8))))
             ));
         }
-        let stats = self.stats.clone().unwrap_or_default();
-        if let Some(d) = &stats.durations {
-            out.push(self.fact("time", d));
+
+        // The next command, the one thing to type.
+        let next = if self.goal_gap.is_some() {
+            Some((format!("slag --temper {} resume", self.warden_rounds + 1), "forges the gap as new ingots".to_string()))
+        } else if let Some(first) = cracked.first() {
+            Some((format!("less logs/*_ASSAY_{}_*.log", first.id), "the failing proof's own output".to_string()))
+        } else if left > 0 {
+            Some(("slag resume".to_string(), format!("forges the {left} left")))
+        } else {
+            match stats.commits.filter(|n| *n > 0) {
+                Some(n) => Some((format!("git log --stat -{n}"), "the work, commit by commit".to_string())),
+                None => Some(("git status".to_string(), "the work in the tree".to_string())),
+            }
+        };
+        if let Some((cmd, why)) = next {
+            let room = w.saturating_sub(12 + cmd.chars().count());
+            out.push(format!(
+                "  {}  {}  {}",
+                dim(&format!("{:<6}", "next")),
+                paint(HOT, &cmd),
+                dim(&tui::clip(&why, room.max(4)))
+            ));
         }
-        if let Some(c) = &stats.churn {
-            out.push(self.fact("churn", c.trim_start_matches("churn: ")));
+        out.push(String::new());
+
+        // Evidence: what ran, and how each proof exited.
+        let mut ran: Vec<String> = Vec::new();
+        let mut quiet_passes = 0;
+        let cap = if w >= 100 { 8 } else { 4 };
+        for ingot in self.plan.iter().filter(|i| i.status != Status::Cracked) {
+            let row = match (&ingot.status, self.proofs.get(&ingot.id)) {
+                (Status::Forged, Some(p)) if p.ok => {
+                    if ran.len() >= cap {
+                        quiet_passes += 1;
+                        continue;
+                    }
+                    let cmd = p.cmd.clone().unwrap_or_else(|| unescape(&ingot.proof));
+                    let room = w.saturating_sub(22 + ingot.id.len());
+                    // The exit code sits in its own column: a reader scans
+                    // down it for anything that is not 0.
+                    let left = format!(
+                        "  {}  {} {}  {}",
+                        dim(&format!("{:<6}", if ran.is_empty() { "ran" } else { "" })),
+                        paint(PURE, "✓"),
+                        paint(PURE, &ingot.id),
+                        tui::clip(&cmd, room.max(8))
+                    );
+                    ran.push(tui::spread(&left, &dim("exit 0"), w));
+                    continue;
+                }
+                // Forged, but this tape kept no outcome for its proof: say
+                // so instead of drawing a ✓ nothing backs.
+                (Status::Forged, _) => format!("{} {}  {}", dim("·"), paint(PURE, &ingot.id), dim("forged; no proof outcome recorded")),
+                (Status::Ore | Status::Molten, _) => format!("{} {}  {}", dim("·"), dim(&ingot.id), dim("not forged yet")),
+                (Status::Cracked, _) => continue,
+            };
+            let label = if ran.is_empty() { "ran" } else { "" };
+            ran.push(format!("  {}  {row}", dim(&format!("{label:<6}"))));
         }
+        out.extend(ran.iter().cloned());
+        if quiet_passes > 0 {
+            let label = if ran.is_empty() { "ran" } else { "" };
+            out.push(format!(
+                "  {}  {}",
+                dim(&format!("{label:<6}")),
+                dim(&format!("… {quiet_passes} more, each proof exit 0"))
+            ));
+        }
+
+        // What git says changed, and where the work now is.
+        let mut diff: Vec<String> = Vec::new();
+        if let Some(d) = &stats.diff {
+            diff.push(d.clone());
+        } else if let Some(c) = &stats.churn {
+            diff.push(format!("{} lines", c.trim_start_matches("churn: ").split(' ').next().unwrap_or("")));
+        }
+        if let Some(n) = stats.commits.filter(|n| *n > 0) {
+            diff.push(format!("{n} {}", if n == 1 { "commit" } else { "commits" }));
+        }
+        if !diff.is_empty() {
+            out.push(self.fact("diff", &diff.join(" · ")));
+        }
+        let mut work: Vec<String> = Vec::new();
+        if let (Some(b), Some(h)) = (&stats.branch, &stats.head) {
+            work.push(format!("{b} @ {h}"));
+        }
+        work.push(format!("{}/", crate::config::LOG_DIR));
+        work.push(crate::config::CRUCIBLE.to_string());
+        out.push(self.fact("work", &work.join(" · ")));
+
+        // What it took.
+        let mut run = vec![tui::clock(self.elapsed(at))];
+        if let Some(api) = stats.durations.as_deref().and_then(|d| d.split(" · ").find(|p| p.starts_with("api "))) {
+            run.push(api.to_string());
+        }
+        if let Some(c) = self.cost {
+            run.push(tui::money(c));
+        }
+        if self.tokens > 0 {
+            run.push(format!("{} tok", tui::tokens(self.tokens)));
+        }
+        if self.retries > 0 {
+            run.push(format!("{} {}", self.retries, if self.retries == 1 { "retry" } else { "retries" }));
+        }
+        out.push(self.fact("run", &run.join(" · ")));
         if let Some(t) = &stats.tool_errors {
-            out.push(format!("  {}  {}", paint(WARM, &format!("{:<6}", "errors")), tui::clip(t.trim_start_matches("tool errors: "), self.width.saturating_sub(10))));
+            out.push(format!(
+                "  {}  {}",
+                paint(WARM, &format!("{:<6}", "errors")),
+                tui::clip(t.trim_start_matches("tool errors: "), w.saturating_sub(10))
+            ));
         }
-        let spend = stats.spend.clone().or_else(|| self.cost.map(tui::money));
-        if let Some(s) = spend {
-            out.push(self.fact("spend", &format!("{s} · {} tok", tui::tokens(self.tokens))));
-            for row in stats.ledger.iter().take(4) {
-                out.push(format!("          {}", dim(&tui::clip(&ledger_row(row), self.width.saturating_sub(10)))));
-            }
-        }
-        if counts.cracked > 0 {
-            for ingot in self.plan.iter().filter(|i| i.status == Status::Cracked) {
-                let room = self.width.saturating_sub(12 + ingot.id.len());
-                out.push(format!(
-                    "  {}  {} {}",
-                    paint(WARM, &format!("{:<6}", "crack")),
-                    paint(WARM, &ingot.id),
-                    tui::clip(&title(&ingot.work), room)
-                ));
-            }
-        }
-        out.push(self.fact(
-            "files",
-            &format!("{} · {} · {}/", crate::config::BLUEPRINT, crate::config::CRUCIBLE, crate::config::LOG_DIR),
-        ));
         out.push(String::new());
     }
 
@@ -817,6 +924,31 @@ fn ledger_row(row: &str) -> String {
         }
         _ => parts.join(" "),
     }
+}
+
+/// `text` wrapped under an indent of `indent` spaces, at most `max` lines.
+fn wrap_indented(text: &str, width: usize, indent: usize, max: usize) -> Vec<String> {
+    let room = width.saturating_sub(indent).max(20);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > room {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.len() > max {
+        let rest = lines[max - 1..].join(" ");
+        lines.truncate(max - 1);
+        lines.push(tui::clip(&rest, room));
+    }
+    lines.into_iter().map(|l| format!("{}{}", " ".repeat(indent), tui::clip(&l, room))).collect()
 }
 
 /// `  gap    text…` wrapped under its label, at most `max` lines.
@@ -1026,6 +1158,8 @@ mod tests {
                 ev(EngineEvent::HeatTick { id: "i2".into(), heat: 1 }),
                 Cue::Proof(Proof { id: "i2".into(), heat: 1, cmd: Some(long.clone()), ok: false, why: Some(long.clone()) }),
                 ev(EngineEvent::IngotDone { id: "i2".into(), ok: false }),
+                Cue::Plan(plan.replace(":status molten", ":status cracked")),
+                ev(EngineEvent::Warning { message: format!("warden round 1: {long}") }),
             ] {
                 lines.extend(echo.cue(&c, t0));
             }
@@ -1064,10 +1198,28 @@ mod tests {
         echo.cue(&Cue::Plan(done), t0);
         echo.cue(&Cue::Stats(Stats { durations: Some("wall 4m12s · api 2m01s · tools 1m40s".into()), ..Default::default() }), t0);
         let text = plain(&echo.finish(t0 + Duration::from_secs(252)));
-        let verdict = text.lines().position(|l| l.contains("CRACKED")).expect(&text);
-        let time = text.lines().position(|l| l.contains("wall 4m12s")).expect(&text);
-        assert!(verdict < time, "{text}");
-        assert!(text.contains("2/3 ingots"), "{text}");
-        assert!(text.contains("crack   i3"), "{text}");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(lines[1].contains("CRACKED") && lines[1].contains("1 of 3"), "{text}");
+        assert!(text.contains("✗ i3"), "{text}");
+        assert!(text.contains("next    less logs/*_ASSAY_i3_*.log"), "{text}");
+        assert!(text.contains("api 2m01s"), "{text}");
+        // No bar anywhere in the verdict block: a full one reads as success.
+        assert!(!text.contains('█') && !text.contains('░'), "{text}");
+    }
+
+    #[test]
+    fn a_forged_ingot_without_a_proof_outcome_gets_no_check_mark() {
+        let mut echo = Echo::new(100);
+        let done = PLAN.replace(":status molten", ":status forged").replace(":status ore", ":status forged");
+        let t0 = Instant::now();
+        echo.cue(&Cue::Plan(done), t0);
+        echo.cue(&Cue::Proof(Proof { id: "i1".into(), heat: 1, cmd: Some("test -f a".into()), ok: true, why: None }), t0);
+        echo.cue(&ev(EngineEvent::Warning { message: "warden round 1: the README is missing".into() }), t0);
+        let text = plain(&echo.finish(t0));
+        assert!(text.contains("GOAL NOT MET"), "{text}");
+        assert!(text.contains("slag --temper 2 resume"), "{text}");
+        assert!(text.contains("✓ i1  test -f a") && text.contains("exit 0"), "{text}");
+        assert!(text.contains("· i2  forged; no proof outcome recorded"), "{text}");
+        assert!(!text.contains("✓ i2"), "{text}");
     }
 }
