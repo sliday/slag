@@ -559,6 +559,8 @@ impl OpenRouter {
                 }
             }
 
+            let rate_limit_header = resp.headers().keys().any(|name|
+                name == reqwest::header::RETRY_AFTER || name.as_str().starts_with("x-ratelimit-"));
             let retry_after_header = parse_retry_after(resp.headers());
             let reset_wait = parse_ratelimit_reset(resp.headers(), now_epoch_ms());
             let code = status.as_u16();
@@ -577,10 +579,15 @@ impl OpenRouter {
                 }
             }
             if code == 400 && !req.tools.is_empty() && is_tool_validation_error(&text) {
-                return Err(SlagError::ToolValidation(self.error_context(&req, ProviderErrorCategory::InvalidRequest,
-                    &tool_validation_message(&text))));
+                let names = req.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(", ");
+                let mut feedback = self.error_context(&req, ProviderErrorCategory::InvalidRequest, &tool_validation_message(&text));
+                feedback.push_str(&format!(" Use only these declared tool names: {names}."));
+                if req.tools.iter().any(|tool| tool.name == "finish") {
+                    feedback.push_str(" To complete the task, call finish with cmd and summary.");
+                }
+                return Err(SlagError::ToolValidation(feedback));
             }
-            let category = classify_response(code, &text);
+            let category = classify_response(code, &text, rate_limit_header);
             let deterministic = matches!(category, ProviderErrorCategory::Auth | ProviderErrorCategory::Billing | ProviderErrorCategory::InvalidRequest);
             if !deterministic && retry_hint.unwrap_or_else(|| transient_status(status)) {
                 // Any transient status may carry Retry-After — 429 rate
@@ -590,7 +597,7 @@ impl OpenRouter {
                 last_err = format!("{status}: {excerpt}");
                 match self.plan_retry(
                     Some(code),
-                    retry_after_header,
+                    retry_after_header.or_else(|| if code == 429 { parse_retry_after_body(&text) } else { None }),
                     reset_wait,
                     attempts_made,
                     budget_used,
@@ -598,6 +605,15 @@ impl OpenRouter {
                     req.retry,
                 ) {
                     Some(plan) => {
+                        if category == ProviderErrorCategory::RateLimit && plan.delay >= Duration::from_secs(1) {
+                            let message = format!("{}, role {}, model {}: rate limit (429); retry in {:.1}s.",
+                                self.provider.name(), req.role, req.model, plan.delay.as_secs_f64());
+                            if let Some(tx) = self.events.lock().unwrap().as_ref() {
+                                let _ = tx.send(EngineEvent::Warning { message });
+                            } else if !crate::tui::is_quiet() {
+                                eprintln!("    {message}");
+                            }
+                        }
                         next = Some(plan);
                         continue;
                     }
@@ -757,11 +773,14 @@ fn provider_remedy(provider: ProviderPreset, category: ProviderErrorCategory, ba
     }
 }
 
-fn classify_response(status: u16, body: &str) -> ProviderErrorCategory {
+fn classify_response(status: u16, body: &str, rate_limit_header: bool) -> ProviderErrorCategory {
     let body = body.to_ascii_lowercase();
+    if status == 429 && (rate_limit_header || body.contains("rate limit") || body.contains("try again in")) {
+        return ProviderErrorCategory::RateLimit;
+    }
     if status == 402 || (matches!(status, 403 | 429) && [
         "insufficient_quota", "insufficient quota", "insufficient credit", "out of credit",
-        "credits exhausted", "credit balance", "spend limit", "spending limit", "billing",
+        "credits exhausted", "credit balance", "spend limit", "spending limit", "billing limit",
         "payment required", "exceeded your current quota", "monthly limit", "budget exceeded",
         "no credits", "credit limit", "run out of credits", "purchase credits", "exhausted its credits",
         "exhausted your credits", "billing_hard_limit_reached", "daily spend limit",
@@ -865,6 +884,12 @@ fn should_retry_override(headers: &reqwest::header::HeaderMap) -> Option<bool> {
 /// Honor Retry-After seconds or an HTTP date, with a 60-second cap.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     parse_retry_after_at(headers, std::time::SystemTime::now())
+}
+
+fn parse_retry_after_body(body: &str) -> Option<Duration> {
+    let pattern = regex::Regex::new(r"(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(?:s\b|seconds?\b)").unwrap();
+    let seconds: f64 = pattern.captures(body)?.get(1)?.as_str().parse().ok()?;
+    Some(Duration::from_secs_f64(seconds.min(RETRY_AFTER_CAP_SECS as f64)))
 }
 
 fn parse_retry_after_at(headers: &reqwest::header::HeaderMap, now: std::time::SystemTime) -> Option<Duration> {
@@ -2593,6 +2618,11 @@ mod tests {
 
             let mut heartbeats = 0;
             while let Ok(event) = rx.try_recv() {
+                if let EngineEvent::Warning { message } = &event {
+                    assert_eq!(status, 429);
+                    assert!(message.contains("rate limit (429)"), "{message}");
+                    continue;
+                }
                 let EngineEvent::ApiRetry { attempt, status: s, remaining_secs } = event else {
                     panic!("unexpected event");
                 };
@@ -2902,6 +2932,70 @@ mod tests {
         }
     }
 
+    const GROQ_TPM_BODY: &str = "Rate limit reached for model openai/gpt-oss-120b ... on tokens per minute (TPM): Limit 8000, Used 6596, Requested 3872. Please try again in 18.5s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing";
+
+    #[tokio::test]
+    async fn groq_tpm_with_billing_url_waits_and_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(GROQ_TPM_BODY))
+            .up_to_n_times(1).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri())
+            .with_unattended(false).with_max_attempts(2);
+        let (tx, mut rx) = super::super::events::channel();
+        provider.set_event_sink(tx);
+        let started = std::time::Instant::now();
+        assert!(provider.chat(request(vec![], None)).await.is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(18_500));
+        let EngineEvent::Warning { message } = rx.try_recv().unwrap() else { panic!("missing throttle status") };
+        assert!(message.contains("groq") && message.contains("rate limit") && message.contains("18.5s"), "{message}");
+        assert!(rx.try_recv().is_err(), "one status line per wait");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_headers_override_billing_text_on_429() {
+        for header in ["retry-after", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(429).insert_header(header, "1").set_body_string("Check billing limits"))
+                .expect(1).mount(&server).await;
+            let provider = pinned(&server.uri()).with_max_attempts(1);
+            let error = provider.chat(request(vec![], None)).await.unwrap_err();
+            assert!(error.retryable(), "{header}: {error}");
+            assert!(!error.is_deterministic_provider(), "{header}: {error}");
+        }
+        assert_eq!(classify_response(429, "https://console.groq.com/settings/billing", false), ProviderErrorCategory::RateLimit);
+    }
+
+    #[test]
+    fn body_retry_delay_preserves_fractions_and_caps_waits() {
+        assert_eq!(parse_retry_after_body(GROQ_TPM_BODY), Some(Duration::from_millis(18_500)));
+        assert_eq!(parse_retry_after_body("Try again in 600s."), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after_body("try again in 1.5 seconds"), Some(Duration::from_millis(1500)));
+        for body in ["try again in NaNs", "try again in -1s", "try again in 18.5sessions", "billing"] {
+            assert_eq!(parse_retry_after_body(body), None, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_errors_remain_billing_without_rate_limit_signals() {
+        for (preset, status, body) in [
+            (ProviderPreset::Xai, 403, "Your team has exhausted its credits. Purchase credits to continue."),
+            (ProviderPreset::OpenAI, 429, r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(preset, "test-key", server.uri()).with_max_attempts(3);
+            let SlagError::ProviderApi(error) = provider.chat(request(vec![], None)).await.unwrap_err() else { panic!("expected billing") };
+            assert_eq!(error.category, ProviderErrorCategory::Billing);
+        }
+    }
+
     #[tokio::test]
     async fn local_connection_errors_name_the_provider_and_server_remedy() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3119,10 +3213,14 @@ mod tests {
             })))
             .expect(1).mount(&server).await;
         let provider = OpenRouter::with_provider(ProviderPreset::Groq, "secret-test-key", server.uri());
-        let error = provider.chat(request(vec![spec()], None)).await.unwrap_err();
+        let mut finish = spec();
+        finish.name = "finish".into();
+        let error = provider.chat(request(vec![spec(), finish], None)).await.unwrap_err();
         let SlagError::ToolValidation(message) = error else { panic!("expected tool validation error") };
         assert!(message.contains("missing pattern [redacted]"));
         assert!(message.contains("grep"));
+        assert!(message.contains("Use only these declared tool names: read_file, finish."));
+        assert!(message.contains("To complete the task, call finish with cmd and summary."));
         assert!(!message.contains("secret-test-key"));
     }
 
