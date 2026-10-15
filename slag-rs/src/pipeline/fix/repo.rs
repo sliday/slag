@@ -249,13 +249,12 @@ pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
 
 /// Process groups of the commands running right now. A Ctrl-C exits the
 /// process without dropping anything, so `kill_on_drop` never fires there;
-/// this list is what the shutdown path kills instead.
+/// this list is what the shutdown path kills instead. `slag fix` registers
+/// `kill_running` with the shutdown hooks; nothing here touches them, so
+/// a unit test's commands cannot be killed by another test's shutdown.
 fn running() -> &'static std::sync::Mutex<Vec<u32>> {
     static RUNNING: std::sync::OnceLock<std::sync::Mutex<Vec<u32>>> = std::sync::OnceLock::new();
-    RUNNING.get_or_init(|| {
-        crate::shutdown::register(kill_running);
-        std::sync::Mutex::new(Vec::new())
-    })
+    RUNNING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 /// Kill every command slag started and has not seen finish. Called before

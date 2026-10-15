@@ -106,6 +106,8 @@ pub async fn run(
             let _ = std::fs::remove_file(&path);
         });
     }
+    // A Ctrl-C must not leave a test run writing into the repository.
+    crate::shutdown::register(repo::kill_running);
 
     // Outside git, a shadow repository still tracks what the session
     // changed, so the change list, the test guard, and the reproduction
@@ -502,7 +504,9 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
 
     let proof_cmd = out.checks[0].cmd.clone();
     let clock = std::time::Instant::now();
-    out.repro = reproduce(job, &before, &changed, &proof_cmd, baseline.as_ref()).await;
+    let rescuer = Rescuer { register: &register_shutdown, stop: repo::kill_running };
+    out.repro =
+        reproduce(job, &before, &changed, &proof_cmd, baseline.as_ref(), &rescuer).await;
     out.phases.repro = clock.elapsed().as_secs_f64();
     match &out.repro {
         Repro::NotShown(why) => note(hooks, &format!("reproduction not shown: {why}"), false),
@@ -588,6 +592,7 @@ async fn reproduce(
     changed: &[String],
     cmd: &str,
     baseline: Option<&Run>,
+    rescuer: &Rescuer<'_>,
 ) -> Repro {
     let from_baseline = || match baseline {
         Some(b) if !b.ok() && !b.unusable() => Some(Repro::Baseline { status: b.status() }),
@@ -618,8 +623,9 @@ async fn reproduce(
     }
 
     // Swap the source files back to their pre-session content, run, swap
-    // the fix back in. A Ctrl-C in between must not cost the user the fix,
-    // so the restore is registered with the shutdown hooks first.
+    // the fix back in. A Ctrl-C at any point must not cost the user the
+    // fix, so a rescue is registered first, and every swap and the rescue
+    // take one lock: see `Swap`.
     let fixed: Vec<Saved> = sources
         .iter()
         .map(|p| {
@@ -629,24 +635,32 @@ async fn reproduce(
             (path, now, mode)
         })
         .collect();
-    let pending = Arc::new(Mutex::new(Some(fixed.clone())));
-    let rescue = pending.clone();
-    crate::shutdown::register(move || {
-        if let Some(files) = rescue.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            // The test run is still going: stop it before it can write
-            // over the restore.
-            repo::kill_running();
-            restore(&files);
-        }
-    });
+    let swap = Arc::new(Mutex::new(Swap { phase: Phase::Armed, fixed }));
+    let rescue = swap.clone();
+    let stop = rescuer.stop;
+    (rescuer.register)(Box::new(move || Swap::rescue(&rescue, stop)));
     let originals: Vec<Saved> = sources
         .iter()
         .map(|p| (git.top.join(p), git.original(before, p), None))
         .collect();
-    restore(&originals);
+    let interrupted = || Repro::NotShown("interrupted".into());
+    {
+        let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
+        if s.phase != Phase::Armed {
+            return interrupted();
+        }
+        restore(&originals);
+        s.phase = Phase::Swapped;
+    }
     let run = repo::run(cmd, &job.cwd, TEST_TIMEOUT).await;
-    if let Some(files) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        restore(&files);
+    {
+        let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
+        if s.phase != Phase::Swapped {
+            // The rescue ran during the check and already put the fix back.
+            return interrupted();
+        }
+        restore(&s.fixed);
+        s.phase = Phase::Done;
     }
 
     if run.unusable() {
@@ -659,6 +673,56 @@ async fn reproduce(
         });
     }
     Repro::Regression { status: run.status() }
+}
+
+/// Where `reproduce` hands its rescue, and how the rescue stops a check
+/// still running. A real fix registers with the shutdown hooks and kills
+/// slag's commands; unit tests keep the rescue in a local slot, so no test
+/// can fire another test's rescue.
+struct Rescuer<'a> {
+    register: &'a dyn Fn(Box<dyn FnOnce() + Send>),
+    stop: fn(),
+}
+
+fn register_shutdown(hook: Box<dyn FnOnce() + Send>) {
+    crate::shutdown::register(hook);
+}
+
+/// Where the reproduction swap stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// The fix is on disk and nothing is swapped yet.
+    Armed,
+    /// The pre-session sources are on disk while the check runs.
+    Swapped,
+    /// The fix is back and the rescue has nothing to do.
+    Done,
+    /// The rescue ran. The fix is on disk, and no swap may start again.
+    Rescued,
+}
+
+/// The swap state and the fix's bytes, behind one lock shared by
+/// `reproduce` and its rescue. Deciding to swap and swapping happen under
+/// that lock, so the rescue cannot run between them, and the originals
+/// are never written once the rescue has put the fix back.
+struct Swap {
+    phase: Phase,
+    fixed: Vec<Saved>,
+}
+
+impl Swap {
+    fn rescue(swap: &Mutex<Swap>, stop: fn()) {
+        let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
+        if s.phase == Phase::Swapped {
+            // The check is still going: stop it before it can write over
+            // the restore.
+            stop();
+            restore(&s.fixed);
+        }
+        if s.phase != Phase::Done {
+            s.phase = Phase::Rescued;
+        }
+    }
 }
 
 /// One file as the reproduction check found it: path, content, and mode
@@ -1153,36 +1217,106 @@ mod tests {
         assert!(verify(&job, &hooks, None, None).await.is_empty());
     }
 
-    /// The core proof: with the fix taken out the new test must fail, and
-    /// the fix must be back on disk afterwards either way.
-    #[tokio::test]
-    async fn reproduction_reverts_the_source_and_puts_the_fix_back() {
+    /// The rescue a unit test gets: kept in this slot, never in the
+    /// process-wide shutdown hooks, so no other test can fire it.
+    type Slot = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+    fn no_stop() {}
+
+    fn fire(slot: &Slot) {
+        let hook = slot.lock().unwrap().take().expect("a rescue was registered");
+        hook();
+    }
+
+    /// A committed `value.txt` of 1, then the session's fix (2) and the
+    /// test that checks for it.
+    fn fixed_repo() -> (tempfile::TempDir, Job, BTreeMap<String, repo::Content>, Vec<String>) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
         std::fs::write(root.join("value.txt"), "1\n").unwrap();
         sh(root, "git add -A && git commit -qm init");
         let job = job_in(root);
-        let git = job.git.as_ref().unwrap();
-        let before = git.snapshot();
-
-        // The session: a fix and a test that checks for it.
+        let before = job.git.as_ref().unwrap().snapshot();
         std::fs::write(root.join("value.txt"), "2\n").unwrap();
         std::fs::create_dir_all(root.join("tests")).unwrap();
         std::fs::write(root.join("tests/check.sh"), "grep -qx 2 value.txt\n").unwrap();
-        let changed = git.changed_since(&before);
+        let changed = job.git.as_ref().unwrap().changed_since(&before);
+        (dir, job, before, changed)
+    }
 
-        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None).await;
+    fn value(job: &Job) -> String {
+        std::fs::read_to_string(job.cwd.join("value.txt")).unwrap()
+    }
+
+    /// The core proof: with the fix taken out the new test must fail, and
+    /// the fix must be back on disk afterwards either way.
+    #[tokio::test]
+    async fn reproduction_reverts_the_source_and_puts_the_fix_back() {
+        let (_dir, job, before, changed) = fixed_repo();
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+
+        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
-        assert_eq!(std::fs::read_to_string(root.join("value.txt")).unwrap(), "2\n", "fix restored");
+        assert_eq!(value(&job), "2\n", "fix restored");
+
+        // A rescue that fires after the check finished has nothing to put
+        // back, and must not undo work done since.
+        std::fs::write(job.cwd.join("value.txt"), "3\n").unwrap();
+        fire(&slot);
+        assert_eq!(value(&job), "3\n", "a late rescue writes nothing");
 
         // A test that passes either way proves nothing; a failing baseline
         // is the fallback evidence.
-        let weak = reproduce(&job, &before, &changed, "true", None).await;
+        std::fs::write(job.cwd.join("value.txt"), "2\n").unwrap();
+        let weak = reproduce(&job, &before, &changed, "true", None, &rescuer).await;
         assert!(matches!(weak, Repro::NotShown(_)), "{weak:?}");
         let base = Run { cmd: "t".into(), code: Some(1), output: String::new(), secs: 0.0, timed_out: false };
-        let fallback = reproduce(&job, &before, &changed, "true", Some(&base)).await;
+        let fallback = reproduce(&job, &before, &changed, "true", Some(&base), &rescuer).await;
         assert_eq!(fallback, Repro::Baseline { status: "exit 1".into() });
+    }
+
+    /// The race that lost a fix: the rescue fired after it was registered
+    /// and before the swap, so it restored nothing, and the swap then wrote
+    /// the originals over the fix for good. Now the swap sees the rescue
+    /// and never starts.
+    #[tokio::test]
+    async fn a_rescue_between_register_and_swap_leaves_the_fix_on_disk() {
+        let (_dir, job, before, changed) = fixed_repo();
+        let fire_at_once = |hook: Box<dyn FnOnce() + Send>| hook();
+        let rescuer = Rescuer { register: &fire_at_once, stop: no_stop };
+
+        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None, &rescuer).await;
+        assert_eq!(repro, Repro::NotShown("interrupted".into()));
+        assert_eq!(value(&job), "2\n", "the fix is on disk");
+    }
+
+    /// A rescue while the check runs puts the fix back, and the end of the
+    /// check does not write over it again.
+    #[tokio::test]
+    async fn a_rescue_during_the_check_puts_the_fix_back() {
+        let (_dir, job, before, changed) = fixed_repo();
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+
+        let check = "echo seen > seen.txt; sleep 1; bash tests/check.sh";
+        let (repro, during) = tokio::join!(
+            reproduce(&job, &before, &changed, check, None, &rescuer),
+            async {
+                while !job.cwd.join("seen.txt").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let during = value(&job);
+                fire(&slot);
+                during
+            }
+        );
+        assert_eq!(during, "1\n", "the originals were on disk during the check");
+        assert_eq!(repro, Repro::NotShown("interrupted".into()));
+        assert_eq!(value(&job), "2\n", "the rescue put the fix back");
     }
 
     #[test]
@@ -1239,7 +1373,10 @@ mod tests {
         std::fs::write(root.join("tests/check.sh"), "test -x run.sh\n").unwrap();
         let changed = git.changed_since(&before);
 
-        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None).await;
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         let mode = std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "the restored script is still executable");
