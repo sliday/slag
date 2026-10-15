@@ -169,6 +169,10 @@ pub(crate) struct DashState {
     /// The row holding the current turn header, so the route folds into it
     /// rather than spending a line of its own.
     pub(crate) turn_row: Option<u64>,
+    /// The tape's clock during a replay; `None` reads the wall clock. Every
+    /// elapsed figure on screen (turn timer, stall tint) goes through
+    /// `now`, so a replayed frame is the same frame every time.
+    pub(crate) clock: Option<Instant>,
     /// The route last announced. An unchanged route is not news, so it is
     /// printed once and then only when it moves.
     pub(crate) route: Option<String>,
@@ -179,6 +183,10 @@ pub(crate) struct DashState {
 }
 
 impl DashState {
+    pub(crate) fn now(&self) -> Instant {
+        self.clock.unwrap_or_else(Instant::now)
+    }
+
     /// Fill the crucible from PLAN.md's ingots, with the status each one
     /// already carries. Events still drive every later change; this only
     /// decides what the pane shows before the first one arrives.
@@ -203,12 +211,13 @@ impl DashState {
         if let Some(i) = self.ingots.iter().position(|r| r.id == id) {
             return &mut self.ingots[i];
         }
+        let now = self.now();
         self.ingots.push(IngotRow {
             id: id.to_string(),
             work: String::new(),
             heat: 0,
             status: IngotStatus::Forging,
-            last_activity: Instant::now(),
+            last_activity: now,
         });
         self.ingots.last_mut().unwrap()
     }
@@ -216,7 +225,7 @@ impl DashState {
     /// Refresh the activity clock on every row still forging. Token and
     /// tool events carry no ingot id, so liveness is per-forge, not per-row.
     fn mark_activity(&mut self) {
-        let now = Instant::now();
+        let now = self.now();
         for row in &mut self.ingots {
             if row.status == IngotStatus::Forging {
                 row.last_activity = now;
@@ -264,7 +273,7 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
         }
         EngineEvent::TurnStart { turn } => {
             state.turn = *turn;
-            state.turn_started = Some(Instant::now());
+            state.turn_started = Some(state.now());
             state.turn_tokens = 0;
             let head = match &state.ingot {
                 Some(ingot) => format!("⚒ [{ingot}] turn {turn}"),
@@ -343,11 +352,12 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
         }
         EngineEvent::IngotStart { id, work } => {
             state.ingot = Some(id.clone());
+            let now = state.now();
             let row = state.row_mut(id);
             row.work = preview(work, 60);
             row.heat = 0;
             row.status = IngotStatus::Forging;
-            row.last_activity = Instant::now();
+            row.last_activity = now;
         }
         EngineEvent::HeatTick { id, heat } => state.row_mut(id).heat = *heat,
         EngineEvent::IngotDone { id, ok } => {
@@ -950,7 +960,7 @@ fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
     let inner = area.width.saturating_sub(2) as usize;
     let visible = area.height.saturating_sub(2) as usize;
     let skip = state.ingots.len().saturating_sub(visible);
-    let now = Instant::now();
+    let now = state.now();
     let lines: Vec<Line> =
         state.ingots.iter().skip(skip).map(|row| ingot_line(row, now, inner)).collect();
     let block = Block::default()
@@ -1165,7 +1175,7 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
         None => format!("  Σ {} tok", state.totals.total_tokens),
     };
     let mut totals_color = palette(tui::PURE);
-    if let Some(status) = forge_status(state, Instant::now()) {
+    if let Some(status) = forge_status(state, state.now()) {
         totals = format!("  {status}");
         totals_color = palette(tui::HOT);
     }
@@ -1179,7 +1189,7 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
     // it worked. WARM (red) — the same colour a crack gets.
     if state
         .pending_cancel
-        .is_some_and(|t| Instant::now().saturating_duration_since(t) < DOUBLE_PRESS)
+        .is_some_and(|t| state.now().saturating_duration_since(t) < DOUBLE_PRESS)
     {
         input_spans.push(Span::styled(
             "  press Ctrl-C again to cancel the forge",
@@ -1351,6 +1361,92 @@ pub async fn run(
     result
 }
 
+/// The engine is gone: no smith reads the steer queue, and the input
+/// takes the next commission instead. Shared by the live loop (channel
+/// closed) and a replay (tape ran out), so both end on the same frame.
+pub(crate) fn mark_finished(state: &mut DashState) {
+    state.finished = true;
+    state.push_feed(
+        palette(tui::BRIGHT),
+        "■ forge finished — type a new commission, or q/Esc to exit".into(),
+    );
+}
+
+// ---------------------------------------------------------------- replay
+
+/// A dashboard state for playing a tape: seeded from the tape's first
+/// plan, on the tape's clock, with no disk reads and no saved spend.
+pub(crate) fn replay_state(plan: Option<&str>, start: Instant) -> DashState {
+    let mut state = DashState { clock: Some(start), ..Default::default() };
+    if let Some(plan) = plan {
+        state.seed_from_plan(plan);
+    }
+    state
+}
+
+/// Render one frame into a `w`×`h` grid and return it as plain text rows,
+/// trailing blanks trimmed. Deterministic: the same state draws the same
+/// rows, which is what lets a replay frame stand in a test.
+pub(crate) fn render_text(state: &DashState, w: u16, h: u16) -> Vec<String> {
+    use ratatui::backend::TestBackend;
+    let Ok(mut terminal) = Terminal::new(TestBackend::new(w.max(1), h.max(1))) else {
+        return Vec::new();
+    };
+    let _ = terminal.draw(|f| draw(f, state));
+    let buf = terminal.backend().buffer();
+    let mut rows = Vec::with_capacity(h as usize);
+    for y in 0..buf.area.height {
+        let mut row = String::new();
+        let mut skip = 0usize;
+        for x in 0..buf.area.width {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let sym = buf[(x, y)].symbol();
+            // A wide glyph owns the next cell too; the backend pads it
+            // with a blank that would double every emoji's width.
+            skip = unicode_cells(sym).saturating_sub(1);
+            row.push_str(sym);
+        }
+        rows.push(row.trim_end().to_string());
+    }
+    rows
+}
+
+fn unicode_cells(s: &str) -> usize {
+    ratatui::text::Span::raw(s).width().max(1)
+}
+
+/// Enter the alternate screen for a replay. Same setup as a live attach,
+/// minus the steer history and the saved spend.
+pub(crate) fn replay_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stderr>>> {
+    register_terminal_restore();
+    enable_raw_mode()?;
+    crossterm::execute!(io::stderr(), EnterAlternateScreen)?;
+    Terminal::new(CrosstermBackend::new(io::stderr()))
+}
+
+/// Draw one replay frame, synchronized where the terminal allows it.
+pub(crate) fn replay_draw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    state: &DashState,
+) -> io::Result<()> {
+    let sync = tui::sync_updates_enabled();
+    if sync {
+        let _ = crossterm::execute!(io::stderr(), crossterm::terminal::BeginSynchronizedUpdate);
+    }
+    let drawn = terminal.draw(|f| draw(f, state)).map(|_| ());
+    if sync {
+        let _ = crossterm::execute!(io::stderr(), crossterm::terminal::EndSynchronizedUpdate);
+    }
+    drawn
+}
+
+pub(crate) fn replay_restore() {
+    restore_terminal();
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
@@ -1397,11 +1493,7 @@ async fn event_loop(
                     }
                     None => {
                         engine_done = true;
-                        state.finished = true;
-                        state.push_feed(
-                            palette(tui::BRIGHT),
-                            "■ forge finished — type a new commission, or q/Esc to exit".into(),
-                        );
+                        mark_finished(state);
                         dirty = true;
                     }
                 }

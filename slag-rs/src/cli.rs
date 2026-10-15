@@ -129,6 +129,33 @@ pub enum Command {
     /// Session spend beside the OpenRouter account balance
     Cost,
 
+    /// Play a recorded run (logs/tape-*.jsonl, or any engine-*.jsonl)
+    /// through the live renderers. Needs no key and no network.
+    Replay {
+        /// Tape or event log to play
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Playback speed; long waits are capped before scaling
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// Play in the full-screen dashboard instead of the stream view
+        #[arg(long)]
+        tui: bool,
+        /// Stop at a moment and hold the frame: start, survey, plan, forge,
+        /// anvils, retry, crack, warden, assay, or an offset (12s, 40%)
+        #[arg(long, value_name = "POINT")]
+        at: Option<String>,
+        /// Seconds to hold the last frame (default: until a key, when --at)
+        #[arg(long, value_name = "SECS")]
+        hold: Option<f64>,
+        /// Draw off-screen at this size and print the frame as text
+        #[arg(long, value_name = "WxH")]
+        size: Option<String>,
+        /// List the moments this tape has, with their offsets
+        #[arg(long)]
+        points: bool,
+    },
+
     /// Lifecycle hooks: the event contract and what is configured
     Hooks {
         #[command(subcommand)]
@@ -171,8 +198,10 @@ impl Cli {
 }
 
 /// The subcommands slag answers to, for the message a suspect verb earns.
-pub const SUBCOMMANDS: &[&str] =
-    &["key", "status", "runs", "insights", "ps", "resume", "update", "rewind", "cost", "hooks"];
+pub const SUBCOMMANDS: &[&str] = &[
+    "key", "status", "runs", "insights", "ps", "resume", "update", "rewind", "cost", "hooks",
+    "replay",
+];
 
 /// The closest subcommand to a typo, when one is close enough to name.
 /// Two edits covers the ordinary slips -- a dropped letter, a doubled one,

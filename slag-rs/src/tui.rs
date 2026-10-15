@@ -18,6 +18,18 @@ pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
 }
 
+/// Set while a run-wide stream presenter owns stderr's live line. An
+/// indicatif spinner ticking on the same line would fight its rewrites.
+static PRESENTER: AtomicBool = AtomicBool::new(false);
+
+pub fn set_presenter(on: bool) {
+    PRESENTER.store(on, Ordering::Relaxed);
+}
+
+fn presenter_active() -> bool {
+    PRESENTER.load(Ordering::Relaxed)
+}
+
 // Palette (cold ore → hot metal → pure steel).
 // Same five hexes the slag.dev site uses (website/src/main.css `--slag-*`),
 // so terminal and web read as one product. Terminals without truecolor get
@@ -92,6 +104,7 @@ pub fn hr() {
 }
 
 pub fn header(title: &str) {
+    crate::render::tape::mark(crate::render::tape::Mark::Header { text: title.to_string() });
     if is_quiet() {
         return;
     }
@@ -109,6 +122,11 @@ pub fn header(title: &str) {
 }
 
 pub fn status_line(icon: &str, color: Color, msg: &str) {
+    crate::render::tape::mark(crate::render::tape::Mark::Status {
+        icon: icon.to_string(),
+        tone: crate::render::tape::Tone::of(color),
+        text: msg.to_string(),
+    });
     if is_quiet() {
         return;
     }
@@ -116,6 +134,7 @@ pub fn status_line(icon: &str, color: Color, msg: &str) {
 }
 
 pub fn show_banner() {
+    crate::render::tape::mark(crate::render::tape::Mark::Banner);
     if is_quiet() {
         return;
     }
@@ -252,6 +271,9 @@ pub fn key_shadowed() {
 }
 
 pub fn ingot_status_line(counts: &CrucibleCounts) {
+    crate::render::tape::mark(crate::render::tape::Mark::Counts {
+        tally: crate::render::tape::Tally::of(counts),
+    });
     if is_quiet() {
         return;
     }
@@ -263,6 +285,9 @@ pub fn ingot_status_line(counts: &CrucibleCounts) {
 }
 
 pub fn temper_bar(counts: &CrucibleCounts) {
+    crate::render::tape::mark(crate::render::tape::Mark::TemperBar {
+        tally: crate::render::tape::Tally::of(counts),
+    });
     if is_quiet() {
         return;
     }
@@ -296,7 +321,7 @@ pub fn temper_bar(counts: &CrucibleCounts) {
 
 /// Create a spinner for long operations
 pub fn spinner(msg: &str) -> ProgressBar {
-    if is_quiet() {
+    if is_quiet() || presenter_active() {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new_spinner();

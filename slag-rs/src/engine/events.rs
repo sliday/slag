@@ -183,12 +183,12 @@ pub struct IngotAccum {
 }
 
 impl IngotAccum {
-    fn new() -> Self {
-        Self { tokens: 0, cost: None, started: Instant::now(), ctx: None }
+    fn new(now: Instant) -> Self {
+        Self { tokens: 0, cost: None, started: now, ctx: None }
     }
 
-    fn reset(&mut self) {
-        *self = Self::new();
+    fn reset(&mut self, now: Instant) {
+        *self = Self::new(now);
     }
 
     fn add(&mut self, usage: &Usage) {
@@ -198,11 +198,11 @@ impl IngotAccum {
         }
     }
 
-    /// The ` · 42s · 118k tok · $0.31` tail.
-    fn tail(&self) -> String {
+    /// The ` · 42s · 118k tok · $0.31` tail, timed against `now`.
+    fn tail(&self, now: Instant) -> String {
         let mut s = format!(
             " · {}s · {} tok",
-            self.started.elapsed().as_secs(),
+            now.saturating_duration_since(self.started).as_secs(),
             fmt_tokens(self.tokens)
         );
         if let Some(cost) = self.cost {
@@ -368,6 +368,13 @@ pub struct RenderState {
     /// Second card of a possible streak, held until we know whether the
     /// third arrives (3+ collapse) or the streak breaks (print it).
     held: Option<Card>,
+    /// The clock every elapsed figure is read against: the wall clock live,
+    /// the tape's clock in a replay. Set by each `feed_at`.
+    now: Instant,
+    /// Whether ingot lifecycle events (start, heat, done, duel) print lines
+    /// of their own. A run-wide presenter turns this off: the pipeline
+    /// already prints those moments, and a replay rebuilds them.
+    lifecycle: bool,
 }
 
 impl RenderState {
@@ -377,6 +384,7 @@ impl RenderState {
         } else {
             0
         };
+        let now = Instant::now();
         Self {
             tty,
             width,
@@ -386,11 +394,19 @@ impl RenderState {
             narrate: None,
             routed_pending: None,
             last_routed: None,
-            accum: IngotAccum::new(),
+            accum: IngotAccum::new(now),
             streak_verb: None,
             streak_count: 0,
             held: None,
+            now,
+            lifecycle: true,
         }
+    }
+
+    /// Leave ingot lifecycle lines to whoever prints the pipeline's stream.
+    pub fn without_lifecycle(mut self) -> Self {
+        self.lifecycle = false;
+        self
     }
 
     /// Override the live-line width clamp (tests; `new` asks the terminal).
@@ -405,6 +421,14 @@ impl RenderState {
     }
 
     pub fn feed(&mut self, event: &EngineEvent) -> Vec<RenderOp> {
+        self.feed_at(event, Instant::now())
+    }
+
+    /// `feed` against an explicit clock, so a replay times every figure
+    /// from the tape rather than from how fast it is being played.
+    pub fn feed_at(&mut self, event: &EngineEvent, now: Instant) -> Vec<RenderOp> {
+        self.now = now.max(self.now);
+        let now = self.now;
         let mut prints: Vec<String> = Vec::new();
         match event {
             // Demoted to live-line metadata: no own lines.
@@ -428,7 +452,7 @@ impl RenderState {
                     name: name.clone(),
                     verb,
                     arg,
-                    started: Instant::now(),
+                    started: now,
                 });
             }
             EngineEvent::ToolResult { name, ok, preview: p, .. } => {
@@ -472,31 +496,41 @@ impl RenderState {
                 ));
             }
             EngineEvent::IngotStart { id, work } => {
-                self.flush_streak(&mut prints);
-                self.accum.reset();
-                prints.push(line(HOT, "🧱", &format!("[{id}] {}", preview(work, 60))));
+                self.accum.reset(now);
+                if self.lifecycle {
+                    self.flush_streak(&mut prints);
+                    prints.push(line(HOT, "🧱", &format!("[{id}] {}", preview(work, 60))));
+                }
             }
             EngineEvent::HeatTick { id, heat } => {
-                self.flush_streak(&mut prints);
-                prints.push(line(WARM, "🔥", &format!("[{id}] heat {heat}")));
+                if self.lifecycle {
+                    self.flush_streak(&mut prints);
+                    prints.push(line(WARM, "🔥", &format!("[{id}] heat {heat}")));
+                }
             }
             EngineEvent::IngotDone { id, ok } => {
-                self.flush_streak(&mut prints);
-                let (color, icon, word) =
-                    if *ok { (PURE, "✅", "forged") } else { (WARM, "❌", "cracked") };
-                prints.push(line(
-                    color,
-                    icon,
-                    &format!("[{id}] {word}{}", dim(&self.accum.tail())),
-                ));
+                if self.lifecycle {
+                    self.flush_streak(&mut prints);
+                    let (color, icon, word) =
+                        if *ok { (PURE, "✅", "forged") } else { (WARM, "❌", "cracked") };
+                    prints.push(line(
+                        color,
+                        icon,
+                        &format!("[{id}] {word}{}", dim(&self.accum.tail(now))),
+                    ));
+                }
             }
             EngineEvent::DuelRound { id, round } => {
-                self.flush_streak(&mut prints);
-                prints.push(line(BRIGHT, "⚔", &format!("[{id}] duel round {round}")));
+                if self.lifecycle {
+                    self.flush_streak(&mut prints);
+                    prints.push(line(BRIGHT, "⚔", &format!("[{id}] duel round {round}")));
+                }
             }
             EngineEvent::DuelVerdict { id, winner, margin } => {
-                self.flush_streak(&mut prints);
-                prints.push(line(PURE, "⚖", &format!("[{id}] cast {winner} wins by {margin}")));
+                if self.lifecycle {
+                    self.flush_streak(&mut prints);
+                    prints.push(line(PURE, "⚖", &format!("[{id}] cast {winner} wins by {margin}")));
+                }
             }
             // A hook's start is JSONL-only: the finish line carries the
             // verdict and the duration, and printing both would double
@@ -557,7 +591,7 @@ impl RenderState {
         let secs = self
             .pending
             .front()
-            .map(|c| c.started.elapsed().as_secs())
+            .map(|c| self.now.saturating_duration_since(c.started).as_secs())
             .unwrap_or(0);
         let mut meta = format!(" · {secs}s · {} tok", fmt_tokens(self.accum.tokens));
         if let Some(cost) = self.accum.cost {
@@ -677,7 +711,7 @@ static STDERR_LIVE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Apply render ops to stderr. The only place the narrator touches a
 /// terminal; IO errors are swallowed (display must never kill the forge).
-fn apply_ops(ops: &[RenderOp]) {
+pub(crate) fn apply_ops(ops: &[RenderOp]) {
     let mut live = STDERR_LIVE.lock().unwrap_or_else(|p| p.into_inner());
     let mut err = std::io::stderr().lock();
     write_ops(ops, &mut err, &mut live);
@@ -719,6 +753,41 @@ impl StderrNarrator {
             }
             apply_ops(&state.finish());
         })
+    }
+}
+
+/// The run-wide stream view. One narrator for every smith and for the
+/// pipeline's own events, fed by the recording session, instead of one
+/// per smith invocation: parallel anvils share one live line rather than
+/// fighting over it, and pipeline warnings (the warden's verdict among
+/// them) reach the terminal instead of a channel nobody reads.
+pub struct StreamPresenter {
+    state: RenderState,
+}
+
+impl StreamPresenter {
+    pub fn new() -> Self {
+        Self { state: RenderState::new(std::io::stderr().is_terminal()).without_lifecycle() }
+    }
+}
+
+impl Default for StreamPresenter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::render::tape::Viewer for StreamPresenter {
+    fn cue(&mut self, cue: &crate::render::tape::Cue, at: Instant) {
+        if let crate::render::tape::Cue::Event(event) = cue {
+            apply_ops(&self.state.feed_at(event, at));
+        }
+    }
+
+    fn tick(&mut self, _at: Instant) {}
+
+    fn finish(&mut self, _at: Instant) {
+        apply_ops(&self.state.finish());
     }
 }
 

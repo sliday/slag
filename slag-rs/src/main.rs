@@ -12,6 +12,7 @@ mod pipeline;
 mod progress;
 mod proof;
 mod render;
+mod replay;
 mod sexp;
 mod shutdown;
 mod smith;
@@ -95,6 +96,23 @@ async fn main() {
         }
         Some(Command::Rewind { ingot, heat }) => cli::show_rewind(ingot.as_deref(), heat),
         Some(Command::Hooks { action: cli::HooksAction::List }) => cli::show_hooks(),
+        Some(Command::Replay { file, speed, tui, at, hold, size, points }) => {
+            match size.as_deref().map(replay::parse_size).transpose() {
+                Ok(size) => {
+                    replay::run(replay::Opts {
+                        file,
+                        speed,
+                        tui: tui || cli.tui,
+                        at,
+                        hold,
+                        size,
+                        points,
+                    })
+                    .await
+                }
+                Err(e) => Err(error::SlagError::Other(anyhow::anyhow!(e))),
+            }
+        }
         None => {
             // A lone bare word reaches here because `commission` is a
             // trailing var-arg: clap has no subcommand to match, so the
@@ -313,16 +331,27 @@ async fn run_pipeline(
     connect_mcp().await;
 
     if !(tui_flag && std::io::stdin().is_terminal()) {
-        // `--trace` without `--tui` is the useful headless case: no
-        // dashboard holds the channel, so the trace sink takes it.
-        let (hooks, sink) = render::trace::attach(EngineHooks::default(), trace);
+        // Headless: the recording session holds the event channel, and its
+        // presenter draws the stream for every smith at once.
+        let tape = render::tape::Session::open(
+            Some(render::tape::default_path()),
+            Some(Box::new(engine::events::StreamPresenter::new())),
+        );
+        tui::set_presenter(true);
+        let hooks = tape.attach(EngineHooks::default());
+        let (hooks, sink) = render::trace::attach(hooks, trace);
         let result =
             pipeline::run(commission, config, anvils, hooks, temper).await;
         if let Some(sink) = sink {
             let _ = sink.await;
         }
+        tape.close().await;
+        tui::set_presenter(false);
         return result;
     }
+
+    // The dashboard holds the event channel; the tape only listens.
+    let tape = render::tape::Session::open(Some(render::tape::default_path()), None);
 
     // One pass per commission. A finished forge is not a full stop: the
     // dashboard hands back whatever the operator typed at the end, and
@@ -334,11 +363,11 @@ async fn run_pipeline(
     let mut commission: Option<String> = commission.map(str::to_string);
     let result = loop {
         let (tx, rx) = engine::events::channel();
-        let hooks = EngineHooks {
+        let hooks = tape.attach(EngineHooks {
             events: Some(tx),
             steer: Some(steer.clone()),
             cancel: Some(cancel.clone()),
-        };
+        });
         // Tee before the dashboard: the trace needs the same stream, and
         // the dashboard must not lose an event to get it.
         let (hooks, trace_sink) = render::trace::attach(hooks, trace.clone());
@@ -396,6 +425,7 @@ async fn run_pipeline(
     if !matches!(result, Err(error::SlagError::Cancelled)) {
         let _ = pipeline::assay::show();
     }
+    tape.close().await;
 
     result
 }
