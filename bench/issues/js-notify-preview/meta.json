@@ -1,0 +1,1 @@
+{"id": "js-notify-preview", "lang": "javascript", "difficulty": "medium", "summary": "Preview truncation slices UTF-16 code units, splitting surrogate pairs and counting emoji double."}

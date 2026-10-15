@@ -1,0 +1,13 @@
+diff --git a/passcheck/core.py b/passcheck/core.py
+index 928ef8d..302c944 100644
+--- a/passcheck/core.py
++++ b/passcheck/core.py
+@@ -13,7 +13,7 @@ def is_strong(password):
+     """
+     has_upper = any(c.isupper() for c in password)
+     has_digit = any(c.isdigit() for c in password)
+-    return len(password) >= MIN_LENGTH or (has_upper and has_digit)
++    return len(password) >= MIN_LENGTH and (has_upper and has_digit)
+ 
+ 
+ def strength_score(password):
