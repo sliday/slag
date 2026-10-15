@@ -17,8 +17,8 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Commission (new project description)
-    #[arg(trailing_var_arg = true)]
+    /// Commission (new project description). Flags may come before or
+    /// after it: `slag "build x" --temper 1` sets temper.
     pub commission: Vec<String>,
 
     /// Branch-per-ingot worktree isolation (not implemented yet; ignored
@@ -1246,8 +1246,8 @@ mod verb_tests {
     #[test]
     fn a_lone_bare_word_is_treated_as_a_mistyped_subcommand() {
         // `slag finalize` appended an addendum to PRD.md and paid for a
-        // survey, because a trailing var-arg swallows anything clap cannot
-        // match to a subcommand.
+        // survey, because the positional commission takes any word clap
+        // cannot match to a subcommand.
         assert_eq!(parse(&["finalize"]).suspect_verb(), Some("finalize"));
     }
 
@@ -1260,13 +1260,21 @@ mod verb_tests {
 
     #[test]
     fn force_is_the_way_to_commission_a_one_word_project() {
-        // The flag has to precede the word: `commission` is a trailing
-        // var-arg, so anything after the first positional is swallowed
-        // into the brief rather than parsed as a flag.
         let cli = parse(&["--force", "tetris"]);
         assert!(cli.force);
         assert_eq!(cli.commission_text().as_deref(), Some("tetris"));
-        assert_eq!(parse(&["tetris", "--force"]).commission_text().as_deref(), Some("tetris --force"));
+        let after = parse(&["tetris", "--force"]);
+        assert!(after.force);
+        assert_eq!(after.commission_text().as_deref(), Some("tetris"));
+    }
+
+    #[test]
+    fn a_flag_after_the_commission_is_a_flag() {
+        // It used to be swallowed into the brief, so `--temper 1` after
+        // the commission silently skipped the goal check.
+        let cli = parse(&["build a word-count CLI", "--temper", "1"]);
+        assert_eq!(cli.temper, 1);
+        assert_eq!(cli.commission_text().as_deref(), Some("build a word-count CLI"));
     }
 
     #[test]

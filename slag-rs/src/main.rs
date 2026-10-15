@@ -132,7 +132,7 @@ async fn main() {
         }
         None => {
             // A lone bare word reaches here because `commission` is a
-            // trailing var-arg: clap has no subcommand to match, so the
+            // positional var-arg: clap has no subcommand to match, so the
             // typo becomes a project brief. Stop before that costs an
             // addendum and a planning pass.
             if let Some(word) = cli.suspect_verb().filter(|_| !cli.force) {
