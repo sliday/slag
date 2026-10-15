@@ -190,11 +190,16 @@ pub struct Usage {
 
 impl Usage {
     pub fn add(&mut self, other: &Usage) {
+        let unknown = ((self.total_tokens > 0 || self.prompt_tokens > 0 || self.completion_tokens > 0) && self.cost.is_none())
+            || ((other.total_tokens > 0 || other.prompt_tokens > 0 || other.completion_tokens > 0) && other.cost.is_none());
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.total_tokens += other.total_tokens;
         if let Some(c) = other.cost {
             *self.cost.get_or_insert(0.0) += c;
+        }
+        if unknown {
+            self.cost = None;
         }
         // One estimated leg makes the whole sum an estimate. The key fields
         // stay put: a fold across models has no single model or role.
@@ -928,7 +933,7 @@ pub mod stats {
                 ..Default::default()
             });
             let lines = ledger_lines(&stats).unwrap();
-            assert!(lines[0].contains("~$0.0100 (est)"), "got {:?}", lines[0]);
+            assert!(lines[0].contains("≈ $0.0100 est."), "got {:?}", lines[0]);
         }
 
         #[test]

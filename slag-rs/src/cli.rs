@@ -312,13 +312,11 @@ pub fn status_json() -> Result<String, SlagError> {
     // Newest event log = the live (or last) smith invocation. Its stem
     // doubles as the run id; there is no other run identity on disk.
     let log = newest_log(Path::new(crate::config::LOG_DIR));
-    let (mut prompt, mut completion, mut log_cost) = (0u64, 0u64, 0f64);
+    let mut usage = crate::engine::Usage::default();
     let (mut last_event, mut last_prompt) = (None, None);
     if let Some(path) = &log {
         if let Ok(contents) = std::fs::read_to_string(path) {
-            prompt = scan_num_sum(&contents, "prompt_tokens") as u64;
-            completion = scan_num_sum(&contents, "completion_tokens") as u64;
-            log_cost = scan_num_sum(&contents, "cost");
+            usage = log_usage(&contents);
             last_event = scan_str_last(&contents, "event");
             last_prompt = scan_num_last(&contents, "prompt_tokens").map(|n| n as u64);
         }
@@ -326,8 +324,9 @@ pub fn status_json() -> Result<String, SlagError> {
 
     // Persisted session costs win over the single-log sum: they cover the
     // whole run, the log only its newest invocation.
-    let session_spend = session_costs_spend(Path::new(SESSION_COSTS));
-    let spend = session_spend.or((log_cost > 0.0).then_some(log_cost));
+    if let Some(session) = session_costs_usage(Path::new(SESSION_COSTS)) {
+        usage = session;
+    }
 
     // The context window is model-dependent and not persisted in the
     // logs, so context is reported in tokens; pct stays null unless the
@@ -352,11 +351,13 @@ pub fn status_json() -> Result<String, SlagError> {
             "total": counts.total,
         },
         "active_anvils": counts.molten,
-        "spend_usd": spend,
+        "spend_usd": usage.cost,
+        "spend_estimated": usage.estimated,
+        "spend": crate::engine::pricing::format_cost(&usage),
         "tokens": {
-            "prompt": prompt,
-            "completion": completion,
-            "total": prompt + completion,
+            "prompt": usage.prompt_tokens,
+            "completion": usage.completion_tokens,
+            "total": usage.total_tokens,
         },
         "context_tokens": last_prompt,
         "context_pct": context_pct,
@@ -370,27 +371,83 @@ pub fn status_json() -> Result<String, SlagError> {
 /// endpoint — and the line degrades to whichever half is real rather than
 /// printing a zero that reads as fact.
 pub fn cost_line(session: Option<f64>, credits: Option<crate::engine::provider::Credits>) -> String {
-    let mut parts = Vec::new();
-    match session {
-        Some(spend) => parts.push(format!("session ${spend:.2}")),
-        None => parts.push("session -".to_string()),
-    }
+    usage_cost_line(&crate::engine::Usage { cost: session, ..Default::default() }, credits)
+}
+
+fn usage_cost_line(usage: &crate::engine::Usage, credits: Option<crate::engine::provider::Credits>) -> String {
+    let spend = crate::engine::pricing::format_cost(usage);
+    let mut parts = vec![format!("session {}", spend.trim_start_matches("spend "))];
     if let Some(c) = credits {
         parts.push(format!("account ${:.2} remaining", c.remaining()));
     }
     parts.join(" · ")
 }
 
+fn log_usage(contents: &str) -> crate::engine::Usage {
+    let mut usage = crate::engine::Usage::default();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if value.get("event").and_then(|v| v.as_str()) != Some("tokens") {
+            continue;
+        }
+        if let Some(value) = value.get("usage") {
+            if let Ok(mut call) = serde_json::from_value::<crate::engine::Usage>(value.clone()) {
+                if call.total_tokens == 0 {
+                    call.total_tokens = call.prompt_tokens + call.completion_tokens;
+                }
+                usage.add(&call);
+            }
+        }
+    }
+    usage
+}
+
+fn session_costs_usage(path: &Path) -> Option<crate::engine::Usage> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    fn fold(value: &serde_json::Value) -> Option<crate::engine::Usage> {
+        if value.get("prompt_tokens").is_some() || value.get("total_tokens").is_some() {
+            let mut usage: crate::engine::Usage = serde_json::from_value(value.clone()).ok()?;
+            if usage.total_tokens == 0 {
+                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+            }
+            return Some(usage);
+        }
+        if let Some(cost) = spend_from_value(value).filter(|_| value.as_f64().is_some() || {
+            ["total_usd", "total", "spend_usd", "spend", "cost"].iter().any(|key| value.get(key).is_some())
+        }) {
+            return Some(crate::engine::Usage { cost: Some(cost), ..Default::default() });
+        }
+        let values: Vec<_> = match value {
+            serde_json::Value::Object(obj) => obj.values().collect(),
+            serde_json::Value::Array(arr) => arr.iter().collect(),
+            _ => return None,
+        };
+        let mut total = crate::engine::Usage::default();
+        let mut found = false;
+        for usage in values.into_iter().filter_map(fold) {
+            total.add(&usage);
+            found = true;
+        }
+        found.then_some(total)
+    }
+    fold(&value)
+}
+
 /// `slag cost`: this run's spend and the account balance.
 pub async fn show_cost() -> Result<(), SlagError> {
-    let spend = session_costs_spend(Path::new(SESSION_COSTS));
+    let usage = session_costs_usage(Path::new(SESSION_COSTS))
+        .or_else(|| newest_log(Path::new(crate::config::LOG_DIR))
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|contents| log_usage(&contents)))
+        .unwrap_or_default();
     // No key: the session half still prints. Reading spend off disk needs
     // no network and no account.
     let credits = match crate::config::EngineConfig::load() {
         Some(cfg) => crate::engine::provider::fetch_credits(&cfg.api_key, &cfg.base_url).await,
         None => None,
     };
-    println!("{}", cost_line(spend, credits));
+    println!("{}", usage_cost_line(&usage, credits));
     if let (Some(c), Some(floor)) = (credits, crate::config::credit_floor()) {
         if c.remaining() < floor {
             println!("  balance is under the ${floor:.2} floor — top up before a long run");
@@ -952,16 +1009,38 @@ mod tests {
         let credits = crate::engine::provider::Credits { granted: 20.0, used: 1.69 };
         assert_eq!(
             cost_line(Some(0.42), Some(credits)),
-            "session $0.42 · account $18.31 remaining"
+            "session $0.4200 · account $18.31 remaining"
         );
         // Unreachable balance endpoint: the session half still prints.
-        assert_eq!(cost_line(Some(0.42), None), "session $0.42");
+        assert_eq!(cost_line(Some(0.42), None), "session $0.4200");
         // Nothing spent yet reads as unknown, not as $0.00.
         assert_eq!(
             cost_line(None, Some(credits)),
-            "session - · account $18.31 remaining"
+            "session unknown · 0 in / 0 out tokens · account $18.31 remaining"
         );
-        assert_eq!(cost_line(None, None), "session -");
+        assert_eq!(cost_line(None, None), "session unknown · 0 in / 0 out tokens");
+    }
+
+    #[test]
+    fn cost_and_status_usage_preserve_estimates_and_unknown_calls() {
+        let priced = r#"{"event":"tokens","usage":{"prompt_tokens":1000,"completion_tokens":200,"cost":0.0031,"estimated":true}}"#;
+        let known = log_usage(priced);
+        assert_eq!(known.total_tokens, 1200);
+        assert_eq!(usage_cost_line(&known, None), "session ≈ $0.0031 est.");
+        let unknown = r#"{"event":"tokens","usage":{"prompt_tokens":1000,"completion_tokens":200}}"#;
+        let mixed = log_usage(&format!("{priced}\n{unknown}"));
+        assert_eq!(mixed.cost, None);
+        assert!(usage_cost_line(&mixed, None).contains("unknown"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("costs.json");
+        std::fs::write(&path, r#"{"a":{"prompt_tokens":1000,"completion_tokens":200,"cost":0.0031,"estimated":true}}"#).unwrap();
+        let persisted = session_costs_usage(&path).unwrap();
+        assert_eq!(persisted.cost, known.cost);
+        assert!(persisted.estimated);
+        std::fs::write(&path, r#"{"a":{"prompt_tokens":1000,"cost":0.0031},"b":{"prompt_tokens":500,"cost":null}}"#).unwrap();
+        let persisted = session_costs_usage(&path).unwrap();
+        assert_eq!(persisted.cost, None);
+        assert_eq!(persisted.prompt_tokens, 1500);
     }
 
     #[test]

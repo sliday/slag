@@ -83,7 +83,19 @@ Override a preset's endpoint with `SLAG_BASE_URL` or `base_url` in the file. Sup
 
 For separate endpoints in a mixed run, use `SLAG_<PROVIDER>_BASE_URL` or `<provider>_base_url`. Endpoint precedence is provider environment, generic environment, OpenRouter alias, provider file, generic file, then preset. slag rejects foreign preset hosts before authentication and does not follow HTTP redirects.
 
-`slag cost` shows session spend. For OpenRouter, it also checks the account balance. Other providers get session spend and a note about the absent balance endpoint. Spend caps use reported response costs; other providers can omit those costs.
+`slag cost` shows session spend. For OpenRouter, it also checks the account balance. Other providers get session spend and a note about the absent balance endpoint.
+
+Local list prices cover cloud defaults and common models, dated 2026-10-15. Sources and rates live in `slag-rs/src/engine/pricing.rs`. These estimates appear as `≈ $0.0031 est.` across spend displays. Unknown prices show input and output tokens. Mixed totals stay unknown if any call has an unknown price. Local and custom models stay unknown unless you set a price. No pricing lookup contacts another provider.
+
+Override list prices in USD per million tokens:
+
+```toml
+[pricing]
+"openai::gpt-4.1-mini" = { input = 0.40, output = 1.60, cached_input = 0.10 }
+"custom::my-model" = { input = 0.20, output = 0.80 }
+```
+
+`input` and `output` are required. `cached_input` is optional. Overrides take precedence over list prices and reported costs. Spend caps use reported costs or these estimates. DeepSeek uses peak rates. Gemini Flash latest uses its current promotional rates. Estimates exclude cache storage, taxes, and discounts.
 
 ## Models
 

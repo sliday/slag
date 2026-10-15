@@ -702,6 +702,8 @@ pub struct CostRecord {
     pub total_tokens: u64,
     #[serde(default)]
     pub cost: Option<f64>,
+    #[serde(default)]
+    pub estimated: bool,
 }
 
 impl CostRecord {
@@ -711,6 +713,7 @@ impl CostRecord {
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
             cost: u.cost,
+            estimated: u.estimated,
         }
     }
 
@@ -720,6 +723,7 @@ impl CostRecord {
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
             cost: self.cost,
+            estimated: self.estimated,
             ..Default::default()
         }
     }
@@ -1017,8 +1021,8 @@ fn draw_header(f: &mut Frame, area: Rect, state: &DashState) {
     if state.totals.total_tokens > 0 {
         right.push(format!("{} tok", tui::tokens(state.totals.total_tokens)));
     }
-    if let Some(c) = state.totals.cost {
-        right.push(tui::money(c));
+    if state.totals.total_tokens > 0 || state.totals.cost.is_some() {
+        right.push(crate::engine::pricing::format_cost(&state.totals));
     }
     let right = format!("{} ", right.join(" · "));
     let used = 11 + right.chars().count();
@@ -2930,6 +2934,7 @@ mod tests {
             cost: Some(0.55),
             prompt_tokens: 6000,
             completion_tokens: 3000,
+            ..Default::default()
         };
         save_session_cost_at(&path, "r1", &resumed).unwrap();
         assert_eq!(load_session_cost_at(&path, "r1"), Some(resumed));
@@ -2947,6 +2952,7 @@ mod tests {
             completion_tokens: 42,
             total_tokens: 142,
             cost: Some(0.05),
+            estimated: true,
             ..Default::default()
         };
         let rec = CostRecord::from_usage(&usage);
@@ -2955,6 +2961,7 @@ mod tests {
         assert_eq!(back.completion_tokens, 42);
         assert_eq!(back.total_tokens, 142);
         assert_eq!(back.cost, Some(0.05));
+        assert!(back.estimated);
 
         assert!(CostRecord::default().is_empty(), "zero spend is not worth a file");
         assert!(!rec.is_empty());

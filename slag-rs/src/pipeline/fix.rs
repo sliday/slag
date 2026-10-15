@@ -1071,7 +1071,7 @@ fn report(out: &Outcome) {
     }
     row("", &out.phases.line());
     if let Some(spend) = &out.spend {
-        row("spend", spend);
+        row("spend", spend.trim_start_matches("spend "));
     }
     if out.branch.is_some() && out.pr.is_none() {
         println!("\n  review: {}git show --stat HEAD{}", fg(tui::HOT), reset());
