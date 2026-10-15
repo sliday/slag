@@ -3,6 +3,7 @@
 #
 #   ./publish-release.sh --build              refresh all assets, publish nothing
 #   ./publish-release.sh --build --target ... refresh one target, publish nothing
+#   ./publish-release.sh --check [--allow-partial] check assets without publishing
 #   ./publish-release.sh "title" "notes"      publish the committed assets
 #
 # The version comes from slag-rs/Cargo.toml, so a release is cut by bumping
@@ -123,12 +124,17 @@ if [ "${1:-}" = "--build" ]; then
         exit 1
     fi
 
-    rm -f slag-*.tar.gz slag-* sha256.sum
     echo "Building slag $VERSION with glibc floor $GLIBC_FLOOR for: ${selected_targets[*]}"
-    assets=()
     for target in "${selected_targets[@]}"; do
         build_target "$target"
-        assets+=("slag-$target.tar.gz" "slag-$target")
+    done
+    if [ ! -x "slag-$TARGET" ]; then
+        build_target "$TARGET"
+    fi
+    cp "slag-$TARGET" ./slag
+    assets=()
+    for asset in slag-*; do
+        [ -f "$asset" ] && assets+=("$asset")
     done
     shasum -a 256 "${assets[@]}" | sort -k2 > sha256.sum
     if [[ " ${selected_targets[*]} " == *" $TARGET "* ]]; then
@@ -159,21 +165,20 @@ if [ "${1:-}" = "--build" ]; then
     exit 0
 fi
 
-TITLE="${1:-}"
-NOTES="${2:-}"
-if [ -z "$TITLE" ] || [ -z "$NOTES" ]; then
-    echo "Usage: $0 --build [--target <triple>] | $0 \"title\" \"notes\"" >&2
-    exit 1
-fi
-
-# A published release must use the current script and version.
-DIRTY=$(git -C "$CRATE_DIR" status --porcelain | grep -vE '^[ MARCUD?]{2} dist-local/(sha256\.sum|slag-[^/]+)$' || true)
-if [ -n "$DIRTY" ]; then
-    echo "Error: working tree has changes outside generated release assets." >&2
-    exit 1
-fi
-if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-    echo "Error: release $TAG already exists. Bump the version in Cargo.toml." >&2
+CHECK=false
+ALLOW_PARTIAL=false
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        --check) CHECK=true ;;
+        --allow-partial) ALLOW_PARTIAL=true ;;
+        *) args+=("$arg") ;;
+    esac
+done
+TITLE="${args[0]:-}"
+NOTES="${args[1]:-}"
+if ! "$CHECK" && { [ -z "$TITLE" ] || [ -z "$NOTES" ]; }; then
+    echo "Usage: $0 --check [--allow-partial] | $0 [--allow-partial] \"title\" \"notes\"" >&2
     exit 1
 fi
 
@@ -181,13 +186,39 @@ fi
 test -f sha256.sum || { echo "Error: sha256.sum missing. Run $0 --build." >&2; exit 1; }
 assets=()
 while read -r checksum asset; do
-    test -f "$asset" || { echo "Error: $asset missing. Run $0 --build." >&2; exit 1; }
+    if [ ! -f "$asset" ] || ! printf '%s  %s\n' "$checksum" "$asset" | shasum -a 256 -c - >/dev/null 2>&1; then
+        if "$ALLOW_PARTIAL"; then
+            echo "Skipping missing or invalid asset: $asset" >&2
+            continue
+        fi
+        echo "Error: $asset is missing or fails its checksum. Run $0 --build." >&2
+        exit 1
+    fi
     assets+=("$asset")
 done < sha256.sum
-shasum -a 256 -c sha256.sum >/dev/null || {
-    echo "Error: assets do not match sha256.sum. Run $0 --build and commit." >&2
+if ! "$ALLOW_PARTIAL"; then
+    for target in "${TARGETS[@]}"; do
+        for required in "slag-$target" "slag-$target.tar.gz"; do
+            found=false
+            for asset in "${assets[@]}"; do
+                [ "$asset" != "$required" ] || found=true
+            done
+            "$found" || { echo "Error: sha256.sum lacks $required. Run $0 --build or use --allow-partial." >&2; exit 1; }
+        done
+    done
+fi
+[ "${#assets[@]}" -gt 0 ] || { echo "Error: no valid release assets." >&2; exit 1; }
+if "$CHECK"; then
+    echo "Release asset check passed: ${#assets[@]} assets."
+    exit 0
+fi
+
+# A published release must use the current script and version.
+DIRTY=$(git -C "$CRATE_DIR" status --porcelain | grep -vE '^[ MARCUD?]{2} dist-local/(sha256\.sum|slag|slag-[^/]+)$' || true)
+if [ -n "$DIRTY" ]; then
+    echo "Error: working tree has changes outside generated release assets." >&2
     exit 1
-}
+fi
 BUILT=$(./"slag-$TARGET" --version | awk '{print $2}')
 if [ "$BUILT" != "$VERSION" ]; then
     echo "Error: asset reports $BUILT but Cargo.toml says $VERSION. Run $0 --build." >&2
@@ -195,10 +226,14 @@ if [ "$BUILT" != "$VERSION" ]; then
 fi
 
 echo "Publishing $TAG to $REPO..."
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    echo "Error: release $TAG already exists. Bump the version in Cargo.toml." >&2
+    exit 1
+fi
 gh release create "$TAG" \
     --repo "$REPO" \
     --title "$TITLE" \
     --notes "$NOTES" \
-    "${assets[@]}"
+    "${assets[@]}" sha256.sum
 
 echo "Published. Verify with: slag update (should report already up to date)"
