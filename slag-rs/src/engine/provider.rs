@@ -71,7 +71,7 @@ fn timeout_from_env() -> Duration {
 /// Build the HTTP client. `drop_idle_pool` disables connection reuse for
 /// the client that replaces one whose pooled connections went stale.
 fn build_client(timeout: Duration, drop_idle_pool: bool) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
     if drop_idle_pool {
         builder = builder.pool_max_idle_per_host(0);
     }
@@ -446,6 +446,7 @@ impl OpenRouter {
     }
 
     async fn chat_direct(&self, req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
+        crate::config::validate_provider_url(self.provider, &self.base_url)?;
         let mut body = self.build_body(&req);
         let mut shape_retries = 0usize;
         let url = format!("{}/chat/completions", self.base_url);
@@ -560,6 +561,9 @@ impl OpenRouter {
                     shape_retries += 1;
                     continue;
                 }
+            }
+            if code == 400 && !req.tools.is_empty() && is_tool_validation_error(&text) {
+                return Err(SlagError::ToolValidation(tool_validation_message(&text)));
             }
             if retry_hint.unwrap_or_else(|| transient_status(status)) {
                 // Any transient status may carry Retry-After — 429 rate
@@ -905,9 +909,11 @@ pub async fn fetch_credits(api_key: &str, base_url: &str) -> Option<Credits> {
     if api_key.is_empty() {
         return None;
     }
+    crate::config::validate_provider_url(ProviderPreset::OpenRouter, base_url).ok()?;
     let url = format!("{}/credits", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let resp = client
@@ -934,9 +940,13 @@ pub enum KeyCheck {
 /// limits and so requires auth. `/models` is public — it answers 200 for a
 /// bogus key and even for no key at all, which made checking it worthless.
 pub async fn check_key(api_key: &str, base_url: &str) -> KeyCheck {
+    if let Err(error) = crate::config::validate_provider_url(ProviderPreset::OpenRouter, base_url) {
+        return KeyCheck::Rejected(error.to_string());
+    }
     let url = format!("{}/key", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -979,6 +989,7 @@ pub async fn fetch_context_length(base_url: &str, model: &str) -> Option<u64> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let resp = client
@@ -1008,6 +1019,7 @@ pub async fn fetch_models_body(base_url: &str) -> Option<String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let resp = client
@@ -1237,6 +1249,29 @@ fn reasoning_from_details(details: Option<&Value>) -> Option<String> {
     } else {
         Some(texts.join("\n"))
     }
+}
+
+fn is_tool_validation_error(text: &str) -> bool {
+    let root = serde_json::from_str::<Value>(text).ok();
+    let error = root.as_ref().map(|root| root.get("error").unwrap_or(root));
+    let code = error.and_then(|error| error.get("code")).and_then(Value::as_str).unwrap_or("");
+    let message = error.and_then(|error| error.get("message")).and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str)).unwrap_or(text).to_ascii_lowercase();
+    code == "tool_use_failed" || message.contains("tool call validation failed")
+        || message.contains("failed to call a function")
+}
+
+fn tool_validation_message(text: &str) -> String {
+    let mut message = excerpt(text);
+    if let Ok(root) = serde_json::from_str::<Value>(text) {
+        let error = root.get("error").unwrap_or(&root);
+        if let Some(generation) = error.get("failed_generation") {
+            let generation = generation.as_str().map(str::to_string).unwrap_or_else(|| generation.to_string());
+            message.push_str(". Rejected tool call: ");
+            message.push_str(&excerpt(&generation));
+        }
+    }
+    message
 }
 
 fn excerpt(text: &str) -> String {
@@ -2924,6 +2959,66 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(rejected_tool_shape(&body, "invalid tool argument"), None);
         assert_eq!(rejected_tool_shape(&body, "unknown parameter parallel_tool_calls"), None);
+    }
+
+    #[tokio::test]
+    async fn tool_validation_errors_return_feedback_without_transport_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": "Tool call validation failed: missing pattern secret-test-key",
+                    "code": "tool_use_failed",
+                    "failed_generation": "{\"name\":\"grep\",\"arguments\":{}}"
+                }
+            })))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "secret-test-key", server.uri());
+        let error = provider.chat(request(vec![spec()], None)).await.unwrap_err();
+        let SlagError::ToolValidation(message) = error else { panic!("expected tool validation error") };
+        assert!(message.contains("missing pattern [redacted]"));
+        assert!(message.contains("grep"));
+        assert!(!message.contains("secret-test-key"));
+    }
+
+    #[tokio::test]
+    async fn plain_text_tool_validation_errors_return_feedback() {
+        for message in ["Tool call validation failed: missing pattern", "Failed to call a function: missing pattern"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(400).set_body_string(message))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri());
+            let error = provider.chat(request(vec![spec()], None)).await.unwrap_err();
+            assert!(matches!(error, SlagError::ToolValidation(ref feedback) if feedback == message));
+        }
+        assert!(!is_tool_validation_error("invalid tool schema: missing required property"));
+    }
+
+    #[tokio::test]
+    async fn tool_validation_requires_declared_tools_and_a_400() {
+        for (status, tools) in [(400, vec![]), (401, vec![spec()]), (422, vec![spec()])] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "error": {"message": "Tool call validation failed", "code": "tool_use_failed"}
+                })))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri());
+            assert!(matches!(provider.chat(request(tools, None)).await.unwrap_err(), SlagError::ProviderApi(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_do_not_follow_redirects() {
+        let server = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", destination.uri()))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "secret-test-key", server.uri());
+        assert!(provider.chat(request(vec![], None)).await.is_err());
+        assert!(destination.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

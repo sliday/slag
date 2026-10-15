@@ -52,8 +52,8 @@ Each preset supplies a base URL and a default model for each role:
 | [openai](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-4.1-mini` |
 | [anthropic](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk) | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
 | [gemini](https://ai.google.dev/gemini-api/docs/openai) | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `gemini-flash-latest` |
-| [groq](https://console.groq.com/docs/overview) | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `openai/gpt-oss-20b` |
-| [cerebras](https://inference-docs.cerebras.ai/resources/openai) | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `gpt-oss-120b` |
+| [groq](https://console.groq.com/docs/overview) | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
+| [cerebras](https://inference-docs.cerebras.ai/resources/openai) | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `qwen-3.8-27b` |
 | [xai](https://docs.x.ai/developers/model-capabilities/text/generate-text) | `https://api.x.ai/v1` | `XAI_API_KEY` | `grok-4.3` |
 | [mistral](https://docs.mistral.ai/api) | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `mistral-small-latest` |
 | [deepseek](https://api-docs.deepseek.com/) | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
@@ -79,9 +79,9 @@ slag checks OpenRouter keys before storage. It saves other providers' keys witho
 
 slag stores keys in `~/.config/slag/config.toml` with mode 0600. Set `SLAG_CONFIG_DIR` to move this directory. Each provider uses `<provider>_api_key`, such as `openai_api_key`. Its environment key takes precedence over the stored key.
 
-Override a preset's endpoint with `SLAG_BASE_URL` or `base_url` in the file. Supply the API root, such as `https://example.com/v1`, without `/chat/completions`. slag keeps `SLAG_OPENROUTER_BASE` as a base URL alias.
+Override a preset's endpoint with `SLAG_BASE_URL` or `base_url` in the file. Supply the API root, such as `https://example.com/v1`, without `/chat/completions`. `SLAG_OPENROUTER_BASE` overrides OpenRouter only.
 
-For separate endpoints in a mixed run, use `SLAG_<PROVIDER>_BASE_URL` or `<provider>_base_url`. Endpoint precedence is the provider environment override, generic environment override, alias, provider file override, generic file override, then preset.
+For separate endpoints in a mixed run, use `SLAG_<PROVIDER>_BASE_URL` or `<provider>_base_url`. Endpoint precedence is provider environment, generic environment, OpenRouter alias, provider file, generic file, then preset. slag rejects foreign preset hosts before authentication and does not follow HTTP redirects.
 
 `slag cost` shows session spend. For OpenRouter, it also checks the account balance. Other providers get session spend and a note about the absent balance endpoint. Spend caps use reported response costs; other providers can omit those costs.
 
@@ -115,7 +115,7 @@ Set a key for each provider you name. A bare model ID uses the selected provider
 
 With another provider selected, bare `openrouter/auto` uses that provider's default. Use `openrouter::openrouter/auto` to request OpenRouter routing.
 
-Provider settings join the existing model, duel, screenshot, MCP, and spend settings in the same file. OpenRouter keeps its routing, `reasoning_details` replay, pricing lookup, and attribution headers. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. Other providers receive supported reasoning fields or omit them.
+Provider settings join the existing model, duel, screenshot, MCP, and spend settings in the same file. OpenRouter keeps its routing, `reasoning_details` replay, pricing lookup, and attribution headers. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. The agent recovers standalone JSON against declared tool schemas and rejects prose or code fences. It returns provider tool-validation errors to the model, with a limit of three consecutive failures. Other providers receive supported reasoning fields or omit them.
 
 ### MCP servers
 
@@ -253,7 +253,7 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `SLAG_REASONING_EFFORT` | `low`, `medium`, `high` for models that take it |
 | `SLAG_SCREENSHOT_CMD` | Shell command producing a screenshot for visual assay of web ingots |
 | `SLAG_CONFIG_DIR` | Move the config directory off `~/.config/slag` |
-| `SLAG_OPENROUTER_BASE` | Legacy alias for the base URL override |
+| `SLAG_OPENROUTER_BASE` | Legacy OpenRouter-only base URL override |
 | `SLAG_CHAR_BUDGET` | Transcript char budget before an agent session compacts (default 600000). Lower it for small-context models. |
 | `NO_COLOR` | Set to anything to drop color from the output |
 | `COLORTERM` | Read for `truecolor` / `24bit`; without it slag falls back to 256-color |

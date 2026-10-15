@@ -133,6 +133,9 @@ pub enum SlagError {
     #[error("provider error (transient): {0}")]
     ProviderTransient(String),
 
+    #[error("provider tool validation failed: {0}")]
+    ToolValidation(String),
+
     #[error("tool error: {0}")]
     Tool(String),
 

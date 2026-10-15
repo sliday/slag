@@ -84,8 +84,8 @@ Presets supply these API roots, key variables, and default models:
 | openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-4.1-mini` |
 | anthropic | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
 | gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `gemini-flash-latest` |
-| groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `openai/gpt-oss-20b` |
-| cerebras | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `gpt-oss-120b` |
+| groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
+| cerebras | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `qwen-3.8-27b` |
 | xai | `https://api.x.ai/v1` | `XAI_API_KEY` | `grok-4.3` |
 | mistral | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `mistral-small-latest` |
 | deepseek | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
@@ -97,9 +97,9 @@ Presets supply these API roots, key variables, and default models:
 
 Use a loaded model ID for LM Studio or custom servers. Install the Ollama model before use. Anthropic's preset uses its evaluation compatibility layer, which ignores strict tool schemas and hoists system messages.
 
-Override any API root with `SLAG_BASE_URL` or `base_url`. Keep `/chat/completions` off the root. `SLAG_OPENROUTER_BASE` remains a base URL alias. Provider-specific overrides use `SLAG_<PROVIDER>_BASE_URL` or `<provider>_base_url`.
+Override any API root with `SLAG_BASE_URL` or `base_url`. Keep `/chat/completions` off the root. `SLAG_OPENROUTER_BASE` overrides OpenRouter only. Provider-specific overrides use `SLAG_<PROVIDER>_BASE_URL` or `<provider>_base_url`.
 
-Endpoint precedence is provider environment, generic environment, legacy alias, provider file, generic file, then preset. Provider-specific overrides let mixed roles use separate proxies.
+Endpoint precedence is provider environment, generic environment, OpenRouter alias, provider file, generic file, then preset. Provider-specific overrides let mixed roles use separate proxies. slag rejects foreign preset hosts before authentication and does not follow HTTP redirects.
 
 `slag key` shows the active provider and key presence without key values. It prompts for a missing required key on a terminal. `slag key --provider NAME KEY` stores a named provider's key. Only OpenRouter uses the OpenRouter key-check endpoint.
 
@@ -118,7 +118,9 @@ Use `provider::model` to route one role through another provider, such as `model
 
 `--auto` resets roles to the selected provider's default. Explicit model flags take precedence. File keys stay lowercase; environment names stay uppercase. Bare `openrouter/auto` also uses the selected provider's default. Use `openrouter::openrouter/auto` for OpenRouter routing.
 
-OpenRouter keeps its reasoning object, `reasoning_details` replay, attribution headers, pricing lookup, and native fallback routing. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. Other providers receive supported reasoning fields or omit them. `slag cost` shows session spend and a one-line balance note for non-OpenRouter providers. Spend caps depend on reported response costs outside OpenRouter.
+OpenRouter keeps its reasoning object, `reasoning_details` replay, attribution headers, pricing lookup, and native fallback routing. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. The agent recovers standalone JSON against declared tool schemas and rejects prose or code fences. It returns provider tool-validation errors to the model, with a limit of three consecutive failures.
+
+Other providers receive supported reasoning fields or omit them. `slag cost` shows session spend and a one-line balance note for non-OpenRouter providers. Spend caps depend on reported response costs outside OpenRouter.
 
 ### MCP servers
 

@@ -231,8 +231,8 @@ impl ProviderPreset {
             Self::OpenAI => "gpt-4.1-mini",
             Self::Anthropic => "claude-sonnet-4-5",
             Self::Gemini => "gemini-flash-latest",
-            Self::Groq => "openai/gpt-oss-20b",
-            Self::Cerebras => "gpt-oss-120b",
+            Self::Groq => "openai/gpt-oss-120b",
+            Self::Cerebras => "qwen-3.8-27b",
             Self::Xai => "grok-4.3",
             Self::Mistral => "mistral-small-latest",
             Self::DeepSeek => "deepseek-flash",
@@ -276,11 +276,44 @@ pub fn provider_base_url(provider: ProviderPreset) -> String {
     let entries = config_entries();
     env_nonempty(&format!("SLAG_{}_BASE_URL", provider.name().to_ascii_uppercase()))
         .or_else(|| env_nonempty("SLAG_BASE_URL"))
-        .or_else(|| env_nonempty("SLAG_OPENROUTER_BASE"))
+        .or_else(|| (provider == ProviderPreset::OpenRouter)
+            .then(|| env_nonempty("SLAG_OPENROUTER_BASE")).flatten())
         .or_else(|| file_value(&entries, &format!("{}_base_url", provider.name())))
         .or_else(|| file_value(&entries, "base_url"))
         .unwrap_or_else(|| provider.base_url().into())
         .trim_end_matches('/').to_string()
+}
+
+pub fn validate_provider_url(provider: ProviderPreset, base_url: &str) -> Result<(), SlagError> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|_| SlagError::Config("invalid provider base URL".into()))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(SlagError::Config("provider base URL requires an HTTP(S) host".into()));
+    }
+    let host = url.host_str().unwrap().trim_end_matches('.');
+    for (domain, owner) in [
+        ("openrouter.ai", ProviderPreset::OpenRouter),
+        ("openai.com", ProviderPreset::OpenAI),
+        ("anthropic.com", ProviderPreset::Anthropic),
+        ("generativelanguage.googleapis.com", ProviderPreset::Gemini),
+        ("groq.com", ProviderPreset::Groq),
+        ("cerebras.ai", ProviderPreset::Cerebras),
+        ("x.ai", ProviderPreset::Xai),
+        ("mistral.ai", ProviderPreset::Mistral),
+        ("deepseek.com", ProviderPreset::DeepSeek),
+        ("together.ai", ProviderPreset::Together),
+        ("together.xyz", ProviderPreset::Together),
+        ("fireworks.ai", ProviderPreset::Fireworks),
+    ] {
+        if provider != ProviderPreset::Custom && provider != owner
+            && (host == domain || host.ends_with(&format!(".{domain}"))) {
+            return Err(SlagError::Config(format!(
+                "refusing to send {} credentials to a {} host; select --provider {}",
+                provider.name(), owner.name(), owner.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn provider_for_model(model: &str) -> Result<Option<(ProviderPreset, String)>, SlagError> {
@@ -315,6 +348,7 @@ pub fn resolve_connection(
             "{} requires base_url or SLAG_BASE_URL", provider.name()
         )));
     }
+    validate_provider_url(provider, &base_url)?;
     Ok((provider, key, base_url, model))
 }
 
@@ -1000,8 +1034,8 @@ mod tests {
             ("openai", Some("OPENAI_API_KEY"), "gpt-4.1-mini"),
             ("anthropic", Some("ANTHROPIC_API_KEY"), "claude-sonnet-4-5"),
             ("gemini", Some("GEMINI_API_KEY"), "gemini-flash-latest"),
-            ("groq", Some("GROQ_API_KEY"), "openai/gpt-oss-20b"),
-            ("cerebras", Some("CEREBRAS_API_KEY"), "gpt-oss-120b"),
+            ("groq", Some("GROQ_API_KEY"), "openai/gpt-oss-120b"),
+            ("cerebras", Some("CEREBRAS_API_KEY"), "qwen-3.8-27b"),
             ("xai", Some("XAI_API_KEY"), "grok-4.3"),
             ("mistral", Some("MISTRAL_API_KEY"), "mistral-small-latest"),
             ("deepseek", Some("DEEPSEEK_API_KEY"), "deepseek-flash"),
@@ -1042,7 +1076,7 @@ mod tests {
         std::env::set_var("SLAG_MODEL_PLAN", "openai::gpt-4.1-mini");
         let cfg = EngineConfig::load().unwrap();
         assert_eq!(cfg.api_key, "env-cerebras");
-        assert_eq!(cfg.model_base, "cerebras::gpt-oss-120b");
+        assert_eq!(cfg.model_base, "cerebras::qwen-3.8-27b");
         assert_eq!(cfg.model_plan, "openai::gpt-4.1-mini");
         assert_eq!(cfg.model_alt, cfg.model_base);
         assert_eq!(cfg.model_judge, cfg.model_base);
@@ -1051,17 +1085,74 @@ mod tests {
     }
 
     #[test]
-    fn named_provider_endpoints_override_the_global_alias() {
+    fn legacy_endpoint_alias_only_applies_to_openrouter() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_engine_env();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("SLAG_CONFIG_DIR", dir.path());
         std::env::set_var("SLAG_OPENROUTER_BASE", "http://legacy/v1");
-        assert_eq!(provider_base_url(ProviderPreset::Cerebras), "http://legacy/v1");
+        assert_eq!(provider_base_url(ProviderPreset::OpenRouter), "http://legacy/v1");
+        assert_eq!(provider_base_url(ProviderPreset::Cerebras), ProviderPreset::Cerebras.base_url());
         std::env::set_var("SLAG_BASE_URL", "http://global/v1");
         assert_eq!(provider_base_url(ProviderPreset::Cerebras), "http://global/v1");
         std::env::set_var("SLAG_CEREBRAS_BASE_URL", "http://cerebras/v1");
         assert_eq!(provider_base_url(ProviderPreset::Cerebras), "http://cerebras/v1");
+        clear_engine_env();
+    }
+
+    #[test]
+    fn provider_credentials_reject_other_preset_hosts() {
+        let providers = [
+            ProviderPreset::OpenRouter, ProviderPreset::OpenAI, ProviderPreset::Anthropic,
+            ProviderPreset::Gemini, ProviderPreset::Groq, ProviderPreset::Cerebras,
+            ProviderPreset::Xai, ProviderPreset::Mistral, ProviderPreset::DeepSeek,
+            ProviderPreset::Together, ProviderPreset::Fireworks,
+        ];
+        for provider in providers {
+            for destination in providers {
+                let connection = resolve_connection("model", provider, "test-key", destination.base_url());
+                assert_eq!(connection.is_ok(), provider == destination,
+                    "{} key to {} host", provider.name(), destination.name());
+            }
+            assert!(validate_provider_url(provider, "http://127.0.0.1:1234/v1").is_ok());
+            assert!(validate_provider_url(provider, "https://proxy.example/v1").is_ok());
+        }
+        assert!(validate_provider_url(ProviderPreset::Cerebras, "https://OPENROUTER.AI./api/v1").is_err());
+        assert!(validate_provider_url(ProviderPreset::Cerebras, "https://proxy.openrouter.ai/v1").is_err());
+        assert!(validate_provider_url(ProviderPreset::OpenAI, "https://api.together.xyz/v1").is_err());
+        assert!(validate_provider_url(ProviderPreset::OpenAI, "file:///tmp/socket").is_err());
+        assert!(validate_provider_url(ProviderPreset::Custom, ProviderPreset::OpenAI.base_url()).is_ok());
+    }
+
+    #[test]
+    fn endpoint_overrides_cannot_route_preset_keys_to_another_preset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::env::set_var("SLAG_PROVIDER", "cerebras");
+        std::env::set_var("CEREBRAS_API_KEY", "cerebras-key");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+        std::env::set_var("SLAG_OPENROUTER_BASE", ProviderPreset::OpenRouter.base_url());
+        let cfg = EngineConfig::load().unwrap();
+        assert_eq!(cfg.base_url, ProviderPreset::Cerebras.base_url());
+        assert!(cfg.connection_for_model(&cfg.model_base).is_ok());
+        assert_eq!(cfg.connection_for_model("openai::gpt-4.1-mini").unwrap().2,
+            ProviderPreset::OpenAI.base_url());
+        for variable in ["SLAG_BASE_URL", "SLAG_CEREBRAS_BASE_URL"] {
+            std::env::set_var(variable, ProviderPreset::OpenRouter.base_url());
+            let cfg = EngineConfig::load().unwrap();
+            assert!(cfg.connection_for_model(&cfg.model_base).is_err());
+            std::env::remove_var(variable);
+        }
+        for setting in ["base_url", "cerebras_base_url"] {
+            std::fs::write(dir.path().join("config.toml"), format!(
+                "{setting} = \"{}\"\n", ProviderPreset::OpenRouter.base_url())).unwrap();
+            let cfg = EngineConfig::load().unwrap();
+            assert!(cfg.connection_for_model(&cfg.model_base).is_err());
+        }
+        std::env::set_var("SLAG_BASE_URL", ProviderPreset::Cerebras.base_url());
+        assert!(EngineConfig::load().unwrap().connection_for_model("openai::gpt-4.1-mini").is_err());
         clear_engine_env();
     }
 
