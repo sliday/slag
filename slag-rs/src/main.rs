@@ -144,7 +144,13 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("\n  {}✗{} {e}\n", fg(tui::WARM), reset());
+        // The assay above already printed the gap in full; the last line
+        // only has to say how the run ended.
+        let line = match &e {
+            error::SlagError::GoalNotMet(_) => "goal not met; the gap is above".to_string(),
+            other => other.to_string(),
+        };
+        eprintln!("\n  {}✗{} {line}\n", fg(tui::WARM), reset());
         resume_hint();
         std::process::exit(1);
     }

@@ -12,7 +12,8 @@
 #
 # Output: <out_dir>/<cols>x<rows>/<renderer>-<nn>-<moment>.png
 #
-# Needs vhs (charm.sh). SLAG_BIN picks the binary (default
+# Needs vhs (charm.sh); ImageMagick, when present, shrinks the PNGs
+# (SHOTS_QUANTIZE=0 keeps them raw). SLAG_BIN picks the binary (default
 # target/debug/slag); SHOTS_SIZES narrows the sizes ("80x24 120x36").
 set -euo pipefail
 
@@ -28,7 +29,7 @@ out=$(cd "$out" && pwd)
 # The two recorded runs: a forge with parallel anvils, retries and cracks,
 # and a small tempered one that reaches the warden.
 forge=$runs/textstats.tape.jsonl
-temper=$runs/hello-temper.tape.jsonl
+temper=$runs/hello-goal.tape.jsonl
 for t in "$forge" "$temper"; do
   [ -f "$t" ] || { echo "tui-shots: missing fixture $t" >&2; exit 1; }
 done
@@ -70,8 +71,9 @@ shot() { # renderer name size command [keys-to-leave]
   cat <<EOF
 Type "clear; $cmd"
 Enter
-Sleep 2s
+Sleep 3s
 Screenshot "$dir/$renderer-$name.png"
+Sleep 600ms
 $leave
 Sleep 400ms
 EOF
@@ -117,6 +119,13 @@ EOF
     shot cli "10-status" "$dir" "cd $work/project && slag status; cd $work/empty" ""
   } > "$tape"
   echo "tui-shots: $size" >&2
-  vhs "$tape" >/dev/null
+  vhs "$tape" >/dev/null 2>&1 || { echo "tui-shots: vhs failed on $size" >&2; exit 1; }
 done
+# Terminal frames carry few real colours; 96 keeps the anti-aliasing and
+# cuts each PNG to about a third. Same input, same output: deterministic.
+if command -v magick >/dev/null && [ "${SHOTS_QUANTIZE:-1}" = 1 ]; then
+  for f in "$out"/*/*.png; do
+    magick "$f" +dither -colors 96 -strip -define png:compression-level=9 "$f"
+  done
+fi
 echo "tui-shots: frames in $out" >&2

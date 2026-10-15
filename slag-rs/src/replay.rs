@@ -107,9 +107,9 @@ async fn play_stream(tape: &Tape, opts: &Opts, stop: Option<u64>) {
     if let Some((w, _)) = opts.size {
         crate::tui::set_width(w as usize);
     }
-    let mut view = Stream::new(tty, opts.size.map(|(w, _)| w as usize));
-    let epoch = Instant::now();
     let instant = stop.is_some();
+    let mut view = Stream::new(tty, opts.size.map(|(w, _)| w as usize)).defer_footer(instant);
+    let epoch = Instant::now();
     let mut last_t = 0u64;
     for timed in &tape.cues {
         if stop.is_some_and(|s| timed.t > s) {
@@ -152,7 +152,7 @@ async fn play_dashboard(tape: &Tape, opts: &Opts, stop: Option<u64>) -> Result<(
         Cue::Doc { name, text } if name == crate::config::ORE_FILE => Some(text.as_str()),
         _ => None,
     });
-    let mut state = crate::dashboard::replay_state(tape.first_plan(), commission, epoch);
+    let mut state = crate::dashboard::replay_state(commission, epoch);
     let end = stop.unwrap_or(tape.duration());
 
     // Off-screen: fold every cue up to the stop, draw once, print rows.
@@ -177,9 +177,7 @@ async fn play_dashboard(tape: &Tape, opts: &Opts, stop: Option<u64>) -> Result<(
 fn fold_until(state: &mut crate::dashboard::DashState, tape: &Tape, end: u64, epoch: Instant) {
     for timed in tape.cues.iter().take_while(|c| c.t <= end) {
         state.clock = Some(epoch + Duration::from_millis(timed.t));
-        if let Cue::Event(e) = &timed.cue {
-            crate::dashboard::apply_event(state, e.clone());
-        }
+        absorb(state, &timed.cue);
     }
     state.clock = Some(epoch + Duration::from_millis(end));
 }
@@ -217,9 +215,7 @@ async fn drive_dashboard(
             }
             last_t = timed.t;
             state.clock = Some(epoch + Duration::from_millis(timed.t));
-            if let Cue::Event(e) = &timed.cue {
-                crate::dashboard::apply_event(state, e.clone());
-            }
+            absorb(state, &timed.cue);
             if drawn_at.elapsed() >= frame {
                 crate::dashboard::replay_draw(terminal, state).map_err(SlagError::Io)?;
                 drawn_at = Instant::now();
@@ -242,6 +238,16 @@ async fn drive_dashboard(
         }
     }
     Ok(())
+}
+
+/// What a live dashboard learns from one cue: events from its channel,
+/// plans from re-reading PLAN.md when it changes.
+fn absorb(state: &mut crate::dashboard::DashState, cue: &Cue) {
+    match cue {
+        Cue::Event(e) => crate::dashboard::apply_event(state, e.clone()),
+        Cue::Plan(plan) => state.absorb_plan(plan),
+        _ => {}
+    }
 }
 
 /// q, Esc or Ctrl-C within `wait`. Raw mode swallows the shell's Ctrl-C,

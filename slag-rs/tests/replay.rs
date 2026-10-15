@@ -4,7 +4,7 @@
 use assert_cmd::Command;
 
 const FORGE: &str = "tests/fixtures/runs/textstats.tape.jsonl";
-const TEMPER: &str = "tests/fixtures/runs/hello-temper.tape.jsonl";
+const TEMPER: &str = "tests/fixtures/runs/hello-goal.tape.jsonl";
 
 fn fixture(rel: &str) -> String {
     format!("{}/{rel}", env!("CARGO_MANIFEST_DIR"))

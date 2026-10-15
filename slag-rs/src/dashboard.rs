@@ -60,19 +60,6 @@ const HINT_DONE: &str = "⏎ new commission · ↑ history · ^O expand · q qui
 const PLACEHOLDER: &str = "steer the smith";
 const PLACEHOLDER_DONE: &str = "describe the next commission";
 
-/// `(43 lines · 1.2kB · 0.3s)` — what a collapsed tool result is hiding.
-/// Sub-second durations read in ms; a `0.0s` says nothing.
-pub(crate) fn result_counts(lines: usize, bytes: usize, ms: u64) -> String {
-    let size = if bytes < 1024 {
-        format!("{bytes}B")
-    } else {
-        format!("{:.1}kB", bytes as f64 / 1024.0)
-    };
-    let took = if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", ms as f64 / 1000.0) };
-    let unit = if lines == 1 { "line" } else { "lines" };
-    format!("({lines} {unit} · {size} · {took})")
-}
-
 /// tui.rs palette (crossterm) → ratatui, same values. Runs through the
 /// same truecolor downgrade so the dashboard and the stream view never
 /// disagree about what "hot" looks like.
@@ -184,6 +171,8 @@ pub(crate) struct DashState {
     pub(crate) commission: Option<String>,
     /// When this view started, for the run clock in the header.
     pub(crate) started: Option<Instant>,
+    /// The warden's last word on the goal: met, not met, or not judged.
+    pub(crate) goal: Option<bool>,
     /// The route last announced. An unchanged route is not news, so it is
     /// printed once and then only when it moves.
     pub(crate) route: Option<String>,
@@ -209,6 +198,30 @@ impl DashState {
                 // Molten means a previous run died mid-ingot. It is not
                 // forging now -- nothing is -- so it reads as pending
                 // until an event says otherwise.
+                crate::sexp::Status::Ore | crate::sexp::Status::Molten => IngotStatus::Queued,
+            };
+            let row = self.row_mut(&ingot.id);
+            row.work = preview(&ingot.work, 60);
+            row.heat = ingot.heat;
+            row.status = status;
+        }
+    }
+
+    /// Take in a newer PLAN.md mid-run: rows for ingots the view has not
+    /// seen yet (a freshly cast mold, an addendum, a re-smelt's split), and
+    /// work text for rows that only had an id. A row an event already
+    /// drives keeps its status: events are fresher than a file.
+    pub(crate) fn absorb_plan(&mut self, plan: &str) {
+        for ingot in crate::crucible::parse_ingot_lines(plan) {
+            if let Some(row) = self.ingots.iter_mut().find(|r| r.id == ingot.id) {
+                if row.work.is_empty() {
+                    row.work = preview(&ingot.work, 60);
+                }
+                continue;
+            }
+            let status = match ingot.status {
+                crate::sexp::Status::Forged => IngotStatus::Forged,
+                crate::sexp::Status::Cracked => IngotStatus::Cracked,
                 crate::sexp::Status::Ore | crate::sexp::Status::Molten => IngotStatus::Queued,
             };
             let row = self.row_mut(&ingot.id);
@@ -393,6 +406,11 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             }
             return;
         }
+        EngineEvent::Warning { message: text } | EngineEvent::Narrate { text }
+            if crate::render::echo::warden_word(text).is_some() =>
+        {
+            state.goal = crate::render::echo::warden_word(text).map(|w| w.starts_with("goal met"));
+        }
         EngineEvent::ContextGauge { pct, used_tokens, budget_tokens } => {
             state.ctx = Some((*pct, *used_tokens, *budget_tokens));
         }
@@ -501,7 +519,14 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
         EngineEvent::Steer { text } => {
             (palette(tui::BRIGHT), format!("↪ steer  {}", preview(text, 200)))
         }
-        EngineEvent::Finish { summary } => (palette(tui::PURE), format!("■ {}", finish_gist(summary))),
+        EngineEvent::Finish { summary } => match crate::engine::events::verdict_gist(summary) {
+            Some((true, text)) => (palette(tui::PURE), format!("⚖ judged pass — {text}")),
+            Some((false, text)) => (palette(tui::WARM), format!("⚖ judged fail — {text}")),
+            None => (
+                palette(tui::PURE),
+                format!("■ {}", crate::engine::events::finish_gist(summary).unwrap_or_else(|| preview(summary, 400))),
+            ),
+        },
         EngineEvent::Error { message } => (palette(tui::WARM), format!("✗ {}", preview(message, 200))),
         EngineEvent::Narrate { text } => match crate::render::echo::warden_word(text) {
             Some(word) => warden_row(text, word),
@@ -544,23 +569,6 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
             (palette(tui::COLD), format!("⚓ hook {name} {verdict} ({duration_ms}ms)"))
         }
     }
-}
-
-/// A finish summary as the feed shows it. A survey or casting pass ends on
-/// its whole document, which the dashboard has no phase to recognise, so
-/// the shape gives it away: S-expression ingots, or a markdown heading.
-fn finish_gist(summary: &str) -> String {
-    let ingots = summary.matches("(ingot ").count();
-    if ingots > 0 {
-        let noun = if ingots == 1 { "ingot" } else { "ingots" };
-        return format!("mold cast · {ingots} {noun}");
-    }
-    let first = summary.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    if let Some(heading) = first.strip_prefix('#') {
-        let heading = heading.trim_start_matches('#').trim();
-        return format!("document drafted · {}", preview(heading, 120));
-    }
-    preview(summary, 400)
 }
 
 /// The warden's word on the goal, as one feed row.
@@ -1016,7 +1024,12 @@ fn draw_header(f: &mut Frame, area: Rect, state: &DashState) {
     let left_w: usize = spans.iter().map(|s| s.width()).sum();
     let pad = width.saturating_sub(left_w + right.chars().count());
     spans.push(Span::raw(" ".repeat(pad)));
-    let phase_color = if state.finished { palette(tui::PURE) } else { palette(tui::HOT) };
+    let failed = state.ingots.iter().any(|r| r.status == IngotStatus::Cracked) || state.goal == Some(false);
+    let phase_color = match (state.finished, failed) {
+        (true, true) => palette(tui::WARM),
+        (true, false) => palette(tui::PURE),
+        _ => palette(tui::HOT),
+    };
     spans.push(Span::styled(right, Style::default().fg(phase_color)));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1025,7 +1038,12 @@ fn draw_header(f: &mut Frame, area: Rect, state: &DashState) {
 fn run_phase(state: &DashState) -> String {
     if state.finished {
         let cracked = state.ingots.iter().filter(|r| r.status == IngotStatus::Cracked).count();
-        return if cracked > 0 { format!("finished · {cracked} cracked") } else { "finished".into() };
+        return match (cracked, state.goal) {
+            (n, _) if n > 0 => format!("finished · {n} cracked"),
+            (_, Some(false)) => "finished · goal not met".into(),
+            (_, Some(true)) => "finished · goal met".into(),
+            _ => "finished".into(),
+        };
     }
     let forging: Vec<&str> = state
         .ingots
@@ -1052,14 +1070,8 @@ fn run_phase(state: &DashState) -> String {
 /// comes off. Truncation lands on a word boundary: a title cut mid-word
 /// reads as corruption rather than as an abbreviation.
 fn ingot_title(work: &str, width: usize) -> String {
-    let work = crate::render::echo::unescape(work);
-    let mut t = work.trim();
-    for label in ["GOAL:", "TASK:", "INGOT:", "WORK:"] {
-        if t.len() >= label.len() && t[..label.len()].eq_ignore_ascii_case(label) {
-            t = t[label.len()..].trim_start();
-            break;
-        }
-    }
+    let named = crate::render::echo::title(work);
+    let t = named.trim();
     if t.chars().count() <= width {
         return t.to_string();
     }
@@ -1476,19 +1488,39 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
         }
         None if state.finished => {
             let (counts, _) = dash_counts(state);
-            let verdict = if counts.cracked > 0 {
+            let mut verdict = if counts.cracked > 0 {
                 format!(" ✗ {} of {} forged · {} cracked", counts.forged, counts.total, counts.cracked)
+            } else if state.goal == Some(false) {
+                format!(" ✗ {} of {} forged · goal not met", counts.forged, counts.total)
             } else {
                 format!(" █ {} of {} forged", counts.forged, counts.total)
             };
-            let color = if counts.cracked > 0 { palette(tui::WARM) } else { palette(tui::PURE) };
+            if state.goal == Some(true) {
+                verdict.push_str(" · goal met");
+            }
+            let failed = counts.cracked > 0 || state.goal == Some(false);
+            let color = if failed { palette(tui::WARM) } else { palette(tui::PURE) };
             (verdict, color)
         }
         None if state.turn_started.is_some() => (
             format!(" {} {}…", tui::spinner_frame(0), tui::forge_verb(state.turn)),
             palette(tui::HOT),
         ),
-        None => (" idle".to_string(), palette(tui::COLD)),
+        // Ingots on the anvil with no turn open: the forge is running a
+        // proof or a judge between turns, which is still work.
+        None if forging_count(state) > 0 => {
+            let ids: Vec<&str> = state
+                .ingots
+                .iter()
+                .filter(|r| r.status == IngotStatus::Forging)
+                .map(|r| r.id.as_str())
+                .collect();
+            (format!(" ⚒ checking {}", ids.join(" ")), palette(tui::HOT))
+        }
+        None if !state.finished && (state.turn > 0 || !state.feed.is_empty()) => {
+            (" · between turns".to_string(), palette(tui::COLD))
+        }
+        None => (" · waiting for the first turn".to_string(), palette(tui::COLD)),
     };
     let mut top = vec![Span::styled(status.clone(), Style::default().fg(status_color))];
     if let Some((pct, _, _)) = state.ctx {
@@ -1693,6 +1725,24 @@ pub(crate) fn commission_line(prd: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// PLAN.md, re-read when its modification time moves. Checked on the draw
+/// tick, so a stat call every 33ms and a read only when the file changed.
+#[derive(Default)]
+struct PlanWatch {
+    seen: Option<std::time::SystemTime>,
+}
+
+impl PlanWatch {
+    fn changed(&mut self) -> Option<String> {
+        let modified = std::fs::metadata(CRUCIBLE).and_then(|m| m.modified()).ok()?;
+        if self.seen == Some(modified) {
+            return None;
+        }
+        self.seen = Some(modified);
+        std::fs::read_to_string(CRUCIBLE).ok()
+    }
+}
+
 /// The engine is gone: no smith reads the steer queue, and the input
 /// takes the next commission instead. Shared by the live loop (channel
 /// closed) and a replay (tape ran out), so both end on the same frame.
@@ -1700,7 +1750,7 @@ pub(crate) fn mark_finished(state: &mut DashState) {
     state.finished = true;
     state.push_feed(
         palette(tui::BRIGHT),
-        "■ forge finished — type a new commission, or q/Esc to exit".into(),
+        "■ forge finished".into(),
     );
 }
 
@@ -1708,17 +1758,13 @@ pub(crate) fn mark_finished(state: &mut DashState) {
 
 /// A dashboard state for playing a tape: seeded from the tape's first
 /// plan, on the tape's clock, with no disk reads and no saved spend.
-pub(crate) fn replay_state(plan: Option<&str>, commission: Option<&str>, start: Instant) -> DashState {
-    let mut state = DashState {
+pub(crate) fn replay_state(commission: Option<&str>, start: Instant) -> DashState {
+    DashState {
         clock: Some(start),
         started: Some(start),
         commission: commission.and_then(commission_line),
         ..Default::default()
-    };
-    if let Some(plan) = plan {
-        state.seed_from_plan(plan);
     }
-    state
 }
 
 /// Render one frame into a `w`×`h` grid and return it as plain text rows,
@@ -1795,6 +1841,7 @@ async fn event_loop(
     cancel: &CancelFlag,
 ) -> io::Result<Option<String>> {
     let mut interval = tokio::time::interval(FRAME);
+    let mut plan_watch = PlanWatch::default();
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut engine_done = false;
@@ -1848,6 +1895,11 @@ async fn event_loop(
                 }
             }
             _ = interval.tick() => {
+                // A mold cast mid-run reaches no event; the file says it.
+                if let Some(plan) = plan_watch.changed() {
+                    state.absorb_plan(&plan);
+                    dirty = true;
+                }
                 // Stalled rows change appearance with no event arriving:
                 // keep the "(stalled Ns)" counter ticking on screen.
                 if has_stalled(&state, Instant::now()) {
@@ -2586,14 +2638,6 @@ mod tests {
             bytes: preview.len(),
             ms: 300,
         }
-    }
-
-    #[test]
-    fn a_collapsed_result_says_what_it_is_hiding() {
-        assert_eq!(result_counts(43, 1536, 300), "(43 lines · 1.5kB · 300ms)");
-        // Sub-second reads in ms; "0.0s" would say nothing.
-        assert_eq!(result_counts(1, 12, 4), "(1 line · 12B · 4ms)");
-        assert_eq!(result_counts(9, 100, 2500), "(9 lines · 100B · 2.5s)");
     }
 
     #[test]

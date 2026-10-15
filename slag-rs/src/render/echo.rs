@@ -26,6 +26,9 @@ pub enum Phase {
     Forge,
     Warden,
     Assay,
+    /// A phase this view has no word for (a new flow's own header). The
+    /// footer still runs, naming it by its header.
+    Other,
 }
 
 impl Phase {
@@ -37,7 +40,8 @@ impl Phase {
             "FORGE" => Phase::Forge,
             "WARDEN" => Phase::Warden,
             "ASSAY" | "GOAL NOT MET" => Phase::Assay,
-            _ => Phase::Idle,
+            "FIRING FURNACE" => Phase::Idle,
+            _ => Phase::Other,
         }
     }
 
@@ -48,7 +52,7 @@ impl Phase {
             Phase::Plan => Some("casting the mold"),
             Phase::Forge => Some("forging"),
             Phase::Warden => Some("judging"),
-            Phase::Idle | Phase::Assay => None,
+            Phase::Idle | Phase::Assay | Phase::Other => None,
         }
     }
 }
@@ -85,6 +89,8 @@ pub struct Echo {
     blueprint: Option<String>,
     commission_shown: bool,
     phase: Phase,
+    /// The last phase header, as printed.
+    header: Option<String>,
     /// Ingots on an anvil now, in start order.
     anvils: Vec<Anvil>,
     /// Heats resolved by a proof cue, so the event that ends them does not
@@ -111,6 +117,7 @@ impl Echo {
             blueprint: None,
             commission_shown: false,
             phase: Phase::Idle,
+            header: None,
             anvils: Vec::new(),
             resolved: Vec::new(),
             started: None,
@@ -130,6 +137,17 @@ impl Echo {
 
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+
+    /// The footer's verb: the phase's own word, or a new flow's header
+    /// lowercased (`FIX · reproducing` → `fix`).
+    pub fn phase_verb(&self) -> Option<String> {
+        match self.phase {
+            Phase::Other => self.header.as_deref().map(|h| {
+                h.split(" · ").next().unwrap_or(h).to_lowercase()
+            }),
+            p => p.verb().map(str::to_string),
+        }
     }
 
     pub fn anvils(&self) -> &[Anvil] {
@@ -221,6 +239,7 @@ impl Echo {
             }
             Mark::Header { text } => {
                 self.phase = Phase::of(text);
+                self.header = Some(text.clone());
                 if text == "ASSAY" {
                     if !self.assay_done {
                         self.assay(at, out);
@@ -355,6 +374,12 @@ impl Echo {
     /// A heat's outcome, read from the forge's logs. A failure prints now;
     /// a pass waits for the ingot's "forged" line, which carries it.
     fn proof(&mut self, p: &Proof, out: &mut Vec<String>) {
+        // An outcome for a heat this anvil never ran: the last heat before
+        // a re-smelt, closed late by the rewritten ingot's first tick. The
+        // re-smelt line already accounted for it.
+        if self.anvils.iter().any(|a| a.id == p.id && a.heat == 0) {
+            return;
+        }
         if p.ok {
             if let Some(a) = self.anvils.iter_mut().find(|a| a.id == p.id) {
                 a.proof = p.cmd.clone();
@@ -368,21 +393,22 @@ impl Echo {
         out.push(self.heat_line(&p.id, heat, p.cmd.as_deref(), why));
     }
 
-    /// `    ✗ i2 heat 1/5  node --test — 2 tests failed`
+    /// `    ✗ i2 heat 1/5  AssertionError: 3 != 4`. The reason leads: the
+    /// ingot's header already showed its proof, so the command only fills
+    /// in when no reason was recorded.
     fn heat_line(&self, id: &str, heat: u8, cmd: Option<&str>, why: Option<&str>) -> String {
         let max = self.max_heat(id).unwrap_or(heat.max(1));
         let head = format!("{id} heat {heat}/{max}");
-        let mut room = self.width.saturating_sub(8 + head.chars().count());
+        let room = self.width.saturating_sub(8 + head.chars().count());
         let mut line = format!("    {} {}", paint(WARM, "✗"), paint(WARM, &head));
-        if let Some(cmd) = cmd {
-            let c = tui::clip(cmd, room.min(48).max(8));
-            room = room.saturating_sub(c.chars().count() + 2);
-            line.push_str(&format!("  {}", dim(&c)));
-        }
-        if let Some(why) = why {
-            if room > 8 {
-                line.push_str(&format!(" {} {}", dim("—"), tui::clip(why, room.saturating_sub(3))));
+        match (why, cmd) {
+            (Some(why), _) if room > 8 => {
+                line.push_str(&format!("  {}", tui::clip(why, room)));
             }
+            (None, Some(cmd)) if room > 8 => {
+                line.push_str(&format!("  {}", dim(&tui::clip(cmd, room))));
+            }
+            _ => {}
         }
         line
     }
@@ -468,12 +494,25 @@ impl Echo {
         }
     }
 
+    /// Settle an ingot's last heat before its re-smelt line: the final heat
+    /// failed (that is why it was re-smelted), and no tick followed it.
+    fn close_for_resmelt(&mut self, id: &str, out: &mut Vec<String>) {
+        if let Some(at) = self.anvils.iter().position(|a| a.id == id) {
+            let anvil = self.anvils.remove(at);
+            if anvil.heat > 0 && !self.take_resolved(id, anvil.heat) {
+                let proof = self.ingot(id).map(|i| unescape(&i.proof)).filter(|p| !p.is_empty());
+                out.push(self.heat_line(id, anvil.heat, proof.as_deref(), None));
+            }
+        }
+    }
+
     /// A failed ingot the founder rewrote or split instead of cracking.
     fn resmelts(&mut self, next: &[Ingot], out: &mut Vec<String>) {
-        for old in &self.plan {
+        let previous = self.plan.clone();
+        for old in &previous {
             match next.iter().find(|n| n.id == old.id) {
                 Some(new) if new.smelt > old.smelt => {
-                    self.anvils.retain(|a| a.id != old.id);
+                    self.close_for_resmelt(&old.id, out);
                     let room = self.width.saturating_sub(18 + old.id.len());
                     out.push(format!(
                         "  {} {}  {}",
@@ -489,7 +528,7 @@ impl Echo {
                         .map(|n| n.id.as_str())
                         .collect();
                     if !parts.is_empty() {
-                        self.anvils.retain(|a| a.id != old.id);
+                        self.close_for_resmelt(&old.id, out);
                         out.push(format!(
                             "  {} {}  {}",
                             paint(HOT, "♻"),
@@ -522,14 +561,16 @@ impl Echo {
         }
     }
 
-    /// The mold, one ingot a row: `    i1  ∥ g1  package manifest …`.
-    /// ∥ forges beside others, → waits its turn.
+    /// The mold, one ingot a row: `    i1  par g1  package manifest …`.
+    /// `par` forges beside others, `seq` waits its turn.
     fn table(&self, rows: &[&Ingot], out: &mut Vec<String>) {
         let id_w = rows.iter().map(|i| i.id.chars().count()).max().unwrap_or(2);
         let shown = rows.len().min(12);
         for ingot in rows.iter().take(shown) {
-            let lane = if ingot.solo { paint(HOT, "∥") } else { dim("→") };
-            let room = self.width.saturating_sub(id_w + 14);
+            // Words, not glyphs: `∥` renders as a stray bar in half the
+            // fonts a terminal ships with.
+            let lane = if ingot.solo { paint(HOT, "par") } else { dim("seq") };
+            let room = self.width.saturating_sub(id_w + 16);
             out.push(format!(
                 "    {}  {} {}  {}",
                 paint(PURE, &format!("{:<id_w$}", ingot.id)),
@@ -603,7 +644,13 @@ impl Echo {
 
         if let Some(gap) = &self.goal_gap {
             out.extend(wrap_labelled("gap", gap, self.width, 3).into_iter().map(|l| paint(WARM, &l)));
-            out.push(format!("         {}", dim("the tasks passed; the commission did not. raise --temper to forge the gap.")));
+            out.push(format!(
+                "          {}",
+                dim(&tui::clip(
+                    "the tasks passed; the commission did not. raise --temper to forge the gap.",
+                    self.width.saturating_sub(10)
+                ))
+            ));
         }
         let stats = self.stats.clone().unwrap_or_default();
         if let Some(d) = &stats.durations {
@@ -619,7 +666,7 @@ impl Echo {
         if let Some(s) = spend {
             out.push(self.fact("spend", &format!("{s} · {} tok", tui::tokens(self.tokens))));
             for row in stats.ledger.iter().take(4) {
-                out.push(format!("          {}", dim(&tui::clip(&squeeze(row), self.width.saturating_sub(10)))));
+                out.push(format!("          {}", dim(&tui::clip(&ledger_row(row), self.width.saturating_sub(10)))));
             }
         }
         if counts.cracked > 0 {
@@ -696,7 +743,16 @@ pub fn title(work: &str) -> String {
             break;
         }
     }
-    t.to_string()
+    // A brief runs on (`Why: …`, file lists, rules); its first sentence is
+    // the name. Kept whole when that sentence is too short to name it.
+    let cut = [". ", " Why:", " WHY:"]
+        .iter()
+        .filter_map(|m| t.find(m).map(|i| if *m == ". " { i + 1 } else { i }))
+        .min();
+    match cut {
+        Some(i) if i >= 12 => t[..i].trim_end().to_string(),
+        _ => t.to_string(),
+    }
 }
 
 /// A plan string as a person typed it: the crucible keeps `\"` and `\\`
@@ -711,9 +767,25 @@ fn commission(prd: &str) -> Option<String> {
     prd.lines().map(str::trim).rfind(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string)
 }
 
-/// Collapse runs of spaces a column-aligned ledger row carries.
-fn squeeze(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+/// A spend ledger row as a reader wants it: the call site first, then
+/// what it burned, then the model without its vendor prefix.
+/// `anthropic/claude-haiku-5.5  smith  1619164 tok  $0.1784`
+/// → `smith      1.6M tok  $0.18  claude-haiku-5.5`.
+fn ledger_row(row: &str) -> String {
+    let parts: Vec<&str> = row.split_whitespace().collect();
+    match parts.as_slice() {
+        [model, role, n, "tok", cost @ ..] => {
+            let tok = n.parse::<u64>().map(tui::tokens).unwrap_or_else(|_| n.to_string());
+            let dollars = cost
+                .first()
+                .and_then(|c| c.trim_start_matches('$').parse::<f64>().ok())
+                .map(tui::money)
+                .unwrap_or_else(|| cost.join(" "));
+            let model = model.rsplit('/').next().unwrap_or(model);
+            format!("{role:<9} {tok:>6} tok  {dollars:<7} {model}")
+        }
+        _ => parts.join(" "),
+    }
 }
 
 /// `  gap    text…` wrapped under its label, at most `max` lines.
@@ -845,7 +917,7 @@ mod tests {
             ],
         );
         assert_eq!(text.matches("heat 1/5").count(), 1, "{text}");
-        assert!(text.contains("✗ i2 heat 1/5  node --test — 2 tests failed"), "{text}");
+        assert!(text.contains("✗ i2 heat 1/5  2 tests failed"), "{text}");
         assert!(text.contains("✓ i2 forged"), "{text}");
         assert!(text.contains("heat 2/5"), "{text}");
     }
@@ -884,8 +956,26 @@ mod tests {
             ],
         );
         assert!(text.contains("mold  3 ingots"), "{text}");
-        assert!(text.contains("i3  → g1  docs"), "{text}");
-        assert!(text.contains("i1  ∥ g1  write a"), "{text}");
+        assert!(text.contains("i3  seq g1  docs"), "{text}");
+        assert!(text.contains("i1  par g1  write a"), "{text}");
+    }
+
+    #[test]
+    fn a_ledger_row_leads_with_the_call_site() {
+        assert_eq!(
+            ledger_row("anthropic/claude-haiku-5.5  smith       1619164 tok  $0.1784"),
+            "smith       1.6M tok  $0.18   claude-haiku-5.5"
+        );
+        assert_eq!(ledger_row("odd row"), "odd row");
+    }
+
+    #[test]
+    fn a_title_is_the_briefs_first_sentence() {
+        assert_eq!(title("Goal: make the core pure. Why: tests import it."), "make the core pure.");
+        assert_eq!(title("TASK: a thin CLI over core Why: users run it"), "a thin CLI over core");
+        // Too short to stand alone: keep the whole brief.
+        assert_eq!(title("Fix it. Then document the API"), "Fix it. Then document the API");
+        assert_eq!(title(r#"say \"hi\""#), r#"say "hi""#);
     }
 
     #[test]

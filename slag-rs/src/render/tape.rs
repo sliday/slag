@@ -211,13 +211,6 @@ impl Tape {
         self.cues.last().map_or(0, |c| c.t)
     }
 
-    /// The first PLAN.md the tape saw, for seeding a crucible view.
-    pub fn first_plan(&self) -> Option<&str> {
-        self.cues.iter().find_map(|c| match &c.cue {
-            Cue::Plan(p) => Some(p.as_str()),
-            _ => None,
-        })
-    }
 }
 
 // ─── reading ────────────────────────────────────────────────────────────
@@ -452,14 +445,11 @@ pub fn locate(tape: &Tape, spec: &str) -> Result<u64, String> {
                 })
             })
             .map(|i| advance(tape, i, 1)),
-        "warden" => tape.cues.iter().position(|c| {
-            is_event(c, |e| match e {
-                EngineEvent::Warning { message } | EngineEvent::Narrate { text: message } => {
-                    message.starts_with("warden round")
-                }
-                _ => false,
-            })
-        }).map(|i| advance(tape, i, 1)),
+        // The goal verdict when the run reached one; otherwise the first
+        // time the warden sent a plan document back.
+        "warden" => warden_at(tape, "warden round")
+            .or_else(|| warden_at(tape, "warden rejected the"))
+            .map(|i| advance(tape, i, 1)),
         "assay" | "end" => return Ok(end),
         other => {
             let names: Vec<&str> = POINTS.iter().map(|(n, _)| *n).collect();
@@ -473,6 +463,17 @@ pub fn locate(tape: &Tape, spec: &str) -> Result<u64, String> {
         Some(i) => Ok(tape.cues[i].t),
         None => Err(format!("this tape has no `{spec}` moment")),
     }
+}
+
+fn warden_at(tape: &Tape, prefix: &str) -> Option<usize> {
+    tape.cues.iter().position(|c| {
+        is_event(c, |e| match e {
+            EngineEvent::Warning { message } | EngineEvent::Narrate { text: message } => {
+                message.starts_with(prefix)
+            }
+            _ => false,
+        })
+    })
 }
 
 fn is_event(c: &Timed, f: impl Fn(&EngineEvent) -> bool) -> bool {
@@ -559,11 +560,6 @@ pub fn mark(m: Mark) {
     send(Cue::Mark(m));
 }
 
-/// Whether a session is recording right now.
-pub fn recording() -> bool {
-    bus().lock().unwrap_or_else(|p| p.into_inner()).is_some()
-}
-
 /// What a session does with each cue besides writing it down. The live
 /// stream presenter implements this; a dashboard run passes none, since
 /// the dashboard already holds the event channel.
@@ -578,7 +574,6 @@ pub trait Viewer: Send {
 pub struct Session {
     tx: UnboundedSender<Stamped>,
     task: JoinHandle<()>,
-    path: Option<PathBuf>,
 }
 
 /// How often a viewer gets a tick (spinner frame, elapsed seconds).
@@ -591,12 +586,8 @@ impl Session {
     pub fn open(path: Option<PathBuf>, viewer: Option<Box<dyn Viewer>>) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *bus().lock().unwrap_or_else(|p| p.into_inner()) = Some(tx.clone());
-        let task = tokio::spawn(run_session(rx, path.clone(), viewer));
-        Self { tx, task, path }
-    }
-
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+        let task = tokio::spawn(run_session(rx, path, viewer));
+        Self { tx, task }
     }
 
     /// Tap `hooks.events` for one pipeline pass. A dashboard already holds

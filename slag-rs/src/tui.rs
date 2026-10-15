@@ -289,13 +289,6 @@ pub fn bar(counts: &CrucibleCounts, cells: usize) -> String {
     out
 }
 
-pub fn hr() {
-    if is_quiet() {
-        return;
-    }
-    println!("{}", dim(&"─".repeat(width())));
-}
-
 pub fn header(title: &str) {
     crate::render::tape::mark(crate::render::tape::Mark::Header { text: title.to_string() });
     if is_quiet() {

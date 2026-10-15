@@ -274,6 +274,44 @@ fn classify(name: &str, args: &str) -> (String, Option<String>) {
     (verb, arg)
 }
 
+/// A judge's report (`VERDICT: pass … EVIDENCE: …`) as one readable
+/// clause: whether it passed, and the evidence or the gap that says why.
+/// `None` for a summary that is not a verdict.
+pub(crate) fn verdict_gist(summary: &str) -> Option<(bool, String)> {
+    if !summary.contains("VERDICT") {
+        return None;
+    }
+    let v = crate::pipeline::warden::parse_verdict(summary);
+    let why = if v.fulfilled { v.evidence } else { v.gap };
+    Some((v.fulfilled, if why.is_empty() { "no reason given".to_string() } else { why }))
+}
+
+/// A finish summary that is really a document (a planning pass ends on
+/// what it wrote) as one line about it: S-expression ingots, a re-smelt's
+/// rewrite, or a markdown heading. `None` for an ordinary summary.
+pub(crate) fn finish_gist(summary: &str) -> Option<String> {
+    let ingots = summary.matches("(ingot ").count();
+    if summary.trim_start().starts_with("REWRITE") || summary.trim_start().starts_with("SPLIT") {
+        let ids: Vec<&str> = summary
+            .match_indices(":id \"")
+            .filter_map(|(at, m)| summary[at + m.len()..].split('"').next())
+            .collect();
+        let verb = if summary.trim_start().starts_with("SPLIT") { "split into" } else { "rewrote" };
+        return Some(format!("re-smelt {verb} {}", ids.join(" · ")));
+    }
+    if ingots > 0 {
+        let noun = if ingots == 1 { "ingot" } else { "ingots" };
+        return Some(format!("mold cast · {ingots} {noun}"));
+    }
+    let first = summary.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if first.starts_with('#') {
+        let heading = first.trim_start_matches('#').trim();
+        let lines = summary.lines().count();
+        return Some(format!("document drafted · {lines} lines · {}", preview(heading, 120)));
+    }
+    None
+}
+
 /// The verb and subject a card shows for a tool call, for any view that
 /// lists calls (the dashboard feed uses the same words as the stream).
 pub(crate) fn tool_label(name: &str, args: &str) -> (String, Option<String>) {
@@ -608,8 +646,18 @@ impl RenderState {
             }
             EngineEvent::Finish { summary } => {
                 self.flush_streak(&mut prints);
-                let head = format!("  {} ", paint(PURE, "■"));
-                prints.extend(wrap_hanging(&head, summary, width, 4, 2));
+                // A judge's report reads as its verdict, not as the raw
+                // `VERDICT: … GAP: … EVIDENCE: …` block it arrives in.
+                if let Some((pass, why)) = verdict_gist(summary) {
+                    let (word, color) = if pass { ("pass", PURE) } else { ("fail", WARM) };
+                    let head = format!("  {} {}  ", paint(color, "⚖"), paint(color, &format!("judged {word}")));
+                    prints.extend(wrap_hanging(&head, &why, width, 4, 2));
+                } else if let Some(gist) = finish_gist(summary) {
+                    prints.push(line(PURE, "■", &dim(&preview(&gist, width.saturating_sub(4)))));
+                } else {
+                    let head = format!("  {} ", paint(PURE, "■"));
+                    prints.extend(wrap_hanging(&head, summary, width, 4, 2));
+                }
             }
             EngineEvent::Error { message } => {
                 self.flush_streak(&mut prints);
@@ -1464,6 +1512,28 @@ mod tests {
         assert!(printed(&mid).is_empty(), "second card is held until the streak resolves");
         let joined = printed(&state.finish()).join("\n");
         assert!(joined.contains("pwd"), "{joined}");
+    }
+
+    #[test]
+    fn a_judges_report_reads_as_its_verdict() {
+        let mut state = RenderState::new(false);
+        let lines = printed(&state.feed(&EngineEvent::Finish {
+            summary: "VERDICT: fail\nGAP: no test covers the CLI\nEVIDENCE: ran it".into(),
+        }));
+        let text = lines.join("\n");
+        assert!(text.contains("judged fail") && text.contains("no test covers the CLI"), "{text}");
+        assert!(!text.contains("VERDICT"), "{text}");
+        assert_eq!(verdict_gist("all done"), None);
+    }
+
+    #[test]
+    fn a_document_summary_condenses_to_one_line() {
+        let rewrite = r#"REWRITE: (ingot :id "i1" :status ore :work "x")"#;
+        assert_eq!(finish_gist(rewrite).as_deref(), Some("re-smelt rewrote i1"));
+        let cast = r#"(ingot :id "i1") (ingot :id "i2")"#;
+        assert_eq!(finish_gist(cast).as_deref(), Some("mold cast · 2 ingots"));
+        assert!(finish_gist("# BLUEPRINT\nbody").unwrap().starts_with("document drafted · 2 lines"));
+        assert_eq!(finish_gist("Wrote the CLI and its tests."), None);
     }
 
     #[test]

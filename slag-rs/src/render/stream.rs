@@ -33,6 +33,7 @@ pub enum Out {
     Err(String),
 }
 
+#[cfg(test)]
 impl Out {
     pub fn text(&self) -> &str {
         match self {
@@ -51,6 +52,9 @@ pub struct Stream {
     pinned: Option<usize>,
     spin: usize,
     footer: Option<String>,
+    /// Hold footer redraws until the next tick. A replay jumping straight
+    /// to a moment would otherwise redraw it once per cue on the way.
+    defer_footer: bool,
 }
 
 impl Stream {
@@ -70,7 +74,14 @@ impl Stream {
             pinned: width,
             spin: 0,
             footer: None,
+            defer_footer: false,
         }
+    }
+
+    /// Draw the footer only on ticks, not on every cue.
+    pub fn defer_footer(mut self, on: bool) -> Self {
+        self.defer_footer = on;
+        self
     }
 
     /// Follow a resized terminal: every line built from now on fits it.
@@ -119,7 +130,8 @@ impl Stream {
 
     /// The footer row for `at`, or `None` when nothing is running.
     pub fn footer_text(&self, at: Instant) -> Option<String> {
-        let verb = self.echo.phase().verb()?;
+        let verb = self.echo.phase_verb()?;
+        let verb = verb.as_str();
         let mut left = format!(
             " {} {}",
             paint(HOT, tui::spinner_frame(self.spin)),
@@ -170,7 +182,11 @@ impl Stream {
     pub fn cue_at(&mut self, cue: &Cue, at: Instant) {
         self.refresh_width();
         let out = self.lines(cue, at);
-        let footer = self.tty.then(|| self.footer_text(at)).flatten();
+        let footer = if self.defer_footer {
+            self.footer.clone()
+        } else {
+            self.tty.then(|| self.footer_text(at)).flatten()
+        };
         self.write(&out, footer);
     }
 
@@ -203,11 +219,12 @@ impl Stream {
                 Out::Err(s) => writeln!(e, "{s}"),
             };
         }
-        if self.tty {
+        // The footer row sits outside the scroll region, so printed lines
+        // never disturb it: it is redrawn only when its text changes.
+        if self.tty && footer != self.footer {
             match &footer {
                 Some(text) => footer_draw(&mut e, text),
-                None if self.footer.is_some() => footer_clear(&mut e),
-                None => {}
+                None => footer_clear(&mut e),
             }
         }
         let _ = e.flush();
@@ -272,8 +289,10 @@ fn footer_draw(e: &mut impl Write, text: &str) {
             let _ = write!(e, "\x1b7\x1b[r\x1b8");
         }
         // Make sure a free row exists below the cursor (scrolling if the
-        // cursor sits on the last row), then fence it off.
-        let _ = write!(e, "\n\x1b[1A\x1b7\x1b[1;{}r\x1b8", rows - 1);
+        // cursor sits on the last row), then fence it off. The cursor hides
+        // while the footer is up: nothing here takes input, and a block
+        // blinking under the ledger reads as a prompt.
+        let _ = write!(e, "\n\x1b[1A\x1b7\x1b[1;{}r\x1b8\x1b[?25l", rows - 1);
         FOOTER_ON.store(true, Ordering::Relaxed);
         FOOTER_ROWS.store(rows, Ordering::Relaxed);
         if !RESTORE_REGISTERED.swap(true, Ordering::Relaxed) {
@@ -299,7 +318,7 @@ pub fn footer_off() {
     }
     let rows = FOOTER_ROWS.load(Ordering::Relaxed);
     let mut e = std::io::stderr().lock();
-    let _ = write!(e, "\x1b7\x1b[{rows};1H\x1b[2K\x1b[r\x1b8");
+    let _ = write!(e, "\x1b7\x1b[{rows};1H\x1b[2K\x1b[r\x1b8\x1b[?25h");
     let _ = e.flush();
 }
 
@@ -390,6 +409,15 @@ mod tests {
         assert!(f.contains("run node --test 0:12"), "{f}");
         assert!(f.contains("1:52 · 41k tok · $0.06"), "{f}");
         assert!(tui::visible_len(&f) <= 119, "{}", f.len());
+    }
+
+    #[test]
+    fn a_flow_this_view_has_no_word_for_still_gets_a_footer() {
+        let mut s = Stream::new(true, Some(80));
+        let t0 = Instant::now();
+        s.lines(&Cue::Mark(Mark::Header { text: "FIX · reproducing the issue".into() }), t0);
+        let f = strip(&s.footer_text(t0).unwrap());
+        assert!(f.contains(" fix"), "{f}");
     }
 
     #[test]
