@@ -1,0 +1,1156 @@
+//! `slag fix`: solve one issue in an existing repository, fast, and prove it.
+//!
+//! The commission pipeline (survey, found, forge, assay) builds a project
+//! from nothing. An issue in a repository that already has code and tests
+//! needs none of that ceremony, and the ingot machinery would write PRD,
+//! BLUEPRINT, and PLAN files into the user's root. So a fix is one agent
+//! session per attempt:
+//!
+//! 1. slag gathers what it can without a model, concurrently: the issue
+//!    (fetched with `gh` when it names one), the test command, and how the
+//!    tests end before any edit.
+//! 2. One forge-mode session reads, reproduces, fixes, and runs the tests.
+//! 3. slag reruns the tests itself. The verdict comes from those exit
+//!    codes, never from the session's summary.
+//! 4. A failed attempt retries on the plan model, starting from the failure
+//!    slag observed and the changes already on disk.
+//! 5. A passing fix gets its reproduction checked (the new test must fail
+//!    with the source change reverted) and lands as one commit on a fresh
+//!    `slag/fix-*` branch, or a draft PR with `--pr`.
+
+mod issue;
+mod repo;
+
+use std::collections::BTreeMap;
+use std::io::IsTerminal;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::cli::FixArgs;
+use crate::config::{EngineConfig, HIGH_GRADE};
+use crate::engine::{emit, stats, EngineEvent};
+use crate::error::SlagError;
+use crate::smith::EngineHooks;
+use crate::tui;
+
+use issue::Issue;
+use repo::{Git, Run, TestCmd};
+
+use super::{bold, fg, reset};
+
+/// The id the fix wears on the event stream, so the dashboard shows it as
+/// one ingot with one heat per attempt.
+const FIX_ID: &str = "fix";
+/// Ceiling for any one test run slag makes. A suite slower than this is
+/// not one a quick fix can afford to run three times.
+const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// How much of the repository's file list reaches the prompt.
+const FILE_LIST_CAP: usize = 200;
+const FILE_LIST_BYTES: usize = 8_000;
+/// How much of an instruction file (AGENTS.md, CLAUDE.md) the prompt gets.
+const INSTRUCTIONS_BYTES: usize = 4_000;
+/// Test output the prompt and the report carry: the end, where the
+/// verdict and the failing assertion are.
+const OUTPUT_TAIL_LINES: usize = 40;
+const OUTPUT_TAIL_BYTES: usize = 4_000;
+/// A retry starts from the previous attempt's diff, capped.
+const RETRY_DIFF_BYTES: usize = 8_000;
+
+/// `slag fix`: resolve the key and the issue, then fix it under the
+/// dashboard or in stream mode.
+pub async fn run(
+    args: FixArgs,
+    tui_flag: bool,
+    trace: Option<PathBuf>,
+    temper: bool,
+) -> Result<(), SlagError> {
+    if let Some(m) = &args.model {
+        std::env::set_var("SLAG_MODEL_BASE", m);
+    }
+    if let Some(m) = &args.plan_model {
+        std::env::set_var("SLAG_MODEL_PLAN", m);
+    }
+    let cwd = std::env::current_dir()?;
+    let git = Git::open(&cwd);
+
+    // Cheap refusals first: nothing below is worth a key prompt or a model
+    // call when there is no issue, or the result cannot land where asked.
+    if args.issue_file.is_none() && args.issue.iter().all(|w| w.trim().is_empty()) {
+        return Err(SlagError::Config(issue::USAGE.into()));
+    }
+    if args.pr {
+        if git.is_none() {
+            return Err(SlagError::Config("--pr needs a git repository".into()));
+        }
+        if !repo::on_path("gh") {
+            return Err(SlagError::Config("--pr needs the GitHub CLI (`gh`) on PATH".into()));
+        }
+    }
+
+    let config = EngineConfig::resolve().await?;
+    if let Some(dir) = crate::cli::sessions_dir() {
+        if let Some(other) = crate::cli::conflict_in(&dir, &cwd) {
+            return Err(SlagError::Config(format!(
+                "another slag (pid {}, started {}) is already working in this directory",
+                other.pid, other.started_at
+            )));
+        }
+    }
+    let run_id = format!("fix-{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+    let session =
+        crate::cli::sessions_dir().and_then(|dir| crate::cli::register_session_in(&dir, &run_id, "fix"));
+    if let Some(path) = session.clone() {
+        crate::shutdown::register(move || {
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    let job = Job {
+        temper: temper || args.temper,
+        args,
+        cwd,
+        git,
+    };
+    // `--tui` needs a real terminal for the key reader; headless runs keep
+    // the stream display, as a forge does.
+    let result = if (tui_flag || job.args.tui) && std::io::stdin().is_terminal() {
+        under_dashboard(job, &config, trace).await
+    } else {
+        in_stream(&job, &config, trace).await
+    };
+
+    if let Some(path) = session {
+        let _ = std::fs::remove_file(path);
+    }
+    let outcome = result?;
+    report(&outcome);
+    match &outcome.verdict {
+        Verdict::Fixed => Ok(()),
+        Verdict::Failed(reason) => Err(SlagError::ProofFailed {
+            id: FIX_ID.into(),
+            reason: reason.clone(),
+        }),
+    }
+}
+
+/// One `slag fix` invocation's fixed inputs.
+struct Job {
+    args: FixArgs,
+    temper: bool,
+    cwd: PathBuf,
+    git: Option<Git>,
+}
+
+async fn in_stream(
+    job: &Job,
+    config: &EngineConfig,
+    trace: Option<PathBuf>,
+) -> Result<Outcome, SlagError> {
+    let (hooks, sink) = crate::render::trace::attach(EngineHooks::default(), trace);
+    let result = fix(job, config, &hooks).await;
+    drop(hooks);
+    if let Some(sink) = sink {
+        let _ = sink.await;
+    }
+    result
+}
+
+/// The dashboard owns the terminal for the run and stays up for review
+/// afterwards, as it does for a forge. Text typed at the end is the next
+/// issue: the finished fix is reported on the real terminal, and the next
+/// one starts from wherever this one left the repository.
+async fn under_dashboard(
+    mut job: Job,
+    config: &EngineConfig,
+    trace: Option<PathBuf>,
+) -> Result<Outcome, SlagError> {
+    let steer = crate::engine::SteerQueue::default();
+    let cancel = crate::engine::CancelFlag::default();
+    loop {
+        let (tx, rx) = crate::engine::events::channel();
+        let hooks = EngineHooks {
+            events: Some(tx),
+            steer: Some(steer.clone()),
+            cancel: Some(cancel.clone()),
+        };
+        let (hooks, trace_sink) = crate::render::trace::attach(hooks, trace.clone());
+        tui::set_quiet(true);
+        let dash = tokio::spawn(crate::dashboard::run(rx, steer.clone(), cancel.clone()));
+        let result = fix(&job, config, &hooks).await;
+        if let Err(e) = &result {
+            emit(&hooks.events, EngineEvent::Error { message: format!("fix stopped: {e}") });
+        }
+        drop(hooks);
+        let next = dash.await.ok().and_then(|r| r.ok()).flatten();
+        if let Some(sink) = trace_sink {
+            let _ = sink.await;
+        }
+        tui::set_quiet(false);
+        match (next, result) {
+            (Some(next), Ok(outcome)) => {
+                report(&outcome);
+                job.args.issue = vec![next];
+                job.args.issue_file = None;
+            }
+            (_, result) => return result,
+        }
+    }
+}
+
+/// How the fix ended. Decided only by commands slag ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    Fixed,
+    Failed(String),
+}
+
+/// Why an attempt failed: one line for the verdict, the full story for
+/// the next attempt's prompt.
+struct Failure {
+    line: String,
+    detail: String,
+}
+
+impl Failure {
+    fn new(line: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { line: line.into(), detail: detail.into() }
+    }
+}
+
+/// `1 attempt`, `3 attempts`.
+fn plural(n: u8, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+/// How the bug was shown to exist, if it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Repro {
+    /// With the source change reverted, the session's new test fails.
+    Regression { status: String },
+    /// The test command failed before any edit and passes now.
+    Baseline { status: String },
+    NotShown(String),
+}
+
+/// Everything the final report needs.
+struct Outcome {
+    issue: Issue,
+    verdict: Verdict,
+    attempts: u8,
+    checks: Vec<Run>,
+    repro: Repro,
+    stat: Vec<String>,
+    summary: String,
+    branch: Option<String>,
+    commit: Option<String>,
+    pr: Option<String>,
+    notes: Vec<String>,
+    /// Where the wall time went, phase by phase, so waste is visible.
+    phases: Phases,
+    /// Run time and spend, taken when the fix ends rather than when the
+    /// report prints: a dashboard left open must not inflate the wall.
+    time: Option<String>,
+    spend: Option<String>,
+}
+
+/// Seconds per phase of one fix, summed across attempts.
+#[derive(Debug, Default, Clone, Copy)]
+struct Phases {
+    gather: f64,
+    session: f64,
+    verify: f64,
+    repro: f64,
+    land: f64,
+}
+
+impl Phases {
+    fn line(&self) -> String {
+        format!(
+            "gather {:.1}s · session {:.1}s · verify {:.1}s · reproduce {:.1}s · commit {:.1}s",
+            self.gather, self.session, self.verify, self.repro, self.land
+        )
+    }
+}
+
+/// Before the first model call: the issue, the test command, and how the
+/// tests end with nothing changed, gathered concurrently.
+async fn gather(job: &Job) -> Result<(Issue, Option<TestCmd>, Option<Run>), SlagError> {
+    let test = match &job.args.test {
+        Some(cmd) => Some(TestCmd { cmd: cmd.clone(), source: "--test".into() }),
+        None => repo::detect_test(&job.cwd),
+    };
+    let baseline = async {
+        match &test {
+            Some(t) => Some(repo::run(&t.cmd, &job.cwd, TEST_TIMEOUT).await),
+            None => None,
+        }
+    };
+    let (issue, baseline) =
+        tokio::join!(issue::resolve(&job.args.issue, job.args.issue_file.as_deref()), baseline);
+    Ok((issue?, test, baseline))
+}
+
+async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Outcome, SlagError> {
+    stats::mark_run_start();
+    tui::show_banner();
+    tui::header("FIX");
+
+    let mut phases = Phases::default();
+    let clock = std::time::Instant::now();
+    let (issue, test, baseline) = gather(job).await?;
+    phases.gather = clock.elapsed().as_secs_f64();
+    emit(
+        &hooks.events,
+        EngineEvent::IngotStart { id: FIX_ID.into(), work: issue.title.clone() },
+    );
+    tui::status_line("░", tui::COLD, &format!("issue: {}", tui::truncate(&issue.title, 70)));
+
+    // A test command that cannot run here says nothing about the bug, and
+    // verifying with it would fail every attempt for the wrong reason.
+    let usable_test = match (&test, &baseline) {
+        (Some(t), Some(b)) if !b.unusable() => Some(t.cmd.clone()),
+        _ => None,
+    };
+    match (&test, &baseline) {
+        (Some(t), Some(b)) => {
+            let line =
+                format!("tests: `{}` (from {}) {} before any edit", t.cmd, t.source, b.status());
+            note(hooks, &line, b.ok());
+        }
+        _ => note(hooks, "tests: none detected; the session must find them", false),
+    }
+
+    if let Some(git) = &job.git {
+        git.hide_scratch();
+    }
+    let before = job.git.as_ref().map(Git::snapshot).unwrap_or_default();
+    let context = context_block(job, &issue, test.as_ref(), baseline.as_ref());
+    let tries = job.args.tries.max(1);
+
+    let mut failure: Option<Failure> = None;
+    let mut checks: Vec<Run> = Vec::new();
+    let mut summary = String::new();
+    let mut changed: Vec<String> = Vec::new();
+    let mut passed = false;
+    let mut attempts = 0u8;
+
+    for attempt in 1..=tries {
+        attempts = attempt;
+        emit(&hooks.events, EngineEvent::HeatTick { id: FIX_ID.into(), heat: attempt });
+        // The first attempt runs on the work model. Anything that needs a
+        // second look gets the plan model and the failure in hand.
+        let grade = if attempt == 1 { 1 } else { HIGH_GRADE };
+        tui::status_line(
+            "⚒",
+            tui::HOT,
+            &format!("attempt {attempt}/{tries} · {}", config.model_for_grade(grade)),
+        );
+        let retry = failure.as_ref().map(|f| retry_block(&f.detail, job.git.as_ref(), &changed));
+        let prompt = crate::flux::fix_prompt(&issue.render(), &context, retry.as_deref());
+        let smith = crate::smith::make_smith(config, "default", grade, hooks);
+        let clock = std::time::Instant::now();
+        let response = super::forge::invoke_absorbing_transients(
+            smith.as_ref(),
+            &prompt,
+            FIX_ID,
+            super::forge::MAX_TRANSIENT_PER_HEAT,
+            hooks,
+        )
+        .await;
+        phases.session += clock.elapsed().as_secs_f64();
+        let response = match response {
+            Ok(r) => r,
+            Err(e @ (SlagError::Cancelled | SlagError::RunBudgetExhausted { .. })) => return Err(e),
+            Err(e) => {
+                failure = Some(Failure::new(
+                    format!("the session failed: {e}"),
+                    format!("The session ended with an error: {e}"),
+                ));
+                note(hooks, &format!("attempt {attempt}: session error: {e}"), false);
+                continue;
+            }
+        };
+        let agent_cmd = crate::proof::extract_cmd(&response);
+        summary = strip_cmd_lines(&response);
+
+        if let Some(git) = &job.git {
+            changed = git.changed_since(&before);
+            // Bytecode a test run rewrote is not part of anyone's fix, even
+            // in a repository that tracks it by mistake.
+            changed.retain(|p| !p.ends_with(".pyc"));
+            if changed.is_empty() {
+                failure = Some(Failure::new(
+                    "the session changed no file",
+                    "The session finished without changing any file.",
+                ));
+                note(hooks, &format!("attempt {attempt}: no file changed"), false);
+                continue;
+            }
+            // A suite goes green easily when tests disappear. The rule is
+            // in the prompt; this is the check that it held.
+            if let Some(lost) = lost_tests(git, &before, &changed) {
+                note(hooks, &format!("attempt {attempt}: {lost}"), false);
+                failure = Some(Failure::new(
+                    lost.clone(),
+                    format!(
+                        "The session {lost}. Restore every existing test exactly as it was, \
+                         unskipped, and add new tests beside them."
+                    ),
+                ));
+                continue;
+            }
+        }
+
+        let clock = std::time::Instant::now();
+        checks = verify(job, hooks, usable_test.as_deref(), agent_cmd.as_deref()).await;
+        phases.verify += clock.elapsed().as_secs_f64();
+        if checks.is_empty() {
+            failure = Some(Failure::new(
+                "nothing to verify with: no test command found and no finish `cmd`",
+                "slag had nothing to verify with: no test command was detected and the \
+                 finish call carried no `cmd`. Find how this repository runs its tests and \
+                 put that command in `cmd`.",
+            ));
+            continue;
+        }
+        if let Some(bad) = checks.iter().find(|c| !c.ok()) {
+            failure = Some(Failure::new(
+                format!("`{}` gave {}", bad.cmd, bad.status()),
+                format!(
+                    "After the session finished, slag ran `{}` and got {}:\n{}",
+                    bad.cmd,
+                    bad.status(),
+                    repo::tail(&bad.output, OUTPUT_TAIL_LINES, OUTPUT_TAIL_BYTES)
+                ),
+            ));
+            continue;
+        }
+
+        if job.temper {
+            match judge(config, hooks, &issue, &checks[0].cmd).await {
+                Ok(v) if v.fulfilled => note(hooks, &format!("warden: pass ({})", v.evidence), true),
+                Ok(v) => {
+                    note(hooks, &format!("warden: {}", v.gap), false);
+                    failure = Some(Failure::new(
+                        format!("the warden rejected the fix: {}", v.gap),
+                        format!(
+                            "The tests pass, but an independent reviewer rejected the fix: {}",
+                            v.gap
+                        ),
+                    ));
+                    continue;
+                }
+                // A warden that cannot run must not sink a verified fix.
+                Err(e) => note(hooks, &format!("warden could not judge the fix: {e}"), false),
+            }
+        }
+        passed = true;
+        break;
+    }
+
+    let mut out = Outcome {
+        issue,
+        verdict: Verdict::Fixed,
+        attempts,
+        checks,
+        repro: Repro::NotShown("the fix did not pass".into()),
+        stat: Vec::new(),
+        summary,
+        branch: None,
+        commit: None,
+        pr: None,
+        notes: Vec::new(),
+        phases,
+        time: None,
+        spend: None,
+    };
+    if let Some(git) = &job.git {
+        out.stat = git.stat(&changed);
+    }
+
+    if !passed {
+        let line = failure.map_or_else(|| "no attempt ran".to_string(), |f| f.line);
+        emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: false });
+        out.verdict = Verdict::Failed(format!("{line} after {}", plural(attempts, "attempt")));
+        if !changed.is_empty() {
+            out.notes.push("the last attempt's changes are left in the working tree".into());
+        }
+        stamp(&mut out);
+        return Ok(out);
+    }
+
+    let proof_cmd = out.checks[0].cmd.clone();
+    let clock = std::time::Instant::now();
+    out.repro = reproduce(job, &before, &changed, &proof_cmd, baseline.as_ref()).await;
+    out.phases.repro = clock.elapsed().as_secs_f64();
+    match &out.repro {
+        Repro::NotShown(why) => note(hooks, &format!("reproduction not shown: {why}"), false),
+        Repro::Regression { status } => {
+            note(hooks, &format!("reproduced: without the fix `{proof_cmd}` gives {status}"), true)
+        }
+        Repro::Baseline { status } => {
+            note(hooks, &format!("reproduced: the tests gave {status} before the fix"), true)
+        }
+    }
+    emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: true });
+
+    let clock = std::time::Instant::now();
+    land(job, &mut out, &changed);
+    out.phases.land = clock.elapsed().as_secs_f64();
+    stamp(&mut out);
+    Ok(out)
+}
+
+/// Name the test files where the session deleted or skipped existing
+/// tests: fewer definitions than before, or more skip markers.
+fn lost_tests(
+    git: &Git,
+    before: &BTreeMap<String, repo::Content>,
+    changed: &[String],
+) -> Option<String> {
+    let hit: Vec<String> = changed
+        .iter()
+        .filter(|p| repo::is_test_path(p))
+        .filter_map(|p| {
+            let old = String::from_utf8(git.original(before, p)?).ok()?;
+            let new = std::fs::read_to_string(git.top.join(p)).unwrap_or_default();
+            let ((old_defs, old_skips), (new_defs, new_skips)) =
+                (repo::test_marks(&old), repo::test_marks(&new));
+            (new_defs < old_defs || new_skips > old_skips).then(|| {
+                format!("{p} ({old_defs} tests, {old_skips} skipped -> {new_defs}, {new_skips})")
+            })
+        })
+        .collect();
+    (!hit.is_empty()).then(|| format!("removed or skipped existing tests in {}", hit.join(", ")))
+}
+
+/// Run the verification commands: the repository's test command, then the
+/// session's own `cmd` when it differs. Sequential on purpose: two test
+/// runs at once fight over build locks and ports.
+async fn verify(
+    job: &Job,
+    hooks: &EngineHooks,
+    test: Option<&str>,
+    agent: Option<&str>,
+) -> Vec<Run> {
+    let mut cmds: Vec<&str> = test.into_iter().collect();
+    if let Some(a) = agent {
+        let same = test.is_some_and(|t| squash(t) == squash(a));
+        if !same && !a.trim().is_empty() {
+            cmds.push(a);
+        }
+    }
+    let mut runs = Vec::new();
+    for cmd in cmds {
+        let run = repo::run(cmd, &job.cwd, TEST_TIMEOUT).await;
+        note(hooks, &format!("verify: `{cmd}` {} in {:.1}s", run.status(), run.secs), run.ok());
+        let ok = run.ok();
+        runs.push(run);
+        if !ok {
+            break;
+        }
+    }
+    runs
+}
+
+fn squash(cmd: &str) -> String {
+    cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Show the bug existed. The strongest proof is the session's own
+/// regression test failing with the source change taken back out; failing
+/// that, a test command that failed before the edit and passes after.
+async fn reproduce(
+    job: &Job,
+    before: &BTreeMap<String, repo::Content>,
+    changed: &[String],
+    cmd: &str,
+    baseline: Option<&Run>,
+) -> Repro {
+    let from_baseline = || match baseline {
+        Some(b) if !b.ok() && !b.unusable() => Some(Repro::Baseline { status: b.status() }),
+        _ => None,
+    };
+    let Some(git) = &job.git else {
+        return from_baseline().unwrap_or(Repro::NotShown("not a git repository".into()));
+    };
+    let (tests, sources): (Vec<&String>, Vec<&String>) =
+        changed.iter().partition(|p| repo::is_test_path(p));
+    let why = if tests.is_empty() {
+        Some("the fix added no test")
+    } else if sources.is_empty() {
+        Some("only test files changed")
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        return from_baseline().unwrap_or_else(|| Repro::NotShown(why.into()));
+    }
+
+    // Swap the source files back to their pre-session content, run, swap
+    // the fix back in. A Ctrl-C in between must not cost the user the fix,
+    // so the restore is registered with the shutdown hooks first.
+    let fixed: Vec<(PathBuf, repo::Content)> = sources
+        .iter()
+        .map(|p| {
+            let path = git.top.join(p);
+            let now = std::fs::read(&path).ok();
+            (path, now)
+        })
+        .collect();
+    let pending = Arc::new(Mutex::new(Some(fixed.clone())));
+    let rescue = pending.clone();
+    crate::shutdown::register(move || {
+        if let Some(files) = rescue.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            restore(&files);
+        }
+    });
+    let originals: Vec<(PathBuf, repo::Content)> = sources
+        .iter()
+        .map(|p| (git.top.join(p), git.original(before, p)))
+        .collect();
+    restore(&originals);
+    let run = repo::run(cmd, &job.cwd, TEST_TIMEOUT).await;
+    if let Some(files) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        restore(&files);
+    }
+
+    if run.unusable() {
+        return from_baseline()
+            .unwrap_or_else(|| Repro::NotShown(format!("the check without the fix {}", run.status())));
+    }
+    if run.ok() {
+        return from_baseline().unwrap_or_else(|| {
+            Repro::NotShown("the new test also passes without the fix".into())
+        });
+    }
+    Repro::Regression { status: run.status() }
+}
+
+/// Write each path's content back, removing paths whose content is `None`.
+fn restore(files: &[(PathBuf, repo::Content)]) {
+    for (path, content) in files {
+        match content {
+            Some(bytes) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(path, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Commit the verified fix on a new branch, and open a draft PR when asked.
+/// A failure here is reported, never fatal: the fix itself is on disk.
+fn land(job: &Job, out: &mut Outcome, changed: &[String]) {
+    let Some(git) = &job.git else {
+        out.notes.push("not a git repository: the fix is in the working tree".into());
+        return;
+    };
+    if job.args.no_commit {
+        out.notes.push("--no-commit: the fix is in the working tree".into());
+        return;
+    }
+    let branch = git.free_branch(&out.issue.branch_name());
+    let message = commit_message(out);
+    match git.commit_on_branch(&branch, changed, &message) {
+        Ok(sha) => {
+            out.stat = git
+                .git(&["show", "--stat", "--format=", "HEAD"])
+                .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+                .unwrap_or_else(|| out.stat.clone());
+            out.branch = Some(branch.clone());
+            out.commit = Some(sha);
+        }
+        Err(e) => {
+            out.notes.push(format!("commit failed, the fix is in the working tree: {e}"));
+            return;
+        }
+    }
+    if job.args.pr {
+        match open_pr(git, &branch, out) {
+            Ok(url) => out.pr = Some(url),
+            Err(e) => out.notes.push(format!("draft PR not opened: {e}")),
+        }
+    }
+}
+
+fn commit_message(out: &Outcome) -> String {
+    let mut msg = format!("fix: {}\n", tui::truncate(&out.issue.title, 68));
+    if !out.summary.trim().is_empty() {
+        msg.push_str(&format!("\n{}\n", out.summary.trim()));
+    }
+    for check in &out.checks {
+        msg.push_str(&format!("\nVerified: `{}` {}", check.cmd, check.status()));
+    }
+    msg.push('\n');
+    if let Some(n) = out.issue.number {
+        msg.push_str(&format!("\nFixes #{n}\n"));
+    }
+    msg
+}
+
+/// Push the branch and open a draft PR whose body carries the
+/// reproduction, the fix, and the verification output.
+fn open_pr(git: &Git, branch: &str, out: &Outcome) -> Result<String, String> {
+    let remote = git
+        .git(&["remote"])
+        .and_then(|r| {
+            let names: Vec<String> = r.lines().map(str::to_string).collect();
+            names.iter().find(|n| *n == "origin").or(names.first()).cloned()
+        })
+        .ok_or("the repository has no remote")?;
+    git.git_checked(&["push", "--quiet", "-u", &remote, branch])?;
+    let body_path = std::env::temp_dir().join(format!("slag-fix-pr-{}.md", std::process::id()));
+    std::fs::write(&body_path, pr_body(out)).map_err(|e| e.to_string())?;
+    let created = std::process::Command::new("gh")
+        .current_dir(&git.top)
+        .args(["pr", "create", "--draft", "--head", branch, "--title"])
+        .arg(format!("fix: {}", out.issue.title))
+        .arg("--body-file")
+        .arg(&body_path)
+        .output()
+        .map_err(|e| e.to_string());
+    let _ = std::fs::remove_file(&body_path);
+    let created = created?;
+    if !created.status.success() {
+        return Err(String::from_utf8_lossy(&created.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&created.stdout).trim().to_string())
+}
+
+fn pr_body(out: &Outcome) -> String {
+    let mut body = String::from("## Issue\n\n");
+    match (&out.issue.number, &out.issue.url) {
+        (Some(n), _) => body.push_str(&format!("Fixes #{n}\n")),
+        (None, _) => body.push_str(&format!("> {}\n", out.issue.title)),
+    }
+    body.push_str("\n## Reproduction\n\n");
+    body.push_str(&repro_line(&out.repro, out.checks.first().map(|c| c.cmd.as_str())));
+    body.push_str("\n\n## Fix\n\n");
+    body.push_str(out.summary.trim());
+    body.push_str("\n\n## Verification\n");
+    for check in &out.checks {
+        body.push_str(&format!(
+            "\n`{}`: {} in {:.1}s\n\n```\n{}\n```\n",
+            check.cmd,
+            check.status(),
+            check.secs,
+            repo::tail(&check.output, 20, 2_000)
+        ));
+    }
+    body.push_str("\nOpened by `slag fix`. Every verdict above comes from a command slag ran.\n");
+    body
+}
+
+fn repro_line(repro: &Repro, cmd: Option<&str>) -> String {
+    let cmd = cmd.unwrap_or("the tests");
+    match repro {
+        Repro::Regression { status } => {
+            format!("With the source change reverted, `{cmd}` gives {status}: the new test catches the bug.")
+        }
+        Repro::Baseline { status } => format!("Before the fix, `{cmd}` gave {status}."),
+        Repro::NotShown(why) => format!("Not shown: {why}."),
+    }
+}
+
+/// The warden judges the fix on disk against the issue. It never sees the
+/// fixer's summary.
+async fn judge(
+    config: &EngineConfig,
+    hooks: &EngineHooks,
+    issue: &Issue,
+    verify: &str,
+) -> Result<super::warden::Verdict, SlagError> {
+    let smith = crate::smith::make_warden(config, hooks);
+    let raw = smith
+        .invoke(&crate::flux::fix_warden_prompt(&issue.render(), verify))
+        .await?;
+    Ok(super::warden::parse_verdict(&raw))
+}
+
+/// What slag already knows about the repository, so the session does not
+/// spend turns finding it.
+fn context_block(
+    job: &Job,
+    issue: &Issue,
+    test: Option<&TestCmd>,
+    baseline: Option<&Run>,
+) -> String {
+    let mut s = String::from("=== REPOSITORY ===\n");
+    let files = repo::file_list(&job.cwd, job.git.as_ref());
+    // Naming the likely files lets the first turn read them all at once
+    // instead of spending a turn finding them.
+    let likely = repo::rank_files(&job.cwd, &files, &repo::issue_terms(&issue.render()), 6);
+    if !likely.is_empty() {
+        s.push_str(&format!(
+            "Files that mention the names in the issue: {}\n\n",
+            likely.join(", ")
+        ));
+    }
+    let mut listed = String::new();
+    let mut shown = 0;
+    for f in files.iter().take(FILE_LIST_CAP) {
+        if listed.len() + f.len() > FILE_LIST_BYTES {
+            break;
+        }
+        listed.push_str(f);
+        listed.push('\n');
+        shown += 1;
+    }
+    if shown < files.len() {
+        s.push_str(&format!("{} files; the first {shown}:\n", files.len()));
+    } else {
+        s.push_str(&format!("{} files:\n", files.len()));
+    }
+    s.push_str(&listed);
+
+    for name in [crate::config::ALLOY_FILE, "CLAUDE.md"] {
+        if let Ok(text) = std::fs::read_to_string(job.cwd.join(name)) {
+            if text.trim().is_empty() {
+                continue;
+            }
+            s.push_str(&format!(
+                "\n=== PROJECT INSTRUCTIONS ===\n{}\nContents of {name}:\n{}\n",
+                crate::flux::INSTRUCTION_OVERRIDE_HEADER,
+                clip(&text, INSTRUCTIONS_BYTES)
+            ));
+            break;
+        }
+    }
+
+    s.push_str("\n=== TESTS ===\n");
+    match (test, baseline) {
+        (Some(t), Some(b)) if b.unusable() => s.push_str(&format!(
+            "`{}` (from {}) could not run here: {}. Find the command this repository \
+             really uses and put it in the finish `cmd`.\n{}\n",
+            t.cmd,
+            t.source,
+            b.status(),
+            repo::tail(&b.output, 10, 1_000)
+        )),
+        (Some(t), Some(b)) => s.push_str(&format!(
+            "Test command (from {}): {}\nslag ran it before any edit: {} in {:.1}s. The end of \
+             its output:\n{}\n",
+            t.source,
+            t.cmd,
+            b.status(),
+            b.secs,
+            repo::tail(&b.output, OUTPUT_TAIL_LINES, OUTPUT_TAIL_BYTES)
+        )),
+        _ => s.push_str(
+            "No test command was detected. Find how this repository runs its tests \
+             (README, CI config, manifests) and put that command in the finish `cmd`.\n",
+        ),
+    }
+    s
+}
+
+/// The retry's starting point: what failed, and what is already on disk.
+fn retry_block(failure: &str, git: Option<&Git>, changed: &[String]) -> String {
+    let mut s = failure.trim().to_string();
+    if let Some(git) = git.filter(|_| !changed.is_empty()) {
+        s.push_str(&format!(
+            "\n\nThe working tree still holds that attempt's changes:\n{}\n\nStart from this \
+             state. Find out why it fails and fix that; start over only if the approach is \
+             wrong.",
+            clip(&git.diff_of(changed), RETRY_DIFF_BYTES)
+        ));
+    }
+    s
+}
+
+fn clip(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text.to_string();
+    }
+    let mut cut = bytes;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n... (cut at {bytes} bytes)", &text[..cut])
+}
+
+/// The finish summary without the `CMD:` line the finish tool appends.
+fn strip_cmd_lines(response: &str) -> String {
+    response
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("CMD:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// One progress line: to the dashboard as narration or a warning, and to
+/// the terminal in stream mode.
+fn note(hooks: &EngineHooks, text: &str, good: bool) {
+    if good {
+        emit(&hooks.events, EngineEvent::Narrate { text: text.to_string() });
+        tui::status_line("✓", tui::COLD, text);
+    } else {
+        emit(&hooks.events, EngineEvent::Warning { message: text.to_string() });
+        tui::status_line("!", tui::WARM, text);
+    }
+}
+
+/// Record run time and spend as of now. The stats are process-wide, so a
+/// second fix under one dashboard reports the running total.
+fn stamp(out: &mut Outcome) {
+    let run = stats::snapshot();
+    out.time = stats::durations_line(&run);
+    out.spend = stats::ledger_lines(&run)
+        .map(|_| crate::engine::pricing::format_cost(&run.ledger.total()));
+}
+
+/// The final report, printed on the real terminal after any dashboard is
+/// gone.
+fn report(out: &Outcome) {
+    if tui::is_quiet() {
+        return;
+    }
+    let (word, color) = match &out.verdict {
+        Verdict::Fixed => ("FIXED", tui::PURE),
+        Verdict::Failed(_) => ("NOT FIXED", tui::WARM),
+    };
+    tui::header(&format!("FIX · {word}"));
+    let row = |label: &str, value: &str| {
+        println!("  {}{label:<11}{} {value}", fg(tui::COLD), reset());
+    };
+    let title = match out.issue.number {
+        Some(n) => format!("#{n} {}", out.issue.title),
+        None => out.issue.title.clone(),
+    };
+    row("issue", &tui::truncate(&title, 80));
+    let attempts = plural(out.attempts, "attempt");
+    match &out.verdict {
+        Verdict::Fixed => row("verdict", &format!("{}{}{word}{} in {attempts}", bold(), fg(color), reset())),
+        Verdict::Failed(reason) => row("verdict", &format!("{}{word}{}: {reason}", fg(color), reset())),
+    }
+    if out.verdict == Verdict::Fixed {
+        row("reproduced", &repro_line(&out.repro, out.checks.first().map(|c| c.cmd.as_str())));
+    }
+    for (i, check) in out.checks.iter().enumerate() {
+        let label = match (i, check.ok()) {
+            (0, true) => "verified",
+            (_, false) => "failed",
+            _ => "",
+        };
+        row(label, &format!("`{}` {} · {:.1}s", check.cmd, check.status(), check.secs));
+    }
+    if let Some(bad) = out.checks.iter().find(|c| !c.ok()) {
+        for line in repo::tail(&bad.output, 12, 1_500).lines() {
+            println!("               {}", tui::dim(line));
+        }
+    }
+    for (i, line) in out.stat.iter().enumerate() {
+        row(if i == 0 { "changed" } else { "" }, line);
+    }
+    if let (Some(branch), Some(sha)) = (&out.branch, &out.commit) {
+        row("branch", &format!("{branch} @ {sha}"));
+    }
+    if let Some(pr) = &out.pr {
+        row("pr", pr);
+    }
+    for n in &out.notes {
+        row("note", n);
+    }
+    if let Some(line) = &out.time {
+        row("time", line);
+    }
+    row("", &out.phases.line());
+    if let Some(spend) = &out.spend {
+        row("spend", spend);
+    }
+    if out.branch.is_some() && out.pr.is_none() {
+        println!("\n  review: {}git show --stat HEAD{}", fg(tui::HOT), reset());
+    }
+    println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn job_in(dir: &Path) -> Job {
+        Job {
+            args: FixArgs {
+                issue: vec![],
+                issue_file: None,
+                test: None,
+                tries: 1,
+                pr: false,
+                no_commit: false,
+                temper: false,
+                model: None,
+                plan_model: None,
+                tui: false,
+            },
+            temper: false,
+            cwd: dir.to_path_buf(),
+            git: Git::open(dir),
+        }
+    }
+
+    fn sh(dir: &Path, cmd: &str) {
+        let ok = std::process::Command::new("bash")
+            .args(["-c", cmd])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "{cmd}");
+    }
+
+    #[test]
+    fn the_finish_cmd_line_stays_out_of_the_summary() {
+        assert_eq!(strip_cmd_lines("Root cause: a.py:3\nFixed it.\nCMD: npm test"), "Root cause: a.py:3\nFixed it.");
+    }
+
+    #[test]
+    fn the_context_names_the_tests_and_how_they_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "").unwrap();
+        let job = job_in(dir.path());
+        let test = TestCmd { cmd: "python3 -m unittest".into(), source: "Python tests".into() };
+        let base = Run {
+            cmd: test.cmd.clone(),
+            code: Some(1),
+            output: "FAIL: test_x\nAssertionError".into(),
+            secs: 0.2,
+            timed_out: false,
+        };
+        let issue = Issue::from_text("crash in `helper_fn`");
+        std::fs::write(dir.path().join("b.py"), "def helper_fn(): pass\n").unwrap();
+        let ctx = context_block(&job, &issue, Some(&test), Some(&base));
+        assert!(ctx.contains("mention the names in the issue: b.py"), "{ctx}");
+        assert!(ctx.contains("a.py"), "{ctx}");
+        assert!(ctx.contains("python3 -m unittest") && ctx.contains("exit 1"), "{ctx}");
+        assert!(ctx.contains("AssertionError"), "{ctx}");
+
+        let none = context_block(&job, &issue, None, None);
+        assert!(none.contains("No test command was detected"), "{none}");
+    }
+
+    #[test]
+    fn the_prompt_keeps_the_repository_free_of_plan_files() {
+        let prompt = crate::flux::fix_prompt("Export drops a day", "=== TESTS ===\n", None);
+        assert!(prompt.contains("Export drops a day"));
+        assert!(prompt.contains("regression test"));
+        assert!(prompt.contains("PLAN.md"), "the prompt forbids plan files by name");
+        assert!(!prompt.contains("PREVIOUS ATTEMPT"));
+        let retry = crate::flux::fix_prompt("x", "", Some("`npm test` gave exit 1"));
+        assert!(retry.contains("PREVIOUS ATTEMPT FAILED") && retry.contains("exit 1"));
+    }
+
+    #[tokio::test]
+    async fn verification_skips_a_cmd_that_repeats_the_test_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = job_in(dir.path());
+        let hooks = EngineHooks::default();
+        let runs = verify(&job, &hooks, Some("true"), Some("  true ")).await;
+        assert_eq!(runs.len(), 1);
+        let runs = verify(&job, &hooks, Some("false"), Some("true")).await;
+        assert_eq!(runs.len(), 1, "a failing check stops the rest");
+        assert!(!runs[0].ok());
+        assert!(verify(&job, &hooks, None, None).await.is_empty());
+    }
+
+    /// The core proof: with the fix taken out the new test must fail, and
+    /// the fix must be back on disk afterwards either way.
+    #[tokio::test]
+    async fn reproduction_reverts_the_source_and_puts_the_fix_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        std::fs::write(root.join("value.txt"), "1\n").unwrap();
+        sh(root, "git add -A && git commit -qm init");
+        let job = job_in(root);
+        let git = job.git.as_ref().unwrap();
+        let before = git.snapshot();
+
+        // The session: a fix and a test that checks for it.
+        std::fs::write(root.join("value.txt"), "2\n").unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/check.sh"), "grep -qx 2 value.txt\n").unwrap();
+        let changed = git.changed_since(&before);
+
+        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None).await;
+        assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
+        assert_eq!(std::fs::read_to_string(root.join("value.txt")).unwrap(), "2\n", "fix restored");
+
+        // A test that passes either way proves nothing; a failing baseline
+        // is the fallback evidence.
+        let weak = reproduce(&job, &before, &changed, "true", None).await;
+        assert!(matches!(weak, Repro::NotShown(_)), "{weak:?}");
+        let base = Run { cmd: "t".into(), code: Some(1), output: String::new(), secs: 0.0, timed_out: false };
+        let fallback = reproduce(&job, &before, &changed, "true", Some(&base)).await;
+        assert_eq!(fallback, Repro::Baseline { status: "exit 1".into() });
+    }
+
+    #[test]
+    fn deleting_or_skipping_an_existing_test_is_caught() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        let suite = "def test_a():\n    pass\n\ndef test_b():\n    pass\n";
+        std::fs::write(root.join("tests/test_x.py"), suite).unwrap();
+        sh(root, "git add -A && git commit -qm init");
+        let git = Git::open(root).unwrap();
+        let before = git.snapshot();
+        let changed = vec!["tests/test_x.py".to_string()];
+
+        std::fs::write(root.join("tests/test_x.py"), format!("{suite}\ndef test_new():\n    pass\n")).unwrap();
+        assert_eq!(lost_tests(&git, &before, &changed), None, "adding a test is the point");
+
+        std::fs::write(root.join("tests/test_x.py"), "def test_a():\n    pass\n").unwrap();
+        let lost = lost_tests(&git, &before, &changed).expect("a deleted test is caught");
+        assert!(lost.contains("tests/test_x.py (2 tests, 0 skipped -> 1, 0)"), "{lost}");
+
+        std::fs::write(root.join("tests/test_x.py"), format!("import pytest\n@pytest.mark.skip\n{suite}")).unwrap();
+        assert!(lost_tests(&git, &before, &changed).is_some(), "a skipped test is caught");
+    }
+
+    #[test]
+    fn a_github_fix_closes_its_issue_in_the_commit() {
+        let out = Outcome {
+            issue: Issue {
+                title: "Crash on empty input".into(),
+                body: "b".into(),
+                number: Some(7),
+                url: None,
+            },
+            verdict: Verdict::Fixed,
+            attempts: 1,
+            checks: vec![Run { cmd: "npm test".into(), code: Some(0), output: "ok".into(), secs: 1.0, timed_out: false }],
+            repro: Repro::Regression { status: "exit 1".into() },
+            stat: vec![],
+            summary: "Root cause: a.js:3".into(),
+            branch: None,
+            commit: None,
+            pr: None,
+            notes: vec![],
+            phases: Phases::default(),
+            time: None,
+            spend: None,
+        };
+        let msg = commit_message(&out);
+        assert!(msg.starts_with("fix: Crash on empty input\n"), "{msg}");
+        assert!(msg.contains("Verified: `npm test` exit 0") && msg.contains("Fixes #7"), "{msg}");
+        let body = pr_body(&out);
+        assert!(body.contains("## Reproduction") && body.contains("new test catches the bug"), "{body}");
+        assert!(body.contains("## Verification") && body.contains("`npm test`: exit 0"), "{body}");
+    }
+}

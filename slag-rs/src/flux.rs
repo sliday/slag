@@ -524,6 +524,67 @@ pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
     )
 }
 
+/// The brief for one `slag fix` attempt.
+///
+/// `context` is what slag already knows about the repository (file list,
+/// test command, how the tests ended before any edit), gathered so the
+/// smith spends no turns rediscovering it. `retry` carries the failure
+/// slag observed after the previous attempt. The finish summary stays a
+/// summary here: slag writes the report from commands it ran itself.
+pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
+    let retry = retry
+        .map(|r| format!("=== PREVIOUS ATTEMPT FAILED ===\n{r}\n\n"))
+        .unwrap_or_default();
+    format!(
+        "=== ISSUE ===\n{issue}\n\n\
+        {context}\n\
+        {retry}\
+        === HOW TO WORK ===\n\
+        You are fixing this issue in an existing repository with its own code and \
+        tests. Few turns: batch reads, batch edits.\n\
+        1. Locate the code the issue is about. Read it and its tests in ONE turn.\n\
+        2. Reproduce. Add a regression test beside the existing tests, in their \
+        framework and style, that fails because of this bug. If a test is \
+        impractical, reproduce with one shell command instead. slag reruns your test \
+        with the fix reverted to prove it catches the bug, so when the cause is \
+        clear, make the test edit and the fix edit in ONE turn: two edit calls in the \
+        same message. When it is not, run the test first and watch it fail.\n\
+        3. Fix the root cause with the smallest change that resolves the WHOLE issue, \
+        every case it names. Keep public names and signatures.\n\
+        4. Run the full test command. Your test and the existing ones must pass.\n\
+        5. Finish. summary: the root cause as path:line, the fix, the reproduction. \
+        cmd: the full test command, which now runs your regression test.\n\n\
+        RULES:\n\
+        - Never weaken, skip, or delete an existing test.\n\
+        - Create no notes, plans, PRD.md, PLAN.md, or BLUEPRINT.md. Put throwaway \
+        scripts under /tmp, not in the repository.\n\
+        - Run no git commands. slag tracks the changes and commits after it verifies.\n\
+        - No questions. Decide and proceed.\n"
+    )
+}
+
+/// The warden's brief for `slag fix --temper`: does the change on disk
+/// resolve the issue? It sees the issue and the verification command, never
+/// the fixer's summary.
+pub fn fix_warden_prompt(issue: &str, verify: &str) -> String {
+    format!(
+        "ROLE: independent reviewer. You did NOT write this fix and you owe its \
+         author nothing.\n\n\
+         THE ISSUE:\n{issue}\n\n\
+         The fix is uncommitted in this repository: `git diff` and `git status` \
+         show it. Its tests run with: {verify}\n\n\
+         Read the diff. Run the tests. Probe the cases the issue names that the \
+         tests do not cover. Do not edit any file.\n\n\
+         Judge the issue, not the tests: a passing suite that misses a case the \
+         issue names is a fail. A fix that changes behavior the issue never asked \
+         about is a fail.\n\n\
+         Report EXACTLY these three lines, last, and nothing after them:\n\
+         VERDICT: pass or fail\n\
+         GAP: one sentence, empty when it passes\n\
+         EVIDENCE: what you actually ran or read"
+    )
+}
+
 /// Which flux inputs are live at forge start, as a compact label
 /// (`"blueprint+alloy+crucible+ledger"`, or `"bare"` when none carry
 /// content). Recorded in the run log's metadata line so a lister can tell
