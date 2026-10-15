@@ -4,7 +4,8 @@
 //! hermes fuzzy ladder (exact → line-trimmed → whitespace-normalized →
 //! indentation-flexible) with escape-drift and replace_all guards.
 //! recipe_view is the one sandbox exception: config-dir recipes are
-//! trusted local config and read directly.
+//! trusted local config and read directly. Shell commands get OS-level
+//! write confinement from `engine::sandbox`.
 
 // Declared here (not in the frozen engine/mod.rs). Integrator: move this
 // to `pub mod recipes;` in engine/mod.rs when the freeze lifts and drop
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
@@ -121,6 +122,10 @@ pub struct ToolBox {
     /// so ctrl-C ends a ten-minute proof now rather than at the next turn
     /// boundary. `None` (tests, duel casts) never interrupts.
     cancel: Option<super::CancelFlag>,
+    /// OS-level write confinement for shell commands. Resolved from
+    /// config at the first shell call, so a toolbox that never shells out
+    /// never probes; tests pin one with `with_sandbox`.
+    sandbox: Arc<OnceLock<super::sandbox::Sandbox>>,
 }
 
 impl ToolBox {
@@ -137,7 +142,19 @@ impl ToolBox {
             checkpoint: None,
             policy: Arc::new(super::policy::Policy::default()),
             steer: None,
+            sandbox: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Pin the shell sandbox instead of resolving it from config.
+    #[cfg(test)]
+    pub fn with_sandbox(mut self, sandbox: super::sandbox::Sandbox) -> Self {
+        self.sandbox = Arc::new(OnceLock::from(sandbox));
+        self
+    }
+
+    fn sandbox(&self) -> &super::sandbox::Sandbox {
+        self.sandbox.get_or_init(|| super::sandbox::Sandbox::for_root(&self.root))
     }
 
     /// Attach a command policy; `bash` refuses commands it denies.
@@ -1090,7 +1107,7 @@ impl ToolBox {
         // Lossless-in-spirit noise reduction on successful bash output only:
         // errors (Err path) and other tools (grep calls run_shell directly)
         // are untouched.
-        let out = self.run_shell(command, timeout).await?;
+        let out = self.run_shell(command, timeout, true).await?;
         let reduced = reduce_bash_output(&out);
         Ok(match allow_note {
             Some(note) => format!("{note}{reduced}"),
@@ -1098,11 +1115,17 @@ impl ToolBox {
         })
     }
 
-    async fn run_shell(&self, command: &str, timeout_secs: u64) -> Result<String, SlagError> {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-lc")
-            .arg(command)
-            .current_dir(&self.root)
+    /// `explain_denials` turns a sandbox-refused write into a plain note.
+    /// Only `bash` asks: grep output quotes file contents, which may carry
+    /// the same errno text without any write behind it.
+    async fn run_shell(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+        explain_denials: bool,
+    ) -> Result<String, SlagError> {
+        let mut cmd = self.sandbox().command(command);
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1161,6 +1184,16 @@ impl ToolBox {
                         ));
                     }
                 }
+                let note = explain_denials
+                    .then(|| self.sandbox().denial_note(&merged, !output.status.success()))
+                    .flatten();
+                if let Some(note) = note {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(&note);
+                    out.push('\n');
+                }
                 if !output.status.success() {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
@@ -1211,10 +1244,8 @@ impl ToolBox {
             .try_clone()
             .map_err(|e| SlagError::Tool(format!("cannot clone {rel} handle: {e}")))?;
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-lc")
-            .arg(command)
-            .current_dir(&self.root)
+        let mut cmd = self.sandbox().command(command);
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err));
@@ -1366,7 +1397,7 @@ impl ToolBox {
             p = sh_quote(pattern),
             t = sh_quote(&rel),
         );
-        let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT).await?;
+        let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT, false).await?;
         // `run_shell` appends its own spill note when the raw output blew
         // the bash cap. That line is not a match — counting it would pad
         // the tail-cut arithmetic below — and the file it names holds the
@@ -1441,7 +1472,7 @@ impl ToolBox {
             d = sh_quote(&dir.display().to_string()),
             b = sh_quote(base),
         );
-        let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT).await?;
+        let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT, false).await?;
         // Results are dir-relative; re-anchor them workspace-relative.
         let rel_dir = dir
             .strip_prefix(&self.root)

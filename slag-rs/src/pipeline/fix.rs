@@ -37,7 +37,7 @@ use crate::tui;
 use issue::Issue;
 use repo::{Git, Run, TestCmd};
 
-use super::{bold, fg, reset};
+use super::{bold, reset};
 
 /// The id the fix wears on the event stream, so the dashboard shows it as
 /// one ingot with one heat per attempt.
@@ -1014,68 +1014,110 @@ fn stamp(out: &mut Outcome) {
         .map(|_| crate::engine::pricing::format_cost(&run.ledger.total()));
 }
 
-/// The final report, printed on the real terminal after any dashboard is
-/// gone.
+/// The fix's report card, laid out like the forge's assay: one verdict,
+/// the next command, then the evidence (each check with its exit code,
+/// the reproduction, the diff stat, where the commit is, what it took).
 fn report(out: &Outcome) {
     if tui::is_quiet() {
         return;
     }
-    let (word, color) = match &out.verdict {
-        Verdict::Fixed => ("FIXED", tui::PURE),
-        Verdict::Failed(_) => ("NOT FIXED", tui::WARM),
-    };
-    tui::header(&format!("FIX · {word}"));
-    let row = |label: &str, value: &str| {
-        println!("  {}{label:<11}{} {value}", fg(tui::COLD), reset());
+    let w = tui::width();
+    let fixed = out.verdict == Verdict::Fixed;
+    tui::header(if fixed { "FIX · FIXED" } else { "FIX · NOT FIXED" });
+    let label = |name: &str| tui::dim(&format!("{name:<6}"));
+    let row = |name: &str, value: &str| {
+        println!("  {}  {}", label(name), tui::clip(value, w.saturating_sub(10)));
     };
     let title = match out.issue.number {
         Some(n) => format!("#{n} {}", out.issue.title),
         None => out.issue.title.clone(),
     };
-    row("issue", &tui::truncate(&title, 80));
     let attempts = plural(out.attempts, "attempt");
+
+    // The verdict, alone on its line.
     match &out.verdict {
-        Verdict::Fixed => row("verdict", &format!("{}{}{word}{} in {attempts}", bold(), fg(color), reset())),
-        Verdict::Failed(reason) => row("verdict", &format!("{}{word}{}: {reason}", fg(color), reset())),
-    }
-    if out.verdict == Verdict::Fixed {
-        row("reproduced", &repro_line(&out.repro, out.checks.first().map(|c| c.cmd.as_str())));
-    }
-    for (i, check) in out.checks.iter().enumerate() {
-        let label = match (i, check.ok()) {
-            (0, true) => "verified",
-            (_, false) => "failed",
-            _ => "",
-        };
-        row(label, &format!("`{}` {} · {:.1}s", check.cmd, check.status(), check.secs));
-    }
-    if let Some(bad) = out.checks.iter().find(|c| !c.ok()) {
-        for line in repo::tail(&bad.output, 12, 1_500).lines() {
-            println!("               {}", tui::dim(line));
+        Verdict::Fixed => {
+            let head = format!("  {} {}  ", tui::paint(tui::PURE, "✓"), tui::paint(tui::PURE, &format!("{}FIXED{}", bold(), reset())));
+            let rest = format!("{title} · {attempts}");
+            println!("{head}{}", tui::clip(&rest, w.saturating_sub(tui::visible_len(&head))));
+        }
+        Verdict::Failed(reason) => {
+            let head = format!("  {} {}  ", tui::paint(tui::WARM, "✗"), tui::paint(tui::WARM, &format!("{}NOT FIXED{}", bold(), reset())));
+            println!("{head}{}", tui::clip(reason, w.saturating_sub(tui::visible_len(&head))));
+            row("issue", &title);
         }
     }
-    for (i, line) in out.stat.iter().enumerate() {
-        row(if i == 0 { "changed" } else { "" }, line);
+
+    // The one thing to do next.
+    let next = match (&out.verdict, &out.pr, &out.branch) {
+        (Verdict::Fixed, Some(pr), _) => (format!("open {pr}"), "the pull request".to_string()),
+        (Verdict::Fixed, None, Some(_)) => ("git show --stat HEAD".to_string(), "review the commit".to_string()),
+        (Verdict::Fixed, None, None) => ("git diff".to_string(), "review the change".to_string()),
+        (Verdict::Failed(_), _, _) => (
+            format!("slag fix --tries {} …", out.attempts.saturating_add(2)),
+            "the same issue, more attempts".to_string(),
+        ),
+    };
+    let room = w.saturating_sub(12 + next.0.chars().count());
+    println!("  {}  {}  {}", label("next"), tui::paint(tui::HOT, &next.0), tui::dim(&tui::clip(&next.1, room.max(4))));
+    println!();
+
+    // What ran, and how it exited.
+    for (i, check) in out.checks.iter().enumerate() {
+        let (glyph, color) = if check.ok() { ("✓", tui::PURE) } else { ("✗", tui::WARM) };
+        let meta = format!("{} · {:.1}s", check.status(), check.secs);
+        let left = format!(
+            "  {}  {} {}",
+            label(if i == 0 { "proof" } else { "" }),
+            tui::paint(color, glyph),
+            tui::clip(&check.cmd, w.saturating_sub(16 + meta.chars().count()))
+        );
+        println!("{}", tui::spread(&left, &tui::paint(if check.ok() { tui::COLD } else { tui::WARM }, &meta), w));
     }
+    if fixed {
+        let repro = match &out.repro {
+            Repro::Regression { status } => format!("{} without the fix: {status}, so the new test catches the bug", tui::paint(tui::WARM, "✗")),
+            Repro::Baseline { status } => format!("{} before the fix: {status}", tui::paint(tui::WARM, "✗")),
+            Repro::NotShown(why) => format!("{} reproduction not shown: {why}", tui::dim("·")),
+        };
+        println!("  {}  {}", label(if out.checks.is_empty() { "proof" } else { "" }), tui::clip(&repro, w.saturating_sub(10)));
+    }
+    if let Some(bad) = out.checks.iter().find(|c| !c.ok()) {
+        for line in repo::tail(&bad.output, 8, 1_500).lines() {
+            println!("            {}", tui::dim(&tui::clip(line, w.saturating_sub(12))));
+        }
+    }
+
+    // What changed, and where it is.
+    for (i, line) in out.stat.iter().enumerate() {
+        row(if i == 0 { "diff" } else { "" }, line.trim());
+    }
+    let mut work = Vec::new();
     if let (Some(branch), Some(sha)) = (&out.branch, &out.commit) {
-        row("branch", &format!("{branch} @ {sha}"));
+        work.push(format!("{branch} @ {sha}"));
     }
     if let Some(pr) = &out.pr {
-        row("pr", pr);
+        work.push(pr.clone());
+    }
+    if !work.is_empty() {
+        row("work", &work.join(" · "));
     }
     for n in &out.notes {
         row("note", n);
     }
+
+    // What it took.
+    let mut took = Vec::new();
     if let Some(line) = &out.time {
-        row("time", line);
+        took.push(line.clone());
+    }
+    if let Some(spend) = out.spend.as_deref().filter(|s| s.trim() != "-") {
+        took.push(spend.to_string());
+    }
+    if !took.is_empty() {
+        row("run", &took.join(" · "));
     }
     row("", &out.phases.line());
-    if let Some(spend) = &out.spend {
-        row("spend", spend);
-    }
-    if out.branch.is_some() && out.pr.is_none() {
-        println!("\n  review: {}git show --stat HEAD{}", fg(tui::HOT), reset());
-    }
     println!();
 }
 

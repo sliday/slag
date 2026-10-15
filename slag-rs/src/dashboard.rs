@@ -173,6 +173,8 @@ pub(crate) struct DashState {
     pub(crate) started: Option<Instant>,
     /// The warden's last word on the goal: met, not met, or not judged.
     pub(crate) goal: Option<bool>,
+    /// The highest warden round that has spoken, for the next command.
+    pub(crate) warden_rounds: u32,
     /// The route last announced. An unchanged route is not news, so it is
     /// printed once and then only when it moves.
     pub(crate) route: Option<String>,
@@ -423,6 +425,13 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
             if crate::render::echo::warden_word(text).is_some() =>
         {
             state.goal = crate::render::echo::warden_word(text).map(|w| w.starts_with("goal met"));
+            if let Some(n) = text
+                .strip_prefix("warden round ")
+                .and_then(|r| r.split(':').next())
+                .and_then(|n| n.trim().parse::<u32>().ok())
+            {
+                state.warden_rounds = state.warden_rounds.max(n);
+            }
         }
         EngineEvent::ContextGauge { pct, used_tokens, budget_tokens } => {
             state.ctx = Some((*pct, *used_tokens, *budget_tokens));
@@ -1237,7 +1246,16 @@ fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
                 lines.push(Line::from(""));
             }
             lines.push(Line::from(""));
-            lines.push(bar_line(&counts, inner_w));
+            // Once the run is over the bar gives way to the verdict: a full
+            // bar under a failed goal reads as success at a glance.
+            let failed = counts.cracked > 0 || state.goal == Some(false);
+            if state.finished && failed {
+                let (verdict, color, _) = final_verdict(state);
+                let lead = verdict.split(" · ").next().unwrap_or(&verdict).to_string();
+                lines.push(Line::from(Span::styled(preview(&lead, inner_w), Style::default().fg(color))));
+            } else {
+                lines.push(bar_line(&counts, inner_w));
+            }
         }
     }
     let block = pane(Line::from(title)).padding(ratatui::widgets::Padding::horizontal(1));
@@ -1497,20 +1515,15 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
             (format!(" {} {}", tui::spinner_frame(frame), s.trim_start_matches("⚒ ")), palette(tui::HOT))
         }
         None if state.finished => {
-            let (counts, _) = dash_counts(state);
-            let mut verdict = if counts.cracked > 0 {
-                format!(" ✗ {} of {} forged · {} cracked", counts.forged, counts.total, counts.cracked)
-            } else if state.goal == Some(false) {
-                format!(" ✗ {} of {} forged · goal not met", counts.forged, counts.total)
-            } else {
-                format!(" █ {} of {} forged", counts.forged, counts.total)
+            let (verdict, color, next) = final_verdict(state);
+            // The verdict's lead clause and the next command; the counts
+            // already sit in the crucible's title.
+            let lead = verdict.split(" · ").next().unwrap_or(&verdict).to_string();
+            let line = match next {
+                Some(next) => format!(" {lead} · next: q, then {next}"),
+                None => format!(" {verdict}"),
             };
-            if state.goal == Some(true) {
-                verdict.push_str(" · goal met");
-            }
-            let failed = counts.cracked > 0 || state.goal == Some(false);
-            let color = if failed { palette(tui::WARM) } else { palette(tui::PURE) };
-            (verdict, color)
+            (format!(" {}", preview(&line, width.saturating_sub(10))), color)
         }
         None if state.turn_started.is_some() => (
             format!(" {} {}…", tui::spinner_frame(0), tui::forge_verb(state.turn)),
@@ -1758,10 +1771,46 @@ impl PlanWatch {
 /// closed) and a replay (tape ran out), so both end on the same frame.
 pub(crate) fn mark_finished(state: &mut DashState) {
     state.finished = true;
-    state.push_feed(
-        palette(tui::BRIGHT),
-        "■ forge finished".into(),
-    );
+    let (verdict, color, next) = final_verdict(state);
+    let mut row = format!("■ finished · {}", verdict.trim_start_matches(['✗', '█', '!', ' ']));
+    if let Some(next) = next {
+        row.push_str(&format!(" — next: {next}"));
+    }
+    state.push_feed(color, row);
+}
+
+/// The run's one truthful verdict, its colour, and the command that comes
+/// next when there is one. A failed goal outranks forged ingots: every task
+/// passing its proof is not the commission being met.
+fn final_verdict(state: &DashState) -> (String, Color, Option<String>) {
+    let (counts, _) = dash_counts(state);
+    let left = counts.ore + counts.molten;
+    if counts.cracked > 0 {
+        return (
+            format!("✗ {} of {} cracked · {} forged", counts.cracked, counts.total, counts.forged),
+            palette(tui::WARM),
+            Some("slag status".to_string()),
+        );
+    }
+    if state.goal == Some(false) {
+        return (
+            format!("✗ goal not met · {}/{} ingots passed their proofs", counts.forged, counts.total),
+            palette(tui::WARM),
+            Some(format!("slag --temper {} resume", state.warden_rounds + 1)),
+        );
+    }
+    if left > 0 {
+        return (
+            format!("! paused · {} of {} forged, {left} queued", counts.forged, counts.total),
+            palette(tui::BRIGHT),
+            Some("slag resume".to_string()),
+        );
+    }
+    let mut v = format!("█ forged · {}/{} ingots passed their proofs", counts.forged, counts.total);
+    if state.goal == Some(true) {
+        v.push_str(" · goal met");
+    }
+    (v, palette(tui::PURE), None)
 }
 
 // ---------------------------------------------------------------- replay
@@ -2146,6 +2195,19 @@ mod tests {
         apply_event(&mut state, EngineEvent::TurnStart { turn: 4 });
         let head = &state.feed.back().unwrap().text;
         assert!(head.contains("i1 · turn 4"), "{head}");
+    }
+
+    #[test]
+    fn a_failed_goal_replaces_the_bar_and_names_the_next_command() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "a".into() });
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i1".into(), ok: true });
+        apply_event(&mut state, EngineEvent::Warning { message: "warden round 1: no README".into() });
+        mark_finished(&mut state);
+        let rows = render_text(&state, 100, 24).join("\n");
+        assert!(rows.contains("goal not met"), "{rows}");
+        assert!(rows.contains("slag --temper 2 resume"), "{rows}");
+        assert!(!rows.contains("100%"), "no full bar under a failed goal:\n{rows}");
     }
 
     #[test]

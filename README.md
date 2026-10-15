@@ -205,6 +205,29 @@ slag fix --issue-file ISSUE.md --pr
 
 A failed attempt retries on the plan model, starting from the failure slag saw. `--tries N` sets the attempts (default 3), `--no-commit` leaves the fix in the working tree, `--pr` pushes the branch and opens a draft PR, and `--temper` adds the warden as an independent judge. Outside git, slag tracks the changes in a private temporary repository and commits nothing.
 
+## Sandbox
+
+The smith's shell commands can read anything and reach the network. They can write only inside the workspace, the temp dirs, and the tool caches under `$HOME`: `.cargo`, `.rustup`, `.npm`, `.cache`, `Library/Caches`, `.gradle`, `.m2`, `go`, `.bun`, `.pnpm-store`, `.local/share/pnpm`, `.yarn`, plus wherever `CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME`, `GOPATH`, `GOCACHE`, `GOMODCACHE` or `XDG_CACHE_HOME` point. A workspace in a linked git worktree or a repo subdirectory can also write its git dir. The file tools already refuse paths outside the workspace. The sandbox needs no setup:
+
+| Platform | Backend |
+|----------|---------|
+| macOS | `sandbox-exec` with a generated Seatbelt profile |
+| Linux with `bwrap` | bubblewrap: the whole filesystem read-only, the writable paths bound read-write |
+| Linux without `bwrap` | Landlock, kernel 5.13 or later |
+| Linux with neither | No confinement. slag prints one warning per run that names bubblewrap. |
+| Other platforms | No confinement, with one warning per run |
+
+On macOS, `sandbox-exec` fails when slag already runs inside another sandbox. slag then runs unconfined and warns once. On Linux, a `bwrap` that fails to start (no user namespaces) falls through to Landlock.
+
+When the sandbox refuses a write, the tool result tells the model `write outside the workspace was blocked by slag's sandbox: <path>`, so it changes approach instead of retrying.
+
+```toml
+sandbox = "auto"                               # or "off"
+sandbox_writable = ["~/data", "/srv/scratch"]  # extra writable paths
+```
+
+`--no-sandbox` or `SLAG_SANDBOX=off` turns it off. Precedence is flag, then environment, then file. A model writes every `:proof` and `CMD:` line, and `slag fix` can edit the test scripts it then runs, so slag runs proofs, CMD checks, and `slag fix` test runs in the same sandbox. A refused write shows up in the failure as `write blocked by slag's sandbox: <path>`. Hooks and `screenshot_cmd` stay outside it because you wrote them.
+
 ## Architecture
 
 ```
@@ -256,6 +279,7 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `--plan-model MODEL` | Planner model for grade 3+ ingots |
 | `--judge-model MODEL` | Duel judge model |
 | `--worktree` | Branch-per-ingot isolation. Not implemented yet, warns and runs in the shared checkout. |
+| `--no-sandbox` | Let shell commands write outside the workspace (see [Sandbox](#sandbox)) |
 
 ## Environment
 
@@ -268,6 +292,7 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `SLAG_MODEL_BASE` / `_PLAN` / `_ALT` / `_JUDGE` | Per-role model ids |
 | `SLAG_DUEL` | `auto` (default), `on`, `off` |
 | `SLAG_DUEL_ROUNDS` | Override the duel round cap |
+| `SLAG_SANDBOX` | `auto` (default) or `off` for the shell sandbox |
 | `SLAG_MAX_COST_INGOT` | Dollar ceiling for a single ingot session (file key `max_cost_per_ingot`). Default uncapped. |
 | `SLAG_MAX_COST_RUN` | Dollar ceiling for the whole run (file key `max_cost_per_run`). Default uncapped. |
 | `SLAG_REASONING_EFFORT` | `low`, `medium`, `high` for models that take it |

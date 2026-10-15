@@ -571,7 +571,7 @@ impl RenderState {
     /// Columns a printed line may use.
     fn room(&self) -> usize {
         if self.width == 0 {
-            240
+            crate::tui::width()
         } else {
             self.width
         }

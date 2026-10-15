@@ -137,14 +137,45 @@ pub struct Stats {
     pub spend: Option<String>,
     #[serde(default)]
     pub ledger: Vec<String>,
+    /// `git diff --shortstat` from the commit the run started on to HEAD:
+    /// what the run changed, as git counts it.
+    #[serde(default)]
+    pub diff: Option<String>,
+    /// Commits the run added, and where the work now is.
+    #[serde(default)]
+    pub commits: Option<usize>,
+    #[serde(default)]
+    pub head: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// HEAD when the run began, so the assay can say what the run changed.
+static START_HEAD: Mutex<Option<String>> = Mutex::new(None);
+
+fn git(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 impl Stats {
-    /// What `engine::stats` holds right now.
+    /// Note where the run starts. Outside a git repository there is
+    /// nothing to note, and the assay leaves the diff out.
+    pub fn mark_start() {
+        *START_HEAD.lock().unwrap_or_else(|p| p.into_inner()) = git(&["rev-parse", "HEAD"]);
+    }
+
+    /// What `engine::stats` holds right now, and what git says changed.
     pub fn capture() -> Self {
         use crate::engine::stats;
         let run = stats::snapshot();
         let total = run.ledger.total();
+        let start = START_HEAD.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let range = start.as_ref().map(|s| format!("{s}..HEAD"));
         Self {
             durations: stats::durations_line(&run),
             churn: stats::churn_line(&run),
@@ -152,6 +183,13 @@ impl Stats {
             spend: (total.total_tokens > 0 || total.cost.is_some())
                 .then(|| crate::engine::pricing::format_cost(&total)),
             ledger: stats::ledger_lines(&run).unwrap_or_default(),
+            diff: start.as_deref().and_then(|s| git(&["diff", "--shortstat", s, "HEAD"])),
+            commits: range
+                .as_deref()
+                .and_then(|r| git(&["rev-list", "--count", r]))
+                .and_then(|n| n.parse().ok()),
+            head: start.as_ref().and(git(&["rev-parse", "--short", "HEAD"])),
+            branch: start.as_ref().and(git(&["rev-parse", "--abbrev-ref", "HEAD"])),
         }
     }
 }
@@ -584,6 +622,7 @@ impl Session {
     /// feeds the viewer). The previous holder of the bus, if any, is
     /// replaced: one process records one run.
     pub fn open(path: Option<PathBuf>, viewer: Option<Box<dyn Viewer>>) -> Self {
+        Stats::mark_start();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *bus().lock().unwrap_or_else(|p| p.into_inner()) = Some(tx.clone());
         let task = tokio::spawn(run_session(rx, path, viewer));
