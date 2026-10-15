@@ -259,6 +259,16 @@ pub fn tail(text: &str, lines: usize, bytes: usize) -> String {
     out
 }
 
+/// Build output and dependencies a test run writes. A repository without a
+/// `.gitignore` for them still must not see them in the fix, and reading
+/// a whole `target/` into a snapshot would cost more than the fix.
+pub fn is_build_output(path: &str) -> bool {
+    path.ends_with(".pyc")
+        || path.split('/').any(|c| {
+            matches!(c, "node_modules" | "target" | "__pycache__" | ".pytest_cache" | ".venv" | "venv")
+        })
+}
+
 /// Does this path hold tests rather than the code under test?
 pub fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -297,25 +307,96 @@ pub struct Git {
     /// The working directory, relative to `top` (`""` at the top, else
     /// `sub/dir/`). Scratch the engine writes lands here.
     pub prefix: String,
+    /// For a directory outside git: a private repository in the temp dir
+    /// whose one commit is the directory as it was before the session.
+    /// It gives a plain directory the same change tracking and the same
+    /// reproduction check, commits nothing for the user, and is deleted
+    /// on drop.
+    shadow: Option<PathBuf>,
 }
+
+/// What a shadow repository never tracks: build output, dependencies,
+/// and the engine's own scratch.
+const SHADOW_EXCLUDES: &str = "logs/\n.slag/\nnode_modules/\ntarget/\n__pycache__/\n*.pyc\n.venv/\nvenv/\n";
+/// A directory with more files than this is not a project; shadowing it
+/// would cost more than the fix.
+const SHADOW_MAX_FILES: usize = 20_000;
 
 impl Git {
     /// The repository containing `dir`, if any.
     pub fn open(dir: &Path) -> Option<Self> {
         let top = git_in(dir, &["rev-parse", "--show-toplevel"])?;
         let prefix = git_in(dir, &["rev-parse", "--show-prefix"]).unwrap_or_default();
-        Some(Self { top: PathBuf::from(top.trim()), prefix: prefix.trim().to_string() })
+        Some(Self { top: PathBuf::from(top.trim()), prefix: prefix.trim().to_string(), shadow: None })
+    }
+
+    /// Snapshot a directory that is not in git into a shadow repository.
+    pub fn shadow(dir: &Path) -> Option<Self> {
+        let top = dir.canonicalize().ok()?;
+        let mut count = Vec::new();
+        walk(&top, &top, 8, &mut count, SHADOW_MAX_FILES);
+        if count.len() >= SHADOW_MAX_FILES {
+            return None;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or_default();
+        let home = std::env::temp_dir().join(format!("slag-fix-{}-{nanos}", std::process::id()));
+        git_in(Path::new("."), &["init", "-q", &home.to_string_lossy()])?;
+        let git_dir = home.join(".git");
+        let _ = std::fs::write(git_dir.join("info").join("exclude"), SHADOW_EXCLUDES);
+        let git = Self { top, prefix: String::new(), shadow: Some(git_dir) };
+        git.git_checked(&["add", "-A"]).ok()?;
+        git.git_checked(&[
+            "-c",
+            "user.name=slag",
+            "-c",
+            "user.email=slag@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--no-verify",
+            "--allow-empty",
+            "-m",
+            "before slag fix",
+        ])
+        .ok()?;
+        Some(git)
+    }
+
+    /// True for a shadow repository: there is no real repository to
+    /// branch or commit in.
+    pub fn is_shadow(&self) -> bool {
+        self.shadow.is_some()
+    }
+
+    /// `git -C <dir>`, pointed at the shadow repository when there is one.
+    fn command(&self, dir: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(dir);
+        if let Some(git_dir) = &self.shadow {
+            cmd.arg("--git-dir").arg(git_dir).arg("--work-tree").arg(&self.top);
+        }
+        cmd
     }
 
     pub fn git(&self, args: &[&str]) -> Option<String> {
-        git_in(&self.top, args)
+        let out = self.command(&self.top).args(args).stderr(Stdio::null()).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Files git tracks under `dir`, relative to `dir`.
+    pub fn ls_files(&self, dir: &Path) -> Option<String> {
+        let out = self.command(dir).arg("ls-files").stderr(Stdio::null()).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Run git and report its stderr on failure.
     pub fn git_checked(&self, args: &[&str]) -> Result<String, String> {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.top)
+        let out = self
+            .command(&self.top)
             .args(args)
             .env("GIT_LITERAL_PATHSPECS", "1")
             .output()
@@ -362,7 +443,7 @@ impl Git {
         else {
             return Vec::new();
         };
-        parse_porcelain_z(&raw)
+        parse_porcelain_z(&raw).into_iter().filter(|p| !is_build_output(p)).collect()
     }
 
     /// What the dirty files hold right now. Taken before the session so
@@ -389,9 +470,8 @@ impl Git {
         if let Some(old) = before.get(path) {
             return old.clone();
         }
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&self.top)
+        let out = self
+            .command(&self.top)
             .args(["show", &format!("HEAD:{path}")])
             .stderr(Stdio::null())
             .output()
@@ -477,6 +557,14 @@ impl Git {
     }
 }
 
+impl Drop for Git {
+    fn drop(&mut self) {
+        if let Some(home) = self.shadow.as_ref().and_then(|d| d.parent()) {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+}
+
 fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -557,21 +645,19 @@ pub fn rank_files(dir: &Path, files: &[String], terms: &[String], top: usize) ->
 /// Tracked files under the working directory, as the smith's map of the
 /// repository. Outside git, a shallow walk that skips build output.
 pub fn file_list(dir: &Path, git: Option<&Git>) -> Vec<String> {
-    if git.is_some() {
-        if let Some(out) = git_in(dir, &["ls-files"]) {
-            return out.lines().map(str::to_string).collect();
-        }
+    if let Some(out) = git.and_then(|g| g.ls_files(dir)) {
+        return out.lines().map(str::to_string).collect();
     }
     let mut files = Vec::new();
-    walk(dir, dir, 4, &mut files);
+    walk(dir, dir, 4, &mut files, 2_000);
     files.sort();
     files
 }
 
-fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>, cap: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        if out.len() >= 2_000 {
+        if out.len() >= cap {
             return;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -581,7 +667,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
         let path = entry.path();
         match entry.file_type() {
             Ok(t) if t.is_dir() && depth > 0 && !SKIP_DIRS.contains(&name.as_str()) => {
-                walk(root, &path, depth - 1, out)
+                walk(root, &path, depth - 1, out, cap)
             }
             Ok(t) if t.is_file() => {
                 if let Ok(rel) = path.strip_prefix(root) {
@@ -754,6 +840,28 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_directory_gets_a_shadow_that_tracks_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.py", "x = 1\n");
+        write(dir.path(), "logs/old.jsonl", "{}\n");
+        let git = Git::shadow(dir.path()).expect("a small directory is shadowed");
+        assert!(git.is_shadow());
+        assert!(!dir.path().join(".git").exists(), "the user's directory gets no .git");
+        assert_eq!(file_list(dir.path(), Some(&git)), ["src/a.py"], "scratch is not tracked");
+
+        let before = git.snapshot();
+        write(dir.path(), "src/a.py", "x = 2\n");
+        write(dir.path(), "tests/test_a.py", "assert True\n");
+        write(dir.path(), "logs/engine.jsonl", "{}\n");
+        assert_eq!(git.changed_since(&before), ["src/a.py", "tests/test_a.py"]);
+        assert_eq!(git.original(&before, "src/a.py").as_deref(), Some(&b"x = 1\n"[..]));
+
+        let home = git.shadow.clone().unwrap();
+        drop(git);
+        assert!(!home.exists(), "the shadow is deleted with its handle");
+    }
+
+    #[test]
     fn only_the_sessions_changes_reach_the_commit() {
         let (dir, git) = repo();
         git.hide_scratch();
@@ -765,6 +873,7 @@ mod tests {
         write(dir.path(), "src/a.py", "x = 2\n");
         write(dir.path(), "tests/test_a.py", "assert True\n");
         write(dir.path(), "logs/engine-1.jsonl", "{}\n");
+        write(dir.path(), "target/debug/junk", "build output\n");
 
         let changed = git.changed_since(&before);
         assert_eq!(changed, ["src/a.py", "tests/test_a.py"], "scratch and WIP stay out");
@@ -780,8 +889,8 @@ mod tests {
         assert!(!committed.contains("notes.txt"), "the user's WIP is not swept in");
         assert_eq!(
             git.git(&["status", "--porcelain"]).unwrap().trim(),
-            "M notes.txt",
-            "the WIP stays dirty and the scratch stays hidden"
+            "M notes.txt\n?? target/",
+            "the WIP stays dirty, build output stays out, the scratch stays hidden"
         );
         assert_eq!(git.free_branch("slag/fix-a"), "slag/fix-a-2");
     }

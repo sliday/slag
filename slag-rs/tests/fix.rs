@@ -167,3 +167,25 @@ fn fix_without_an_issue_says_how_to_give_one() {
         .failure()
         .stderr(predicates::str::contains("--issue-file"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_outside_git_is_fixed_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("value.txt"), "1\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+    std::fs::write(dir.path().join("tests/check.sh"), "grep -qx 2 value.txt\n").unwrap();
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("finish", json!({"summary": "value.txt now holds 2.", "cmd": "bash tests/check.sh"})),
+    ])
+    .await;
+
+    let out = slag_fix(dir.path(), &server, &["value is wrong", "--test", "bash tests/check.sh"]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("FIXED") && stdout.contains("value.txt +1 -1"), "{stdout}");
+    assert!(stdout.contains("not a git repository"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("value.txt")).unwrap(), "2\n");
+    assert!(!dir.path().join(".git").exists(), "slag fix never turns a directory into a repo");
+}

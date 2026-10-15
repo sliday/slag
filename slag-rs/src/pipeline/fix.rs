@@ -106,6 +106,10 @@ pub async fn run(
         });
     }
 
+    // Outside git, a shadow repository still tracks what the session
+    // changed, so the change list, the test guard, and the reproduction
+    // check work the same. It is taken after the refusals above.
+    let git = git.or_else(|| Git::shadow(&cwd));
     let job = Job {
         temper: temper || args.temper,
         args,
@@ -380,9 +384,6 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
 
         if let Some(git) = &job.git {
             changed = git.changed_since(&before);
-            // Bytecode a test run rewrote is not part of anyone's fix, even
-            // in a repository that tracks it by mistake.
-            changed.retain(|p| !p.ends_with(".pyc"));
             if changed.is_empty() {
                 failure = Some(Failure::new(
                     "the session changed no file",
@@ -652,7 +653,7 @@ fn restore(files: &[(PathBuf, repo::Content)]) {
 /// Commit the verified fix on a new branch, and open a draft PR when asked.
 /// A failure here is reported, never fatal: the fix itself is on disk.
 fn land(job: &Job, out: &mut Outcome, changed: &[String]) {
-    let Some(git) = &job.git else {
+    let Some(git) = job.git.as_ref().filter(|g| !g.is_shadow()) else {
         out.notes.push("not a git repository: the fix is in the working tree".into());
         return;
     };
