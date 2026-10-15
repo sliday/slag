@@ -136,14 +136,14 @@ github = "gh-mcp --stdio"
 
 ### Shell sandbox
 
-`engine/sandbox.rs` confines the `bash` tool's writes to the workspace, the temp dirs, the tool caches under `$HOME`, and an out-of-root git dir. Reads and network stay open. `ToolBox` resolves it at the first shell call; `bash`, `grep`, `glob`, and background jobs all run under it. Proofs, `slag fix` test runs, and hooks run outside it.
+`engine/sandbox.rs` confines the `bash` tool's writes to the workspace, the temp dirs, the tool caches under `$HOME`, and an out-of-root git dir. Reads and network stay open. `ToolBox` resolves it at the first shell call; `bash`, `grep`, `glob`, and background jobs all run under it. `proof::run_shell_in` runs proofs and CMD lines (forge and duel) in it, and `fix::repo::run` runs every `slag fix` test command in it, because the model writes or can edit both. Hooks and `screenshot_cmd` stay outside: the user wrote them.
 
 | Setting | Env | `config.toml` key | Flag |
 |---------|-----|-------------------|------|
 | mode: `auto` (default) or `off` | `SLAG_SANDBOX` | `sandbox` | `--no-sandbox` |
 | extra writable paths | | `sandbox_writable = ["~/data"]` | |
 
-Backends: macOS runs `sandbox-exec` with a generated Seatbelt profile. Linux uses `bwrap` when it works, else Landlock (raw syscalls, no crate), else runs unconfined. `main.rs` calls `sandbox::preflight()` before the dashboard starts, which prints one warning per run when nothing can confine writes. A refused write adds `write outside the workspace was blocked by slag's sandbox: <path>` to the tool result.
+Backends: macOS runs `sandbox-exec` with a generated Seatbelt profile. Linux uses `bwrap` when it works, else Landlock (raw syscalls, no crate), else runs unconfined. `main.rs` calls `sandbox::preflight()` before the dashboard starts, which prints one warning per run when nothing can confine writes. A refused write adds `write outside the workspace was blocked by slag's sandbox: <path>` to the tool result, leads a failed proof's output, and rides on a fix test run's `status()`.
 
 Other environment knobs include `SLAG_DUEL`, `SLAG_DUEL_ROUNDS`, `SLAG_REASONING_EFFORT`, `SLAG_SCREENSHOT_CMD`, `SLAG_CONFIG_DIR`, and `SLAG_CHAR_BUDGET` (agent compaction budget). `tui.rs` also reads `NO_COLOR` and `COLORTERM`.
 

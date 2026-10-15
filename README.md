@@ -207,7 +207,7 @@ A failed attempt retries on the plan model, starting from the failure slag saw. 
 
 ## Sandbox
 
-The smith's shell commands can read anything and reach the network. They can write only inside the workspace, the temp dirs, and the tool caches under `$HOME`: `.cargo`, `.rustup`, `.npm`, `.cache`, `Library/Caches`, `.gradle`, `.m2`, `go`, `.bun`, `.pnpm-store`, `.local/share/pnpm`, `.yarn`. A workspace in a linked git worktree or a repo subdirectory can also write its git dir. The file tools already refuse paths outside the workspace. The sandbox needs no setup:
+The smith's shell commands can read anything and reach the network. They can write only inside the workspace, the temp dirs, and the tool caches under `$HOME`: `.cargo`, `.rustup`, `.npm`, `.cache`, `Library/Caches`, `.gradle`, `.m2`, `go`, `.bun`, `.pnpm-store`, `.local/share/pnpm`, `.yarn`, plus wherever `CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME`, `GOPATH`, `GOCACHE`, `GOMODCACHE` or `XDG_CACHE_HOME` point. A workspace in a linked git worktree or a repo subdirectory can also write its git dir. The file tools already refuse paths outside the workspace. The sandbox needs no setup:
 
 | Platform | Backend |
 |----------|---------|
@@ -226,7 +226,7 @@ sandbox = "auto"                               # or "off"
 sandbox_writable = ["~/data", "/srv/scratch"]  # extra writable paths
 ```
 
-`--no-sandbox` or `SLAG_SANDBOX=off` turns it off. Precedence is flag, then environment, then file. Commands slag runs itself (proofs, the `slag fix` test runs, hooks) stay outside the sandbox.
+`--no-sandbox` or `SLAG_SANDBOX=off` turns it off. Precedence is flag, then environment, then file. A model writes every `:proof` and `CMD:` line, and `slag fix` can edit the test scripts it then runs, so slag runs proofs, CMD checks, and `slag fix` test runs in the same sandbox. A refused write shows up in the failure as `write blocked by slag's sandbox: <path>`. Hooks and `screenshot_cmd` stay outside it because you wrote them.
 
 ## Architecture
 

@@ -380,13 +380,13 @@ async fn run_cast(
         return Ok(None);
     };
 
-    let (ok, output) = run_shell_in(&cmd, dir).await;
+    let (ok, output) = proof::run_shell_in(&cmd, dir).await;
     if !ok {
         return Ok(None);
     }
 
     let proof_output = if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
-        let (proof_ok, proof_out) = run_shell_in(&ingot.proof, dir).await;
+        let (proof_ok, proof_out) = proof::run_shell_in(&ingot.proof, dir).await;
         if !proof_ok {
             return Ok(None);
         }
@@ -575,7 +575,9 @@ fn append_ledger(repo: &Path, ingot: &Ingot, winner: char, rounds: u8) {
         });
 }
 
-/// `proof::run_shell` mirrored with an explicit working directory.
+/// The screenshot command, unconfined: it comes from the user's own
+/// config, like a hook. Model-written CMD and proof lines take
+/// `proof::run_shell_in`, which runs them in the sandbox.
 async fn run_shell_in(cmd: &str, dir: &Path) -> (bool, String) {
     match tokio::process::Command::new("bash")
         .args(["-c", cmd])
