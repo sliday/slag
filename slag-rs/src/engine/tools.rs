@@ -437,7 +437,9 @@ impl ToolBox {
                 "Search file contents for a regex pattern (ripgrep). Default output_mode \
                  files_with_matches lists matching file paths; content prints \
                  file:line:content matches (with optional -A/-B/-C context lines); count \
-                 prints per-file match counts. Paths are workspace-relative.",
+                 prints per-file match counts. Paths are workspace-relative. \
+                 Broad searches skip root logs/, .git, and slag-anvil-* paths. \
+                 Name a heap path or glob to include it.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -457,7 +459,9 @@ impl ToolBox {
             spec(
                 "glob",
                 "Find files by glob pattern (e.g. '*.rs', 'src/**/*.ts'). \
-                 Returns workspace-relative paths, capped at 100 files.",
+                 Returns workspace-relative paths, capped at 100 files. \
+                 Broad searches skip root logs/, .git, and slag-anvil-* paths. \
+                 Name a heap path or pattern to include it.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -635,6 +639,9 @@ impl ToolBox {
                 }
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 if is_dir {
+                    if self.is_heap_path(&entry.path()) {
+                        continue;
+                    }
                     if !matches!(
                         entry.file_name().to_str(),
                         Some(".git" | "target" | "node_modules" | ".venv")
@@ -1248,6 +1255,45 @@ impl ToolBox {
         ))
     }
 
+    fn is_heap_path(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else { return false };
+        relative.starts_with("logs") || relative.components().any(|c| {
+            let name = c.as_os_str().to_string_lossy();
+            name == ".git" || name.starts_with("slag-anvil-")
+        })
+    }
+
+    /// Prune scratch directories before traversal. Literal heap paths opt in.
+    fn heap_filters(&self, target: &Path, glob: Option<&str>) -> (String, String) {
+        let relative = target.strip_prefix(&self.root).unwrap_or(target);
+        let names = relative.components()
+            .chain(Path::new(glob.unwrap_or("")).components())
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let mut rg = String::new();
+        let mut prune = Vec::new();
+        for (name, pattern) in [("logs", "/logs/**"), (".git", ".git"), ("slag-anvil-", "slag-anvil-*")] {
+            let explicit = names.iter().any(|n| {
+                if name == "slag-anvil-" { n.starts_with(name) } else { n == name }
+            });
+            if explicit || (name == "logs" && target != self.root) {
+                continue;
+            }
+            rg.push_str(&format!(" -g {}", sh_quote(&format!("!{pattern}"))));
+            prune.push(if name == "logs" {
+                "-path './logs'".to_string()
+            } else {
+                format!("-name {}", sh_quote(pattern))
+            });
+        }
+        let find = if prune.is_empty() {
+            String::new()
+        } else {
+            format!("\\( {} \\) -prune -o ", prune.join(" -o "))
+        };
+        (rg, find)
+    }
+
     /// Search file contents with rg (grep fallback). Three output modes:
     /// files_with_matches (default, rg -l), content (rg -n plus optional
     /// -A/-B/-C context), and count (rg --count). -i, a glob filter, and
@@ -1300,9 +1346,9 @@ impl ToolBox {
             _ => "-l".into(),
         };
         let mode_grep = match mode {
-            "content" => format!("-rn{ctx}"),
-            "count" => "-rc".into(),
-            _ => "-rl".into(),
+            "content" => format!("-n{ctx}"),
+            "count" => "-c".into(),
+            _ => "-l".into(),
         };
         let case = if insensitive { " -i" } else { "" };
         let rg_glob = glob_filter
@@ -1311,10 +1357,11 @@ impl ToolBox {
         let grep_glob = glob_filter
             .map(|g| format!(" --include={}", sh_quote(g)))
             .unwrap_or_default();
+        let (rg_heap, find_heap) = self.heap_filters(&target, glob_filter);
         let cmd = format!(
             "cd {root} && if command -v rg >/dev/null 2>&1; then \
-             rg --no-heading -H {mode_rg}{case}{rg_glob} -e {p} {t}; \
-             else grep -H {mode_grep}{case}{grep_glob} -e {p} {t}; fi",
+             rg --no-heading -H {mode_rg}{case}{rg_glob}{rg_heap} -e {p} {t}; \
+             else find {t} {find_heap}-type f -exec grep -H {mode_grep}{case}{grep_glob} -e {p} {{}} +; fi",
             root = sh_quote(&self.root.display().to_string()),
             p = sh_quote(pattern),
             t = sh_quote(&rel),
@@ -1387,8 +1434,9 @@ impl ToolBox {
         let raw_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let dir = self.resolve(raw_path)?;
         let base = pattern.rsplit('/').next().unwrap_or(pattern);
+        let (rg_heap, find_heap) = self.heap_filters(&dir, Some(pattern));
         let cmd = format!(
-            "cd {d} && if command -v rg >/dev/null 2>&1; then rg --files -g {p}; else find . -type f -name {b}; fi",
+            "cd {d} && if command -v rg >/dev/null 2>&1; then rg --files -g {p}{rg_heap}; else find . {find_heap}-type f -name {b} -print; fi",
             p = sh_quote(pattern),
             d = sh_quote(&dir.display().to_string()),
             b = sh_quote(base),
@@ -4329,6 +4377,70 @@ Collecting\n\
         assert!(!out.output.contains("c.txt"), "{}", out.output);
         for line in out.output.lines() {
             assert!(!line.starts_with('/'), "path not relative: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn broad_file_searches_skip_the_heap_but_keep_application_logs() {
+        let (dir, tb) = setup();
+        for name in ["logs", "src/logs", "nested/slag-anvil-i1", ".git/worktrees"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            write(&dir, &format!("{name}/needle.txt"), "needle\n");
+        }
+        write(&dir, "source.txt", "needle\n");
+        for (tool, args) in [
+            ("glob", json!({"pattern": "**/*"})),
+            ("grep", json!({"pattern": "needle"})),
+            ("grep", json!({"pattern": "needle", "output_mode": "content"})),
+            ("grep", json!({"pattern": "needle", "output_mode": "count"})),
+        ] {
+            let out = tb.dispatch(&call(tool, args)).await;
+            assert!(!out.is_error, "{}", out.output);
+            assert!(out.output.contains("source.txt"), "{}", out.output);
+            assert!(out.output.contains("src/logs/needle.txt"), "{}", out.output);
+            assert!(!out.output.lines().any(|l| l.starts_with("logs/")), "{}", out.output);
+            assert!(!out.output.contains("slag-anvil-i1"), "{}", out.output);
+            assert!(!out.output.contains(".git/"), "{}", out.output);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_heap_paths_still_support_glob_grep_and_read() {
+        let (dir, tb) = setup();
+        std::fs::create_dir_all(dir.path().join("logs/tool-results")).unwrap();
+        write(&dir, "logs/tool-results/result.txt", "needle\n");
+        for (tool, args) in [
+            ("glob", json!({"pattern": "logs/**/*.txt"})),
+            ("glob", json!({"pattern": "*.txt", "path": "logs"})),
+            ("grep", json!({"pattern": "needle", "glob": "logs/**/*.txt"})),
+            ("grep", json!({"pattern": "needle", "path": "./logs"})),
+            ("read_file", json!({"path": "logs/tool-results/result.txt"})),
+        ] {
+            let out = tb.dispatch(&call(tool, args)).await;
+            assert!(!out.is_error, "{}", out.output);
+            assert!(out.output.contains(if tool == "read_file" { "needle" } else { "logs/tool-results/result.txt" }), "{}", out.output);
+        }
+        let missing = tb.dispatch(&call("read_file", json!({"path": "result.txt"}))).await;
+        assert!(missing.is_error);
+        assert!(!missing.output.contains("logs/tool-results/result.txt"), "{}", missing.output);
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_paths_and_application_log_searches_remain_available() {
+        let (dir, tb) = setup();
+        for name in ["src/logs", "nested/slag-anvil-i1", ".git/worktrees"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            write(&dir, &format!("{name}/needle.txt"), "needle\n");
+            for tool in ["glob", "grep"] {
+                let args = if tool == "glob" {
+                    json!({"pattern": "*.txt", "path": name})
+                } else {
+                    json!({"pattern": "needle", "path": name})
+                };
+                let out = tb.dispatch(&call(tool, args)).await;
+                assert!(!out.is_error, "{}", out.output);
+                assert!(out.output.contains(&format!("{name}/needle.txt")), "{}", out.output);
+            }
         }
     }
 
