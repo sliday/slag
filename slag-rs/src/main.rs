@@ -332,12 +332,15 @@ async fn run_pipeline(
 
     if !(tui_flag && std::io::stdin().is_terminal()) {
         // Headless: the recording session holds the event channel, and its
-        // presenter draws the stream for every smith at once.
+        // stream view draws the whole run from it, as the dashboard does.
+        // The pipeline goes quiet so nothing prints twice; a replay of the
+        // tape then draws exactly what this run drew.
         let tape = render::tape::Session::open(
             Some(render::tape::default_path()),
-            Some(Box::new(engine::events::StreamPresenter::new())),
+            Some(Box::new(render::stream::Stream::live())),
         );
         tui::set_presenter(true);
+        tui::set_quiet(true);
         let hooks = tape.attach(EngineHooks::default());
         let (hooks, sink) = render::trace::attach(hooks, trace);
         let result =
@@ -346,6 +349,7 @@ async fn run_pipeline(
             let _ = sink.await;
         }
         tape.close().await;
+        tui::set_quiet(false);
         tui::set_presenter(false);
         return result;
     }
@@ -411,7 +415,7 @@ async fn run_pipeline(
                 // the next forge is about to reuse the screen. Print the
                 // report now or it is lost between passes.
                 if !matches!(result, Err(error::SlagError::Cancelled)) {
-                    let _ = pipeline::assay::show();
+                    print_assay();
                 }
                 commission = Some(next);
             }
@@ -423,59 +427,101 @@ async fn run_pipeline(
     // reprint the final report on the real terminal. A cracked run needs
     // it most, so only a cancel (nothing to report) skips it.
     if !matches!(result, Err(error::SlagError::Cancelled)) {
-        let _ = pipeline::assay::show();
+        print_assay();
     }
     tape.close().await;
 
     result
 }
 
+/// The assay in the stream view's words, on the real terminal. The pipeline
+/// still records its marks for the tape (`assay::show` with color off goes
+/// nowhere while quiet), so a replay sees the same report.
+fn print_assay() {
+    for line in render::echo::assay_report(tui::width()) {
+        println!("{line}");
+    }
+}
+
 fn show_status() -> Result<(), error::SlagError> {
     tui::show_banner();
+    let width = tui::width();
+    let label = |name: &str| tui::dim(&format!("{name:<10}"));
 
     let crucible_path = Path::new(config::CRUCIBLE);
     if !crucible_path.exists() {
-        println!("\n  No crucible found. Run `slag \"Your Commission\"` to start.\n");
+        println!();
+        println!(
+            "  No crucible found here. Start one with {}slag \"describe what to build\"{}",
+            fg(tui::HOT),
+            reset()
+        );
+        println!();
         return Ok(());
     }
 
     let crucible = crucible::Crucible::load(crucible_path)?;
     let counts = crucible.counts();
-
-    let ore_path = Path::new(config::ORE_FILE);
-    if ore_path.exists() {
-        let ore = std::fs::read_to_string(ore_path)?;
-        let commission = ore.lines().last().unwrap_or("(unknown)");
-        println!(
-            "\n  {}Commission:{} {}",
-            fg(tui::HOT),
-            reset(),
-            tui::truncate(commission, 50)
-        );
-    }
-
-    let has_bp = Path::new(config::BLUEPRINT).exists();
-    println!(
-        "  {}Blueprint: {}{}",
-        fg(tui::COLD),
-        if has_bp { "yes" } else { "no" },
-        reset()
-    );
-
-    print!("  ");
-    tui::ingot_status_line(&counts);
     println!();
-    tui::temper_bar(&counts);
 
-    if counts.cracked > 0 {
-        println!("\n  {}Cracked:{}", fg(tui::WARM), reset());
-        for ingot in &crucible.ingots {
-            if ingot.status == sexp::Status::Cracked {
-                println!("    {}✗{} [{}] {}", fg(tui::WARM), reset(), ingot.id, ingot.work);
-            }
+    if let Ok(ore) = std::fs::read_to_string(config::ORE_FILE) {
+        if let Some(commission) = dashboard::commission_line(&ore) {
+            println!("  {}  {}", label("commission"), tui::clip(&commission, width.saturating_sub(14)));
         }
     }
+    let blueprint = match std::fs::read_to_string(config::BLUEPRINT) {
+        Ok(doc) => format!("{} · {} lines", config::BLUEPRINT, doc.lines().count()),
+        Err(_) => tui::dim("not drafted yet"),
+    };
+    println!("  {}  {blueprint}", label("blueprint"));
+    println!("  {}  {} · {} ingots", label("crucible"), config::CRUCIBLE, counts.total);
+    println!("{}", tui::counts_text(&counts, width));
+    println!();
 
+    // Every ingot, one row each: this is the one screen that shows them all.
+    let shown = 20;
+    let id_w = crucible.ingots.iter().map(|i| i.id.chars().count()).max().unwrap_or(2);
+    for ingot in crucible.ingots.iter().take(shown) {
+        let (glyph, color) = match ingot.status {
+            sexp::Status::Forged => ("✓", tui::PURE),
+            sexp::Status::Cracked => ("✗", tui::WARM),
+            sexp::Status::Molten => ("⚒", tui::HOT),
+            sexp::Status::Ore => ("·", tui::COLD),
+        };
+        let heat = if ingot.heat > 1 { format!("heat {}", ingot.heat) } else { String::new() };
+        let room = width.saturating_sub(id_w + 10 + heat.chars().count());
+        let title = render::echo::title(&ingot.work);
+        let left = format!(
+            "    {} {}  {}",
+            tui::paint(color, glyph),
+            tui::paint(if ingot.status == sexp::Status::Ore { tui::COLD } else { tui::PURE }, &format!("{:<id_w$}", ingot.id)),
+            tui::clip(&title, room)
+        );
+        println!("{}", tui::spread(&left, &tui::paint(color, &heat), width));
+    }
+    if crucible.ingots.len() > shown {
+        println!("    {}", tui::dim(&format!("… {} more in {}", crucible.ingots.len() - shown, config::CRUCIBLE)));
+    }
+
+    // What to do next, when there is something to do.
+    println!();
+    if counts.ore + counts.molten > 0 {
+        println!(
+            "  {}  {}slag resume{}  {}",
+            label("next"),
+            fg(tui::HOT),
+            reset(),
+            tui::dim(&format!("forges the {} left", counts.ore + counts.molten))
+        );
+    } else if counts.cracked > 0 {
+        println!(
+            "  {}  {}",
+            label("next"),
+            tui::dim(&format!("read why they cracked in {}/, or commission a fix", config::LOG_DIR))
+        );
+    } else {
+        println!("  {}  {}", label("next"), tui::dim("every ingot forged; commission the next change"));
+    }
     println!();
     Ok(())
 }

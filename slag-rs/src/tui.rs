@@ -92,15 +92,208 @@ pub fn downgrade(color: Color) -> Color {
     }
 }
 
+// ─── stream vocabulary ──────────────────────────────────────────────────
+//
+// Every line slag prints shares one gutter: two spaces, a one-cell glyph,
+// a space, then content, with metadata trailing dim. Nothing wraps: a
+// line that would overflow is clipped with an ellipsis, so the ledger
+// stays one clean column at 80 columns as at 200. Color carries meaning,
+// never decoration: HOT is in progress, PURE is done, WARM is a failure,
+// BRIGHT needs a look, COLD is everything else.
+
+/// Width a replay pins with `--size`, so off-screen frames clip the same
+/// way every time. 0 = ask the terminal.
+static WIDTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_width(cols: usize) {
+    WIDTH.store(cols, Ordering::Relaxed);
+}
+
+/// Columns one printed line may use: the terminal's width minus the last
+/// column, which triggers autowrap on most terminals. 100 without one.
+pub fn width() -> usize {
+    let pinned = WIDTH.load(Ordering::Relaxed);
+    let cols = if pinned > 0 {
+        pinned
+    } else {
+        crossterm::terminal::size().map(|(w, _)| w as usize).ok().filter(|w| *w > 0).unwrap_or(101)
+    };
+    cols.saturating_sub(1).max(20)
+}
+
+/// Clip plain text to `max` columns, ending in `…` when it had to cut.
+/// Whitespace runs (newlines included) collapse to one space first, so a
+/// multi-line message can never break the one-line-per-entry ledger.
+pub fn clip(s: &str, max: usize) -> String {
+    crate::engine::events::preview(s, max)
+}
+
+/// `0:42`, `12:05`, `1:02:05`: run clocks read the same at every size.
+pub fn clock(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// `$0.004`, `$0.06`, `$1.24`. A cheap run shows real digits rather than
+/// rounding to a `$0.00` that reads as free.
+pub fn money(dollars: f64) -> String {
+    if dollars < 0.01 {
+        format!("${dollars:.3}")
+    } else {
+        format!("${dollars:.2}")
+    }
+}
+
+/// `118234` → `118k`; small counts stay exact.
+pub fn tokens(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else if n < 1_000_000 {
+        format!("{}k", (n + 500) / 1000)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+/// Visible columns of a painted string: escape sequences cost nothing.
+pub fn visible_len(s: &str) -> usize {
+    let mut n = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `left` and `right` on one line, `right` flush to `width`. When both do
+/// not fit, `right` goes: the left side is the entry, the right its meta.
+pub fn spread(left: &str, right: &str, width: usize) -> String {
+    let (l, r) = (visible_len(left), visible_len(right));
+    if r == 0 || l + 2 + r > width {
+        return left.to_string();
+    }
+    format!("{left}{}{right}", " ".repeat(width - l - r))
+}
+
+/// The wordmark: the site's fire gradient on either side of the name.
+pub fn banner_lines() -> Vec<String> {
+    let ramp = [COLD, WARM, HOT, BRIGHT];
+    let mut left = String::new();
+    for (i, c) in ramp.iter().enumerate() {
+        left.push_str(&paint(*c, ["░", "▒", "▓", "█"][i]));
+    }
+    let mut right = String::new();
+    for (i, c) in ramp.iter().rev().enumerate() {
+        right.push_str(&paint(*c, ["█", "▓", "▒", "░"][i]));
+    }
+    vec![
+        format!(
+            "  {left} {}{}SLAG{}{} {right}  {}",
+            bold(),
+            fg(PURE),
+            reset(),
+            unbold(),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        format!("  {}", dim("survey → plan → forge → assay")),
+    ]
+}
+
+/// A phase opens with one rule, not three: `── FORGE ─────── 1:40`. The
+/// part of the title before ` · ` is the phase and reads bold; the rest is
+/// its detail. `right` (usually the run clock) sits at the far end.
+pub fn rule_line(title: &str, right: &str, width: usize) -> String {
+    let (name, detail) = match title.split_once(" · ") {
+        Some((n, d)) => (n, Some(d)),
+        None => (title, None),
+    };
+    // Fixed costs: "── " before the name, " " + at least three rule cells
+    // after everything, and " right" when there is a right side.
+    let tail_w = if right.is_empty() { 0 } else { right.chars().count() + 1 };
+    let fixed = 3 + 1 + 3 + tail_w;
+    let name = clip(name, width.saturating_sub(fixed).max(4));
+    let mut used = 3 + name.chars().count();
+    let detail = detail.and_then(|d| {
+        let room = width.saturating_sub(used + 3 + 4 + tail_w);
+        (room >= 6).then(|| clip(d, room))
+    });
+    let mut head = format!("{} {}{}{}{}", dim("──"), bold(), fg(PURE), name, reset());
+    if let Some(d) = &detail {
+        head.push_str(&format!(" {}", dim(&format!("· {d}"))));
+        used += 3 + d.chars().count();
+    }
+    let fill = width.saturating_sub(used + 1 + tail_w).max(1);
+    let tail = if right.is_empty() { String::new() } else { format!(" {right}") };
+    format!("{head} {}{}", dim(&"─".repeat(fill)), dim(&tail))
+}
+
+/// `  ◆ Blueprint: BLUEPRINT.md` — one glyph, one message. The pipeline
+/// picks the glyph; a full block reads as a brick at this size, so it
+/// prints as a diamond.
+pub fn status_text(icon: &str, color: Color, msg: &str, width: usize) -> String {
+    let icon = if icon == "█" { "◆" } else { icon };
+    format!("  {} {}", paint(color, icon), clip(msg, width.saturating_sub(4)))
+}
+
+/// The forge's progress at a glance: a fire-gradient bar, then the tally.
+/// `  ████████░░░░░░░░  2/5 forged · 1 forging · 2 queued`
+pub fn counts_text(counts: &CrucibleCounts, width: usize) -> String {
+    let mut parts = vec![format!("{}/{} forged", counts.forged, counts.total)];
+    if counts.molten > 0 {
+        parts.push(format!("{} forging", counts.molten));
+    }
+    if counts.ore > 0 {
+        parts.push(format!("{} queued", counts.ore));
+    }
+    let tally = parts.join(" · ");
+    let cracked = if counts.cracked > 0 {
+        format!(" {} {}", dim("·"), paint(WARM, &format!("{} cracked", counts.cracked)))
+    } else {
+        String::new()
+    };
+    let cells = width.saturating_sub(tally.len() + 16).clamp(8, 24);
+    format!("  {}  {}{cracked}", bar(counts, cells), paint(PURE, &tally))
+}
+
+/// The fire bar: forged cells take the palette from WARM to BRIGHT along
+/// their position, cracked cells end the fill in WARM, the rest is COLD.
+pub fn bar(counts: &CrucibleCounts, cells: usize) -> String {
+    let total = counts.total.max(1);
+    let filled = (counts.forged * cells + total / 2) / total;
+    let cracked = ((counts.cracked * cells + total / 2) / total).min(cells - filled.min(cells));
+    let mut out = String::new();
+    for i in 0..filled.min(cells) {
+        let color = match i * 3 / cells.max(1) {
+            0 => WARM,
+            1 => HOT,
+            _ => BRIGHT,
+        };
+        out.push_str(&paint(color, "█"));
+    }
+    out.push_str(&paint(WARM, &"▓".repeat(cracked)));
+    out.push_str(&dim(&"░".repeat(cells.saturating_sub(filled + cracked))));
+    out
+}
+
 pub fn hr() {
     if is_quiet() {
         return;
     }
-    println!(
-        "{}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{}",
-        fg(COLD),
-        reset()
-    );
+    println!("{}", dim(&"─".repeat(width())));
 }
 
 pub fn header(title: &str) {
@@ -109,16 +302,7 @@ pub fn header(title: &str) {
         return;
     }
     println!();
-    hr();
-    println!(
-        "{}{}  \u{2692} {}{}{}",
-        bold(),
-        fg(PURE),
-        title,
-        reset(),
-        unbold(),
-    );
-    hr();
+    println!("{}", rule_line(title, "", width()));
 }
 
 pub fn status_line(icon: &str, color: Color, msg: &str) {
@@ -130,7 +314,7 @@ pub fn status_line(icon: &str, color: Color, msg: &str) {
     if is_quiet() {
         return;
     }
-    println!("  {}{}{} {}", fg(color), icon, reset(), msg);
+    println!("{}", status_text(icon, color, msg, width()));
 }
 
 pub fn show_banner() {
@@ -139,29 +323,9 @@ pub fn show_banner() {
         return;
     }
     println!();
-    print!("  {}░░░", fg(COLD));
-    print!("{}▒", fg(WARM));
-    print!("{}▒", fg(HOT));
-    print!("{}▓", fg(BRIGHT));
-    print!("{}█", fg(PURE));
-    print!(
-        "  {}{}SLAG{}",
-        bold(),
-        fg(PURE),
-        unbold(),
-    );
-    print!("  {}█", fg(PURE));
-    print!("{}▓", fg(BRIGHT));
-    print!("{}▒", fg(HOT));
-    print!("{}▒", fg(WARM));
-    println!("{}░░░{}", fg(COLD), reset());
-
-    println!("  {}cold      hot       pure{}", fg(COLD), reset());
-    println!(
-        "  {}survey · design · forge · temper{}",
-        fg(COLD),
-        reset()
-    );
+    for line in banner_lines() {
+        println!("{line}");
+    }
 }
 
 /// First-run key prompt. Two lines of why, one line to act on, then the
@@ -169,20 +333,15 @@ pub fn show_banner() {
 pub fn key_intro() {
     show_banner();
     println!();
+    println!("  {}", paint(PURE, "slag forges through OpenRouter: one key, every model."));
     println!(
-        "  {}slag forges through OpenRouter. One key, every model.{}",
-        fg(PURE),
-        reset()
+        "  {}  {}",
+        dim("get one at"),
+        paint(BRIGHT, "https://openrouter.ai/workspaces/default/keys")
     );
-    println!(
-        "  {}get one at{} {}https://openrouter.ai/workspaces/default/keys{}",
-        fg(COLD),
-        reset(),
-        fg(BRIGHT),
-        reset()
-    );
+    println!("  {}", dim("it is checked once, then saved where only you can read it."));
     println!();
-    print!("  {}key{} {}› {}", fg(HOT), reset(), fg(COLD), reset());
+    print!("  {} {} ", paint(HOT, "key"), dim("›"));
     flush();
 }
 
@@ -190,23 +349,14 @@ pub fn key_intro() {
 /// later 401 does not read like a mystery.
 pub fn key_unverified(why: &str) {
     println!(
-        "  {}▒{} could not reach OpenRouter ({}) — saving unverified",
-        fg(WARM),
-        reset(),
-        why
+        "  {} could not reach OpenRouter ({why}); saving the key unverified",
+        paint(BRIGHT, "!")
     );
 }
 
 /// Confirm where the key landed, so the user can find or delete it later.
 pub fn key_saved(path: &std::path::Path) {
-    println!(
-        "  {}█{} saved to {}{}{}",
-        fg(PURE),
-        reset(),
-        fg(COLD),
-        path.display(),
-        reset()
-    );
+    println!("  {} key saved to {}", paint(PURE, "✓"), dim(&path.display().to_string()));
     println!();
 }
 
@@ -215,46 +365,27 @@ pub fn key_saved(path: &std::path::Path) {
 pub fn key_panel(source: Option<(&str, String)>, models: &[(&str, &str, Option<&str>)]) {
     show_banner();
     println!();
+    let w = width();
     match source {
         Some((from, masked)) => {
-            println!(
-                "  {}key{}    {}{}{}  {}from {}{}",
-                fg(COLD),
-                reset(),
-                fg(PURE),
-                masked,
-                reset(),
-                fg(COLD),
-                from,
-                reset()
-            );
+            println!("  {}  {}  {}", dim(&format!("{:<6}", "key")), paint(PURE, &masked), dim(&format!("from {from}")));
         }
         None => {
             println!(
-                "  {}key{}    {}none{}  {}run `slag key` or set OPENROUTER_API_KEY{}",
-                fg(COLD),
-                reset(),
-                fg(WARM),
-                reset(),
-                fg(COLD),
-                reset()
+                "  {}  {}  {}",
+                dim(&format!("{:<6}", "key")),
+                paint(WARM, "none"),
+                dim("run `slag key` or set OPENROUTER_API_KEY")
             );
         }
     }
     for (role, model, note) in models {
-        println!(
-            "  {}{:<6}{} {}{}{}{}",
-            fg(COLD),
-            role,
-            reset(),
-            fg(BRIGHT),
-            model,
-            reset(),
-            match note {
-                Some(note) => format!("  {}{note}{}", fg(COLD), reset()),
-                None => String::new(),
-            }
-        );
+        let note = match note {
+            Some(note) => format!("  {}", dim(note)),
+            None => String::new(),
+        };
+        let line = format!("  {}  {}{note}", dim(&format!("{role:<6}")), paint(PURE, model));
+        println!("{}", if visible_len(&line) > w { format!("  {}  {}", dim(&format!("{role:<6}")), paint(PURE, &clip(model, w.saturating_sub(10)))) } else { line });
     }
     println!();
 }
@@ -263,13 +394,13 @@ pub fn key_panel(source: Option<(&str, String)>, models: &[(&str, &str, Option<&
 /// Say so at the moment of saving, not three 401s later.
 pub fn key_shadowed() {
     println!(
-        "  {}▒{} OPENROUTER_API_KEY is set and wins over the saved key — \
-         unset it to use this one",
-        fg(WARM),
-        reset()
+        "  {} OPENROUTER_API_KEY is set and wins over the saved key; unset it to use this one",
+        paint(BRIGHT, "!")
     );
 }
 
+/// The tally on its own line. Callers print their own indent and newline
+/// around it (the pipeline does), so this prints the line body only.
 pub fn ingot_status_line(counts: &CrucibleCounts) {
     crate::render::tape::mark(crate::render::tape::Mark::Counts {
         tally: crate::render::tape::Tally::of(counts),
@@ -277,11 +408,7 @@ pub fn ingot_status_line(counts: &CrucibleCounts) {
     if is_quiet() {
         return;
     }
-    print!("[ ✅{} done | 🔥{} forging | 🧱{} queued", counts.forged, counts.molten, counts.ore);
-    if counts.cracked > 0 {
-        print!(" | ❌{} failed", counts.cracked);
-    }
-    print!(" ]");
+    print!("{}", counts_text(counts, width()).trim_start());
 }
 
 pub fn temper_bar(counts: &CrucibleCounts) {
@@ -291,32 +418,15 @@ pub fn temper_bar(counts: &CrucibleCounts) {
     if is_quiet() {
         return;
     }
-    let total = counts.total.max(1);
-    let pct = counts.forged * 100 / total;
-    let filled = counts.forged * 20 / total;
-    let empty = 20 - filled;
+    println!("{}", temper_text(counts, width()));
+}
 
-    print!("  {}[{}", fg(COLD), reset());
-    for i in 0..filled {
-        if i < filled / 3 {
-            print!("{}▒{}", fg(WARM), reset());
-        } else if i < filled * 2 / 3 {
-            print!("{}▓{}", fg(HOT), reset());
-        } else {
-            print!("{}█{}", fg(BRIGHT), reset());
-        }
-    }
-    for _ in 0..empty {
-        print!("{}░{}", fg(COLD), reset());
-    }
-    println!(
-        "{}]{} {}{}%{}",
-        fg(COLD),
-        reset(),
-        fg(PURE),
-        pct,
-        reset()
-    );
+/// `  ████████████████████░░░░  83%` — the assay's bar, wider than the
+/// running tally's because it is the last thing on screen.
+pub fn temper_text(counts: &CrucibleCounts, width: usize) -> String {
+    let cells = width.saturating_sub(10).clamp(10, 40);
+    let pct = counts.forged * 100 / counts.total.max(1);
+    format!("  {}  {}", bar(counts, cells), paint(PURE, &format!("{pct}%")))
 }
 
 /// Create a spinner for long operations

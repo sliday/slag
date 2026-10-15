@@ -1,158 +1,270 @@
-//! echo — the pipeline's own stream lines, rebuilt from a tape.
+//! echo — the forge's skeleton in the stream view, built from cues.
 //!
-//! In a live stream-mode run the pipeline prints the forge's skeleton
-//! itself: the founder's table, each ingot's header, every heat and its
-//! proof, the assay. Those prints reach the terminal and nothing else, so
-//! a tape cannot hold them. What a tape does hold is enough to rebuild
-//! them: ingot lifecycle events, `tui` marks, and PLAN.md as it changed.
+//! The stream view has two layers. The narrator (`engine::events`) tells
+//! what the smiths do, one tool call per line. The echo tells where the
+//! run stands: phase rules, the blueprint and the mold, each ingot as it
+//! reaches the anvil, every heat that fails, every ingot that lands, and
+//! the assay. It reads only cues (events, `tui` marks, plan snapshots,
+//! proof outcomes), so a live run and its replay print the same lines.
 //!
-//! `Echo` replays that skeleton. Marks go back through the same `tui`
-//! function that printed them live. Lines the pipeline prints raw are
-//! rebuilt here in the pipeline's format, from the same data. Two things
-//! a tape cannot recover are approximated: the proof command a smith
-//! chose (shown as the ingot's `:proof`) and why a heat failed (shown as
-//! a bare ✗).
+//! Every function here returns lines; `render::stream` decides where they
+//! go. Lines never wrap: each is built to fit `width`.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::engine::EngineEvent;
-use crate::pipeline::{bold, fg, reset};
-use crate::render::tape::{Cue, Mark};
+use crate::render::tape::{Cue, Mark, Proof, Stats};
 use crate::sexp::{Ingot, Status};
-use crate::tui;
+use crate::tui::{self, dim, paint, BRIGHT, COLD, HOT, PURE, WARM};
 
-/// What the echo is waiting to print once the next cue fills it in.
+/// Which part of the run is on screen. Drives the footer's verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Idle,
+    Survey,
+    Plan,
+    Forge,
+    Warden,
+    Assay,
+}
+
+impl Phase {
+    fn of(header: &str) -> Self {
+        let head = header.split(" · ").next().unwrap_or(header);
+        match head {
+            "SURVEYOR" => Phase::Survey,
+            "FOUNDER" => Phase::Plan,
+            "FORGE" => Phase::Forge,
+            "WARDEN" => Phase::Warden,
+            "ASSAY" | "GOAL NOT MET" => Phase::Assay,
+            _ => Phase::Idle,
+        }
+    }
+
+    /// The footer's verb for this phase.
+    pub fn verb(self) -> Option<&'static str> {
+        match self {
+            Phase::Survey => Some("surveying"),
+            Phase::Plan => Some("casting the mold"),
+            Phase::Forge => Some("forging"),
+            Phase::Warden => Some("judging"),
+            Phase::Idle | Phase::Assay => None,
+        }
+    }
+}
+
+/// What the echo waits on before it can print.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     None,
-    /// `Mold: …` printed; the founder's table follows once the plan lands.
+    /// `Mold: …` printed; the table follows once the plan lands.
     Table,
+    /// `N ingots added`; the new rows follow once the plan lands.
+    Added(Vec<String>),
     /// `Blueprint: …` printed; the excerpt follows once the doc lands.
     Excerpt,
 }
 
+/// An ingot on the anvil.
 #[derive(Debug, Clone)]
-struct OpenHeat {
-    id: String,
-    heat: u8,
+pub struct Anvil {
+    pub id: String,
+    pub heat: u8,
+    pub since: Instant,
+    /// The passing proof's command, held for the "forged" line.
+    proof: Option<String>,
 }
 
 pub struct Echo {
+    width: usize,
     plan: Vec<Ingot>,
     pending: Pending,
-    doc: Option<String>,
-    /// Ingots on an anvil right now, in start order.
-    open: Vec<String>,
-    /// Heats printed by the live pipeline only once they resolve.
-    heats: Vec<OpenHeat>,
-    after_header: bool,
-    in_assay: bool,
-    last_gap: Option<String>,
+    /// The status text a pending excerpt or table heads with.
+    blueprint_head: Option<String>,
+    mold_head: Option<String>,
+    blueprint: Option<String>,
+    commission_shown: bool,
+    phase: Phase,
+    /// Ingots on an anvil now, in start order.
+    anvils: Vec<Anvil>,
+    /// Heats resolved by a proof cue, so the event that ends them does not
+    /// print a second, vaguer line.
+    resolved: Vec<(String, u8)>,
+    started: Option<Instant>,
+    retries: usize,
+    stats: Option<Stats>,
     tokens: u64,
     cost: Option<f64>,
-}
-
-impl Default for Echo {
-    fn default() -> Self {
-        Self::new()
-    }
+    goal_gap: Option<String>,
+    goal_met: bool,
+    assay_done: bool,
 }
 
 impl Echo {
-    pub fn new() -> Self {
+    pub fn new(width: usize) -> Self {
         Self {
+            width,
             plan: Vec::new(),
             pending: Pending::None,
-            doc: None,
-            open: Vec::new(),
-            heats: Vec::new(),
-            after_header: false,
-            in_assay: false,
-            last_gap: None,
+            blueprint_head: None,
+            mold_head: None,
+            blueprint: None,
+            commission_shown: false,
+            phase: Phase::Idle,
+            anvils: Vec::new(),
+            resolved: Vec::new(),
+            started: None,
+            retries: 0,
+            stats: None,
             tokens: 0,
             cost: None,
+            goal_gap: None,
+            goal_met: false,
+            assay_done: false,
         }
     }
 
-    /// Print whatever `cue` meant to the pipeline's stream.
-    pub fn cue(&mut self, cue: &Cue, _at: Instant) {
+    pub fn set_width(&mut self, width: usize) {
+        self.width = width;
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    pub fn anvils(&self) -> &[Anvil] {
+        &self.anvils
+    }
+
+    pub fn started(&self) -> Option<Instant> {
+        self.started
+    }
+
+    /// Run totals so far: tokens, and dollars when the provider said.
+    pub fn spend(&self) -> (u64, Option<f64>) {
+        (self.tokens, self.cost)
+    }
+
+    /// Max heats for an ingot, from the plan.
+    pub fn max_heat(&self, id: &str) -> Option<u8> {
+        self.ingot(id).map(|i| i.max)
+    }
+
+    /// The lines `cue` adds to the stream.
+    pub fn cue(&mut self, cue: &Cue, at: Instant) -> Vec<String> {
+        self.started.get_or_insert(at);
+        let mut out = Vec::new();
         if !matches!(cue, Cue::Plan(_) | Cue::Doc { .. }) {
-            self.flush_pending();
+            self.flush_pending(&mut out);
         }
         match cue {
             Cue::Plan(text) => {
-                self.plan = crate::crucible::parse_ingot_lines(text);
-                if self.pending == Pending::Table {
-                    self.flush_pending();
+                let next = crate::crucible::parse_ingot_lines(text);
+                if self.phase == Phase::Forge {
+                    self.resmelts(&next, &mut out);
+                }
+                self.plan = next;
+                if matches!(self.pending, Pending::Table | Pending::Added(_)) {
+                    self.flush_pending(&mut out);
                 }
             }
             Cue::Doc { name, text } => {
-                if name != crate::config::BLUEPRINT {
-                    return;
-                }
-                self.doc = Some(text.clone());
-                if self.pending == Pending::Excerpt {
-                    self.flush_pending();
-                }
-            }
-            Cue::Mark(m) => self.mark(m),
-            Cue::Event(e) => self.event(e),
-        }
-    }
-
-    /// End of tape: settle anything still waiting.
-    pub fn finish(&mut self) {
-        self.flush_pending();
-        tui::flush();
-    }
-
-    fn mark(&mut self, m: &Mark) {
-        let was_header = self.after_header;
-        self.after_header = false;
-        match m {
-            Mark::Banner => tui::show_banner(),
-            Mark::Header { text } => {
-                self.in_assay = text == "ASSAY";
-                tui::header(text);
-                self.after_header = true;
-                if self.in_assay {
-                    self.assay_head();
-                }
-                if text == "GOAL NOT MET" {
-                    if let Some(gap) = &self.last_gap {
-                        println!("  {}{gap}{}\n", fg(tui::WARM), reset());
-                        println!("  the tasks passed; the commission did not.");
-                        println!(
-                            "  raise --temper to forge the gap, or read {}.\n",
-                            crate::config::LEDGER
-                        );
+                if name == crate::config::BLUEPRINT {
+                    self.blueprint = Some(text.clone());
+                    if self.pending == Pending::Excerpt {
+                        self.flush_pending(&mut out);
+                    }
+                } else if name == crate::config::ORE_FILE && !self.commission_shown {
+                    self.commission_shown = true;
+                    if let Some(line) = commission(text) {
+                        out.push(self.labelled("◇", COLD, "commission", &line));
                     }
                 }
             }
-            Mark::Status { icon, tone, text } => {
-                tui::status_line(icon, tone.color(), text);
-                if text.starts_with("Mold:") {
-                    self.pending = Pending::Table;
-                } else if text.starts_with("Blueprint:") {
-                    self.pending = Pending::Excerpt;
-                }
-            }
-            Mark::Counts { tally } => {
-                print!("{}", if was_header { "  " } else { "\n  " });
-                tui::ingot_status_line(&tally.counts());
-                println!();
-            }
-            Mark::TemperBar { tally } => {
-                tui::temper_bar(&tally.counts());
-                if self.in_assay {
-                    self.assay_tail();
-                }
-            }
+            Cue::Mark(m) => self.mark(m, at, &mut out),
+            Cue::Event(e) => self.event(e, at, &mut out),
+            Cue::Proof(p) => self.proof(p, &mut out),
+            Cue::Stats(s) => self.stats = Some(s.clone()),
         }
-        tui::flush();
+        out
     }
 
-    fn event(&mut self, e: &EngineEvent) {
+    /// End of the run: the assay, unless a mark already printed it.
+    pub fn finish(&mut self, at: Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        self.flush_pending(&mut out);
+        if !self.assay_done && !self.plan.is_empty() {
+            self.assay(at, &mut out);
+        }
+        out
+    }
+
+    fn elapsed(&self, at: Instant) -> Duration {
+        self.started.map_or(Duration::ZERO, |s| at.saturating_duration_since(s))
+    }
+
+    fn ingot(&self, id: &str) -> Option<&Ingot> {
+        self.plan.iter().find(|i| i.id == id)
+    }
+
+    /// `  ◇ label  text`, with the label padded so a run of these aligns.
+    fn labelled(&self, glyph: &str, color: crossterm::style::Color, label: &str, text: &str) -> String {
+        let room = self.width.saturating_sub(6 + label.chars().count());
+        format!("  {} {}  {}", paint(color, glyph), dim(label), tui::clip(text, room))
+    }
+
+    fn mark(&mut self, m: &Mark, at: Instant, out: &mut Vec<String>) {
+        match m {
+            Mark::Banner => {
+                out.push(String::new());
+                out.extend(tui::banner_lines());
+            }
+            Mark::Header { text } => {
+                self.phase = Phase::of(text);
+                if text == "ASSAY" {
+                    if !self.assay_done {
+                        self.assay(at, out);
+                    }
+                    return;
+                }
+                if text == "GOAL NOT MET" {
+                    // The assay's verdict line already says so, with the
+                    // gap under it; a second banner would only repeat it.
+                    return;
+                }
+                out.push(String::new());
+                out.push(tui::rule_line(text, &tui::clock(self.elapsed(at)), self.width));
+            }
+            Mark::Status { icon, tone, text } => {
+                if let Some(path) = text.strip_prefix("Blueprint: ") {
+                    self.pending = Pending::Excerpt;
+                    self.blueprint_head = Some(path.to_string());
+                    return;
+                }
+                if text.starts_with("Mold:") {
+                    self.pending = Pending::Table;
+                    self.mold_head = Some(text.trim_start_matches("Mold:").trim().to_string());
+                    return;
+                }
+                if let Some(n) = text.strip_suffix(" ingots added") {
+                    let known: Vec<String> = self.plan.iter().map(|i| i.id.clone()).collect();
+                    self.pending = Pending::Added(known);
+                    self.mold_head = Some(format!("{n} ingots added"));
+                    return;
+                }
+                out.push(tui::status_text(icon, tone.color(), text, self.width));
+            }
+            Mark::Counts { tally } => {
+                out.push(tui::counts_text(&tally.counts(), self.width));
+            }
+            Mark::TemperBar { .. } => {
+                // Only the assay draws this bar, and the echo draws the
+                // assay whole.
+            }
+        }
+    }
+
+    fn event(&mut self, e: &EngineEvent, at: Instant, out: &mut Vec<String>) {
         match e {
             EngineEvent::Tokens { usage } => {
                 self.tokens += usage.total_tokens;
@@ -160,48 +272,144 @@ impl Echo {
                     *self.cost.get_or_insert(0.0) += c;
                 }
             }
-            EngineEvent::Warning { message } if message.starts_with("warden round") => {
-                self.last_gap = message.split_once(": ").map(|(_, gap)| gap.to_string());
+            EngineEvent::Warning { message } => {
+                if let Some(gap) = warden_word(message) {
+                    self.goal_gap = Some(gap.to_string());
+                    self.goal_met = false;
+                }
+            }
+            EngineEvent::Narrate { text } => {
+                if warden_word(text).is_some_and(|w| w.starts_with("goal met")) {
+                    self.goal_gap = None;
+                    self.goal_met = true;
+                }
             }
             EngineEvent::IngotStart { id, .. } => {
-                if self.open.is_empty() {
-                    self.anvils_line(id);
+                if self.phase != Phase::Forge {
+                    self.phase = Phase::Forge;
                 }
-                if !self.open.contains(id) {
-                    self.open.push(id.clone());
+                if self.anvils.is_empty() {
+                    self.anvils_line(id, out);
                 }
-                self.ingot_head(id);
+                self.anvils.retain(|a| &a.id != id);
+                self.anvils.push(Anvil { id: id.clone(), heat: 0, since: at, proof: None });
+                self.ingot_head(id, out);
             }
             EngineEvent::HeatTick { id, heat } => {
-                // A new heat means the last one on this ingot failed.
-                self.resolve(id, false);
-                self.heats.push(OpenHeat { id: id.clone(), heat: *heat });
+                // A new heat means the last one on this ingot failed. When
+                // no proof cue said how, say only that it did.
+                if let Some(prev) = self.anvils.iter().find(|a| &a.id == id).map(|a| a.heat) {
+                    if prev > 0 && !self.take_resolved(id, prev) {
+                        let proof = self.ingot(id).map(|i| unescape(&i.proof)).filter(|p| !p.is_empty());
+                        out.push(self.heat_line(id, prev, proof.as_deref(), None));
+                    }
+                }
+                if *heat >= 2 {
+                    self.retries += 1;
+                }
+                if let Some(a) = self.anvils.iter_mut().find(|a| &a.id == id) {
+                    a.heat = *heat;
+                } else {
+                    self.anvils.push(Anvil { id: id.clone(), heat: *heat, since: at, proof: None });
+                }
             }
             EngineEvent::IngotDone { id, ok } => {
-                self.resolve(id, *ok);
-                self.open.retain(|o| o != id);
+                let anvil = self.anvils.iter().position(|a| &a.id == id).map(|i| self.anvils.remove(i));
+                let heat = anvil.as_ref().map_or(0, |a| a.heat);
+                if !*ok && heat > 0 && !self.take_resolved(id, heat) {
+                    let proof = self.ingot(id).map(|i| unescape(&i.proof)).filter(|p| !p.is_empty());
+                    out.push(self.heat_line(id, heat, proof.as_deref(), None));
+                }
+                self.resolved.retain(|(i, _)| i != id);
+                let took = anvil.as_ref().map(|a| at.saturating_duration_since(a.since));
+                let cmd = anvil
+                    .and_then(|a| a.proof)
+                    .or_else(|| self.ingot(id).map(|i| unescape(&i.proof)))
+                    .filter(|p| !p.is_empty());
+                out.push(self.done_line(id, *ok, heat, cmd.as_deref(), took));
             }
             EngineEvent::DuelRound { id, round } => {
-                println!(
-                    "    {}⚔ [{id}] duel round {round}{}",
-                    fg(tui::BRIGHT),
-                    reset()
-                );
+                out.push(format!("    {} {}", paint(BRIGHT, "⚔"), dim(&format!("{id} duel round {round}"))));
+            }
+            EngineEvent::DuelVerdict { id, winner, margin } => {
+                out.push(format!(
+                    "    {} {}",
+                    paint(PURE, "⚖"),
+                    dim(&format!("{id} cast {winner} wins by {margin}"))
+                ));
             }
             _ => {}
         }
-        tui::flush();
     }
 
-    fn ingot(&self, id: &str) -> Option<&Ingot> {
-        self.plan.iter().find(|i| i.id == id)
+    fn take_resolved(&mut self, id: &str, heat: u8) -> bool {
+        match self.resolved.iter().position(|(i, h)| i == id && *h == heat) {
+            Some(at) => {
+                self.resolved.remove(at);
+                true
+            }
+            None => false,
+        }
     }
 
-    /// `⚒⚒⚒ 3 anvils: i1 i2 i3`, once per parallel batch. The batch is
+    /// A heat's outcome, read from the forge's logs. A failure prints now;
+    /// a pass waits for the ingot's "forged" line, which carries it.
+    fn proof(&mut self, p: &Proof, out: &mut Vec<String>) {
+        if p.ok {
+            if let Some(a) = self.anvils.iter_mut().find(|a| a.id == p.id) {
+                a.proof = p.cmd.clone();
+            }
+            return;
+        }
+        let heat = self.anvils.iter().find(|a| a.id == p.id).map_or(p.heat, |a| a.heat);
+        self.resolved.push((p.id.clone(), heat));
+        // A reason with no words in it (a rule of dashes) is no reason.
+        let why = p.why.as_deref().filter(|w| w.chars().any(char::is_alphanumeric));
+        out.push(self.heat_line(&p.id, heat, p.cmd.as_deref(), why));
+    }
+
+    /// `    ✗ i2 heat 1/5  node --test — 2 tests failed`
+    fn heat_line(&self, id: &str, heat: u8, cmd: Option<&str>, why: Option<&str>) -> String {
+        let max = self.max_heat(id).unwrap_or(heat.max(1));
+        let head = format!("{id} heat {heat}/{max}");
+        let mut room = self.width.saturating_sub(8 + head.chars().count());
+        let mut line = format!("    {} {}", paint(WARM, "✗"), paint(WARM, &head));
+        if let Some(cmd) = cmd {
+            let c = tui::clip(cmd, room.min(48).max(8));
+            room = room.saturating_sub(c.chars().count() + 2);
+            line.push_str(&format!("  {}", dim(&c)));
+        }
+        if let Some(why) = why {
+            if room > 8 {
+                line.push_str(&format!(" {} {}", dim("—"), tui::clip(why, room.saturating_sub(3))));
+            }
+        }
+        line
+    }
+
+    /// `  ✓ i2 forged  heat 2/5 · node --test · 1:12`
+    fn done_line(&self, id: &str, ok: bool, heat: u8, cmd: Option<&str>, took: Option<Duration>) -> String {
+        let max = self.max_heat(id).unwrap_or(heat.max(1));
+        let (glyph, color, word) = if ok { ("✓", PURE, "forged") } else { ("✗", WARM, "cracked") };
+        let mut meta = vec![if ok { format!("heat {heat}/{max}") } else { format!("after {heat} heats") }];
+        if let Some(t) = took {
+            meta.push(tui::clock(t));
+        }
+        let head = format!("  {} {}", paint(color, glyph), paint(color, &format!("{id} {word}")));
+        let used = 5 + id.chars().count() + word.len();
+        let tail = meta.join(" · ");
+        let room = self.width.saturating_sub(used + tail.chars().count() + 6);
+        let cmd = match cmd {
+            Some(c) if ok && room > 10 => format!("  {}", dim(&tui::clip(c, room))),
+            _ => String::new(),
+        };
+        tui::spread(&format!("{head}{cmd}"), &dim(&tail), self.width)
+    }
+
+    /// `  ⚒ 3 anvils  i1 · i2 · i3`, once per parallel batch: the batch is
     /// what the plan shows molten when its first ingot starts.
-    fn anvils_line(&self, first: &str) {
-        let solo = self.ingot(first).is_some_and(|i| i.solo);
-        if !solo {
+    fn anvils_line(&self, first: &str, out: &mut Vec<String>) {
+        if !self.ingot(first).is_some_and(|i| i.solo) {
             return;
         }
         let mut ids: Vec<&str> = self
@@ -210,141 +418,230 @@ impl Echo {
             .filter(|i| i.solo && i.status == Status::Molten)
             .map(|i| i.id.as_str())
             .collect();
-        if ids.is_empty() {
-            ids.push(first);
+        if !ids.contains(&first) {
+            // A copy of the plan from before the batch was marked: rebuild
+            // it the way the scheduler picks one, solo ore up to the
+            // default anvil count.
+            ids = self
+                .plan
+                .iter()
+                .filter(|i| i.solo && matches!(i.status, Status::Ore | Status::Molten))
+                .map(|i| i.id.as_str())
+                .take(crate::config::MAX_ANVILS)
+                .collect();
         }
-        println!(
-            "\n  {}⚒{}⚒{}{}⚒{} {}{} anvils:{} {}{}{}{}",
-            fg(tui::HOT),
-            fg(tui::BRIGHT),
-            bold(),
-            fg(tui::PURE),
-            reset(),
-            fg(tui::COLD),
-            ids.len(),
-            reset(),
-            bold(),
-            fg(tui::PURE),
-            ids.join(" "),
-            reset(),
-        );
+        if ids.len() < 2 {
+            return;
+        }
+        out.push(format!(
+            "  {} {}  {}",
+            paint(HOT, "⚒"),
+            paint(HOT, &format!("{} anvils", ids.len())),
+            paint(PURE, &ids.join(" · "))
+        ));
     }
 
-    fn ingot_head(&self, id: &str) {
+    /// `  ▣ i2  pure counting core with no I/O …          g1 · cli`
+    /// `    proof  node --test test/count.test.js`
+    fn ingot_head(&self, id: &str, out: &mut Vec<String>) {
         let Some(ingot) = self.ingot(id) else {
-            println!("\n  {}▣{} {}{}[{id}]{}", fg(tui::HOT), reset(), bold(), fg(tui::PURE), reset());
+            out.push(format!("  {} {}", paint(HOT, "▣"), paint(PURE, id)));
             return;
         };
-        println!(
-            "\n  {}▣{} {}{}[{}]{} {}{}{}",
-            fg(tui::HOT),
-            reset(),
-            bold(),
-            fg(tui::PURE),
-            ingot.id,
-            reset(),
-            tui::truncate(&ingot.work, 42),
-            if ingot.is_complex() {
-                format!(" {}◉{}", fg(tui::BRIGHT), reset())
-            } else {
-                String::new()
-            },
-            if ingot.is_web() {
-                format!(" {}⚡{}", fg(tui::HOT), reset())
-            } else {
-                String::new()
-            },
+        let mut tags = vec![format!("g{}", ingot.grade)];
+        let skill = ingot.skill.to_string();
+        if skill != "default" {
+            tags.push(skill);
+        }
+        let tags = tags.join(" · ");
+        let room = self.width.saturating_sub(8 + id.chars().count() + tags.chars().count());
+        let left = format!(
+            "  {} {}  {}",
+            paint(HOT, "▣"),
+            paint(PURE, id),
+            tui::clip(&title(&ingot.work), room)
         );
-        println!(
-            "    {}gr:{} skill:{} proof:{}{}",
-            fg(tui::COLD),
-            ingot.grade,
-            ingot.skill,
-            tui::truncate(&ingot.proof, 30),
-            reset(),
-        );
+        out.push(tui::spread(&left, &dim(&tags), self.width));
+        if !ingot.proof.is_empty() {
+            let room = self.width.saturating_sub(12);
+            out.push(format!("    {}  {}", dim("proof"), dim(&tui::clip(&unescape(&ingot.proof), room))));
+        }
     }
 
-    /// Print a heat's line now that its outcome is known. Live, the line
-    /// sits in stdout's buffer until the proof runs, so it reaches the
-    /// screen whole, after the smith's cards: the same place it lands here.
-    fn resolve(&mut self, id: &str, ok: bool) {
-        let Some(at) = self.heats.iter().position(|h| h.id == id) else {
-            return;
-        };
-        let heat = self.heats.remove(at);
-        let (max, proof) = self
-            .ingot(id)
-            .map(|i| (i.max, i.proof.clone()))
-            .unwrap_or((5, String::new()));
-        let hc = match heat.heat {
-            1..=2 => tui::WARM,
-            3 => tui::HOT,
-            4 => tui::BRIGHT,
-            _ => tui::PURE,
-        };
-        let hb = if heat.heat > 4 { bold() } else { String::new() };
-        let cmd = if proof.is_empty() {
-            String::new()
-        } else {
-            format!("{}{}{} ", fg(tui::COLD), tui::truncate(&proof, 32), reset())
-        };
-        let verdict = if ok {
-            format!("{}{}█{}", bold(), fg(tui::PURE), reset())
-        } else {
-            format!("{}✗{}", fg(tui::WARM), reset())
-        };
-        println!("    {hb}{}⚒ {}/{max}{} {cmd}{verdict}", fg(hc), heat.heat, reset());
+    /// A failed ingot the founder rewrote or split instead of cracking.
+    fn resmelts(&mut self, next: &[Ingot], out: &mut Vec<String>) {
+        for old in &self.plan {
+            match next.iter().find(|n| n.id == old.id) {
+                Some(new) if new.smelt > old.smelt => {
+                    self.anvils.retain(|a| a.id != old.id);
+                    let room = self.width.saturating_sub(18 + old.id.len());
+                    out.push(format!(
+                        "  {} {}  {}",
+                        paint(HOT, "♻"),
+                        paint(HOT, &format!("{} re-smelted", old.id)),
+                        dim(&tui::clip(&title(&new.work), room))
+                    ));
+                }
+                None if old.status != Status::Forged => {
+                    let parts: Vec<&str> = next
+                        .iter()
+                        .filter(|n| n.id.starts_with(&old.id) && n.id != old.id)
+                        .map(|n| n.id.as_str())
+                        .collect();
+                    if !parts.is_empty() {
+                        self.anvils.retain(|a| a.id != old.id);
+                        out.push(format!(
+                            "  {} {}  {}",
+                            paint(HOT, "♻"),
+                            paint(HOT, &format!("{} split", old.id)),
+                            paint(PURE, &parts.join(" · "))
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
-    fn flush_pending(&mut self) {
+    fn flush_pending(&mut self, out: &mut Vec<String>) {
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::None => {}
-            Pending::Table => self.founder_table(),
-            Pending::Excerpt => self.excerpt(),
+            Pending::Table => {
+                let head = self.mold_head.take().unwrap_or_default();
+                out.push(self.labelled("◆", PURE, "mold", &head));
+                let rows: Vec<&Ingot> = self.plan.iter().collect();
+                self.table(&rows, out);
+            }
+            Pending::Added(known) => {
+                let head = self.mold_head.take().unwrap_or_default();
+                out.push(self.labelled("+", HOT, "mold", &head));
+                let rows: Vec<&Ingot> = self.plan.iter().filter(|i| !known.contains(&i.id)).collect();
+                self.table(&rows, out);
+            }
+            Pending::Excerpt => self.excerpt(out),
         }
     }
 
-    fn founder_table(&self) {
-        println!();
-        println!(
-            "  {}{:<5} {:<3} {:<4} {:<7} {}{}",
-            fg(tui::COLD),
-            "ID",
-            "GR",
-            "SOLO",
-            "SKILL",
-            "WORK",
-            reset()
-        );
-        for ingot in self.plan.iter().take(10) {
-            let solo_sym = if ingot.solo { "∥" } else { "→" };
-            println!(
-                "  {}{:<5}{} {:<3} {:<4} {:<7} {}",
-                fg(tui::HOT),
-                ingot.id,
-                reset(),
-                ingot.grade,
-                solo_sym,
-                ingot.skill.to_string(),
-                tui::truncate(&ingot.work, 38),
-            );
+    /// The mold, one ingot a row: `    i1  ∥ g1  package manifest …`.
+    /// ∥ forges beside others, → waits its turn.
+    fn table(&self, rows: &[&Ingot], out: &mut Vec<String>) {
+        let id_w = rows.iter().map(|i| i.id.chars().count()).max().unwrap_or(2);
+        let shown = rows.len().min(12);
+        for ingot in rows.iter().take(shown) {
+            let lane = if ingot.solo { paint(HOT, "∥") } else { dim("→") };
+            let room = self.width.saturating_sub(id_w + 14);
+            out.push(format!(
+                "    {}  {} {}  {}",
+                paint(PURE, &format!("{:<id_w$}", ingot.id)),
+                lane,
+                dim(&format!("g{}", ingot.grade)),
+                tui::clip(&title(&ingot.work), room)
+            ));
         }
-        if self.plan.len() > 10 {
-            println!("  {}+{} more{}", fg(tui::COLD), self.plan.len() - 10, reset());
+        if rows.len() > shown {
+            out.push(format!("    {}", dim(&format!("… {} more in {}", rows.len() - shown, crate::config::CRUCIBLE))));
         }
     }
 
-    fn excerpt(&self) {
-        let Some(doc) = &self.doc else { return };
-        println!();
-        let lines: Vec<&str> = doc.lines().collect();
-        for line in lines.iter().take(20) {
-            println!("  {}{line}{}", fg(tui::COLD), reset());
+    /// The blueprint's opening, enough to recognise it: its first lines of
+    /// prose, clipped, and how much more there is.
+    fn excerpt(&mut self, out: &mut Vec<String>) {
+        let path = self.blueprint_head.take().unwrap_or_else(|| crate::config::BLUEPRINT.to_string());
+        let Some(doc) = &self.blueprint else {
+            out.push(self.labelled("◆", PURE, "blueprint", &path));
+            return;
+        };
+        let total = doc.lines().count();
+        out.push(self.labelled("◆", PURE, "blueprint", &format!("{path} · {total} lines")));
+        let picked: Vec<&str> = doc
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("---") && !l.starts_with('|'))
+            .take(4)
+            .collect();
+        let room = self.width.saturating_sub(4);
+        for line in &picked {
+            out.push(format!("    {}", dim(&tui::clip(line, room))));
         }
-        if lines.len() > 20 {
-            println!("\n  {}... +{} lines{}", fg(tui::COLD), lines.len() - 20, reset());
+    }
+
+    /// The report card: the verdict first, then what it cost.
+    fn assay(&mut self, at: Instant, out: &mut Vec<String>) {
+        self.assay_done = true;
+        self.phase = Phase::Assay;
+        let counts = self.counts();
+        out.push(String::new());
+        out.push(tui::rule_line("ASSAY", &tui::clock(self.elapsed(at)), self.width));
+
+        let (glyph, color, word) = if counts.cracked > 0 {
+            ("✗", WARM, "CRACKED")
+        } else if self.goal_gap.is_some() {
+            ("✗", WARM, "GOAL NOT MET")
+        } else if counts.forged < counts.total {
+            ("!", BRIGHT, "PAUSED")
+        } else {
+            ("█", PURE, "FORGED")
+        };
+        let mut facts = vec![format!("{}/{} ingots", counts.forged, counts.total)];
+        if self.retries > 0 {
+            facts.push(format!("{} {}", self.retries, if self.retries == 1 { "retry" } else { "retries" }));
         }
+        facts.push(tui::clock(self.elapsed(at)));
+        if let Some(c) = self.cost {
+            facts.push(tui::money(c));
+        }
+        if self.goal_met {
+            facts.push("goal met".to_string());
+        }
+        out.push(format!(
+            "  {} {}   {}",
+            paint(color, glyph),
+            paint(color, &format!("{}{word}{}", bold_on(), bold_off())),
+            dim(&facts.join(" · "))
+        ));
+        out.push(tui::temper_text(&counts, self.width));
+
+        if let Some(gap) = &self.goal_gap {
+            out.extend(wrap_labelled("gap", gap, self.width, 3).into_iter().map(|l| paint(WARM, &l)));
+            out.push(format!("         {}", dim("the tasks passed; the commission did not. raise --temper to forge the gap.")));
+        }
+        let stats = self.stats.clone().unwrap_or_default();
+        if let Some(d) = &stats.durations {
+            out.push(self.fact("time", d));
+        }
+        if let Some(c) = &stats.churn {
+            out.push(self.fact("churn", c.trim_start_matches("churn: ")));
+        }
+        if let Some(t) = &stats.tool_errors {
+            out.push(format!("  {}  {}", paint(WARM, &format!("{:<6}", "errors")), tui::clip(t.trim_start_matches("tool errors: "), self.width.saturating_sub(10))));
+        }
+        let spend = stats.spend.clone().or_else(|| self.cost.map(tui::money));
+        if let Some(s) = spend {
+            out.push(self.fact("spend", &format!("{s} · {} tok", tui::tokens(self.tokens))));
+            for row in stats.ledger.iter().take(4) {
+                out.push(format!("          {}", dim(&tui::clip(&squeeze(row), self.width.saturating_sub(10)))));
+            }
+        }
+        if counts.cracked > 0 {
+            for ingot in self.plan.iter().filter(|i| i.status == Status::Cracked) {
+                let room = self.width.saturating_sub(12 + ingot.id.len());
+                out.push(format!(
+                    "  {}  {} {}",
+                    paint(WARM, &format!("{:<6}", "crack")),
+                    paint(WARM, &ingot.id),
+                    tui::clip(&title(&ingot.work), room)
+                ));
+            }
+        }
+        out.push(self.fact(
+            "files",
+            &format!("{} · {} · {}/", crate::config::BLUEPRINT, crate::config::CRUCIBLE, crate::config::LOG_DIR),
+        ));
+        out.push(String::new());
+    }
+
+    fn fact(&self, label: &str, text: &str) -> String {
+        format!("  {}  {}", dim(&format!("{label:<6}")), tui::clip(text, self.width.saturating_sub(10)))
     }
 
     fn counts(&self) -> crate::crucible::CrucibleCounts {
@@ -359,45 +656,278 @@ impl Echo {
         }
         c
     }
+}
 
-    fn assay_head(&self) {
-        let counts = self.counts();
-        print!(
-            "  {}{}{}{} ingots  {}{}{}{} forged",
-            bold(),
-            fg(tui::PURE),
-            counts.total,
-            reset(),
-            bold(),
-            fg(tui::PURE),
-            counts.forged,
-            reset(),
-        );
-        if counts.cracked > 0 {
-            print!("  {}{}{} cracked", fg(tui::WARM), counts.cracked, reset());
+/// The assay for the run that just ended in this directory, from PLAN.md
+/// and the run's own figures. The dashboard's alternate screen took the
+/// in-run assay with it, so the caller prints this after it closes.
+pub fn assay_report(width: usize) -> Vec<String> {
+    let Ok(plan) = std::fs::read_to_string(crate::config::CRUCIBLE) else {
+        return Vec::new();
+    };
+    let stats = Stats::capture();
+    let now = Instant::now();
+    let wall = crate::engine::stats::snapshot().wall.unwrap_or_default();
+    let mut echo = Echo::new(width);
+    let start = now.checked_sub(wall).unwrap_or(now);
+    echo.cue(&Cue::Plan(plan), start);
+    let total = crate::engine::stats::snapshot().ledger.total();
+    echo.tokens = total.total_tokens;
+    echo.cost = total.cost;
+    echo.cue(&Cue::Stats(stats), now);
+    echo.finish(now)
+}
+
+/// `warden round 2: no tests cover the CLI` → `no tests cover the CLI`.
+pub fn warden_word(msg: &str) -> Option<&str> {
+    let rest = msg.strip_prefix("warden round ")?;
+    rest.split_once(": ").map(|(_, w)| w)
+}
+
+/// What an ingot is, not how the founder labelled it: plans open every
+/// `:work` with `Goal:` or `TASK:`, which is boilerplate once it is on
+/// every row.
+pub fn title(work: &str) -> String {
+    let work = unescape(work);
+    let mut t = work.trim();
+    for label in ["GOAL:", "TASK:", "INGOT:", "WORK:"] {
+        if t.len() >= label.len() && t[..label.len()].eq_ignore_ascii_case(label) {
+            t = t[label.len()..].trim_start();
+            break;
         }
-        println!();
+    }
+    t.to_string()
+}
+
+/// A plan string as a person typed it: the crucible keeps `\"` and `\\`
+/// escaped, which reads as noise on screen.
+pub fn unescape(s: &str) -> String {
+    s.replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+/// The commission as one line: PRD.md's last non-empty line, which is
+/// where `fire_furnace` writes it.
+fn commission(prd: &str) -> Option<String> {
+    prd.lines().map(str::trim).rfind(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string)
+}
+
+/// Collapse runs of spaces a column-aligned ledger row carries.
+fn squeeze(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `  gap    text…` wrapped under its label, at most `max` lines.
+fn wrap_labelled(label: &str, text: &str, width: usize, max: usize) -> Vec<String> {
+    let room = width.saturating_sub(10).max(20);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > room {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.len() > max {
+        lines.truncate(max);
+        if let Some(last) = lines.last_mut() {
+            *last = tui::clip(&format!("{last} …"), room);
+        }
+    }
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { format!("  {label:<6}  {l}") } else { format!("          {l}") })
+        .collect()
+}
+
+fn bold_on() -> String {
+    if tui::colored() {
+        "\x1b[1m".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn bold_off() -> String {
+    if tui::colored() {
+        "\x1b[22m".to_string()
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PLAN: &str = r#"(ingot :id "i1" :status molten :solo t :grade 1 :skill default :heat 0 :max 5 :proof "test -f a" :work "Goal: write a")
+(ingot :id "i2" :status molten :solo t :grade 2 :skill cli :heat 0 :max 5 :proof "node --test" :work "Goal: write b")
+(ingot :id "i3" :status ore :solo nil :grade 1 :skill default :heat 0 :max 5 :proof "true" :work "Goal: docs")"#;
+
+    fn ev(e: EngineEvent) -> Cue {
+        Cue::Event(e)
     }
 
-    fn assay_tail(&mut self) {
-        self.in_assay = false;
-        let counts = self.counts();
-        if let Some(cost) = self.cost {
-            println!("\n  {}spend ${cost:.2}{}", fg(tui::COLD), reset());
-        }
-        if counts.cracked > 0 {
-            println!("\n  {}Cracked:{}", fg(tui::WARM), reset());
-            for ingot in self.plan.iter().filter(|i| i.status == Status::Cracked) {
-                println!("    {}✗{} [{}] {}", fg(tui::WARM), reset(), ingot.id, ingot.work);
+    fn plain(lines: &[String]) -> String {
+        lines.iter().map(|l| strip(l)).collect::<Vec<_>>().join("\n")
+    }
+
+    fn strip(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
             }
         }
-        println!("\n  {}blueprint: {}{}", fg(tui::COLD), crate::config::BLUEPRINT, reset());
-        println!("  {}crucible:  {}{}", fg(tui::COLD), crate::config::CRUCIBLE, reset());
-        println!("  {}slag heap: {}{}", fg(tui::COLD), crate::config::LOG_DIR, reset());
-        if counts.cracked > 0 {
-            println!("\n  {}{}✗ CRACKED{}\n", fg(tui::WARM), bold(), reset());
-        } else {
-            println!("\n  {}{}█ FORGED{}\n", bold(), fg(tui::PURE), reset());
+        out
+    }
+
+    fn feed(echo: &mut Echo, cues: &[Cue]) -> String {
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for (i, c) in cues.iter().enumerate() {
+            out.extend(echo.cue(c, t0 + Duration::from_secs(i as u64)));
         }
+        plain(&out)
+    }
+
+    #[test]
+    fn a_parallel_batch_announces_its_anvils_once() {
+        let mut echo = Echo::new(80);
+        let text = feed(
+            &mut echo,
+            &[
+                Cue::Mark(Mark::Header { text: "FORGE".into() }),
+                Cue::Plan(PLAN.into()),
+                ev(EngineEvent::IngotStart { id: "i1".into(), work: "a".into() }),
+                ev(EngineEvent::IngotStart { id: "i2".into(), work: "b".into() }),
+            ],
+        );
+        assert_eq!(text.matches("2 anvils").count(), 1, "{text}");
+        assert!(text.contains("i1 · i2"), "{text}");
+        assert!(text.contains("▣ i2  write b"), "{text}");
+        assert!(text.contains("g2 · cli"), "{text}");
+        assert!(!text.contains("Goal:"), "plan labels come off: {text}");
+    }
+
+    #[test]
+    fn a_failed_heat_prints_its_reason_once() {
+        let mut echo = Echo::new(100);
+        let text = feed(
+            &mut echo,
+            &[
+                Cue::Plan(PLAN.into()),
+                ev(EngineEvent::IngotStart { id: "i2".into(), work: "b".into() }),
+                ev(EngineEvent::HeatTick { id: "i2".into(), heat: 1 }),
+                Cue::Proof(Proof {
+                    id: "i2".into(),
+                    heat: 1,
+                    cmd: Some("node --test".into()),
+                    ok: false,
+                    why: Some("2 tests failed".into()),
+                }),
+                ev(EngineEvent::HeatTick { id: "i2".into(), heat: 2 }),
+                Cue::Proof(Proof { id: "i2".into(), heat: 2, cmd: Some("node --test".into()), ok: true, why: None }),
+                ev(EngineEvent::IngotDone { id: "i2".into(), ok: true }),
+            ],
+        );
+        assert_eq!(text.matches("heat 1/5").count(), 1, "{text}");
+        assert!(text.contains("✗ i2 heat 1/5  node --test — 2 tests failed"), "{text}");
+        assert!(text.contains("✓ i2 forged"), "{text}");
+        assert!(text.contains("heat 2/5"), "{text}");
+    }
+
+    #[test]
+    fn without_proof_cues_a_retry_still_shows() {
+        let mut echo = Echo::new(80);
+        let text = feed(
+            &mut echo,
+            &[
+                Cue::Plan(PLAN.into()),
+                ev(EngineEvent::IngotStart { id: "i1".into(), work: "a".into() }),
+                ev(EngineEvent::HeatTick { id: "i1".into(), heat: 1 }),
+                ev(EngineEvent::HeatTick { id: "i1".into(), heat: 2 }),
+                ev(EngineEvent::IngotDone { id: "i1".into(), ok: false }),
+            ],
+        );
+        assert!(text.contains("✗ i1 heat 1/5"), "{text}");
+        assert!(text.contains("✗ i1 heat 2/5"), "{text}");
+        assert!(text.contains("✗ i1 cracked"), "{text}");
+    }
+
+    #[test]
+    fn the_mold_follows_its_status_once_the_plan_lands() {
+        let mut echo = Echo::new(80);
+        let text = feed(
+            &mut echo,
+            &[
+                Cue::Mark(Mark::Header { text: "FOUNDER · casting mold".into() }),
+                Cue::Mark(Mark::Status {
+                    icon: "█".into(),
+                    tone: crate::render::tape::Tone::Pure,
+                    text: "Mold: 3 ingots (2 simple, 1 complex, 0 web)".into(),
+                }),
+                Cue::Plan(PLAN.into()),
+            ],
+        );
+        assert!(text.contains("mold  3 ingots"), "{text}");
+        assert!(text.contains("i3  → g1  docs"), "{text}");
+        assert!(text.contains("i1  ∥ g1  write a"), "{text}");
+    }
+
+    #[test]
+    fn every_line_fits_the_width() {
+        for width in [40usize, 79, 119] {
+            let mut echo = Echo::new(width);
+            let long = "x".repeat(400);
+            let plan = PLAN.replace("write b", &long);
+            let mut lines = Vec::new();
+            let t0 = Instant::now();
+            for c in [
+                Cue::Mark(Mark::Banner),
+                Cue::Mark(Mark::Header { text: format!("SURVEYOR · {long}") }),
+                Cue::Doc { name: "PRD.md".into(), text: long.clone() },
+                Cue::Plan(plan.clone()),
+                ev(EngineEvent::IngotStart { id: "i2".into(), work: long.clone() }),
+                ev(EngineEvent::HeatTick { id: "i2".into(), heat: 1 }),
+                Cue::Proof(Proof { id: "i2".into(), heat: 1, cmd: Some(long.clone()), ok: false, why: Some(long.clone()) }),
+                ev(EngineEvent::IngotDone { id: "i2".into(), ok: false }),
+            ] {
+                lines.extend(echo.cue(&c, t0));
+            }
+            lines.extend(echo.finish(t0));
+            for l in &lines {
+                let n = tui::visible_len(l);
+                assert!(n <= width, "{n} > {width}: {:?}", strip(l));
+            }
+        }
+    }
+
+    #[test]
+    fn the_assay_leads_with_the_verdict() {
+        let mut echo = Echo::new(80);
+        let done = PLAN.replace(":status molten", ":status forged").replace(":status ore", ":status cracked");
+        let t0 = Instant::now();
+        echo.cue(&Cue::Plan(done), t0);
+        echo.cue(&Cue::Stats(Stats { durations: Some("wall 4m12s · api 2m01s · tools 1m40s".into()), ..Default::default() }), t0);
+        let text = plain(&echo.finish(t0 + Duration::from_secs(252)));
+        let verdict = text.lines().position(|l| l.contains("CRACKED")).expect(&text);
+        let time = text.lines().position(|l| l.contains("wall 4m12s")).expect(&text);
+        assert!(verdict < time, "{text}");
+        assert!(text.contains("2/3 ingots"), "{text}");
+        assert!(text.contains("crack   i3"), "{text}");
     }
 }

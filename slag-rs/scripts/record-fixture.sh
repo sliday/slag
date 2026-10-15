@@ -43,7 +43,9 @@ export COLORTERM=truecolor
 # A private tmux server inherits this environment, key included, without
 # the key ever appearing on a command line.
 sock=slag-fixture-$$
-args=$(printf '%q ' "$bin" "$commission" "$@")
+# Flags go before the commission: it is a trailing var-arg, so anything
+# after it (`--temper 1` included) would be read as more commission text.
+args=$(printf '%q ' "$bin" "$@" "$commission")
 tmux -L "$sock" new-session -d -s rec -x 120 -y 36 -c "$work" \
   "$args; echo \$? > '$work/.exit'"
 tmux -L "$sock" pipe-pane -o -t rec "cat > '$work/.terminal.log'"

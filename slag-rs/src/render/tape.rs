@@ -110,6 +110,52 @@ pub enum Mark {
     TemperBar { tally: Tally },
 }
 
+/// How one heat ended: the command the smith offered as proof, whether
+/// it held, and the first line of why not. Read from the forge's own
+/// STRIKE/ASSAY logs the moment the heat resolves, since no event says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proof {
+    pub id: String,
+    pub heat: u8,
+    #[serde(default)]
+    pub cmd: Option<String>,
+    pub ok: bool,
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
+/// The run-wide figures the assay reports, captured when the run closes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stats {
+    #[serde(default)]
+    pub durations: Option<String>,
+    #[serde(default)]
+    pub churn: Option<String>,
+    #[serde(default)]
+    pub tool_errors: Option<String>,
+    #[serde(default)]
+    pub spend: Option<String>,
+    #[serde(default)]
+    pub ledger: Vec<String>,
+}
+
+impl Stats {
+    /// What `engine::stats` holds right now.
+    pub fn capture() -> Self {
+        use crate::engine::stats;
+        let run = stats::snapshot();
+        let total = run.ledger.total();
+        Self {
+            durations: stats::durations_line(&run),
+            churn: stats::churn_line(&run),
+            tool_errors: stats::tool_errors_line(&run),
+            spend: (total.total_tokens > 0 || total.cost.is_some())
+                .then(|| crate::engine::pricing::format_cost(&total)),
+            ledger: stats::ledger_lines(&run).unwrap_or_default(),
+        }
+    }
+}
+
 /// One thing that happened, without its time.
 #[derive(Debug, Clone)]
 pub enum Cue {
@@ -117,8 +163,13 @@ pub enum Cue {
     Mark(Mark),
     /// PLAN.md as it stood at this moment.
     Plan(String),
-    /// A document the pipeline showed an excerpt of (the blueprint).
+    /// A document the pipeline showed an excerpt of (the blueprint), or
+    /// the commission (PRD.md).
     Doc { name: String, text: String },
+    /// A heat's outcome, just before the event that ended it.
+    Proof(Proof),
+    /// The assay's figures, as the run closed.
+    Stats(Stats),
 }
 
 /// A cue and its offset from the start of the run.
@@ -248,6 +299,12 @@ fn decode_cue(v: &Value) -> Option<Cue> {
     {
         return Some(Cue::Doc { name: name.to_string(), text: text.to_string() });
     }
+    if let Some(p) = v.get("proof") {
+        return serde_json::from_value::<Proof>(p.clone()).ok().map(Cue::Proof);
+    }
+    if let Some(st) = v.get("stats") {
+        return serde_json::from_value::<Stats>(st.clone()).ok().map(Cue::Stats);
+    }
     None
 }
 
@@ -324,6 +381,8 @@ pub fn encode(t: u64, cue: &Cue) -> Option<String> {
         Cue::Mark(m) => serde_json::to_value(m).ok()?,
         Cue::Plan(p) => serde_json::json!({ "plan": p }),
         Cue::Doc { name, text } => serde_json::json!({ "doc": name, "text": text }),
+        Cue::Proof(p) => serde_json::json!({ "proof": p }),
+        Cue::Stats(st) => serde_json::json!({ "stats": st }),
     };
     let obj = v.as_object_mut()?;
     // `t` first reads better in a pager; serde_json keeps insertion order
@@ -563,6 +622,7 @@ impl Session {
     /// the file and the viewer to finish. Bounded, so a stuck write cannot
     /// hold the exit hostage.
     pub async fn close(self) {
+        let _ = self.tx.send((Instant::now(), Cue::Stats(Stats::capture())));
         {
             let mut bus = bus().lock().unwrap_or_else(|p| p.into_inner());
             *bus = None;
@@ -590,8 +650,8 @@ async fn run_session(
             cue = rx.recv() => {
                 let Some((at, cue)) = cue else { break };
                 let t = at.saturating_duration_since(base).as_millis() as u64;
-                let extra = snap.after(&cue);
-                for c in std::iter::once(cue).chain(extra) {
+                let (before, after) = snap.around(&cue);
+                for c in before.into_iter().chain(std::iter::once(cue)).chain(after) {
                     if let Some(f) = file.as_mut() {
                         if let Some(line) = encode(t, &c) {
                             let ok = f.write_all(line.as_bytes()).await.is_ok()
@@ -642,15 +702,66 @@ async fn open_tape(path: &Path) -> Option<tokio::fs::File> {
 }
 
 /// Copies of the project files a replay needs, taken when they can have
-/// changed and written only when they did.
+/// changed and written only when they did, plus each heat's outcome.
 #[derive(Default)]
 struct Snapshots {
     plan: Option<String>,
     blueprint: Option<String>,
     ore: Option<String>,
+    /// Heats still on the anvil: ingot, heat, and when it began.
+    heats: Vec<(String, u8, std::time::SystemTime)>,
 }
 
 impl Snapshots {
+    /// Cues to write before `cue` (a heat's outcome must land before the
+    /// event that ends the heat) and after it (files that may have moved).
+    fn around(&mut self, cue: &Cue) -> (Vec<Cue>, Vec<Cue>) {
+        let mut before = Vec::new();
+        // The forge marks a batch molten, saves, then starts each ingot: a
+        // copy taken first shows the batch the start belongs to.
+        if let Cue::Event(EngineEvent::IngotStart { .. }) = cue {
+            before.extend(self.plan_if_moved());
+        }
+        match cue {
+            Cue::Event(EngineEvent::HeatTick { id, heat }) => {
+                if let Some(p) = self.close_heat(id, false) {
+                    before.push(Cue::Proof(p));
+                }
+                self.heats.push((id.clone(), *heat, std::time::SystemTime::now()));
+            }
+            Cue::Event(EngineEvent::IngotDone { id, ok }) => {
+                if let Some(p) = self.close_heat(id, *ok) {
+                    before.push(Cue::Proof(p));
+                }
+            }
+            // A rewind follows a failed heat at once; the outcome is known.
+            Cue::Event(EngineEvent::Warning { message }) => {
+                if let Some(id) = rewound(message) {
+                    if let Some(p) = self.close_heat(id, false) {
+                        before.push(Cue::Proof(p));
+                    }
+                }
+            }
+            _ => {}
+        }
+        (before, self.after(cue))
+    }
+
+    fn plan_if_moved(&mut self) -> Option<Cue> {
+        let plan = std::fs::read_to_string(crate::config::CRUCIBLE).ok()?;
+        if self.plan.as_deref() == Some(plan.as_str()) {
+            return None;
+        }
+        self.plan = Some(plan.clone());
+        Some(Cue::Plan(plan))
+    }
+
+    fn close_heat(&mut self, id: &str, ok: bool) -> Option<Proof> {
+        let at = self.heats.iter().position(|(i, _, _)| i == id)?;
+        let (id, heat, since) = self.heats.remove(at);
+        Some(read_proof(std::path::Path::new(crate::config::LOG_DIR), &id, heat, ok, since))
+    }
+
     fn after(&mut self, cue: &Cue) -> Vec<Cue> {
         let mut out = Vec::new();
         let plan_may_move = match cue {
@@ -664,12 +775,7 @@ impl Snapshots {
             _ => false,
         };
         if plan_may_move {
-            if let Ok(plan) = std::fs::read_to_string(crate::config::CRUCIBLE) {
-                if self.plan.as_deref() != Some(plan.as_str()) {
-                    self.plan = Some(plan.clone());
-                    out.push(Cue::Plan(plan));
-                }
-            }
+            out.extend(self.plan_if_moved());
         }
         if matches!(cue, Cue::Mark(_)) {
             if let Ok(doc) = std::fs::read_to_string(crate::config::ORE_FILE) {
@@ -689,6 +795,93 @@ impl Snapshots {
         }
         out
     }
+}
+
+/// `[i2] rewound 3 file(s) to attempt start …` → `i2`.
+pub fn rewound(message: &str) -> Option<&str> {
+    let (id, rest) = message.strip_prefix('[')?.split_once("] ")?;
+    rest.starts_with("rewound ").then_some(id)
+}
+
+/// Read a heat's outcome from the forge's logs: the smith's reply
+/// (`*_STRIKE_<id>_<n>.log`, whose last `CMD:` line is the proof it
+/// offered) and the command's run (`*_ASSAY_<id>_<n>.log`, `exit=` first).
+/// Only files written since the heat began count, so an older run's logs
+/// for the same id never speak for this one. Whatever is missing stays
+/// `None`; the outcome itself always comes from the event.
+pub fn read_proof(
+    logs: &Path,
+    id: &str,
+    heat: u8,
+    ok: bool,
+    since: std::time::SystemTime,
+) -> Proof {
+    let strike = newest_log(logs, &format!("_STRIKE_{id}_"), since);
+    let assay = newest_log(logs, &format!("_ASSAY_{id}_"), since);
+    let cmd = strike.as_deref().and_then(crate::proof::extract_cmd);
+    let why = if ok {
+        None
+    } else if strike.is_none() {
+        Some("the smith stopped before offering a proof".to_string())
+    } else if cmd.is_none() {
+        Some("no CMD line in the reply".to_string())
+    } else {
+        match assay.as_deref().map(|a| a.split_once('\n').unwrap_or((a, ""))) {
+            Some((exit, out)) if exit.trim() != "exit=0" => {
+                Some(failure_gist(out).unwrap_or_else(|| "the proof exited non-zero".to_string()))
+            }
+            Some(_) => Some("the smith's check passed; the ingot's proof or bar did not".to_string()),
+            None => Some("the proof never ran".to_string()),
+        }
+    };
+    Proof { id: id.to_string(), heat, cmd, ok, why }
+}
+
+/// The line of a failing command's output that says why: an exception
+/// with its message first (`AssertionError: 3 != 4`), then a FAIL line,
+/// then anything mentioning an error, then the first line with words in it.
+/// Rules and separators (`-----`) are never the reason.
+pub fn failure_gist(out: &str) -> Option<String> {
+    let lines: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.chars().any(char::is_alphanumeric))
+        .collect();
+    let rank = |l: &str| -> u8 {
+        let low = l.to_lowercase();
+        if l.contains("Error:") || l.contains("Exception:") {
+            0
+        } else if l.starts_with("FAIL") || low.contains("failed") {
+            1
+        } else if ["error", "not found", "no such", "unexpected", "cannot", "expected"]
+            .iter()
+            .any(|k| low.contains(k))
+        {
+            2
+        } else {
+            3
+        }
+    };
+    let best = lines.iter().min_by_key(|l| rank(l))?;
+    Some(crate::engine::events::preview(best, 120))
+}
+
+fn newest_log(dir: &Path, needle: &str, since: std::time::SystemTime) -> Option<String> {
+    let mut best: Option<(String, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.contains(needle) || !name.ends_with(".log") {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| m + Duration::from_secs(1) >= since);
+        if fresh && best.as_ref().is_none_or(|(b, _)| name > *b) {
+            best = Some((name, entry.path()));
+        }
+    }
+    std::fs::read_to_string(best?.1).ok()
 }
 
 /// `logs/tape-<ts>.jsonl`, beside the run's other logs.
@@ -782,6 +975,32 @@ mod tests {
         assert_eq!(tape.cues.len(), 1);
         assert_eq!(tape.skipped, 2);
         assert_eq!(tape.meta.unwrap().version, "2.9.0");
+    }
+
+    #[test]
+    fn a_failure_gist_skips_rules_and_prefers_the_exception() {
+        let unittest = "F.\n======\nFAIL: test_top (tests.test_core.T)\n------\nTraceback (most recent call last):\n  File \"x\", line 3\nAssertionError: 3 != 4\n------\nRan 2 tests\nFAILED (failures=1)\n";
+        assert_eq!(failure_gist(unittest).as_deref(), Some("AssertionError: 3 != 4"));
+        assert_eq!(failure_gist("-----\n=====\n").as_deref(), None);
+        assert_eq!(failure_gist("grep: x: No such file or directory").as_deref(), Some("grep: x: No such file or directory"));
+    }
+
+    #[test]
+    fn a_heat_outcome_is_read_from_its_own_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = std::time::SystemTime::now() - Duration::from_secs(5);
+        std::fs::write(dir.path().join("20261015_100000_STRIKE_i2_1.log"), "did it\nCMD: node --test\n").unwrap();
+        std::fs::write(dir.path().join("20261015_100001_ASSAY_i2_1.log"), "exit=1\nnot ok 1 - adds\nError: expected 3\n").unwrap();
+        let p = read_proof(dir.path(), "i2", 1, false, since);
+        assert_eq!(p.cmd.as_deref(), Some("node --test"));
+        assert_eq!(p.why.as_deref(), Some("Error: expected 3"));
+        // Another ingot's logs never speak for this one.
+        let q = read_proof(dir.path(), "i3", 1, false, since);
+        assert_eq!(q.cmd, None);
+        assert!(q.why.unwrap().contains("smith stopped"));
+        // A pass carries its command and no reason.
+        let ok = read_proof(dir.path(), "i2", 1, true, since);
+        assert_eq!((ok.cmd.as_deref(), ok.why), (Some("node --test"), None));
     }
 
     #[test]

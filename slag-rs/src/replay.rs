@@ -17,9 +17,8 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::engine::events::{apply_ops, RenderState};
 use crate::error::SlagError;
-use crate::render::echo::Echo;
+use crate::render::stream::Stream;
 use crate::render::tape::{self, Cue, Tape};
 
 /// A recorded gap longer than this plays as this, before `--speed`. Model
@@ -102,12 +101,13 @@ fn hold_for(opts: &Opts, stopped: bool) -> Option<Duration> {
 }
 
 async fn play_stream(tape: &Tape, opts: &Opts, stop: Option<u64>) {
-    let tty = std::io::stderr().is_terminal() && opts.size.is_none();
-    let mut narrator = RenderState::new(tty).without_lifecycle();
+    let tty = std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+        && opts.size.is_none();
     if let Some((w, _)) = opts.size {
-        narrator = narrator.with_live_width(w as usize);
+        crate::tui::set_width(w as usize);
     }
-    let mut echo = Echo::new();
+    let mut view = Stream::new(tty, opts.size.map(|(w, _)| w as usize));
     let epoch = Instant::now();
     let instant = stop.is_some();
     let mut last_t = 0u64;
@@ -116,30 +116,43 @@ async fn play_stream(tape: &Tape, opts: &Opts, stop: Option<u64>) {
             break;
         }
         if !instant {
-            tokio::time::sleep(pace(timed.t - last_t, opts.speed)).await;
+            // Sleep in footer-sized steps, so its clocks move with the play.
+            let wait = pace(timed.t - last_t, opts.speed);
+            let resume = Instant::now() + wait;
+            loop {
+                let left = resume.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(left.min(crate::render::tape::TICK)).await;
+                let played = wait.saturating_sub(resume.saturating_duration_since(Instant::now()));
+                let virt = last_t + played.mul_f64(opts.speed.max(0.01)).as_millis() as u64;
+                view.tick_at(epoch + Duration::from_millis(virt.min(timed.t)));
+            }
         }
         last_t = timed.t;
-        let at = epoch + Duration::from_millis(timed.t);
-        echo.cue(&timed.cue, at);
-        if let Cue::Event(e) = &timed.cue {
-            apply_ops(&narrator.feed_at(e, at));
-        }
+        view.cue_at(&timed.cue, epoch + Duration::from_millis(timed.t));
     }
     let stopped_early = stop.is_some_and(|s| s < tape.duration());
-    if !stopped_early {
-        echo.finish();
-        apply_ops(&narrator.finish());
+    if stopped_early {
+        // Draw the footer as it stood at the stop, then hold the frame.
+        view.tick_at(epoch + Duration::from_millis(stop.unwrap_or(0)));
     } else {
-        crate::tui::flush();
+        view.finish_at(epoch + Duration::from_millis(tape.duration()));
     }
     if let Some(hold) = hold_for(opts, stopped_early) {
         tokio::time::sleep(hold).await;
     }
+    crate::render::stream::footer_off();
 }
 
 async fn play_dashboard(tape: &Tape, opts: &Opts, stop: Option<u64>) -> Result<(), SlagError> {
     let epoch = Instant::now();
-    let mut state = crate::dashboard::replay_state(tape.first_plan(), epoch);
+    let commission = tape.cues.iter().find_map(|c| match &c.cue {
+        Cue::Doc { name, text } if name == crate::config::ORE_FILE => Some(text.as_str()),
+        _ => None,
+    });
+    let mut state = crate::dashboard::replay_state(tape.first_plan(), commission, epoch);
     let end = stop.unwrap_or(tape.duration());
 
     // Off-screen: fold every cue up to the stop, draw once, print rows.
