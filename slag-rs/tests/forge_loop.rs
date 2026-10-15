@@ -235,3 +235,132 @@ async fn unchanged_pass_stops_panicked_anvils_without_provider_calls() {
     let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
     assert!(plan.contains(":heat 255"), "{plan}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn mock_smith_skips_heap_discovery_with_rg_and_find() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for fallback in [false, true] {
+        let root = project("(ingot :id \"i1\" :status ore :solo nil :max 1 :proof \"true\" :work \"Inspect project files\")\n");
+        let config = tempfile::tempdir().unwrap();
+        std::fs::rename(root.path().join(".git"), config.path().join("git-metadata")).unwrap();
+        std::fs::write(
+            root.path().join(".git"),
+            format!("gitdir: {}\n", config.path().join("git-metadata").display()),
+        )
+        .unwrap();
+        for file in [
+            "logs/heap.txt",
+            "src/logs/app.txt",
+            "nested/slag-anvil-i1/cast.txt",
+            "source.txt",
+        ] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "heap needle\n").unwrap();
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let n = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .count();
+                let calls = match n {
+                    0 => vec![
+                        ("glob", serde_json::json!({"pattern": "**/*"})),
+                        ("grep", serde_json::json!({"pattern": "."})),
+                    ],
+                    2 => vec![
+                        (
+                            "glob",
+                            serde_json::json!({"pattern": "*.txt", "path": "logs"}),
+                        ),
+                        (
+                            "grep",
+                            serde_json::json!({"pattern": "needle", "path": "logs"}),
+                        ),
+                        ("read_file", serde_json::json!({"path": "logs/heap.txt"})),
+                    ],
+                    _ => vec![],
+                };
+                let (message, finish) =
+                    if calls.is_empty() {
+                        (serde_json::json!({"content": "CMD: true"}), "stop")
+                    } else {
+                        let tools: Vec<_> = calls.into_iter().enumerate().map(|(i, (name, args))| {
+                        serde_json::json!({"id": format!("tool-{n}-{i}"), "type": "function",
+                            "function": {"name": name, "arguments": args.to_string()}})
+                    }).collect();
+                        (
+                            serde_json::json!({"content": null, "tool_calls": tools}),
+                            "tool_calls",
+                        )
+                    };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": message, "finish_reason": finish}]
+                }))
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut cmd = forge(root.path(), config.path(), &server.uri(), "off");
+        if fallback {
+            let bin = config.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let shell = bin.join("sh");
+            std::fs::write(&shell, "#!/bin/sh\nif [ \"$1\" = \"-lc\" ]; then\n  exec /bin/sh -c 'command() { return 1; }; eval \"$1\"' sh \"$2\"\nfi\nexec /bin/sh \"$@\"\n").unwrap();
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            cmd.env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(bin)
+                        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                )
+                .unwrap(),
+            );
+        }
+        cmd.assert().success();
+        let requests = server.received_requests().await.unwrap();
+        let last: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        let results: Vec<_> = last["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(results.len(), 5);
+        for output in &results[..2] {
+            assert!(
+                output.contains("source.txt"),
+                "fallback={fallback}: {output}"
+            );
+            assert!(
+                output.contains("src/logs/app.txt"),
+                "fallback={fallback}: {output}"
+            );
+            assert!(
+                !output.lines().any(|l| l.starts_with("logs/")),
+                "fallback={fallback}: {output}"
+            );
+            assert!(
+                !output.contains("slag-anvil-i1"),
+                "fallback={fallback}: {output}"
+            );
+            assert!(
+                !output.lines().any(|l| l == ".git"),
+                "fallback={fallback}: {output}"
+            );
+        }
+        assert!(results[2].contains("logs/heap.txt"), "{}", results[2]);
+        assert!(results[3].contains("logs/heap.txt"), "{}", results[3]);
+        assert!(results[4].contains("heap needle"), "{}", results[4]);
+    }
+}
