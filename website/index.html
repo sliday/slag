@@ -5,7 +5,7 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2692;</text></svg>" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>slag - fix issues fast, with any model</title>
-    <meta name="description" content="slag fixes issues in your repo and proves each fix with your own tests. It runs on any LLM provider with one flag, and forges whole projects from one sentence in proof-gated ingots. One binary." />
+    <meta name="description" content="slag fixes issues in your repo and proves each fix with your own tests. It runs on any OpenAI-compatible provider with one flag, and forges whole projects from one sentence in proof-gated ingots. One binary." />
     <link rel="preload" as="image" href="/media/slag-hero-poster.webp" type="image/webp" />
   </head>
   <body>
@@ -63,9 +63,9 @@
         <!-- Logo - div instead of pre (no gray bg) -->
         <div class="hero-logo"><span style="color: var(--slag-cold);">░░░</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-pure);">█</span>  <span style="color: var(--slag-pure); font-weight: bold;">SLAG</span>  <span style="color: var(--slag-pure);">█</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-cold);">░░░</span></div>
         <p style="color: var(--slag-pure); margin-top: 1lh; font-size: 1.1rem; font-weight: bold; text-align: center; position: relative; z-index: 1;">Fix issues fast, with any model.</p>
-        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Point slag at an issue. It reproduces the bug, fixes it, and proves the fix with your own tests. You review a branch, or a draft PR with <code>--pr</code>. One flag picks the provider. Hand it a sentence instead and it forges a whole project in proof-gated ingots.</p>
+        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Point slag at an issue. It writes a regression test, fixes the code, and proves the fix with your own tests. You review one commit on a branch, or a draft PR with <code>--pr</code>. One flag picks the provider. Hand it a sentence instead and it forges a whole project in proof-gated ingots.</p>
         <figure class="hero-video">
-          <video id="hero-video" autoplay muted loop playsinline preload="metadata" poster="/media/slag-hero-poster.webp" width="1600" height="900" aria-label="Demo, 24 seconds, no sound. slag fix 482 --pr reproduces the bug as a failing test, patches src/export.py, passes the full suite, and opens a draft PR. The same command runs on cerebras, groq, anthropic, openai, gemini, ollama and other providers with --provider, and roles can mix providers. Then slag &quot;build a todo api&quot; --temper 1 forges four ingots, each checked by its proof, one after a retry, and a warden judges the result.">
+          <video id="hero-video" autoplay muted loop playsinline preload="metadata" poster="/media/slag-hero-poster.webp" width="1600" height="900" aria-label="Demo, 29 seconds, no sound, recorded from real slag 2.9.0 runs. slag fix &quot;Leaderboard order is wrong&quot; runs the tests, writes a regression test, fixes src/leaderboard.js, shows the new test fails without the fix, and commits on a branch: FIXED in 1 attempt, wall 5 seconds. slag key --provider shows each preset&#39;s default models, and SLAG_MODEL_PLAN=openai::gpt-4.1-mini moves the plan role to OpenAI. slag &quot;a word-count CLI in Python&quot; casts 3 ingots, re-smelts one that cracked, and forges 3 of 3.">
             <source src="/media/slag-hero.webm" type='video/webm; codecs="vp9"' />
             <source src="/media/slag-hero.mp4" type="video/mp4" />
           </video>
@@ -100,12 +100,12 @@
             <code data-copy>curl -sSf https://slag.dev/install.sh | sh</code>
           </div>
           <div class="cmd-line">
-            <span class="cmd-comment"># fix issue 123 in the repo you are in, then open a draft PR</span>
-            <code data-copy>slag fix 123 --pr</code>
+            <span class="cmd-comment"># fix an issue in the repo you are in</span>
+            <code data-copy>slag fix "export drops the last day of the range"</code>
           </div>
           <div class="cmd-line">
-            <span class="cmd-comment"># describe the bug instead, on any provider</span>
-            <code data-copy>slag fix "dates are off by one in the export" --provider groq</code>
+            <span class="cmd-comment"># a GitHub issue, fetched with gh, on another provider, then a draft PR</span>
+            <code data-copy>slag fix 123 --provider cerebras --pr</code>
           </div>
           <div class="cmd-line">
             <span class="cmd-comment"># or forge a whole project from one sentence</span>
@@ -116,8 +116,8 @@
             <code data-copy>slag --tui "Build a REST API with auth and rate limiting"</code>
           </div>
         </div>
-        <p class="disclaimer">One key from one provider is the whole setup. Pick it with <code>--provider</code>, <code>SLAG_PROVIDER</code>, or <code>provider</code> in <code>~/.config/slag/config.toml</code>: cerebras, groq, openai, anthropic, gemini, xai, mistral, deepseek, together, fireworks, ollama, lmstudio, or openrouter, the default. slag reads the provider's usual key variable (<code>GROQ_API_KEY</code>, <code>OPENAI_API_KEY</code>, and so on), or the key <code>slag key</code> stores. Local models through ollama need no key. Each role (plan, work, judge) can run on a different provider.</p>
-        <p class="disclaimer"><code>slag fix</code> takes an issue number, a GitHub issue URL, or plain text. It reproduces the bug first, then fixes it and runs your test suite. It commits on a <code>slag/fix-…</code> branch and prints the command that proves the fix.</p>
+        <p class="disclaimer">slag needs one key from one provider. Choose the provider with <code>--provider NAME</code>, <code>SLAG_PROVIDER</code>, or <code>provider = "NAME"</code> in <code>~/.config/slag/config.toml</code>: openrouter (the default), openai, anthropic, gemini, groq, cerebras, xai, mistral, deepseek, together, fireworks, ollama, lmstudio, or custom. Each preset brings its base URL and a default model. slag reads the provider's key variable, such as <code>CEREBRAS_API_KEY</code>, or the key that <code>slag key --provider NAME</code> stores. ollama and lmstudio need no key.</p>
+        <p class="disclaimer"><code>slag fix</code> takes free text, an issue number, a GitHub issue URL, or <code>--issue-file</code>. It runs your tests before any edit, writes a regression test, fixes the code, and reruns the tests itself. Then it reverts the fix to show the new test fails without it. The fix lands as one commit on a <code>slag/fix-&lt;slug&gt;</code> branch (<code>slag/fix-&lt;n&gt;-&lt;slug&gt;</code> for a GitHub issue). <code>--pr</code> pushes it and opens a draft PR; <code>--no-commit</code> leaves it in the working tree.</p>
         <p class="disclaimer">slag runs shell commands and edits files in the directory you start it in. Point it at a fresh directory or a repo you can revert.</p>
         <p class="disclaimer">The published build is macOS on Apple Silicon. Elsewhere, clone the repo and run <code>cargo install --path slag-rs</code>.</p>
       </section>
@@ -130,7 +130,7 @@
         <div class="phase-grid">
           <div class="phase-card" box="square">
             <div><span is="badge" class="molten phase-num">&#x2694;</span><span class="phase-name">Twin-Cast Duels</span></div>
-            <p class="phase-desc">High-grade ingots get cast twice in separate git worktrees. A judge model assays both casts and merges the winner; a split verdict discards both and re-casts with the critique. Fires when cast B (<code>SLAG_MODEL_ALT</code>) differs from the worker model, or per ingot via <code>:duel t</code>.</p>
+            <p class="phase-desc">A solo ingot can forge as two or three casts in separate git worktrees, each steered by its own direction prompt, so even one model explores different solutions. A judge model assays the casts and merges the winner. <code>SLAG_DUEL=auto</code> (the default) picks 1 to 3 casts by grade and work; <code>on</code>, <code>off</code>, or <code>:duel t</code> per ingot override it.</p>
           </div>
           <div class="phase-card" box="square">
             <div><span is="badge" class="molten phase-num">&#x25A3;</span><span class="phase-name">Ratatui Dashboard + Steering</span></div>
@@ -153,8 +153,12 @@
             <p class="phase-desc">Every ingot carries a <code>:proof</code> shell command. Exit 0 forges the ingot and commits; anything else feeds the error back and retries. No commit lands without its proof passing.</p>
           </div>
           <div class="phase-card" box="square">
-            <div><span is="badge" class="molten phase-num">&#x21BB;</span><span class="phase-name">openrouter/auto by Default</span></div>
-            <p class="phase-desc">All four model roles (work, plan, duel, judge) route through <code>openrouter/auto</code> until you pin one. A fresh key forges with zero model configuration.</p>
+            <div><span is="badge" class="molten phase-num">&#x21BB;</span><span class="phase-name">Any Provider</span></div>
+            <p class="phase-desc"><code>--provider</code> picks one of 14 presets, from openrouter and openai to cerebras, groq, and a local ollama. Each brings its base URL and a default model, so a fresh key forges with no model to choose. Write <code>provider::model</code> to run one role elsewhere: <code>--provider cerebras --plan-model openai::gpt-4.1-mini</code>.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="forged phase-num">&#x2692;</span><span class="phase-name">Issue Fixes</span></div>
+            <p class="phase-desc"><code>slag fix</code> skips the survey and the plan. One agent session adds a regression test and fixes the bug. slag reruns your tests itself and reverts the fix once to prove the new test catches the bug. The verdict comes from exit codes, not from the model's summary.</p>
           </div>
         </div>
       </section>
@@ -198,9 +202,9 @@
     |
     |  grade >= 3   --> plan model
     |  default      --> work model
-    |  both         --> openrouter/auto
+    |  unset        --> the provider's default
     v
- <span style="color:var(--slag-hot);">STRIKE</span> (agent session over OpenRouter)
+ <span style="color:var(--slag-hot);">STRIKE</span> (agent session over your provider)
     |
     v
  <span style="color:var(--slag-cold);">TOOLS</span> (read, write, edit, grep, bash)
@@ -243,7 +247,7 @@
               <span is="badge" class="forged phase-num">3</span>
               <span class="phase-name">FORGE</span>
             </div>
-            <p class="phase-desc">Strikes each ingot with an agent session over OpenRouter. Solo ingots run on parallel anvils (up to 3). Grade picks the model. Retries with slag feedback on failure. Commits on success.</p>
+            <p class="phase-desc">Strikes each ingot with an agent session over your provider. Solo ingots run on parallel anvils (up to 3). Grade picks the model. Retries with slag feedback on failure. Commits on success.</p>
           </div>
           <div class="phase-card" box="square">
             <div>
@@ -262,8 +266,8 @@
         <h2>Design Decisions</h2>
 
         <details box="square">
-          <summary>Why One Key?</summary>
-          <p>slag speaks to OpenRouter and nothing else. That is one credential to paste, one bill to read, and every model on the router reachable by id. The four roles (work, plan, duel, judge) all default to openrouter/auto, so a fresh key forges without you choosing a model. Override any role when you have an opinion: a flag, an environment variable, or a line in <code>~/.config/slag/config.toml</code>. The file wants the lowercase key; the uppercase name is the environment variable and is ignored inside the file.</p>
+          <summary>Why Any Provider?</summary>
+          <p>slag speaks the OpenAI-compatible chat-completions API, so any provider that serves it works, local ones included. A preset brings the base URL and a default model for every role, so a fresh key forges without you choosing a model. OpenRouter stays the default. Override any role when you have an opinion: a flag, an environment variable, or a line in <code>~/.config/slag/config.toml</code>. Write <code>provider::model</code> to send one role to another provider; the <code>::</code> keeps OpenRouter ids such as <code>openai/gpt-5</code> working. The file wants the lowercase key; the uppercase name is the environment variable and is ignored inside the file.</p>
           <table class="field-table">
             <thead>
               <tr>
@@ -300,7 +304,7 @@
               </tr>
             </tbody>
           </table>
-          <p>The key itself, the duel knobs, and the spend caps follow the same rule: <code>openrouter_api_key</code>, <code>duel</code>, <code>duel_rounds</code>, <code>screenshot_cmd</code>, <code>max_cost_per_ingot</code>, <code>max_cost_per_run</code> in the file; <code>OPENROUTER_API_KEY</code>, <code>SLAG_DUEL</code>, <code>SLAG_DUEL_ROUNDS</code>, <code>SLAG_SCREENSHOT_CMD</code>, <code>SLAG_MAX_COST_INGOT</code>, <code>SLAG_MAX_COST_RUN</code> in the environment.</p>
+          <p>The provider, its key, the duel knobs, and the spend caps follow the same rule: <code>provider</code>, <code>&lt;provider&gt;_api_key</code> (such as <code>openai_api_key</code>), <code>duel</code>, <code>duel_rounds</code>, <code>screenshot_cmd</code>, <code>max_cost_per_ingot</code>, <code>max_cost_per_run</code> in the file; <code>SLAG_PROVIDER</code>, the provider's key variable (such as <code>OPENAI_API_KEY</code>), <code>SLAG_DUEL</code>, <code>SLAG_DUEL_ROUNDS</code>, <code>SLAG_SCREENSHOT_CMD</code>, <code>SLAG_MAX_COST_INGOT</code>, <code>SLAG_MAX_COST_RUN</code> in the environment.</p>
         </details>
 
         <details box="square">
@@ -424,10 +428,11 @@
             </tr>
           </thead>
           <tbody>
-            <tr><td><code>slag fix &lt;issue&gt;</code></td><td>Reproduce, fix, and prove an issue in this repo. Takes a number, a GitHub issue URL, or text. <code>--pr</code> opens a draft PR</td></tr>
+            <tr><td><code>slag fix ISSUE</code></td><td>Fix one issue in this repository and commit it on a new branch. Takes free text, an issue number, or a GitHub issue URL. <code>--pr</code> opens a draft PR</td></tr>
             <tr><td><code>slag "commission"</code></td><td>Write PRD.md from the commission and run the full pipeline</td></tr>
             <tr><td><code>slag</code></td><td>Forge the PRD.md already in this directory</td></tr>
-            <tr><td><code>slag key [KEY]</code></td><td>Show the active provider and its key, or store a key</td></tr>
+            <tr><td><code>slag key [KEY] [--provider NAME]</code></td><td>Show provider setup or store its key</td></tr>
+            <tr><td><code>slag cost</code></td><td>Show session spend, and the provider balance when available</td></tr>
             <tr><td><code>slag status</code></td><td>Show crucible state</td></tr>
             <tr><td><code>slag resume</code></td><td>Resume an existing forge</td></tr>
             <tr><td><code>slag update</code></td><td>Self-update to the latest release</td></tr>
@@ -441,13 +446,13 @@
             </tr>
           </thead>
           <tbody>
-            <tr><td><code>--provider NAME</code></td><td>LLM provider: openrouter (default), cerebras, groq, openai, anthropic, gemini, ollama, and more</td></tr>
+            <tr><td><code>--provider NAME</code></td><td>Chat-completions provider (overrides <code>SLAG_PROVIDER</code>)</td></tr>
             <tr><td><code>--tui</code></td><td>Full-screen dashboard: crucible, live feed, steering input</td></tr>
             <tr><td><code>--anvils N</code></td><td>Max parallel anvil workers (default 3)</td></tr>
-            <tr><td><code>--auto</code></td><td>Force <code>openrouter/auto</code> on all four roles, ignoring pinned models</td></tr>
-            <tr><td><code>--model MODEL</code></td><td>Worker model, any OpenRouter id</td></tr>
-            <tr><td><code>--plan-model MODEL</code></td><td>Planner model for grade &ge; 3 ingots</td></tr>
-            <tr><td><code>--judge-model MODEL</code></td><td>Duel judge model</td></tr>
+            <tr><td><code>--auto</code></td><td>Reset all roles to the selected provider's default model, ignoring environment and config model settings</td></tr>
+            <tr><td><code>--model MODEL</code></td><td>Worker model ID or <code>provider::model</code></td></tr>
+            <tr><td><code>--plan-model MODEL</code></td><td>Planner model ID or <code>provider::model</code>, also for grade &ge; 3 ingots</td></tr>
+            <tr><td><code>--judge-model MODEL</code></td><td>Duel judge model ID or <code>provider::model</code></td></tr>
             <tr><td><code>--worktree</code></td><td>Branch-per-ingot isolation. Not implemented yet: warns and runs in the shared checkout</td></tr>
           </tbody>
         </table>
@@ -459,7 +464,9 @@
             </tr>
           </thead>
           <tbody>
-            <tr><td><code>OPENROUTER_API_KEY</code></td><td>The key. Overrides the stored one</td></tr>
+            <tr><td><code>OPENROUTER_API_KEY</code>, <code>OPENAI_API_KEY</code>, <code>CEREBRAS_API_KEY</code>, …</td><td>The provider's key. Overrides that provider's stored key</td></tr>
+            <tr><td><code>SLAG_PROVIDER</code></td><td>Default provider; <code>--provider</code> takes precedence</td></tr>
+            <tr><td><code>SLAG_BASE_URL</code></td><td>Override the selected provider's API root</td></tr>
             <tr><td><code>SLAG_MODEL_BASE</code> / <code>_PLAN</code> / <code>_ALT</code> / <code>_JUDGE</code></td><td>Per-role model ids</td></tr>
             <tr><td><code>SLAG_DUEL</code></td><td><code>auto</code> (default) / <code>on</code> / <code>off</code></td></tr>
             <tr><td><code>SLAG_DUEL_ROUNDS</code></td><td>Override the duel round cap</td></tr>
@@ -469,7 +476,7 @@
             <tr><td><code>SLAG_SCREENSHOT_CMD</code></td><td>Shell command producing a screenshot for visual assay of web ingots</td></tr>
             <tr><td><code>SLAG_CHAR_BUDGET</code></td><td>Transcript char budget before an agent session compacts</td></tr>
             <tr><td><code>SLAG_CONFIG_DIR</code></td><td>Move the config directory off <code>~/.config/slag</code></td></tr>
-            <tr><td><code>SLAG_OPENROUTER_BASE</code></td><td>Point slag at a proxy instead of OpenRouter</td></tr>
+            <tr><td><code>SLAG_OPENROUTER_BASE</code></td><td>Legacy OpenRouter-only base URL override</td></tr>
             <tr><td><code>NO_COLOR</code> / <code>COLORTERM</code></td><td>Drop color entirely / enable truecolor</td></tr>
           </tbody>
         </table>

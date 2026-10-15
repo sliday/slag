@@ -416,14 +416,18 @@ a:hover {
 .hero-logo { font-size: 2.5rem; text-align: center; line-height: 1.2; position: relative; z-index: 1; }
 
 @media (max-width: 639px) {
-  /* Give the video the phone's width: its smallest text is sized for it.
-     The logo shrinks to stay on one line. */
+  /* The video runs edge to edge: its smallest text is sized for the full
+     phone width. The logo shrinks to stay on one line. */
   .forge-header {
     padding: 2ch 1.5ch;
   }
 
   .hero-video {
-    margin-inline: -0.5ch;
+    margin-inline: calc(50% - 50vw);
+  }
+
+  .hero-video video {
+    border-radius: 0;
   }
 
   .hero-logo {
