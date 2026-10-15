@@ -177,6 +177,11 @@ pub async fn run(
 
         let verdict = match warden::judge_artifact(config, &hooks, round).await {
             Ok(v) => v,
+            // A provider that refuses the key or the account stops the run;
+            // `main` reports it once, so no warning restates it here.
+            Err(e) if e.is_deterministic_provider() || crate::error::provider_run_failure().is_some() => {
+                return Err(e);
+            }
             // A warden that cannot run must not fail the forge: the work is
             // built either way, and an unjudged run is worth more than a
             // lost one. Say so and stop tempering.
@@ -254,7 +259,11 @@ pub async fn run(
     // Asked to check the goal and unable to: say so. Reporting FORGED for
     // a run whose every check silently failed is worse than never checking,
     // because it converts an unknown into a claim.
-    if temper_rounds > 0 && !goal_judged && forged.is_ok() {
+    if temper_rounds > 0
+        && !goal_judged
+        && forged.is_ok()
+        && crate::error::provider_run_failure().is_none()
+    {
         crate::engine::emit(
             &hooks.events,
             crate::engine::EngineEvent::Warning {
@@ -299,6 +308,11 @@ async fn checkpoint(
     }
     let verdict = match warden::judge_plan_doc(config, hooks, kind, path).await {
         Ok(v) => v,
+        // A provider refusal is the run's error, reported once by `main`;
+        // the next smith short-circuits on it.
+        Err(e) if e.is_deterministic_provider() || crate::error::provider_run_failure().is_some() => {
+            return None;
+        }
         // Never silent. A checkpoint that cannot run used to disappear,
         // and a run with every check disabled still printed FORGED --
         // which is the laundering this whole mechanism exists to stop.

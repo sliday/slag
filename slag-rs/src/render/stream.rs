@@ -78,6 +78,13 @@ impl Stream {
         }
     }
 
+    /// Print a run-stopping provider error itself (a replay; live runs
+    /// leave that line to `main`).
+    pub fn owning_fatal(mut self, on: bool) -> Self {
+        self.echo = std::mem::replace(&mut self.echo, Echo::new(self.width)).owning_fatal(on);
+        self
+    }
+
     /// Draw the footer only on ticks, not on every cue.
     pub fn defer_footer(mut self, on: bool) -> Self {
         self.defer_footer = on;

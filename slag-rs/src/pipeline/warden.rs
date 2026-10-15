@@ -171,7 +171,11 @@ pub async fn judge_artifact(
     let raw = smith
         .invoke(&crate::flux::warden_prompt(&ore, &bar))
         .await
-        .map_err(|e| SlagError::SurveyFailed(e.to_string()))?;
+        .map_err(|e| {
+            // The warden is not the surveyor: a provider refusal keeps its
+            // own message (provider, role, model, remedy) unwrapped.
+            if e.is_deterministic_provider() { e } else { SlagError::SurveyFailed(e.to_string()) }
+        })?;
     let verdict = parse_verdict(&raw);
     record(round, &verdict);
     Ok(verdict)
