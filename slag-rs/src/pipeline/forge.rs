@@ -22,6 +22,23 @@ use super::{duel, resmelt};
 /// one surfaces and burns the heat like a real failure.
 pub(crate) const MAX_TRANSIENT_PER_HEAT: u8 = 5;
 
+struct FatalCast(Box<dyn Smith>);
+
+impl Smith for FatalCast {
+    fn invoke(&self, prompt: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, SlagError>> + Send + '_>> {
+        let prompt = prompt.to_string();
+        Box::pin(async move {
+            let result = self.0.invoke(&prompt).await;
+            if crate::error::provider_run_failure().is_some()
+                || result.as_ref().err().is_some_and(SlagError::is_deterministic_provider)
+            {
+                return Err(SlagError::Cancelled);
+            }
+            result
+        })
+    }
+}
+
 /// Phase 3: Forge loop — parallel anvils then sequential. The wrapper
 /// anchors run-wide accounting (item 87) and brackets the run log (item
 /// 81): typed metadata first, the assay verdict last.
@@ -30,6 +47,9 @@ pub async fn run(
     max_anvils: usize,
     hooks: &EngineHooks,
 ) -> Result<(), SlagError> {
+    if crate::error::provider_run_failure().is_some() {
+        return Err(SlagError::Cancelled);
+    }
     stats::mark_run_start();
     let run_log = open_run_log(config);
     // Item 59: an instruction file past the cap rides every single flux.
@@ -46,6 +66,9 @@ pub async fn run(
             cracked: counts.cracked,
             ok: result.is_ok(),
         });
+    }
+    if crate::error::provider_run_failure().is_some() {
+        return Err(SlagError::Cancelled);
     }
     result
 }
@@ -227,6 +250,7 @@ async fn run_inner(
 
             // Spawn parallel tasks
             let mut set = tokio::task::JoinSet::new();
+            let batch = ingot_snapshots.clone();
             for ingot in ingot_snapshots {
                 let smith = crate::smith::make_smith(config, ingot.skill.as_str(), ingot.grade, hooks);
                 let task_hooks = hooks.clone();
@@ -251,6 +275,12 @@ async fn run_inner(
             let mut cancelled = false;
             let mut budget_stop: Option<(f64, f64)> = None;
             while let Some(result) = set.join_next().await {
+                if let Some(error) = crate::error::provider_run_failure() {
+                    set.abort_all();
+                    while set.join_next().await.is_some() {}
+                    restore_unfinished_batch(&batch).await?;
+                    return Err(error);
+                }
                 match result {
                     Ok((id, Ok(()))) => {
                         let _guard = CRUCIBLE_LOCK.lock().await;
@@ -281,6 +311,12 @@ async fn run_inner(
                         crucible.save()?;
                         budget_stop = Some((spent, cap));
                     }
+                    Ok((_, Err(e))) if e.is_deterministic_provider() => {
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
+                        restore_unfinished_batch(&batch).await?;
+                        return Err(e);
+                    }
                     Ok((id, Err(_))) => {
                         // Try resmelt. Holding the lock across the smith call
                         // stalls other anvils' heat ticks, but keeps the
@@ -289,7 +325,17 @@ async fn run_inner(
                         let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
                         if let Some(ingot) = crucible.get(&id).cloned() {
                             let smith = crate::smith::make_base_smith(config, hooks);
-                            if resmelt::resmelt_ingot(&mut crucible, &ingot, smith.as_ref()).await.is_ok() {
+                            let result = resmelt::resmelt_ingot(&mut crucible, &ingot, smith.as_ref()).await;
+                            if let Err(e) = result.as_ref() {
+                                if e.is_deterministic_provider() {
+                                    drop(_guard);
+                                    set.abort_all();
+                                    while set.join_next().await.is_some() {}
+                                    restore_unfinished_batch(&batch).await?;
+                                    return result;
+                                }
+                            }
+                            if result.is_ok() {
                                 crucible.save()?;
                             } else {
                                 crucible.set_status(&id, Status::Cracked);
@@ -370,6 +416,10 @@ async fn run_inner(
             drop(_guard);
             return finish_run_over_budget(spent, cap, hooks, run_log).await;
         }
+        if struck.as_ref().is_err_and(|e| e.is_deterministic_provider()) {
+            set_back_to_ore(&ingot.id).await?;
+            return struck;
+        }
         if struck.is_ok() {
             let _guard = CRUCIBLE_LOCK.lock().await;
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
@@ -383,7 +433,15 @@ async fn run_inner(
             let _guard = CRUCIBLE_LOCK.lock().await;
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
             let base_smith = crate::smith::make_base_smith(config, hooks);
-            if resmelt::resmelt_ingot(&mut crucible, &ingot, base_smith.as_ref()).await.is_ok() {
+            let result = resmelt::resmelt_ingot(&mut crucible, &ingot, base_smith.as_ref()).await;
+            if let Err(e) = result.as_ref() {
+                if e.is_deterministic_provider() {
+                    crucible.set_status(&ingot.id, Status::Ore);
+                    crucible.save()?;
+                    return result;
+                }
+            }
+            if result.is_ok() {
                 // Re-smelted: status already updated by resmelt
                 crucible.save()?;
             } else {
@@ -403,6 +461,39 @@ async fn run_inner(
             println!();
         }
     }
+}
+
+async fn restore_unfinished_batch(batch: &[Ingot]) -> Result<(), SlagError> {
+    let _guard = CRUCIBLE_LOCK.lock().await;
+    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    for baseline in batch {
+        if let Some(ingot) = crucible.get_mut(&baseline.id) {
+            if ingot.status != Status::Forged {
+                ingot.status = Status::Ore;
+                ingot.heat = baseline.heat;
+            }
+        }
+    }
+    crucible.save()?;
+    Ok(())
+}
+
+async fn unburn_heat(id: &str) -> Result<(), SlagError> {
+    let _guard = CRUCIBLE_LOCK.lock().await;
+    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    if let Some(ingot) = crucible.get_mut(id) {
+        ingot.heat = ingot.heat.saturating_sub(1);
+    }
+    crucible.save()?;
+    Ok(())
+}
+
+async fn set_back_to_ore(id: &str) -> Result<(), SlagError> {
+    let _guard = CRUCIBLE_LOCK.lock().await;
+    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    crucible.set_status(id, Status::Ore);
+    crucible.save()?;
+    Ok(())
 }
 
 /// Forge one solo ingot: multi-cast duel when the cast count says so,
@@ -432,7 +523,7 @@ async fn forge_ingot(
                 'b' => cfg.model_alt.clone(),
                 _ => cfg.model_plan.clone(),
             };
-            Box::new(
+            Box::new(FatalCast(Box::new(
                 crate::smith::native::NativeSmith::cast(
                     cfg.clone(),
                     ingot.skill.as_str(),
@@ -442,7 +533,7 @@ async fn forge_ingot(
                     hooks,
                 )
                 .with_ingot_spend(cast_spend.clone()),
-            )
+            )))
         };
         // The judge's own LLM calls count against the same caps as the
         // casts: the wrapper folds their cost into `cast_spend` and the
@@ -472,6 +563,10 @@ async fn forge_ingot(
         .await
         {
             Ok(duel::DuelOutcome::Merged { winner, rounds }) => {
+                if let Some(e) = crate::error::provider_run_failure() {
+                    unburn_heat(&ingot.id).await?;
+                    return Err(e);
+                }
                 if !tui::is_quiet() {
                     println!(
                         "    {}{}⚔█{} cast {winner} merged after {rounds} round(s)",
@@ -483,13 +578,29 @@ async fn forge_ingot(
                 return Ok(());
             }
             Ok(duel::DuelOutcome::FellThrough) => {
+                if let Some(e) = crate::error::provider_run_failure() {
+                    unburn_heat(&ingot.id).await?;
+                    return Err(e);
+                }
                 // Both casts failed a round: duel is off for this ingot,
                 // fall through to the single-smith strike below.
             }
             Err(e @ (SlagError::Cancelled | SlagError::RunBudgetExhausted { .. })) => {
+                if let Some(fatal) = crate::error::provider_run_failure() {
+                    unburn_heat(&ingot.id).await?;
+                    return Err(fatal);
+                }
                 return Err(e)
             }
+            Err(e) if e.is_deterministic_provider() => {
+                unburn_heat(&ingot.id).await?;
+                return Err(e);
+            }
             Err(e) => {
+                if let Some(fatal) = crate::error::provider_run_failure() {
+                    unburn_heat(&ingot.id).await?;
+                    return Err(fatal);
+                }
                 if !tui::is_quiet() {
                     println!(
                         "    {}⚔✗{} duel failed ({e}) — single-smith fallback",
@@ -669,6 +780,11 @@ async fn resume_crashed_ingot(
         }
     };
 
+    if let Some(e) = crate::error::provider_run_failure() {
+        checkpoint::rewind_attempt(Path::new("."), &ingot.id, ingot.heat);
+        set_back_to_ore(&ingot.id).await?;
+        return Err(e);
+    }
     match outcome {
         Ok(response) => match verify_and_seal(ingot, &response).await {
             Ok(()) => {
@@ -703,6 +819,10 @@ async fn resume_crashed_ingot(
             crucible.set_status(&ingot.id, Status::Ore);
             crucible.save()?;
             Ok(())
+        }
+        Err(e) if e.is_deterministic_provider() => {
+            set_back_to_ore(&ingot.id).await?;
+            Err(e)
         }
         Err(e) => back_to_ore_after_resume(ingot, hooks, &e.to_string()).await,
     }
@@ -810,6 +930,9 @@ async fn verify_and_seal(ingot: &Ingot, response: &str) -> Result<(), String> {
         if !proof_ok {
             return Err(format!("Proof failed [{}]: {proof_output}", ingot.proof));
         }
+    }
+    if let Some(e) = crate::error::provider_run_failure() {
+        return Err(e.to_string());
     }
     proof::git_commit(&ingot.id, &ingot.work).await;
     Ok(())
@@ -964,6 +1087,11 @@ async fn strike_ingot(
                 ) {
                     return Err(e);
                 }
+                if e.is_deterministic_provider() {
+                    ckpt.rewind();
+                    unburn_heat(&ingot.id).await?;
+                    return Err(e);
+                }
                 slag = Some(format!("Smith error: {e}"));
                 if !quiet {
                     println!("{}✗{}", super::fg(tui::WARM), super::reset());
@@ -973,6 +1101,11 @@ async fn strike_ingot(
             }
         };
 
+        if let Some(e) = crate::error::provider_run_failure() {
+            ckpt.rewind();
+            unburn_heat(&ingot.id).await?;
+            return Err(e);
+        }
         log_to_file(&format!("STRIKE_{}_{heat}", ingot.id), &response);
 
         // Extract CMD
@@ -1023,6 +1156,11 @@ async fn strike_ingot(
             if crate::pipeline::warden::armed() && !ingot.bar.is_empty() {
                 let verdict =
                     crate::pipeline::warden::judge_ingot(config, hooks, ingot).await;
+                if let Some(e) = crate::error::provider_run_failure() {
+                    ckpt.rewind();
+                    unburn_heat(&ingot.id).await?;
+                    return Err(e);
+                }
                 if !verdict.fulfilled {
                     slag = Some(format!("Bar not met [{}]: {}", ingot.id, verdict.gap));
                     if !quiet {
@@ -1033,6 +1171,11 @@ async fn strike_ingot(
                 }
             }
 
+            if let Some(e) = crate::error::provider_run_failure() {
+                ckpt.rewind();
+                unburn_heat(&ingot.id).await?;
+                return Err(e);
+            }
             if !quiet {
                 println!("{}{}█{}", super::bold(), super::fg(tui::PURE), super::reset());
             }
@@ -1226,6 +1369,19 @@ mod tests {
 
     fn transient() -> Result<String, SlagError> {
         Err(SlagError::ProviderTransient("503: overloaded".into()))
+    }
+
+    #[tokio::test]
+    async fn deterministic_cast_failure_aborts_the_duel() {
+        let cast = FatalCast(Box::new(ScriptSmith::new(vec![Err(
+            SlagError::ProviderApi(crate::error::ProviderApiError {
+                category: crate::error::ProviderErrorCategory::Auth,
+                status: Some(401),
+                retryable: false,
+                excerpt: "bad key".into(),
+            }),
+        )])));
+        assert!(matches!(cast.invoke("flux").await, Err(SlagError::Cancelled)));
     }
 
     #[tokio::test]

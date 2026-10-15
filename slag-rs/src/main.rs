@@ -193,6 +193,7 @@ async fn forge(
     }
 
     let config = EngineConfig::resolve().await?;
+    let _provider_run = error::ProviderRunGuard::begin();
     // Only a forge writes logs. `slag key` run from $HOME should not leave
     // an empty ~/logs behind.
     let _ = std::fs::create_dir_all(config::LOG_DIR);
@@ -220,7 +221,7 @@ async fn forge(
     if let Some(path) = session {
         let _ = std::fs::remove_file(path);
     }
-    result
+    error::provider_run_failure().map_or(result, Err)
 }
 
 /// `slag key [KEY]` — the whole configuration surface. With a key it
@@ -405,6 +406,10 @@ async fn run_pipeline(
             let _ = sink.await;
         }
         tui::set_quiet(false);
+
+        if error::provider_run_failure().is_some() {
+            break Err(error::SlagError::Cancelled);
+        }
 
         match next {
             // A fresh commission re-enters the pipeline from the top:
