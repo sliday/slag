@@ -169,11 +169,16 @@ impl Run {
         self.code == Some(0)
     }
 
-    /// `exit 0`, `exit 1`, `timed out after 300s`, or `killed`.
+    /// `exit 0`, `exit 1`, `timed out after 300s`, or `killed`. A write
+    /// the sandbox refused rides along: `exit 1 (write blocked by slag's
+    /// sandbox: /path)`.
     pub fn status(&self) -> String {
         match (self.code, self.timed_out) {
             (_, true) => format!("timed out after {:.0}s", self.secs),
-            (Some(code), _) => format!("exit {code}"),
+            (Some(code), _) => match crate::engine::sandbox::blocked_path(&self.output) {
+                Some(path) => format!("exit {code} (write blocked by slag's sandbox: {path})"),
+                None => format!("exit {code}"),
+            },
             (None, _) => "killed".to_string(),
         }
     }
@@ -187,10 +192,14 @@ impl Run {
 
 /// Run `cmd` under bash in `dir`, stdout and stderr interleaved as a
 /// terminal would show them. `CI=true` keeps watch-mode runners from
-/// waiting on a keypress that never comes.
+/// waiting on a keypress that never comes. The session can rewrite the
+/// test scripts this runs, so it runs in the smith's shell sandbox; a
+/// refused write ends the output with the sandbox's note.
 pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
     let start = Instant::now();
-    let mut command = tokio::process::Command::new("bash");
+    let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let sandbox = crate::engine::sandbox::Sandbox::for_root(&root);
+    let mut command = sandbox.wrap("bash");
     command
         .arg("-c")
         .arg(format!("exec 2>&1\n{cmd}"))
@@ -227,6 +236,12 @@ pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
         Ok(Ok(out)) => {
             let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
             output.push_str(&String::from_utf8_lossy(&out.stderr));
+            if let Some(note) = sandbox.denial_note(&output, !out.status.success()) {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&note);
+            }
             Run { cmd: cmd.to_string(), code: out.status.code(), output, secs, timed_out: false }
         }
         Ok(Err(e)) => Run {
@@ -267,9 +282,13 @@ pub fn kill_running() {
     }
 }
 
+/// The shell's builtin `kill`, not the binary: procps `kill` reads
+/// `-KILL -<pid>` as a kill of every process the user can signal, so a
+/// timed-out test took the whole session down on Linux.
 fn kill_group(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", &format!("-{pid}")])
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -9 -{pid}"))
         .stderr(Stdio::null())
         .status();
 }
@@ -873,6 +892,50 @@ mod tests {
         let slow = run("sleep 5", dir.path(), Duration::from_millis(200)).await;
         assert!(slow.timed_out && slow.unusable() && !slow.ok());
         assert!(slow.status().starts_with("timed out"), "{}", slow.status());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_kills_only_its_own_process_group() {
+        let mut bystander = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let slow = run("sleep 5", dir.path(), Duration::from_millis(200)).await;
+        let alive = bystander.try_wait().unwrap().is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(slow.timed_out);
+        assert!(alive, "the timeout's kill reached a process outside its group");
+    }
+
+    /// The session can rewrite a test script; slag still runs it in the
+    /// sandbox, and the attempt's status names the refused write.
+    #[tokio::test]
+    async fn a_test_script_that_writes_home_is_blocked_and_named() {
+        use crate::engine::sandbox::{backend, Backend};
+        let (_guard, _cfg) = crate::config::isolated_config_dir();
+        std::env::remove_var("SLAG_SANDBOX");
+        if backend() == Backend::None {
+            eprintln!("skipped: no sandbox backend works here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "test.sh", "set -e\ntouch \"$HOME/slag-sandbox-probe\"\necho tests ok\n");
+        let probe = PathBuf::from(std::env::var_os("HOME").unwrap()).join("slag-sandbox-probe");
+        let _ = std::fs::remove_file(&probe);
+        let blocked = run("bash test.sh", dir.path(), Duration::from_secs(30)).await;
+        let leaked = probe.exists();
+        let _ = std::fs::remove_file(&probe);
+        assert!(!leaked, "the test script escaped: {}", blocked.output);
+        assert!(!blocked.ok());
+        assert!(
+            blocked
+                .status()
+                .ends_with(&format!("(write blocked by slag's sandbox: {})", probe.display())),
+            "{}",
+            blocked.status()
+        );
+
+        let fine = run("echo hi > out.txt && test -f out.txt", dir.path(), Duration::from_secs(30)).await;
+        assert!(fine.ok(), "{}", fine.output);
     }
 
     fn repo() -> (tempfile::TempDir, Git) {

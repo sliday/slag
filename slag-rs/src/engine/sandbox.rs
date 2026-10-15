@@ -36,8 +36,22 @@ const HOME_CACHES: &[&str] = &[
     ".yarn",
 ];
 
-/// Env vars that move those caches somewhere else.
-const CACHE_ENV: &[&str] = &["CARGO_HOME", "RUSTUP_HOME", "GOPATH", "XDG_CACHE_HOME"];
+/// Env vars that move those caches, or build output, somewhere else.
+const CACHE_ENV: &[&str] = &[
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOCACHE",
+    "GOMODCACHE",
+    "XDG_CACHE_HOME",
+];
+
+/// How a named denial opens and what follows its path. `blocked_path`
+/// reads a note back with them, so the two stay in step.
+const BLOCKED_NOTE: &str = "[sandbox] write outside the workspace was blocked by slag's sandbox: ";
+const BLOCKED_TAIL: &str = ". Only the workspace, temp dirs and tool caches are writable; \
+     write inside the workspace instead of retrying.";
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -142,22 +156,28 @@ impl Sandbox {
 
     /// `sh -lc <script>`, wrapped in this sandbox.
     pub fn command(&self, script: &str) -> Command {
+        let mut cmd = self.wrap("sh");
+        cmd.arg("-lc").arg(script);
+        cmd
+    }
+
+    /// `program` under this sandbox; the caller adds its arguments.
+    pub fn wrap(&self, program: &str) -> Command {
         let mut cmd = match self.backend {
             Backend::Seatbelt => {
                 let mut cmd = Command::new(SANDBOX_EXEC);
                 cmd.args(self.seatbelt_args());
-                cmd.arg("sh");
+                cmd.arg(program);
                 cmd
             }
             Backend::Bwrap => {
                 let mut cmd = Command::new("bwrap");
                 cmd.args(self.bwrap_args());
-                cmd.arg("--").arg("sh");
+                cmd.arg("--").arg(program);
                 cmd
             }
-            Backend::Landlock | Backend::None => Command::new("sh"),
+            Backend::Landlock | Backend::None => Command::new(program),
         };
-        cmd.arg("-lc").arg(script);
         #[cfg(target_os = "linux")]
         if let Some(ruleset) = &self.ruleset {
             landlock::confine(&mut cmd, std::os::fd::AsRawFd::as_raw_fd(ruleset));
@@ -214,12 +234,7 @@ impl Sandbox {
             }
             match path_near(line, at) {
                 Some(path) if !self.allows(&path) => {
-                    return Some(format!(
-                        "[sandbox] write outside the workspace was blocked by slag's sandbox: {}. \
-                         Only the workspace, temp dirs and tool caches are writable; \
-                         write inside the workspace instead of retrying.",
-                        path.display()
-                    ));
+                    return Some(format!("{BLOCKED_NOTE}{}{BLOCKED_TAIL}", path.display()));
                 }
                 // Inside the writable set: a real permission error, not ours.
                 Some(_) => {}
@@ -245,6 +260,15 @@ impl Sandbox {
         };
         path.starts_with("/dev") || self.writable.iter().any(|w| path.starts_with(w))
     }
+}
+
+/// The path a denial note in `output` names, for one-line summaries such
+/// as a test run's status.
+pub fn blocked_path(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        let rest = line.strip_prefix(BLOCKED_NOTE)?;
+        Some(rest.split_once(BLOCKED_TAIL).map_or(rest, |(path, _)| path))
+    })
 }
 
 /// Probe once per process; the answer cannot change mid-run.
@@ -807,6 +831,15 @@ mod tests {
             sandbox(Backend::None, &[]).denial_note("touch: /x: Operation not permitted", true),
             None
         );
+    }
+
+    #[test]
+    fn blocked_path_reads_the_note_back() {
+        let sb = sandbox(Backend::Seatbelt, &["/ws"]);
+        let note = sb.denial_note("touch: /Users/x/probe: Operation not permitted", true).unwrap();
+        let output = format!("running\n{note}\n");
+        assert_eq!(blocked_path(&output), Some("/Users/x/probe"));
+        assert_eq!(blocked_path("touch: /Users/x/probe: Operation not permitted"), None);
     }
 
     #[test]
