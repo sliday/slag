@@ -120,7 +120,16 @@ Use `provider::model` to route one role through another provider, such as `model
 
 OpenRouter keeps its reasoning object, `reasoning_details` replay, attribution headers, pricing lookup, and native fallback routing. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. The agent recovers standalone JSON against declared tool schemas and rejects prose or code fences. It returns provider tool-validation errors to the model, with a limit of three consecutive failures.
 
-Other providers receive supported reasoning fields or omit them. `slag cost` shows session spend and a one-line balance note for non-OpenRouter providers. Spend caps depend on reported response costs outside OpenRouter.
+Other providers receive supported reasoning fields or omit them. `slag cost` shows session spend and a one-line balance note for non-OpenRouter providers.
+
+`engine/pricing.rs` holds cloud list prices and source URLs, dated 2026-10-15. It estimates default and common models without network calls. All spend displays use `pricing::format_cost`: `≈ $0.0031 est.` for estimates, or input/output tokens when the price is unknown. Mixed totals stay unknown if any call lacks a price. Only OpenRouter reads its `pricing.json` catalog cache. Local/custom models need an override for a cost estimate.
+
+```toml
+[pricing]
+"openai::gpt-4.1-mini" = { input = 0.40, output = 1.60, cached_input = 0.10 }
+```
+
+Rates use USD per million tokens. Input and output rates are required; cached input is optional. Overrides win over list prices and reported costs. Spend caps use reported costs or estimates. DeepSeek uses peak rates; Gemini Flash latest uses current promotional rates. Estimates exclude cache storage, taxes, and discounts.
 
 ### MCP servers
 

@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::engine::EngineEvent;
+use crate::engine::{EngineEvent, Usage};
 use crate::render::tape::{Cue, Mark, Proof, Stats};
 use crate::sexp::{Ingot, Status};
 use crate::tui::{self, dim, paint, BRIGHT, COLD, HOT, PURE, WARM};
@@ -99,8 +99,7 @@ pub struct Echo {
     started: Option<Instant>,
     retries: usize,
     stats: Option<Stats>,
-    tokens: u64,
-    cost: Option<f64>,
+    usage: Usage,
     goal_gap: Option<String>,
     goal_met: bool,
     assay_done: bool,
@@ -133,8 +132,7 @@ impl Echo {
             started: None,
             retries: 0,
             stats: None,
-            tokens: 0,
-            cost: None,
+            usage: Usage::default(),
             goal_gap: None,
             goal_met: false,
             assay_done: false,
@@ -179,8 +177,8 @@ impl Echo {
     }
 
     /// Run totals so far: tokens, and dollars when the provider said.
-    pub fn spend(&self) -> (u64, Option<f64>) {
-        (self.tokens, self.cost)
+    pub fn spend(&self) -> &Usage {
+        &self.usage
     }
 
     /// Max heats for an ingot, from the plan.
@@ -316,10 +314,7 @@ impl Echo {
     fn event(&mut self, e: &EngineEvent, at: Instant, out: &mut Vec<String>) {
         match e {
             EngineEvent::Tokens { usage } => {
-                self.tokens += usage.total_tokens;
-                if let Some(c) = usage.cost {
-                    *self.cost.get_or_insert(0.0) += c;
-                }
+                self.usage.add(usage);
             }
             EngineEvent::Error { message } if crate::engine::events::is_fatal_provider(message) => {
                 if self.fatal.is_none() {
@@ -805,11 +800,11 @@ impl Echo {
         if let Some(api) = stats.durations.as_deref().and_then(|d| d.split(" · ").find(|p| p.starts_with("api "))) {
             run.push(api.to_string());
         }
-        if let Some(c) = self.cost {
-            run.push(tui::money(c));
-        }
-        if self.tokens > 0 {
-            run.push(format!("{} tok", tui::tokens(self.tokens)));
+        if self.usage.total_tokens > 0 || self.usage.cost.is_some() {
+            run.push(crate::engine::pricing::format_cost(&self.usage));
+            if self.usage.cost.is_some() {
+                run.push(format!("{} tok", tui::tokens(self.usage.total_tokens)));
+            }
         }
         if self.retries > 0 {
             run.push(format!("{} {}", self.retries, if self.retries == 1 { "retry" } else { "retries" }));
@@ -857,8 +852,7 @@ pub fn assay_report(width: usize) -> Vec<String> {
     let start = now.checked_sub(wall).unwrap_or(now);
     echo.cue(&Cue::Plan(plan), start);
     let total = crate::engine::stats::snapshot().ledger.total();
-    echo.tokens = total.total_tokens;
-    echo.cost = total.cost;
+    echo.usage = total;
     echo.cue(&Cue::Stats(stats), now);
     echo.finish(now)
 }

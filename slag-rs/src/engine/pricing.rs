@@ -37,6 +37,92 @@ impl Pricing {
     }
 }
 
+/// Published list rates in USD per million tokens. Snapshot date: 2026-10-15.
+#[derive(Debug, Clone, Copy)]
+pub struct ListPrice {
+    pub provider: &'static str,
+    pub model: &'static str,
+    pub input: f64,
+    pub output: f64,
+    pub cached_input: Option<f64>,
+    pub date: &'static str,
+    pub source: &'static str,
+}
+
+impl ListPrice {
+    pub fn cost_of(&self, usage: &Usage, cached_tokens: u64) -> f64 {
+        let cached = cached_tokens.min(usage.prompt_tokens);
+        let mut input = self.input;
+        let mut output = self.output;
+        let mut cached_input = self.cached_input.unwrap_or(input);
+        if self.provider == "xai" && usage.prompt_tokens >= 200_000 {
+            input *= 2.0;
+            output *= 2.0;
+            cached_input *= 2.0;
+        }
+        ((usage.prompt_tokens - cached) as f64 * input
+            + cached as f64 * cached_input
+            + usage.completion_tokens as f64 * output) / 1_000_000.0
+    }
+}
+
+// Official list prices, checked 2026-10-15. Estimates exclude taxes and discounts.
+// DeepSeek uses peak rates. Gemini latest uses the current promotional rate.
+pub const LIST_PRICES: &[ListPrice] = &[
+    ListPrice { provider: "openai", model: "gpt-4.1-mini", input: 0.4, output: 1.6, cached_input: Some(0.1), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
+    ListPrice { provider: "openai", model: "gpt-4.1-mini-2025-04-14", input: 0.4, output: 1.6, cached_input: Some(0.1), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
+    ListPrice { provider: "openai", model: "gpt-4.1", input: 2.0, output: 8.0, cached_input: Some(0.5), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
+    ListPrice { provider: "openai", model: "gpt-4o-mini", input: 0.15, output: 0.6, cached_input: Some(0.075), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
+    ListPrice { provider: "openai", model: "gpt-5-mini", input: 0.25, output: 2.0, cached_input: Some(0.025), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
+    ListPrice { provider: "anthropic", model: "claude-sonnet-4-5", input: 3.0, output: 15.0, cached_input: Some(0.3), date: "2026-10-15", source: "https://platform.claude.com/docs/en/about-claude/pricing" },
+    ListPrice { provider: "anthropic", model: "claude-sonnet-4-6", input: 3.0, output: 15.0, cached_input: Some(0.3), date: "2026-10-15", source: "https://platform.claude.com/docs/en/about-claude/pricing" },
+    ListPrice { provider: "anthropic", model: "claude-haiku-4-5", input: 1.0, output: 5.0, cached_input: Some(0.1), date: "2026-10-15", source: "https://platform.claude.com/docs/en/about-claude/pricing" },
+    ListPrice { provider: "anthropic", model: "claude-opus-4-6", input: 5.0, output: 25.0, cached_input: Some(0.5), date: "2026-10-15", source: "https://platform.claude.com/docs/en/about-claude/pricing" },
+    ListPrice { provider: "gemini", model: "gemini-flash-latest", input: 0.75, output: 3.75, cached_input: Some(0.075), date: "2026-10-15", source: "https://ai.google.dev/gemini-api/docs/pricing" },
+    ListPrice { provider: "gemini", model: "gemini-2.5-flash", input: 0.3, output: 2.5, cached_input: Some(0.03), date: "2026-10-15", source: "https://ai.google.dev/gemini-api/docs/pricing" },
+    ListPrice { provider: "gemini", model: "gemini-2.5-flash-lite", input: 0.1, output: 0.4, cached_input: Some(0.01), date: "2026-10-15", source: "https://ai.google.dev/gemini-api/docs/pricing" },
+    ListPrice { provider: "gemini", model: "gemini-3.1-flash-lite", input: 0.25, output: 1.5, cached_input: Some(0.025), date: "2026-10-15", source: "https://ai.google.dev/gemini-api/docs/pricing" },
+    ListPrice { provider: "groq", model: "openai/gpt-oss-120b", input: 0.15, output: 0.6, cached_input: Some(0.075), date: "2026-10-15", source: "https://console.groq.com/docs/models" },
+    ListPrice { provider: "groq", model: "openai/gpt-oss-20b", input: 0.075, output: 0.3, cached_input: Some(0.037), date: "2026-10-15", source: "https://console.groq.com/docs/models" },
+    ListPrice { provider: "cerebras", model: "qwen-3.8-27b", input: 0.99, output: 1.49, cached_input: None, date: "2026-10-15", source: "https://www.cerebras.ai/pricing" },
+    ListPrice { provider: "cerebras", model: "gpt-oss-120b", input: 0.35, output: 0.75, cached_input: None, date: "2026-10-15", source: "https://www.cerebras.ai/pricing" },
+    ListPrice { provider: "xai", model: "grok-4.3", input: 1.25, output: 2.5, cached_input: Some(0.2), date: "2026-10-15", source: "https://docs.x.ai/developers/pricing" },
+    ListPrice { provider: "xai", model: "grok-4.5", input: 2.0, output: 6.0, cached_input: Some(0.3), date: "2026-10-15", source: "https://docs.x.ai/developers/pricing" },
+    ListPrice { provider: "xai", model: "grok-4.6", input: 2.0, output: 6.0, cached_input: Some(0.5), date: "2026-10-15", source: "https://docs.x.ai/developers/pricing" },
+    ListPrice { provider: "mistral", model: "mistral-small-latest", input: 0.15, output: 0.6, cached_input: Some(0.015), date: "2026-10-15", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "mistral-small-2603", input: 0.15, output: 0.6, cached_input: Some(0.015), date: "2026-10-15", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "mistral-large-2512", input: 0.5, output: 1.5, cached_input: Some(0.05), date: "2026-10-15", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "codestral-2508", input: 0.3, output: 0.9, cached_input: Some(0.03), date: "2026-10-15", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "deepseek", model: "deepseek-flash", input: 0.3, output: 1.2, cached_input: Some(0.006), date: "2026-10-15", source: "https://api-docs.deepseek.com/quick_start/pricing/" },
+    ListPrice { provider: "deepseek", model: "deepseek-v4-flash", input: 0.3, output: 1.2, cached_input: Some(0.006), date: "2026-10-15", source: "https://api-docs.deepseek.com/quick_start/pricing/" },
+    ListPrice { provider: "deepseek", model: "deepseek-v4-pro", input: 1.32, output: 3.96, cached_input: Some(0.044), date: "2026-10-15", source: "https://api-docs.deepseek.com/quick_start/pricing/" },
+    ListPrice { provider: "together", model: "meta-llama/Llama-3.3-70B-Instruct-Turbo", input: 1.04, output: 1.04, cached_input: None, date: "2026-10-15", source: "https://www.together.ai/pricing" },
+    ListPrice { provider: "together", model: "openai/gpt-oss-120b", input: 0.15, output: 0.6, cached_input: None, date: "2026-10-15", source: "https://www.together.ai/pricing" },
+    ListPrice { provider: "together", model: "Qwen/Qwen2.5-7B-Instruct-Turbo", input: 0.3, output: 0.3, cached_input: None, date: "2026-10-15", source: "https://www.together.ai/pricing" },
+    ListPrice { provider: "fireworks", model: "accounts/fireworks/models/glm-5p3-flash", input: 0.15, output: 0.5, cached_input: Some(0.03), date: "2026-10-15", source: "https://docs.fireworks.ai/serverless/pricing" },
+    ListPrice { provider: "fireworks", model: "accounts/fireworks/models/glm-5p3", input: 1.4, output: 4.4, cached_input: Some(0.26), date: "2026-10-15", source: "https://docs.fireworks.ai/serverless/pricing" },
+    ListPrice { provider: "fireworks", model: "accounts/fireworks/models/gpt-oss-120b", input: 0.15, output: 0.6, cached_input: Some(0.015), date: "2026-10-15", source: "https://docs.fireworks.ai/serverless/pricing" },
+];
+
+pub fn builtin_price(provider: crate::config::ProviderPreset, model: &str) -> Option<ListPrice> {
+    LIST_PRICES.iter().find(|price| price.provider == provider.name() && price.model == model).copied()
+}
+
+pub fn override_price(provider: crate::config::ProviderPreset, model: &str) -> Option<ListPrice> {
+    let overrides = crate::config::pricing_overrides();
+    price_override(&overrides, provider, model)
+}
+
+fn price_override(
+    overrides: &HashMap<String, (f64, f64, Option<f64>)>,
+    provider: crate::config::ProviderPreset,
+    model: &str,
+) -> Option<ListPrice> {
+    let &(input, output, cached_input) = overrides.get(&format!("{}::{model}", provider.name()))?;
+    Some(ListPrice { provider: "override", model: "override", input, output, cached_input,
+        date: "user override", source: "config.toml [pricing]" })
+}
+
 /// Model id → price, with the variant-suffix fallback the window cache
 /// already uses (`qwen/qwen3-coder:nitro` → `qwen/qwen3-coder`). Windows
 /// carry across every suffix; prices do not carry across `:free`, whose
@@ -151,14 +237,22 @@ pub fn store(table: &PricingTable) {
     }
 }
 
-/// `$0.0123`, or `~$0.0123 (est)` when the number came from the local
-/// table. `None` cost renders as a dash so a column stays aligned.
+/// Show exact spend, a labelled estimate, or the tokens behind an unknown cost.
 pub fn format_cost(usage: &Usage) -> String {
     match usage.cost {
-        Some(c) if usage.estimated => format!("~${c:.4} (est)"),
+        Some(c) if usage.estimated => format!("≈ ${c:.4} est."),
         Some(c) => format!("${c:.4}"),
-        None => "-".to_string(),
+        None if usage.prompt_tokens == 0 && usage.completion_tokens == 0 && usage.total_tokens > 0 =>
+            format!("spend unknown · {} tokens", token_count(usage.total_tokens)),
+        None => format!("spend unknown · {} in / {} out tokens",
+            token_count(usage.prompt_tokens), token_count(usage.completion_tokens)),
     }
+}
+
+fn token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 { format!("{:.1}M", tokens as f64 / 1_000_000.0) }
+    else if tokens >= 1_000 { format!("{:.1}k", tokens as f64 / 1_000.0) }
+    else { tokens.to_string() }
 }
 
 /// One ledger row: what a single (model, role) pair spent.
@@ -353,14 +447,14 @@ mod tests {
     }
 
     #[test]
-    fn format_cost_marks_estimates_and_dashes_a_missing_cost() {
+    fn format_cost_marks_estimates_and_shows_tokens_for_unknown_cost() {
         let mut u = usage(10, 10);
         u.cost = Some(0.0123);
         assert_eq!(format_cost(&u), "$0.0123");
         u.estimated = true;
-        assert_eq!(format_cost(&u), "~$0.0123 (est)");
+        assert_eq!(format_cost(&u), "≈ $0.0123 est.");
         u.cost = None;
-        assert_eq!(format_cost(&u), "-");
+        assert_eq!(format_cost(&u), "spend unknown · 10 in / 10 out tokens");
     }
 
     #[test]
@@ -374,6 +468,58 @@ mod tests {
         assert!(total.estimated, "one estimated leg makes the sum an estimate");
         assert_eq!(total.cost, Some(1.5));
         assert_eq!(total.prompt_tokens, 15);
+    }
+
+    #[test]
+    fn builtin_defaults_have_dated_provider_scoped_prices() {
+        use crate::config::ProviderPreset;
+        for provider in [ProviderPreset::OpenAI, ProviderPreset::Anthropic, ProviderPreset::Gemini,
+            ProviderPreset::Groq, ProviderPreset::Cerebras, ProviderPreset::Xai, ProviderPreset::Mistral,
+            ProviderPreset::DeepSeek, ProviderPreset::Together, ProviderPreset::Fireworks] {
+            let price = builtin_price(provider, provider.default_model()).unwrap();
+            assert_eq!(price.date, "2026-10-15");
+            assert!(price.source.starts_with("https://"));
+            assert!(LIST_PRICES.iter().filter(|price| price.provider == provider.name()).count() >= 2);
+        }
+        assert!(builtin_price(ProviderPreset::OpenRouter, "gpt-4.1-mini").is_none());
+        assert!(builtin_price(ProviderPreset::Cerebras, "gpt-4.1-mini").is_none());
+        assert!(builtin_price(ProviderPreset::Ollama, "qwen3:8b").is_none());
+    }
+
+    #[test]
+    fn configured_prices_override_list_prices_and_accept_zero() {
+        use crate::config::ProviderPreset;
+        let overrides = HashMap::from([("openai::gpt-4.1-mini".into(), (0.0, 0.0, Some(0.0)))]);
+        let price = price_override(&overrides, ProviderPreset::OpenAI, "gpt-4.1-mini")
+            .or_else(|| builtin_price(ProviderPreset::OpenAI, "gpt-4.1-mini")).unwrap();
+        assert_eq!(price.cost_of(&usage(1_000_000, 100_000), 0), 0.0);
+        assert!(price_override(&overrides, ProviderPreset::Cerebras, "gpt-4.1-mini").is_none());
+    }
+
+    #[test]
+    fn cached_input_uses_the_published_discount_without_double_counting() {
+        let price = builtin_price(crate::config::ProviderPreset::OpenAI, "gpt-4.1-mini").unwrap();
+        let cost = price.cost_of(&usage(1_000_000, 100_000), 250_000);
+        assert!((cost - 0.485).abs() < 1e-9, "{cost}");
+        assert!((price.cost_of(&usage(10, 0), 100) - 0.000001).abs() < 1e-9);
+        let price = builtin_price(crate::config::ProviderPreset::Xai, "grok-4.3").unwrap();
+        assert!((price.cost_of(&usage(200_000, 10_000), 0) - 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_legs_keep_mixed_totals_unknown_in_either_order() {
+        let mut known = usage(100, 10);
+        known.cost = Some(0.01);
+        known.estimated = true;
+        let unknown = usage(62_500, 6_000);
+        assert_eq!(format_cost(&unknown), "spend unknown · 62.5k in / 6.0k out tokens");
+        assert_eq!(format_cost(&Usage { total_tokens: 42, ..Default::default() }), "spend unknown · 42 tokens");
+        for calls in [[known.clone(), unknown.clone()], [unknown.clone(), known.clone()]] {
+            let mut total = Usage::default();
+            for call in calls { total.add(&call); }
+            assert_eq!(total.cost, None);
+            assert!(format_cost(&total).contains("spend unknown"));
+        }
     }
 
     fn attributed(model: &str, role: Role, cost: f64) -> Usage {

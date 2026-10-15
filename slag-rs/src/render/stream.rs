@@ -164,12 +164,12 @@ impl Stream {
         if let Some(start) = self.echo.started() {
             right.push(tui::clock(at.saturating_duration_since(start)));
         }
-        let (tokens, cost) = self.echo.spend();
-        if tokens > 0 {
-            right.push(format!("{} tok", tui::tokens(tokens)));
+        let usage = self.echo.spend();
+        if usage.total_tokens > 0 {
+            right.push(format!("{} tok", tui::tokens(usage.total_tokens)));
         }
-        if let Some(c) = cost {
-            right.push(tui::money(c));
+        if usage.total_tokens > 0 || usage.cost.is_some() {
+            right.push(crate::engine::pricing::format_cost(usage));
         }
         let mut right = right.join(" · ");
         if self.width >= 100 {
@@ -414,8 +414,32 @@ mod tests {
         let f = strip(&s.footer_text(t0 + Duration::from_secs(112)).unwrap());
         assert!(f.contains("forging i2 · heat 2/5"), "{f}");
         assert!(f.contains("run node --test 0:12"), "{f}");
-        assert!(f.contains("1:52 · 41k tok · $0.06"), "{f}");
+        assert!(f.contains("1:52 · 41k tok · $0.0600"), "{f}");
         assert!(tui::visible_len(&f) <= 119, "{}", f.len());
+    }
+
+    #[test]
+    fn footer_preserves_estimates_and_unknown_tokens() {
+        let mut s = Stream::new(true, Some(160));
+        let now = Instant::now();
+        s.lines(&Cue::Mark(Mark::Header { text: "FORGE".into() }), now);
+        s.lines(&Cue::Event(EngineEvent::Tokens {
+            usage: crate::engine::Usage {
+                prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200,
+                cost: Some(0.0031), estimated: true, ..Default::default()
+            },
+        }), now);
+        assert!(strip(&s.footer_text(now).unwrap()).contains("≈ $0.0031 est."));
+        s.lines(&Cue::Event(EngineEvent::Tokens {
+            usage: crate::engine::Usage {
+                prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200,
+                ..Default::default()
+            },
+        }), now);
+        let footer = strip(&s.footer_text(now).unwrap());
+        assert!(footer.contains("spend unknown"), "{footer}");
+        assert!(footer.contains("2.0k in / 400 out tokens"), "{footer}");
+        assert!(!footer.contains("$0.0031"), "{footer}");
     }
 
     #[test]

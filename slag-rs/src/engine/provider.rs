@@ -272,7 +272,7 @@ impl OpenRouter {
     /// belongs here. The judge and the summarizer hold a provider directly
     /// rather than a `ForgeAgent`, so a fold in the agent loop misses them
     /// and their rows vanish from the assay.
-    async fn attribute(&self, resp: &mut NormalizedResponse, req: &ChatRequest) {
+    async fn attribute(&self, resp: &mut NormalizedResponse, req: &ChatRequest, cached_tokens: u64) {
         let ran = resp.model.clone().unwrap_or_else(|| req.model.clone());
         resp.usage.role = Some(req.role);
         resp.usage.model = Some(if self.provider == ProviderPreset::OpenRouter {
@@ -280,8 +280,21 @@ impl OpenRouter {
         } else {
             format!("{}::{ran}", self.provider.name())
         });
-        if self.provider == ProviderPreset::OpenRouter && resp.usage.cost.is_none() {
-            if let Some(cost) = self.models_index().await.prices.estimate(&ran, &resp.usage) {
+        let has_token_split = resp.usage.prompt_tokens > 0 || resp.usage.completion_tokens > 0;
+        let override_price = crate::engine::pricing::override_price(self.provider, &ran)
+            .or_else(|| crate::engine::pricing::override_price(self.provider, &req.model));
+        if let Some(price) = override_price.filter(|_| has_token_split) {
+            resp.usage.cost = Some(price.cost_of(&resp.usage, cached_tokens));
+            resp.usage.estimated = true;
+        } else if resp.usage.cost.is_none() && has_token_split {
+            let cost = if self.provider == ProviderPreset::OpenRouter {
+                self.models_index().await.prices.estimate(&ran, &resp.usage)
+            } else {
+                crate::engine::pricing::builtin_price(self.provider, &ran)
+                    .or_else(|| crate::engine::pricing::builtin_price(self.provider, &req.model))
+                    .map(|price| price.cost_of(&resp.usage, cached_tokens))
+            };
+            if let Some(cost) = cost {
                 resp.usage.cost = Some(cost);
                 resp.usage.estimated = true;
             }
@@ -536,6 +549,7 @@ impl OpenRouter {
                         }))
                     }
                 };
+                let cached_tokens = api.usage.as_ref().map(ApiUsage::cached_tokens).unwrap_or(0);
                 match normalize_for_provider(api, self.provider) {
                     // Empty 200s (no choices, no message, no finish_reason)
                     // are upstream hiccups; burn a retry instead of handing
@@ -552,7 +566,7 @@ impl OpenRouter {
                         }
                     }
                     Ok(mut resp) => {
-                        self.attribute(&mut resp, &req).await;
+                        self.attribute(&mut resp, &req, cached_tokens).await;
                         return Ok(resp);
                     }
                     other => return other,
@@ -1323,6 +1337,10 @@ fn normalize_for_provider(api: ApiResponse, provider: ProviderPreset) -> Result<
         .or(msg.reasoning_content.filter(|s| !s.is_empty()))
         .or_else(|| reasoning_from_details(msg.reasoning_details.as_ref()));
 
+    let mut usage = api.usage.map(|usage| usage.usage).unwrap_or_default();
+    if usage.total_tokens == 0 {
+        usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+    }
     Ok(NormalizedResponse {
         model: api.model.filter(|m| !m.is_empty()),
         content: msg.content.unwrap_or_default(),
@@ -1330,7 +1348,7 @@ fn normalize_for_provider(api: ApiResponse, provider: ProviderPreset) -> Result<
         finish_reason,
         reasoning,
         reasoning_details,
-        usage: api.usage.unwrap_or_default(),
+        usage,
     })
 }
 
@@ -1399,11 +1417,36 @@ struct ApiResponse {
     #[serde(default)]
     choices: Vec<ApiChoice>,
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<ApiUsage>,
     /// Which model actually answered. With `openrouter/auto` this is the
     /// only place the routed id appears.
     #[serde(default)]
     model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiUsage {
+    #[serde(flatten)]
+    usage: Usage,
+    #[serde(default)]
+    prompt_tokens_details: Option<CachedUsage>,
+    #[serde(default)]
+    prompt_cache_hit_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+impl ApiUsage {
+    fn cached_tokens(&self) -> u64 {
+        self.prompt_tokens_details.as_ref().map(|details| details.cached_tokens).unwrap_or(0)
+            .max(self.prompt_cache_hit_tokens).max(self.cache_read_input_tokens)
+    }
+}
+
+#[derive(Deserialize)]
+struct CachedUsage {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -3028,6 +3071,68 @@ mod tests {
             assert!(model.contains("curl"));
             assert!(model.contains("/models"));
         }
+    }
+
+    #[tokio::test]
+    async fn non_router_pricing_is_local_and_cache_aware() {
+        let (_guard, _dir) = crate::config::isolated_config_dir();
+        for preset in [ProviderPreset::OpenAI, ProviderPreset::Anthropic, ProviderPreset::Gemini,
+            ProviderPreset::Groq, ProviderPreset::Cerebras, ProviderPreset::Xai, ProviderPreset::Mistral,
+            ProviderPreset::DeepSeek, ProviderPreset::Together, ProviderPreset::Fireworks,
+            ProviderPreset::Ollama, ProviderPreset::LmStudio, ProviderPreset::Custom] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET")).respond_with(ResponseTemplate::new(500)).expect(0).mount(&server).await;
+            let mut body = ok_body();
+            body["model"] = json!(preset.default_model());
+            body["usage"] = json!({"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 200}});
+            Mock::given(method("POST")).and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body)).expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(preset, "test-key", server.uri()).with_max_attempts(1);
+            let mut req = request(vec![], None);
+            req.model = preset.default_model().into();
+            let response = provider.chat(req).await.unwrap();
+            let price = crate::engine::pricing::builtin_price(preset, preset.default_model());
+            assert_eq!(response.usage.estimated, price.is_some());
+            assert_eq!(response.usage.cost, price.map(|price| price.cost_of(&response.usage, 200)));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        std::env::remove_var("SLAG_CONFIG_DIR");
+    }
+
+    #[tokio::test]
+    async fn missing_token_split_keeps_priced_models_unknown() {
+        let server = MockServer::start().await;
+        let mut body = ok_body();
+        body["model"] = json!("gpt-4.1-mini");
+        body["usage"] = json!({"total_tokens": 1000});
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body)).expect(1).mount(&server).await;
+        let mut req = request(vec![], None);
+        req.model = "gpt-4.1-mini".into();
+        let response = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri()).chat(req).await.unwrap();
+        assert_eq!(response.usage.cost, None);
+        assert_eq!(crate::engine::pricing::format_cost(&response.usage), "spend unknown · 1.0k tokens");
+    }
+
+    #[tokio::test]
+    async fn configured_price_wins_even_over_reported_cost_and_model_aliases() {
+        let (_guard, dir) = crate::config::isolated_config_dir();
+        std::fs::write(dir.path().join("config.toml"), "[pricing]\n\"openai::gpt-4.1-mini\" = { input = 2, output = 4, cached_input = 1 }\n").unwrap();
+        let server = MockServer::start().await;
+        let mut body = ok_body();
+        body["model"] = json!("gpt-4.1-mini-2025-04-14");
+        body["usage"] = json!({"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500,
+            "cost": 99, "prompt_tokens_details": {"cached_tokens": 200}});
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body)).expect(1).mount(&server).await;
+        let mut req = request(vec![], None);
+        req.model = "gpt-4.1-mini".into();
+        let response = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri()).chat(req).await.unwrap();
+        std::env::remove_var("SLAG_CONFIG_DIR");
+        assert!(response.usage.estimated);
+        assert!((response.usage.cost.unwrap() - 0.0038).abs() < 1e-9);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

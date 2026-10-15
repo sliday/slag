@@ -643,6 +643,12 @@ fn write_entries(path: &std::path::Path, entries: &[(String, String)]) -> Result
     let mut out = String::new();
     for (k, v) in entries {
         out.push_str(k);
+        if k.starts_with("pricing.") && v.trim_start().starts_with('{') {
+            out.push_str(" = ");
+            out.push_str(v);
+            out.push('\n');
+            continue;
+        }
         out.push_str(" = \"");
         out.push_str(v);
         out.push_str("\"\n");
@@ -848,6 +854,110 @@ pub fn config_dir_path() -> Option<PathBuf> {
     config_dir()
 }
 
+/// File prices in USD per million input, output, and cached input tokens.
+pub fn pricing_overrides() -> std::collections::HashMap<String, (f64, f64, Option<f64>)> {
+    config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|contents| parse_pricing_overrides(&contents))
+        .unwrap_or_default()
+}
+
+fn parse_pricing_overrides(
+    contents: &str,
+) -> std::collections::HashMap<String, (f64, f64, Option<f64>)> {
+    let mut prices = std::collections::HashMap::new();
+    let mut in_pricing = false;
+    let mut top_level = true;
+    for line in contents.lines() {
+        let line = line[..unquoted_position(line, '#').unwrap_or(line.len())].trim();
+        if line.starts_with('[') {
+            in_pricing = line == "[pricing]";
+            top_level = false;
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let Some(separator) = unquoted_position(line, '=') else {
+            continue;
+        };
+        let raw_key = line[..separator].trim();
+        let raw_key = if in_pricing {
+            raw_key
+        } else if top_level {
+            let Some(key) = raw_key.strip_prefix("pricing.") else { continue };
+            key
+        } else {
+            continue;
+        };
+        let key = if raw_key.starts_with('"') {
+            serde_json::from_str::<String>(raw_key).ok()
+        } else {
+            raw_key.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).map(str::to_string)
+        };
+        let Some(key) = key else { continue };
+        let Some((provider, model)) = key.split_once("::") else { continue };
+        if ProviderPreset::parse(provider).is_err() || model.trim().is_empty() {
+            continue;
+        }
+        let Some(body) = line[separator + 1..].trim().strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}')) else { continue };
+        let mut input = None;
+        let mut output = None;
+        let mut cached_input = None;
+        let mut valid = true;
+        for field in body.split(',') {
+            let Some((name, raw_value)) = field.split_once('=') else {
+                valid = false;
+                break;
+            };
+            let target = match name.trim() {
+                "input" => &mut input,
+                "output" => &mut output,
+                "cached_input" => &mut cached_input,
+                _ => { valid = false; break; }
+            };
+            let Some(value) = raw_value.trim().parse::<f64>().ok()
+                .filter(|value| value.is_finite() && *value >= 0.0) else {
+                valid = false;
+                break;
+            };
+            if target.replace(value).is_some() {
+                valid = false;
+                break;
+            }
+        }
+        if valid {
+            if let (Some(input), Some(output)) = (input, output) {
+                prices.insert(key, (input, output, cached_input));
+            }
+        }
+    }
+    prices
+}
+
+fn unquoted_position(text: &str, needle: char) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quote == Some('"') && ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() {
+            if ch == needle {
+                return Some(index);
+            }
+            if ch == '"' || ch == '\'' {
+                quote = Some(ch);
+            }
+        }
+    }
+    None
+}
+
 fn config_file_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
@@ -873,13 +983,15 @@ fn parse_config_lines(contents: &str) -> Vec<(String, String)> {
         // `[section]` headers namespace the keys under them, so the flat
         // top-level settings and an `[mcp]` server named `model_base`
         // cannot collide.
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+        let header = line[..unquoted_position(line, '#').unwrap_or(line.len())].trim();
+        if let Some(name) = header.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             section = name.trim().to_string();
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
+        let Some(separator) = unquoted_position(line, '=') else {
             continue;
         };
+        let (key, value) = (&line[..separator], &line[separator + 1..]);
         let key = key.trim();
         let mut value = value.trim();
         if value.len() >= 2
@@ -1342,6 +1454,100 @@ mod tests {
             Some("openai/gpt-5")
         );
         assert_eq!(file_value(&parsed, "broken line"), None);
+    }
+
+    #[test]
+    fn pricing_overrides_keep_quoted_model_keys_and_comments() {
+        let prices = parse_pricing_overrides(r#"
+input = 999
+[pricing] # USD per million tokens
+"openai::gpt-4.1-mini" = { input = 0.4, output = 1.6, cached_input = 0.1 } # published price
+'groq::openai/gpt-oss-120b' = { output = 0.75, input = 0.15 }
+"custom::model.#v1=beta" = { input = 0, output = 2 }
+[mcp]
+"openai::gpt-4.1-mini" = { input = 99, output = 99 }
+"#);
+        assert_eq!(prices.len(), 3);
+        assert_eq!(prices["openai::gpt-4.1-mini"], (0.4, 1.6, Some(0.1)));
+        assert_eq!(prices["groq::openai/gpt-oss-120b"], (0.15, 0.75, None));
+        assert_eq!(prices["custom::model.#v1=beta"], (0.0, 2.0, None));
+    }
+
+    #[test]
+    fn pricing_overrides_ignore_invalid_prices() {
+        for entry in [
+            r#""openai::m" = { input = -1, output = 2 }"#,
+            r#""openai::m" = { input = 1, output = NaN }"#,
+            r#""openai::m" = { input = inf, output = 2 }"#,
+            r#""openai::m" = { input = 1, output = 2, cached_input = -1 }"#,
+            r#""openai::m" = { input = 1, output = 2, cached_input = inf }"#,
+            r#""openai::m" = { input = 1 }"#,
+            r#""openai::m" = { output = 2 }"#,
+            r#""openai::m" = { input = 1, output = 2, input = 3 }"#,
+            r#""openai::m" = { input = 1, output = 2, typo = 3 }"#,
+            r#""openai::m" = { input = 1,, output = 2 }"#,
+            r#""openai::m" = { input = 1, output = 2, }"#,
+            r#""openai::m" = { input = "1", output = 2 }"#,
+            r#""unknown::m" = { input = 1, output = 2 }"#,
+            r#""openai::" = { input = 1, output = 2 }"#,
+            r#""m" = { input = 1, output = 2 }"#,
+            r#"openai::m = { input = 1, output = 2 }"#,
+        ] {
+            assert!(parse_pricing_overrides(&format!("[pricing]\n{entry}")).is_empty(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn pricing_overrides_read_the_selected_config_directory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("SLAG_CONFIG_DIR");
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(dir.path().join("config.toml"), r#"
+[pricing]
+"openai::gpt-4.1-mini" = { input = 0.25, output = 0.75 }
+"cerebras::gpt-4.1-mini" = { input = 1, output = 2 }
+"#).unwrap();
+        let prices = pricing_overrides();
+        if let Some(previous) = previous {
+            std::env::set_var("SLAG_CONFIG_DIR", previous);
+        } else {
+            std::env::remove_var("SLAG_CONFIG_DIR");
+        }
+        assert_eq!(prices["openai::gpt-4.1-mini"], (0.25, 0.75, None));
+        assert_eq!(prices["cerebras::gpt-4.1-mini"], (1.0, 2.0, None));
+    }
+
+    #[test]
+    fn pricing_overrides_survive_key_storage_and_removal() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("SLAG_CONFIG_DIR");
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(dir.path().join("config.toml"), r#"
+openrouter_api_key = "old-key"
+[pricing] # USD per million
+"openai::gpt-4.1-mini" = { input = 0.4, output = 1.6, cached_input = 0.1 } # cached rate
+'custom::model.#v1=beta' = { input = 0, output = 2 }
+"#).unwrap();
+        let expected = pricing_overrides();
+        assert_eq!(expected.len(), 2);
+        for provider in [ProviderPreset::OpenRouter, ProviderPreset::Cerebras] {
+            store_key_for_provider(provider, "replacement-key").unwrap();
+            assert_eq!(pricing_overrides(), expected);
+            let contents = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+            assert!(contents.contains("pricing.\"openai::gpt-4.1-mini\" = { input"));
+        }
+        clear_key().unwrap();
+        assert_eq!(pricing_overrides(), expected);
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(!contents.contains("openrouter_api_key"));
+        assert!(contents.contains("cerebras_api_key"));
+        if let Some(previous) = previous {
+            std::env::set_var("SLAG_CONFIG_DIR", previous);
+        } else {
+            std::env::remove_var("SLAG_CONFIG_DIR");
+        }
     }
 
     #[test]

@@ -178,13 +178,14 @@ pub enum RenderOp {
 pub struct IngotAccum {
     pub tokens: u64,
     pub cost: Option<f64>,
+    usage: Usage,
     pub started: Instant,
     pub ctx: Option<u8>,
 }
 
 impl IngotAccum {
     fn new(now: Instant) -> Self {
-        Self { tokens: 0, cost: None, started: now, ctx: None }
+        Self { tokens: 0, cost: None, usage: Usage::default(), started: now, ctx: None }
     }
 
     fn reset(&mut self, now: Instant) {
@@ -193,9 +194,8 @@ impl IngotAccum {
 
     fn add(&mut self, usage: &Usage) {
         self.tokens += usage.total_tokens;
-        if let Some(c) = usage.cost {
-            *self.cost.get_or_insert(0.0) += c;
-        }
+        self.usage.add(usage);
+        self.cost = self.usage.cost;
     }
 
     /// The ` · 42s · 118k tok · $0.31` tail, timed against `now`.
@@ -205,9 +205,7 @@ impl IngotAccum {
             now.saturating_duration_since(self.started).as_secs(),
             fmt_tokens(self.tokens)
         );
-        if let Some(cost) = self.cost {
-            s.push_str(&format!(" · ${cost:.2}"));
-        }
+        s.push_str(&format!(" · {}", super::pricing::format_cost(&self.usage)));
         // A percent on every footer of a short run is noise. The number
         // only becomes actionable once the next turn may start pruning
         // history, so it stays hidden until the gauge goes hot.
@@ -778,9 +776,7 @@ impl RenderState {
         // stale call's timer.
         let (mut label, took) = self.activity().unwrap_or_default();
         let mut meta = format!(" · {}s · {} tok", took.as_secs(), fmt_tokens(self.accum.tokens));
-        if let Some(cost) = self.accum.cost {
-            meta.push_str(&format!(" · ${cost:.2}"));
-        }
+        meta.push_str(&format!(" · {}", super::pricing::format_cost(&self.accum.usage)));
         if self.width > 0 {
             // Visible budget: one row minus the last column (writing into
             // it would trigger autowrap on most terminals).

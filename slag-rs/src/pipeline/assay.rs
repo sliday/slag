@@ -60,7 +60,7 @@ pub fn show() -> Result<(), SlagError> {
         println!(
             "\n  {}spend {}{}",
             super::fg(tui::COLD),
-            crate::engine::pricing::format_cost(&total),
+            crate::engine::pricing::format_cost(&total).trim_start_matches("spend "),
             super::reset(),
         );
         for row in rows {
