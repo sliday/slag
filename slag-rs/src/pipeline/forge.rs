@@ -94,6 +94,7 @@ async fn run_inner(
     hooks: &EngineHooks,
     run_log: &RunLog,
 ) -> Result<(), SlagError> {
+    let mut previous_state = None;
     loop {
         // Ctrl-C from the dashboard: stop between ingots instead of
         // marching every remaining ingot into instant-fail cracks.
@@ -107,6 +108,17 @@ async fn run_inner(
         // to Ore so it gets rescheduled instead of busy-spinning forever.
         let guard = CRUCIBLE_LOCK.lock().await;
         let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+
+        let state: Vec<_> = crucible.ingots
+            .iter()
+            .map(|i| (i.id.clone(), i.status.clone(), i.heat, i.smelt))
+            .collect();
+        if previous_state.as_ref() == Some(&state) && crucible.has_pending() {
+            return Err(SlagError::SmithFailed(
+                "forge made no progress during a scheduling pass".into(),
+            ));
+        }
+        previous_state = Some(state);
 
         // Item 67: a Molten ingot whose transcript is still open is a
         // crashed session, not stale state — resume the recorded
@@ -403,6 +415,9 @@ async fn forge_ingot(
     hooks: &EngineHooks,
     config: &EngineConfig,
 ) -> Result<(), SlagError> {
+    if matches!(ingot.status, Status::Cracked | Status::Forged) {
+        return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
+    }
     if let Some((cfg, n_casts)) = duel_cfg {
         // Casts are rebuilt every round; one shared accumulator keeps the
         // ingot cost cap cumulative across all of an ingot's duel sessions.

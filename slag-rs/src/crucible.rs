@@ -24,12 +24,18 @@ impl Crucible {
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         let content = std::fs::read_to_string(path)?;
         let mut header_lines = Vec::new();
-        let mut ingots = Vec::new();
+        let mut ingots: Vec<Ingot> = Vec::new();
 
         for (n, line) in content.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with("(ingot ") {
                 if let Some(ingot) = parse_ingot(trimmed) {
+                    if ingots.iter().any(|i| i.id == ingot.id) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("{}:{}: duplicate ingot id {}", path.display(), n + 1, ingot.id),
+                        ));
+                    }
                     ingots.push(ingot);
                 } else {
                     // A corrupted line must not vanish silently: the ingot
@@ -327,6 +333,21 @@ mod tests {
         assert_eq!(counts.forged, 1);
         assert_eq!(counts.cracked, 1);
         assert_eq!(counts.molten, 0);
+    }
+
+    #[test]
+    fn load_rejects_a_queued_duplicate_of_a_terminal_ingot() {
+        for status in ["cracked", "forged"] {
+            let content = format!(
+                "(ingot :id \"i1\" :status {status} :heat 5 :max 5 :smelt 1)\n\
+                 (ingot :id \"i1\" :status ore :heat 0 :max 5)\n"
+            );
+            let file = write_temp(&content);
+            let err = Crucible::load(file.path()).expect_err("duplicate IDs cannot reach an anvil");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("i1"));
+            assert_eq!(std::fs::read_to_string(file.path()).unwrap(), content);
+        }
     }
 
     #[test]

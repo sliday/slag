@@ -16,7 +16,7 @@ use crate::engine::{emit, EngineEvent, Provider};
 use crate::error::SlagError;
 use crate::flux;
 use crate::proof;
-use crate::sexp::Ingot;
+use crate::sexp::{Ingot, Status};
 use crate::smith::{EngineHooks, Smith};
 use crate::tui;
 
@@ -93,10 +93,13 @@ where
     // Builds the smith for one cast: `('a' | 'b' | 'c', worktree_root)` → smith.
     F: Fn(char, &Path) -> Box<dyn Smith> + Send + Sync,
 {
+    if matches!(ingot.status, Status::Cracked | Status::Forged) || ingot.heat >= ingot.max {
+        return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
+    }
     let _slot = DUEL_SLOT.lock().await;
     // Each round burns one heat; never schedule more rounds than the
     // ingot's remaining heat budget (:max - :heat) allows.
-    let remaining = ingot.max.saturating_sub(ingot.heat).max(1);
+    let remaining = ingot.max.saturating_sub(ingot.heat);
     let rounds = cfg.duel_rounds(ingot.grade).clamp(1, remaining);
     let mut n = initial_casts.clamp(2, 3) as usize;
     let mut critique: Option<String> = None;
@@ -794,6 +797,30 @@ mod tests {
         let (a, b) = (a.to_string(), b.to_string());
         move |cast, _dir| {
             Box::new(MockSmith(if cast == 'a' { a.clone() } else { b.clone() })) as Box<dyn Smith>
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_or_exhausted_ingots_never_start_casts() {
+        let dir = tempfile::tempdir().unwrap();
+        for (status, heat) in [
+            (Status::Cracked, 0),
+            (Status::Forged, 0),
+            (Status::Ore, 5),
+            (Status::Molten, 7),
+        ] {
+            let mut task = ingot("i1", true, 1, Some(true), "true");
+            task.status = status;
+            task.heat = heat;
+            let casts = |_: char, _: &Path| -> Box<dyn Smith> {
+                panic!("terminal or exhausted ingot reached a cast")
+            };
+            let err = duel_ingot(
+                dir.path(), &task, &cfg(DuelMode::On), &EngineHooks::default(),
+                &casts, &NoJudge, 2,
+            ).await.expect_err("no heat or terminal status must stop the duel");
+            assert!(matches!(err, SlagError::IngotCracked(..)), "{err}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         }
     }
 
