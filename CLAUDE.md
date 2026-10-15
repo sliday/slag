@@ -52,7 +52,7 @@ The repo has three layers:
 | `main.rs` | Entry point, subcommand dispatch, key gate before any forge |
 | `cli.rs` | clap definitions for flags and subcommands |
 | `config.rs` | `EngineConfig`, key storage and verification, model resolution |
-| `engine/` | Chat-completions provider, agent loop, tools, judge, recipes, events, MCP client |
+| `engine/` | Chat-completions provider, agent loop, tools, shell sandbox, judge, recipes, events, MCP client |
 | `smith/` | `NativeSmith` factories (`make_smith`, `make_plan_smith`, `make_base_smith`) |
 | `pipeline/` | surveyor, founder, forge, duel, resmelt, assay |
 | `anvil/` | Worktree helpers. The parallel fan-out itself lives in `pipeline/forge.rs` |
@@ -134,6 +134,17 @@ github = "gh-mcp --stdio"
 
 `engine/mcp.rs` spawns each server once per process at forge start, handshakes it (`initialize` → `notifications/initialized` → `tools/list`), and re-exports its tools as `mcp__<server>__<tool>` beside the native eight. `ToolBox::all_specs()` is natives plus MCP; `ToolBox::specs()` stays natives-only. A server that will not spawn or handshake inside 15s is named in a warning and skipped, never fatal. Recipes gate on these names through `requires_tools` unchanged. Scope is stdio only: no HTTP, no SSE, no OAuth.
 
+### Shell sandbox
+
+`engine/sandbox.rs` confines the `bash` tool's writes to the workspace, the temp dirs, the tool caches under `$HOME`, and an out-of-root git dir. Reads and network stay open. `ToolBox` resolves it at the first shell call; `bash`, `grep`, `glob`, and background jobs all run under it. Proofs, `slag fix` test runs, and hooks run outside it.
+
+| Setting | Env | `config.toml` key | Flag |
+|---------|-----|-------------------|------|
+| mode: `auto` (default) or `off` | `SLAG_SANDBOX` | `sandbox` | `--no-sandbox` |
+| extra writable paths | | `sandbox_writable = ["~/data"]` | |
+
+Backends: macOS runs `sandbox-exec` with a generated Seatbelt profile. Linux uses `bwrap` when it works, else Landlock (raw syscalls, no crate), else runs unconfined. `main.rs` calls `sandbox::preflight()` before the dashboard starts, which prints one warning per run when nothing can confine writes. A refused write adds `write outside the workspace was blocked by slag's sandbox: <path>` to the tool result.
+
 Other environment knobs include `SLAG_DUEL`, `SLAG_DUEL_ROUNDS`, `SLAG_REASONING_EFFORT`, `SLAG_SCREENSHOT_CMD`, `SLAG_CONFIG_DIR`, and `SLAG_CHAR_BUDGET` (agent compaction budget). `tui.rs` also reads `NO_COLOR` and `COLORTERM`.
 
 Behavior constants in `config.rs`: `MAX_ANVILS = 3` (parallel ingot slots), `HIGH_GRADE = 3` (plan-model threshold), `MAX_ITERATE = 3` (self-iteration rounds).
@@ -148,7 +159,7 @@ cargo test              # keep this green
 cargo build --release
 ```
 
-Binary surface: `slag "commission"`, `slag key [KEY]`, `slag status`, `slag resume`, `slag update`. Flags: `--tui`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--worktree` (parses, warns, not implemented).
+Binary surface: `slag "commission"`, `slag key [KEY]`, `slag status`, `slag resume`, `slag update`. Flags: `--tui`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--no-sandbox`, `--worktree` (parses, warns, not implemented).
 
 ## Website (website/)
 

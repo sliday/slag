@@ -12,6 +12,7 @@ pub mod policy;
 pub mod pricing;
 pub mod prompt;
 pub mod provider;
+pub mod sandbox;
 pub mod tools;
 pub mod transcript;
 pub mod hooks;

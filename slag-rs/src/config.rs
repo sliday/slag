@@ -963,6 +963,57 @@ pub fn disable_all_hooks() -> bool {
         .is_some_and(|(_, v)| truthy(v))
 }
 
+/// Shell sandbox switch (`engine::sandbox`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// Confine shell writes with the platform backend when one works.
+    Auto,
+    /// Run shell commands unconfined.
+    Off,
+}
+
+/// The shell sandbox setting and its extra writable paths. Mode resolves
+/// `--no-sandbox` (main sets `SLAG_SANDBOX=off`), then `SLAG_SANDBOX`,
+/// then `sandbox` in the file. Extras come from the file only:
+/// `sandbox_writable = ["~/data", "/srv/scratch"]`, `~/` expanded.
+pub fn sandbox_settings() -> (SandboxMode, Vec<PathBuf>) {
+    let entries = config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_config_lines(&c))
+        .unwrap_or_default();
+    let mode = sandbox_mode_from(env_nonempty("SLAG_SANDBOX"), file_value(&entries, "sandbox"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let extras = file_value(&entries, "sandbox_writable")
+        .map(|v| parse_path_list(&v, home.as_deref()))
+        .unwrap_or_default();
+    (mode, extras)
+}
+
+/// Env beats file. Only an explicit off value disables the sandbox, so a
+/// typo keeps it on.
+fn sandbox_mode_from(env: Option<String>, file: Option<String>) -> SandboxMode {
+    let value = env.or(file).unwrap_or_default().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "off" | "false" | "0" | "no" | "nil" => SandboxMode::Off,
+        _ => SandboxMode::Auto,
+    }
+}
+
+/// `["a", "b"]` or `a, b`, quotes optional, a leading `~/` expanded.
+fn parse_path_list(value: &str, home: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let value = value.trim();
+    let inner = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')).unwrap_or(value);
+    inner
+        .split(',')
+        .map(|item| item.trim().trim_matches(|c| c == '"' || c == '\''))
+        .filter(|item| !item.is_empty())
+        .filter_map(|item| match item.strip_prefix("~/") {
+            Some(rest) => home.map(|h| h.join(rest)),
+            None => Some(PathBuf::from(item)),
+        })
+        .collect()
+}
+
 /// slag spells booleans `t`/`nil` in ingots; config files reach for
 /// `true`/`1`/`yes`. Accept all of them, and treat `nil`/`false`/`0`/`off`
 /// as the explicit no.
@@ -1362,6 +1413,41 @@ mod tests {
             ]
         );
 
+        clear_engine_env();
+    }
+
+    #[test]
+    fn sandbox_mode_takes_env_over_file_and_stays_on_for_typos() {
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(sandbox_mode_from(None, None), SandboxMode::Auto);
+        assert_eq!(sandbox_mode_from(None, some("off")), SandboxMode::Off);
+        assert_eq!(sandbox_mode_from(some("auto"), some("off")), SandboxMode::Auto);
+        assert_eq!(sandbox_mode_from(some("OFF"), some("auto")), SandboxMode::Off);
+        assert_eq!(sandbox_mode_from(some("of"), None), SandboxMode::Auto);
+    }
+
+    #[test]
+    fn sandbox_settings_read_mode_and_extra_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        std::env::remove_var("SLAG_SANDBOX");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "sandbox = \"off\"\nsandbox_writable = [\"~/data\", '/srv/scratch']\n",
+        )
+        .unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+
+        let (mode, extras) = sandbox_settings();
+        assert_eq!(mode, SandboxMode::Off);
+        assert_eq!(extras, vec![home.join("data"), PathBuf::from("/srv/scratch")]);
+
+        // `--no-sandbox` and SLAG_SANDBOX travel the same env path.
+        std::env::set_var("SLAG_SANDBOX", "auto");
+        assert_eq!(sandbox_settings().0, SandboxMode::Auto);
+        std::env::remove_var("SLAG_SANDBOX");
         clear_engine_env();
     }
 
