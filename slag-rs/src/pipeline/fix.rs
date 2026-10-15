@@ -472,6 +472,15 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     };
     if let Some(git) = &job.git {
         out.stat = git.stat(&changed);
+        let reverted = git.reverted(&before);
+        if !reverted.is_empty() {
+            let line = format!(
+                "the session reset uncommitted work in {} to HEAD",
+                reverted.join(", ")
+            );
+            note(hooks, &line, false);
+            out.notes.push(line);
+        }
     }
 
     if !passed {
@@ -514,9 +523,10 @@ fn lost_tests(
     before: &BTreeMap<String, repo::Content>,
     changed: &[String],
 ) -> Option<String> {
+    // Every changed file, not only test files: Rust keeps unit tests
+    // inside the source they test.
     let hit: Vec<String> = changed
         .iter()
-        .filter(|p| repo::is_test_path(p))
         .filter_map(|p| {
             let old = String::from_utf8(git.original(before, p)?).ok()?;
             let new = std::fs::read_to_string(git.top.join(p)).unwrap_or_default();
@@ -593,27 +603,39 @@ async fn reproduce(
         return from_baseline().unwrap_or_else(|| Repro::NotShown(why.into()));
     }
 
+    // A symlink would come back as a copy of its target. Not worth the
+    // risk for a proof: say so instead.
+    if sources.iter().any(|p| {
+        std::fs::symlink_metadata(git.top.join(p)).is_ok_and(|m| m.file_type().is_symlink())
+    }) {
+        return from_baseline().unwrap_or(Repro::NotShown("the fix changed a symlink".into()));
+    }
+
     // Swap the source files back to their pre-session content, run, swap
     // the fix back in. A Ctrl-C in between must not cost the user the fix,
     // so the restore is registered with the shutdown hooks first.
-    let fixed: Vec<(PathBuf, repo::Content)> = sources
+    let fixed: Vec<Saved> = sources
         .iter()
         .map(|p| {
             let path = git.top.join(p);
+            let mode = std::fs::metadata(&path).ok().map(|m| m.permissions());
             let now = std::fs::read(&path).ok();
-            (path, now)
+            (path, now, mode)
         })
         .collect();
     let pending = Arc::new(Mutex::new(Some(fixed.clone())));
     let rescue = pending.clone();
     crate::shutdown::register(move || {
         if let Some(files) = rescue.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            // The test run is still going: stop it before it can write
+            // over the restore.
+            repo::kill_running();
             restore(&files);
         }
     });
-    let originals: Vec<(PathBuf, repo::Content)> = sources
+    let originals: Vec<Saved> = sources
         .iter()
-        .map(|p| (git.top.join(p), git.original(before, p)))
+        .map(|p| (git.top.join(p), git.original(before, p), None))
         .collect();
     restore(&originals);
     let run = repo::run(cmd, &job.cwd, TEST_TIMEOUT).await;
@@ -633,15 +655,24 @@ async fn reproduce(
     Repro::Regression { status: run.status() }
 }
 
+/// One file as the reproduction check found it: path, content, and mode
+/// (`None` keeps whatever mode the file has).
+type Saved = (PathBuf, repo::Content, Option<std::fs::Permissions>);
+
 /// Write each path's content back, removing paths whose content is `None`.
-fn restore(files: &[(PathBuf, repo::Content)]) {
-    for (path, content) in files {
+/// A file recreated from nothing gets its mode back too, or a new script
+/// would lose its executable bit on the way through.
+fn restore(files: &[Saved]) {
+    for (path, content, mode) in files {
         match content {
             Some(bytes) => {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(path, bytes);
+                if let Some(mode) = mode {
+                    let _ = std::fs::set_permissions(path, mode.clone());
+                }
             }
             None => {
                 let _ = std::fs::remove_file(path);
@@ -694,8 +725,8 @@ fn commit_message(out: &Outcome) -> String {
         msg.push_str(&format!("\nVerified: `{}` {}", check.cmd, check.status()));
     }
     msg.push('\n');
-    if let Some(n) = out.issue.number {
-        msg.push_str(&format!("\nFixes #{n}\n"));
+    if let Some(n) = out.issue.closing_ref() {
+        msg.push_str(&format!("\nFixes {n}\n"));
     }
     msg
 }
@@ -731,9 +762,9 @@ fn open_pr(git: &Git, branch: &str, out: &Outcome) -> Result<String, String> {
 
 fn pr_body(out: &Outcome) -> String {
     let mut body = String::from("## Issue\n\n");
-    match (&out.issue.number, &out.issue.url) {
-        (Some(n), _) => body.push_str(&format!("Fixes #{n}\n")),
-        (None, _) => body.push_str(&format!("> {}\n", out.issue.title)),
+    match out.issue.closing_ref() {
+        Some(r) => body.push_str(&format!("Fixes {r}\n")),
+        None => body.push_str(&format!("> {}\n", out.issue.title)),
     }
     body.push_str("\n## Reproduction\n\n");
     body.push_str(&repro_line(&out.repro, out.checks.first().map(|c| c.cmd.as_str())));
@@ -1122,6 +1153,42 @@ mod tests {
 
         std::fs::write(root.join("tests/test_x.py"), format!("import pytest\n@pytest.mark.skip\n{suite}")).unwrap();
         assert!(lost_tests(&git, &before, &changed).is_some(), "a skipped test is caught");
+
+        // Rust keeps unit tests in the source file itself.
+        std::fs::write(root.join("tests/test_x.py"), suite).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let lib = "pub fn f() {}\n#[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n}\n";
+        std::fs::write(root.join("src/lib.rs"), lib).unwrap();
+        sh(root, "git add -A && git commit -qm lib");
+        let before = git.snapshot();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let lost = lost_tests(&git, &before, &["src/lib.rs".to_string()]);
+        assert!(lost.is_some_and(|l| l.contains("src/lib.rs")), "an inline test is caught");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_script_keeps_its_mode_through_the_reproduction() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        std::fs::write(root.join("value.txt"), "1\n").unwrap();
+        sh(root, "git add -A && git commit -qm init");
+        let job = job_in(root);
+        let git = job.git.as_ref().unwrap();
+        let before = git.snapshot();
+
+        std::fs::write(root.join("run.sh"), "#!/bin/sh\necho 2\n").unwrap();
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/check.sh"), "test -x run.sh\n").unwrap();
+        let changed = git.changed_since(&before);
+
+        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None).await;
+        assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
+        let mode = std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the restored script is still executable");
     }
 
     #[test]
@@ -1132,6 +1199,7 @@ mod tests {
                 body: "b".into(),
                 number: Some(7),
                 url: None,
+                repo: None,
             },
             verdict: Verdict::Fixed,
             attempts: 1,

@@ -215,7 +215,13 @@ pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
         }
     };
     let pid = child.id();
+    if let Some(pid) = pid {
+        running().lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+    }
     let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    if let Some(pid) = pid {
+        running().lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != pid);
+    }
     let secs = start.elapsed().as_secs_f64();
     match waited {
         Ok(Ok(out)) => {
@@ -234,14 +240,39 @@ pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
             // kill_on_drop reaches bash only; the test runner it started
             // lives in the same process group.
             if let Some(pid) = pid {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &format!("-{pid}")])
-                    .stderr(Stdio::null())
-                    .status();
+                kill_group(pid);
             }
             Run { cmd: cmd.to_string(), code: None, output: String::new(), secs, timed_out: true }
         }
     }
+}
+
+/// Process groups of the commands running right now. A Ctrl-C exits the
+/// process without dropping anything, so `kill_on_drop` never fires there;
+/// this list is what the shutdown path kills instead.
+fn running() -> &'static std::sync::Mutex<Vec<u32>> {
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<Vec<u32>>> = std::sync::OnceLock::new();
+    RUNNING.get_or_init(|| {
+        crate::shutdown::register(kill_running);
+        std::sync::Mutex::new(Vec::new())
+    })
+}
+
+/// Kill every command slag started and has not seen finish. Called before
+/// any file is restored on the way out, so a test run cannot write over
+/// the restore.
+pub fn kill_running() {
+    let pids = std::mem::take(&mut *running().lock().unwrap_or_else(|e| e.into_inner()));
+    for pid in pids {
+        kill_group(pid);
+    }
+}
+
+fn kill_group(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &format!("-{pid}")])
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// The last `lines` lines of `text`, capped at `bytes`. Test runners put
@@ -464,6 +495,14 @@ impl Git {
             .collect()
     }
 
+    /// Paths that held uncommitted work before the session and are clean
+    /// now: the session put them back to HEAD, and the work is gone from
+    /// the working tree.
+    pub fn reverted(&self, before: &BTreeMap<String, Content>) -> Vec<String> {
+        let dirty = self.dirty_paths();
+        before.keys().filter(|p| !dirty.contains(p)).cloned().collect()
+    }
+
     /// A path's content before the session: the snapshot when it was
     /// already dirty, else HEAD, else absent.
     pub fn original(&self, before: &BTreeMap<String, Content>, path: &str) -> Content {
@@ -545,6 +584,17 @@ impl Git {
         paths: &[String],
         message: &str,
     ) -> Result<String, String> {
+        // `git add` would overwrite a staged version the user has not
+        // committed. Leave such a file alone rather than lose that version.
+        let mut staged = vec!["diff", "--cached", "--name-only", "--"];
+        staged.extend(paths.iter().map(String::as_str));
+        let staged = self.git_checked(&staged)?;
+        if !staged.trim().is_empty() {
+            return Err(format!(
+                "{} had staged changes before the fix; commit them or unstage them first",
+                staged.split_whitespace().collect::<Vec<_>>().join(", ")
+            ));
+        }
         self.git_checked(&["switch", "-c", branch])
             .or_else(|_| self.git_checked(&["checkout", "-b", branch]))?;
         let mut add = vec!["add", "-A", "--"];
@@ -576,8 +626,8 @@ fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Paths from `git status --porcelain -z`. A rename or copy entry carries
-/// its source path in the next field, which is skipped.
+/// Paths from `git status --porcelain -z`. A rename carries its source
+/// path in the next field, and both paths changed; a copy's source did not.
 fn parse_porcelain_z(raw: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut fields = raw.split('\0');
@@ -586,10 +636,14 @@ fn parse_porcelain_z(raw: &str) -> Vec<String> {
             continue;
         }
         let (xy, path) = entry.split_at(3);
-        if xy.starts_with(['R', 'C']) {
-            fields.next();
-        }
         paths.push(path.to_string());
+        // A staged rename's source is part of the change too: committing
+        // only the new path would leave the old one in HEAD.
+        if xy.starts_with(['R', 'C']) {
+            if let Some(from) = fields.next().filter(|_| xy.starts_with('R')) {
+                paths.push(from.to_string());
+            }
+        }
     }
     paths
 }
@@ -789,9 +843,12 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_paths_skip_rename_sources() {
+    fn porcelain_paths_include_rename_sources() {
         let raw = " M src/a.rs\0?? new file.txt\0R  b.rs\0old b.rs\0 D gone.rs\0";
-        assert_eq!(parse_porcelain_z(raw), ["src/a.rs", "new file.txt", "b.rs", "gone.rs"]);
+        assert_eq!(
+            parse_porcelain_z(raw),
+            ["src/a.rs", "new file.txt", "b.rs", "old b.rs", "gone.rs"]
+        );
     }
 
     #[test]
@@ -893,5 +950,22 @@ mod tests {
             "the WIP stays dirty, build output stays out, the scratch stays hidden"
         );
         assert_eq!(git.free_branch("slag/fix-a"), "slag/fix-a-2");
+    }
+
+    #[test]
+    fn a_staged_version_the_user_has_not_committed_is_never_overwritten() {
+        let (dir, git) = repo();
+        let before = git.snapshot();
+        write(dir.path(), "src/a.py", "x = 'staged'\n");
+        let sh = |cmd: &str| {
+            std::process::Command::new("bash").args(["-c", cmd]).current_dir(dir.path()).status().unwrap()
+        };
+        sh("git add src/a.py");
+        write(dir.path(), "src/a.py", "x = 'fixed'\n");
+        let changed = git.changed_since(&before);
+        let err = git.commit_on_branch("slag/fix-a", &changed, "fix: a").unwrap_err();
+        assert!(err.contains("src/a.py had staged changes"), "{err}");
+        assert_eq!(git.git(&["branch", "--show-current"]).unwrap().trim(), "main");
+        assert_eq!(git.git(&["show", ":src/a.py"]).unwrap(), "x = 'staged'\n", "index untouched");
     }
 }

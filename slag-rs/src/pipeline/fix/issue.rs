@@ -23,6 +23,8 @@ pub struct Issue {
     /// GitHub issue number, when the issue came from GitHub.
     pub number: Option<u64>,
     pub url: Option<String>,
+    /// `owner/repo` when the issue came by URL and may live elsewhere.
+    pub repo: Option<String>,
 }
 
 impl Issue {
@@ -40,7 +42,18 @@ impl Issue {
             body: text.to_string(),
             number: None,
             url: None,
+            repo: None,
         }
+    }
+
+    /// How a commit or PR names this issue so that merging closes it:
+    /// `#12` here, `owner/repo#12` when the URL named a repository.
+    pub fn closing_ref(&self) -> Option<String> {
+        let n = self.number?;
+        Some(match &self.repo {
+            Some(repo) => format!("{repo}#{n}"),
+            None => format!("#{n}"),
+        })
     }
 
     /// The issue as the smith reads it.
@@ -154,8 +167,11 @@ async fn fetch(number: u64, repo: Option<&str>) -> Result<Issue, SlagError> {
             err.trim()
         )));
     }
-    parse_gh_json(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| SlagError::Config(format!("gh returned unreadable JSON for issue #{number}")))
+    let mut issue = parse_gh_json(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+        SlagError::Config(format!("gh returned unreadable JSON for issue #{number}"))
+    })?;
+    issue.repo = repo.map(str::to_string);
+    Ok(issue)
 }
 
 /// Parse `gh issue view --json number,title,body,url,comments`.
@@ -193,6 +209,7 @@ fn parse_gh_json(raw: &str) -> Option<Issue> {
         body: format!("{title}\n\n{body}"),
         number: v.get("number").and_then(|n| n.as_u64()),
         url: v.get("url").and_then(|u| u.as_str()).map(str::to_string),
+        repo: None,
     })
 }
 
@@ -286,6 +303,9 @@ mod tests {
         assert_eq!(issue.branch_name(), "slag/fix-12-crash-on-empty-input");
         assert!(issue.body.contains("ana: Also on 2.1"), "{}", issue.body);
         assert!(issue.render().starts_with("#12 Crash on empty input"));
+        assert_eq!(issue.closing_ref().as_deref(), Some("#12"));
+        let elsewhere = Issue { repo: Some("acme/app".into()), ..issue };
+        assert_eq!(elsewhere.closing_ref().as_deref(), Some("acme/app#12"));
     }
 
     #[tokio::test]
