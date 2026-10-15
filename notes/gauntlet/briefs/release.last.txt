@@ -1,0 +1,14 @@
+Committed `56746d9`. Changed only `slag-rs/dist-local/publish-release.sh`.
+
+- Single-target rebuilds retain other assets and regenerate all checksums.
+- `--check` rejects missing entries, missing files, and checksum failures.
+- `--allow-partial` permits valid remaining assets.
+- `./slag` stays identical to the host binary.
+
+Verified full build, then Intel rebuild: all eight assets remained and passed checksums. Both Linux binaries printed `slag 2.9.0` in Docker.
+
+Guard tests rejected each failure case and passed after restoration. Generated assets remain local and uncommitted. No release calls occurred.
+
+ASK: Fix asset retention, publish guards, and host copy; verify and commit.
+🟩Got 🟩Had 🟩Did
+🧠 —

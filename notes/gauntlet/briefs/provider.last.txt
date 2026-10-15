@@ -1,0 +1,37 @@
+Committed `2d46979` on `gauntlet/provider`. No push. The worktree is clean.
+
+Implemented 14 presets, config precedence, `provider::model` roles, named keys, OpenRouter feature gates, bounded retries, and native tool metadata replay.
+
+Changed files:
+
+- [config.rs](slag-rs/src/config.rs), [cli.rs](slag-rs/src/cli.rs), [main.rs](slag-rs/src/main.rs)
+- [provider.rs](slag-rs/src/engine/provider.rs), [mod.rs](slag-rs/src/engine/mod.rs), [native.rs](slag-rs/src/smith/native.rs)
+- [providers_cli.rs](slag-rs/tests/providers_cli.rs), [README.md](README.md), [CLAUDE.md](CLAUDE.md)
+
+Verification: **851 unit tests and nine CLI tests pass**. Clippy passes with warnings.
+
+```bash
+cd slag-rs
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --all-targets
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test live_provider_tool_smoke -- --ignored --nocapture
+git diff HEAD --check
+```
+
+I changed one existing assertion because Retry-After HTTP dates now work. Existing provider fixtures pin OpenRouter to prevent environment races.
+
+| Live smoke | Result | Latency |
+|---|---|---:|
+| OpenRouter | Pass, tool call | 1,067 ms |
+| OpenAI | Skip, key absent | — |
+| Cerebras | Skip, key absent | — |
+| Groq | Skip, key absent | — |
+| Gemini | Skip, key absent | — |
+| xAI | Skip, key absent | — |
+| Mistral | Skip, key absent | — |
+
+Only the OpenRouter key exists in this shell. Six live integrations remain unverified. I found no unresolved endpoint uncertainty. Anthropic’s compatibility limits appear in both docs.
+
+ASK: Make slag’s engine provider agnostic while preserving compatibility.
+🟩Got 🟨Had 🟨Did, six live checks lack keys.
+🧠 Low
