@@ -30,6 +30,38 @@ export const Glyph: React.FC<{name: GlyphName; color: string; t: number}> = ({na
         <path d="M12 4 L18 10 L12 16" />
       </g>
     );
+  } else if (name === 'hammer') {
+    // ⚒, the attempt and anvil glyph: two crossed tools.
+    body = (
+      <g fill="none" stroke={color} strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4 17 L14 7" />
+        <path d="M16 17 L6 7" />
+        <path d="M11 4.5 L16.5 10 L18.5 8 L13 2.5 Z" fill={color} />
+        <path d="M9 4.5 L3.5 10 L1.5 8 L7 2.5 Z" fill={color} />
+      </g>
+    );
+  } else if (name === 'ingot') {
+    // ▣, an ingot on the anvil.
+    body = (
+      <g>
+        <rect x="3" y="3" width="14" height="14" fill="none" stroke={color} strokeWidth={2} />
+        <rect x="7" y="7" width="6" height="6" fill={color} />
+      </g>
+    );
+  } else if (name === 'diamond') {
+    // ◆, a finished artifact: the blueprint, the mold.
+    body = <path d="M10 2.5 L17.5 10 L10 17.5 L2.5 10 Z" fill={color} />;
+  } else if (name === 'resmelt') {
+    // ♻, a cracked ingot rewritten and cast again: a closing loop.
+    body = (
+      <g fill="none" stroke={color} strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M16.5 7.5 A7 7 0 1 0 17 12.5" />
+        <path d="M17.5 2.5 L16.8 7.8 L11.6 7" />
+      </g>
+    );
+  } else if (name === 'square') {
+    // ■, the session's closing summary.
+    body = <rect x="4" y="4" width="12" height="12" fill={color} />;
   } else if (name === 'ore' || name === 'molten' || name === 'forged') {
     // Ingot states as one square: ore is cold and hollow (░), molten
     // glows (▓), forged is solid white (█).

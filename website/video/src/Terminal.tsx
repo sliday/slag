@@ -2,7 +2,7 @@ import React from 'react';
 import {Easing, interpolate, random} from 'remotion';
 import {Glyph} from './Glyph';
 import {ShadeCell} from './Shade';
-import type {BarSeg, Line, RollSeg, Scene, Seg, TextSeg} from './script';
+import type {Line, RollSeg, Scene, Seg, TextSeg} from './script';
 import {charW, layout, palette, toneColor} from './theme';
 
 const ease = Easing.out(Easing.cubic);
@@ -11,7 +11,6 @@ const ramp = (t: number, from: number, dur: number) => ease(clamp01((t - from) /
 
 const isText = (s: Seg): s is TextSeg => 'text' in s;
 const isRoll = (s: Seg): s is RollSeg => 'roll' in s;
-const isBar = (s: Seg): s is BarSeg => 'bar' in s;
 
 const rollIndex = (s: RollSeg, t: number) =>
   t < s.from ? 0 : Math.min(s.roll.length - 1, Math.floor((t - s.from) / s.every));
@@ -19,8 +18,6 @@ const rollIndex = (s: RollSeg, t: number) =>
 const segLength = (s: Seg, t: number): number => {
   if (isText(s)) return s.text.length;
   if (isRoll(s)) return s.roll[rollIndex(s, t)].length;
-  // [ + 20 cells + ] + ' 100%'
-  if (isBar(s)) return 27;
   return 1;
 };
 
@@ -41,13 +38,33 @@ const currentSegs = (line: Line, t: number): Seg[] => {
   return segs;
 };
 
+// The window holds `layout.rows` rows. A line past the last row scrolls
+// the page up, the way a terminal does, over a short glide.
+export const scrollAt = (scene: Scene, t: number): number => {
+  const steps = scene.lines
+    .map((l) => ({at: l.at, top: Math.max(0, l.row - (layout.rows - 1))}))
+    .sort((a, b) => a.at - b.at);
+  let prev = 0;
+  let cur = 0;
+  let at = 0;
+  for (const step of steps) {
+    if (step.at > t) break;
+    if (step.top > cur) {
+      prev = cur;
+      cur = step.top;
+      at = step.at;
+    }
+  }
+  return prev + (cur - prev) * ramp(t, at, 0.16);
+};
+
 export type Burst = {at: number; x: number; y: number; seed: string; big: boolean};
 
 export const sceneBursts = (scene: Scene): Burst[] => {
   const out: Burst[] = [];
   for (const line of scene.lines) {
-    const y = layout.padTop + line.row * layout.lineHeight + layout.lineHeight / 2;
     const push = (at: number, segs: Seg[]) => {
+      const y = layout.padTop + (line.row - scrollAt(scene, at + 0.16)) * layout.lineHeight + layout.lineHeight / 2;
       const x = layout.padX + (sparkColumn(segs, at) + 0.5) * charW;
       out.push({at, x, y, seed: `${scene.id}-${line.row}-${at}`, big: segs.some((s) => 'glyph' in s && s.glyph === 'ok')});
     };
@@ -57,34 +74,11 @@ export const sceneBursts = (scene: Scene): Burst[] => {
   return out;
 };
 
-const Bar: React.FC<{seg: BarSeg; t: number}> = ({seg, t}) => {
-  const {total, forgedAt} = seg.bar;
-  const width = 20;
-  const fill = forgedAt.reduce((acc, at) => acc + ramp(t, at, 0.35) * (width / total), 0);
-  const filled = Math.floor(fill + 1e-6);
-  // Same thresholds as temper_bar() in slag-rs/src/tui.rs.
-  const cells = Array.from({length: width}, (_, i) => {
-    if (i >= filled) return <ShadeCell key={i} ch="░" color={palette.cold} />;
-    if (i < Math.floor(filled / 3)) return <ShadeCell key={i} ch="▒" color={palette.warm} />;
-    if (i < Math.floor((filled * 2) / 3)) return <ShadeCell key={i} ch="▓" color={palette.hot} />;
-    return <ShadeCell key={i} ch="█" color={palette.bright} />;
-  });
-  const pct = Math.round((fill / width) * 100);
-  return (
-    <>
-      <span style={{color: palette.cold}}>[</span>
-      {cells}
-      <span style={{color: palette.cold}}>]</span>
-      <span style={{color: palette.pure}}>{` ${pct}%`}</span>
-    </>
-  );
-};
-
 const Roll: React.FC<{seg: RollSeg; t: number; color: string}> = ({seg, t, color}) => {
   const i = rollIndex(seg, t);
   const word = seg.roll[i];
   const since = t - (seg.from + i * seg.every);
-  const p = i > 0 && since < 0.14 ? ease(clamp01(since / 0.14)) : 1;
+  const p = seg.slide && i > 0 && since < 0.14 ? ease(clamp01(since / 0.14)) : 1;
   if (p >= 1) return <span style={{color}}>{word}</span>;
   const prev = seg.roll[i - 1];
   const h = layout.lineHeight;
@@ -99,7 +93,17 @@ const Roll: React.FC<{seg: RollSeg; t: number; color: string}> = ({seg, t, color
   );
 };
 
-const LineView: React.FC<{line: Line; t: number; frame: number; exit?: Scene['exit']}> = ({line, t, frame, exit}) => {
+// Plain text, with the shade characters drawn as flat cells.
+const TextRun: React.FC<{text: string; color: string; bold?: boolean; opacity: number}> = ({text, color, bold, opacity}) => {
+  const parts = text.split(/([░▒▓█])/).filter((p) => p !== '');
+  return (
+    <span style={{color, fontWeight: bold ? 700 : 400, opacity}}>
+      {parts.map((p, i) => (/^[░▒▓█]$/.test(p) ? <ShadeCell key={i} ch={p} color={color} height="0.72em" gap="0.16ch" /> : p))}
+    </span>
+  );
+};
+
+const LineView: React.FC<{line: Line; t: number; frame: number; top: number; exit?: Scene['exit']}> = ({line, t, frame, top, exit}) => {
   if (t < line.at) return null;
   const segs = currentSegs(line, t);
   const total = segs.reduce((a, s) => a + segLength(s, t), 0);
@@ -123,10 +127,6 @@ const LineView: React.FC<{line: Line; t: number; frame: number; exit?: Scene['ex
     const len = segLength(s, t);
     const room = visible - used;
     used += Math.min(len, room);
-    if (isBar(s)) {
-      nodes.push(<Bar key={k} seg={s} t={t} />);
-      return;
-    }
     if ('glyph' in s) {
       nodes.push(
         <span key={k} style={{opacity: dim}}>
@@ -166,11 +166,7 @@ const LineView: React.FC<{line: Line; t: number; frame: number; exit?: Scene['ex
       );
       return;
     }
-    nodes.push(
-      <span key={k} style={{color: toneColor(s.tone), fontWeight: s.bold ? 700 : 400, opacity: dim}}>
-        {text}
-      </span>,
-    );
+    nodes.push(<TextRun key={k} text={text} color={toneColor(s.tone)} bold={s.bold} opacity={dim} />);
   });
 
   const c = line.cursor;
@@ -200,7 +196,7 @@ const LineView: React.FC<{line: Line; t: number; frame: number; exit?: Scene['ex
       style={{
         position: 'absolute',
         left: layout.padX,
-        top: layout.padTop + line.row * layout.lineHeight,
+        top: layout.padTop + (line.row - top) * layout.lineHeight,
         height: layout.lineHeight,
         lineHeight: `${layout.lineHeight}px`,
         whiteSpace: 'pre',
@@ -255,14 +251,14 @@ export const Sparks: React.FC<{bursts: Burst[]; t: number}> = ({bursts, t}) => {
   return <>{out}</>;
 };
 
-const FocusBand: React.FC<{scene: Scene; t: number}> = ({scene, t}) => {
+const FocusBand: React.FC<{scene: Scene; t: number; top: number}> = ({scene, t, top}) => {
   const marks = scene.focus ?? [];
   let i = -1;
   marks.forEach((m, k) => {
     if (t >= m.at) i = k;
   });
   if (i < 0) return null;
-  const rowY = (row: number) => layout.padTop + row * layout.lineHeight;
+  const rowY = (row: number) => layout.padTop + (row - top) * layout.lineHeight;
   const from = i > 0 ? rowY(marks[i - 1].row) : rowY(marks[i].row);
   const y = from + (rowY(marks[i].row) - from) * ramp(t, marks[i].at, 0.28);
   let opacity = ramp(t, marks[0].at, 0.25);
@@ -285,11 +281,14 @@ const FocusBand: React.FC<{scene: Scene; t: number}> = ({scene, t}) => {
 
 export const TerminalScene: React.FC<{scene: Scene; t: number; frame: number}> = ({scene, t, frame}) => {
   const bursts = sceneBursts(scene);
+  const top = scrollAt(scene, t);
   return (
-    <div style={{position: 'absolute', inset: 0, fontSize: layout.termSize}}>
-      <FocusBand scene={scene} t={t} />
+    // Clip at the first row, as a terminal does: a scrolled row never
+    // peeks into the top padding.
+    <div style={{position: 'absolute', inset: 0, fontSize: layout.termSize, overflow: 'hidden', clipPath: `inset(${layout.padTop}px 0 0 0)`}}>
+      <FocusBand scene={scene} t={t} top={top} />
       {scene.lines.map((line) => (
-        <LineView key={`${scene.id}-${line.row}`} line={line} t={t} frame={frame} exit={scene.exit} />
+        <LineView key={`${scene.id}-${line.row}`} line={line} t={t} frame={frame} top={top} exit={scene.exit} />
       ))}
       <Sparks bursts={bursts} t={t} />
     </div>
