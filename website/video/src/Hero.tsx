@@ -1,5 +1,5 @@
 import React from 'react';
-import {AbsoluteFill, Easing, Sequence, useCurrentFrame, useVideoConfig} from 'remotion';
+import {AbsoluteFill, Easing, useCurrentFrame, useVideoConfig} from 'remotion';
 import {Captions} from './Captions';
 import {EndCard} from './EndCard';
 import type {HeroScript} from './script';
@@ -8,14 +8,6 @@ import {FONT, layout, palette} from './theme';
 
 const ease = Easing.inOut(Easing.cubic);
 const ramp = (t: number, from: number, dur: number) => ease(Math.min(1, Math.max(0, (t - from) / dur)));
-
-// A scene's own clock, so script times stay scene-relative.
-const SceneClock: React.FC<{scene: HeroScript['scenes'][number]}> = ({scene}) => {
-  const local = useCurrentFrame();
-  const {fps} = useVideoConfig();
-  const frame = local + Math.round(scene.from * fps);
-  return <TerminalScene scene={scene} t={local / fps} frame={frame} />;
-};
 
 export const Hero: React.FC<HeroScript> = (script) => {
   const frame = useCurrentFrame();
@@ -63,16 +55,11 @@ export const Hero: React.FC<HeroScript> = (script) => {
           ))}
         </div>
         <div style={{position: 'absolute', left: 0, top: win.strip, right: 0, bottom: 0}}>
-          {script.scenes.map((scene) => (
-            <Sequence
-              key={scene.id}
-              from={Math.round(scene.from * fps)}
-              durationInFrames={Math.round((scene.to - scene.from) * fps)}
-              layout="none"
-            >
-              <SceneClock scene={scene} />
-            </Sequence>
-          ))}
+          {script.scenes
+            .filter((scene) => t >= scene.from && t < scene.to)
+            .map((scene) => (
+              <TerminalScene key={scene.id} scene={scene} t={t - scene.from} frame={frame} />
+            ))}
         </div>
       </div>
       <EndCard card={card} t={t} />

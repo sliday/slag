@@ -122,6 +122,71 @@ const INGOTS: [string, string][] = [
 // Scene-relative times in the forge scene.
 const FORGED_AT = [2.6, 3.4, 4.5, 4.65];
 
+// The fix run in story seconds: the command was typed, Enter lands at
+// 1.2, output follows. The scenes below replay it and also show it settled.
+const FIX_START = 1.2;
+const FIX_LINES: Line[] = [
+  {row: 0, at: 0, instant: true, segs: FIX_CMD},
+  {
+    row: 1,
+    at: 1.35,
+    segs: [t('  issue ', 'cold'), t('#482', 'bright'), t(' export dates off by one', 'fg')],
+  },
+  {
+    row: 2,
+    at: 1.8,
+    segs: [t('  '), g('spin', 'hot'), t(' reproducing', 'fg')],
+    then: [
+      {at: 2.75, segs: [t('  '), g('fail', 'warm'), t(' test_export_dates ', 'fg'), t('fails', 'warm')]},
+      {at: 4.35, burst: true, segs: [t('  '), g('ok', 'pure'), t(' test_export_dates ', 'fg'), t('passes', 'pure')]},
+    ],
+  },
+  {
+    row: 3,
+    at: 3.25,
+    segs: [t('  '), g('spin', 'hot'), t(' patching ', 'fg'), t('src/export.py', 'bright')],
+    then: [{at: 4.05, segs: [t('  '), t('±', 'hot', true), t(' patched  ', 'fg'), t('src/export.py', 'bright')]}],
+  },
+  {
+    row: 4,
+    at: 4.85,
+    burst: true,
+    segs: [t('  '), g('ok', 'pure'), t(' full suite        ', 'fg'), t('passes', 'pure')],
+  },
+  {
+    row: 5,
+    at: 5.55,
+    segs: [t('  '), g('arrow', 'pure'), t(' branch ', 'cold'), t('slag/fix-482-export-dates', 'bright')],
+  },
+  {row: 6, at: 6.05, segs: [t('  '), g('arrow', 'pure'), t(' draft PR', 'pure', true), t(' opened', 'fg')]},
+];
+const FIX_FOCUS = [
+  {at: 1.35, row: 1},
+  {at: 1.8, row: 2},
+  {at: 3.25, row: 3},
+  {at: 4.3, row: 2},
+  {at: 4.85, row: 4},
+  {at: 5.55, row: 5},
+  {at: 6.05, row: 6},
+];
+
+// Every line in its final state, already on screen. The video opens and
+// loops on this frame, and the poster is this frame, so the poster hands
+// over to playback with nothing changing. Reduced-motion visitors see only
+// this: the whole fix in one still.
+const settled = (lines: Line[]): Line[] =>
+  lines.map((l) => ({row: l.row, at: 0, instant: true, segs: l.then?.length ? l.then[l.then.length - 1].segs : l.segs}));
+
+const shift = (lines: Line[], by: number): Line[] =>
+  lines.map((l) => ({
+    ...l,
+    at: l.row === 0 ? 0 : l.at + by,
+    then: l.then?.map((s) => ({...s, at: s.at + by})),
+  }));
+
+// A focus mark before 0 is already in place when the scene starts.
+const RESULT_FOCUS = [{at: -1, row: 6}];
+
 export const heroScript: HeroScript = {
   duration: 24,
   captions: [
@@ -139,54 +204,20 @@ export const heroScript: HeroScript = {
   ],
   scenes: [
     {
-      id: 'fix',
+      id: 'result',
       from: 0,
+      to: FIX_START,
+      exit: {at: 0.7, keep: [0]},
+      focus: RESULT_FOCUS,
+      lines: settled(FIX_LINES),
+    },
+    {
+      id: 'fix',
+      from: FIX_START,
       to: 7.6,
-      exit: {at: 7.35, keep: [0]},
-      focus: [
-        {at: 1.35, row: 1},
-        {at: 1.8, row: 2},
-        {at: 3.25, row: 3},
-        {at: 4.3, row: 2},
-        {at: 4.85, row: 4},
-        {at: 5.55, row: 5},
-        {at: 6.05, row: 6},
-      ],
-      lines: [
-        {row: 0, at: 0, instant: true, segs: FIX_CMD, type: {at: 0.35, cps: 26, keep: 2}, cursor: {from: 0, to: 1.25}},
-        {
-          row: 1,
-          at: 1.35,
-          segs: [t('  issue ', 'cold'), t('#482', 'bright'), t(' export dates off by one', 'fg')],
-        },
-        {
-          row: 2,
-          at: 1.8,
-          segs: [t('  '), g('spin', 'hot'), t(' reproducing', 'fg')],
-          then: [
-            {at: 2.75, segs: [t('  '), g('fail', 'warm'), t(' test_export_dates ', 'fg'), t('fails', 'warm')]},
-            {at: 4.35, burst: true, segs: [t('  '), g('ok', 'pure'), t(' test_export_dates ', 'fg'), t('passes', 'pure')]},
-          ],
-        },
-        {
-          row: 3,
-          at: 3.25,
-          segs: [t('  '), g('spin', 'hot'), t(' patching ', 'fg'), t('src/export.py', 'bright')],
-          then: [{at: 4.05, segs: [t('  '), t('±', 'hot', true), t(' patched  ', 'fg'), t('src/export.py', 'bright')]}],
-        },
-        {
-          row: 4,
-          at: 4.85,
-          burst: true,
-          segs: [t('  '), g('ok', 'pure'), t(' full suite        ', 'fg'), t('passes', 'pure')],
-        },
-        {
-          row: 5,
-          at: 5.55,
-          segs: [t('  '), g('arrow', 'pure'), t(' branch ', 'cold'), t('slag/fix-482-export-dates', 'bright')],
-        },
-        {row: 6, at: 6.05, segs: [t('  '), g('arrow', 'pure'), t(' draft PR', 'pure', true), t(' opened', 'fg')]},
-      ],
+      exit: {at: 7.35 - FIX_START, keep: [0]},
+      focus: FIX_FOCUS.map((f) => ({...f, at: f.at - FIX_START})),
+      lines: shift(FIX_LINES, -FIX_START),
     },
     {
       id: 'provider',
@@ -258,10 +289,11 @@ export const heroScript: HeroScript = {
       ],
     },
     {
-      id: 'rest',
+      id: 'again',
       from: 22.6,
       to: 24,
-      lines: [{row: 0, at: 0, instant: true, segs: [PROMPT], cursor: {from: 0, to: 99}}],
+      focus: RESULT_FOCUS,
+      lines: settled(FIX_LINES),
     },
   ],
   endCard: {from: 20.3, to: 23.0, tagline: 'Fix issues fast, with any model.', url: 'slag.dev'},
