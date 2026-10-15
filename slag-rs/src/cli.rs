@@ -78,6 +78,11 @@ pub struct Cli {
     /// chrome://tracing or Perfetto to see what ran in parallel.
     #[arg(long, value_name = "FILE")]
     pub trace: Option<PathBuf>,
+
+    /// Let shell commands write outside the workspace (equivalent to
+    /// SLAG_SANDBOX=off)
+    #[arg(long, global = true)]
+    pub no_sandbox: bool,
 }
 
 #[derive(Subcommand)]
@@ -985,6 +990,13 @@ mod tests {
 
         let cli = Cli::parse_from(["slag", "build", "it"]);
         assert!(cli.trace.is_none(), "tracing costs a file; opt in explicitly");
+    }
+
+    #[test]
+    fn no_sandbox_flag_parses_before_and_after_fix() {
+        assert!(Cli::parse_from(["slag", "--no-sandbox", "build", "it"]).no_sandbox);
+        assert!(Cli::parse_from(["slag", "fix", "--no-sandbox", "boom"]).no_sandbox);
+        assert!(!Cli::parse_from(["slag", "build", "it"]).no_sandbox, "auto is the default");
     }
 
     #[test]

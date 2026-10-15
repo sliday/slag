@@ -70,6 +70,10 @@ async fn main() {
     if cli.duel {
         std::env::set_var("SLAG_DUEL", "on");
     }
+    // --no-sandbox = SLAG_SANDBOX=off, read downstream like the rest.
+    if cli.no_sandbox {
+        std::env::set_var("SLAG_SANDBOX", "off");
+    }
 
     // Cleanup routing, installed before anything can register a chore:
     // a panic mid-draw and a shell Ctrl-C both drain the same registry,
@@ -81,6 +85,12 @@ async fn main() {
     // Idempotent fixups (deprecated model slugs, old crucible headers)
     // run before any command touches those files.
     migrations::run();
+
+    // Probe the shell sandbox before any dashboard owns the terminal, so
+    // the one "running unconfined" warning stays readable.
+    if matches!(cli.command, None | Some(Command::Resume) | Some(Command::Fix(_))) {
+        engine::sandbox::preflight();
+    }
 
     // `status`, `update` and `key` inspect or repair a broken setup, so
     // none of them may demand the very key the user came here to fix.
