@@ -1,0 +1,5 @@
+{
+  "WIDGET": {"name": "Standard widget", "price": 10.0},
+  "GADGET": {"name": "Deluxe gadget", "price": 24.5},
+  "SPROCKET": {"name": "Spare sprocket", "price": 3.75}
+}

@@ -4,7 +4,7 @@ use crate::crucible::Crucible;
 use crate::error::SlagError;
 use crate::flux;
 use crate::sexp::parser::parse_crucible;
-use crate::sexp::Ingot;
+use crate::sexp::{Ingot, Status};
 use crate::smith::Smith;
 use crate::tui;
 
@@ -52,7 +52,7 @@ pub async fn resmelt_ingot(
         if !quiet {
             println!("    {}✗{} smelter failed", super::fg(tui::WARM), super::reset());
         }
-        SlagError::SmithFailed(e.to_string())
+        if e.is_deterministic_provider() { e } else { SlagError::SmithFailed(e.to_string()) }
     })?;
     spinner.finish_and_clear();
 
@@ -77,7 +77,7 @@ pub async fn resmelt_ingot(
     }
 
     // Try to extract ingot lines from response
-    let new_ingots = parse_crucible(&response);
+    let mut new_ingots = parse_crucible(&response);
     if new_ingots.is_empty() {
         if !quiet {
             println!(
@@ -87,6 +87,20 @@ pub async fn resmelt_ingot(
             );
         }
         return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
+    }
+
+    let mut ids: std::collections::HashSet<_> = crucible.ingots
+        .iter()
+        .filter(|i| i.id != ingot.id)
+        .map(|i| i.id.clone())
+        .collect();
+    for replacement in &mut new_ingots {
+        if !ids.insert(replacement.id.clone()) {
+            return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
+        }
+        replacement.status = Status::Ore;
+        replacement.heat = 0;
+        replacement.smelt = ingot.smelt + 1;
     }
 
     if !quiet {
@@ -146,4 +160,53 @@ fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
     let _ = std::fs::write(&path, content);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sexp::Status;
+    use crate::smith::mock::MockSmith;
+
+    #[tokio::test]
+    async fn resmelt_owns_status_heat_and_smelt_for_rewrites_and_splits() {
+        let dir = tempfile::tempdir().unwrap();
+        for response in [
+            "(ingot :id \"i1\" :status molten :heat 99 :smelt 0)",
+            "(ingot :id \"i1a\" :status forged :heat 4 :smelt 0)\n\
+             (ingot :id \"i1b\" :status cracked :heat 5 :smelt 9)",
+        ] {
+            let ingot = parse_crucible("(ingot :id \"i1\" :status molten :heat 5)").remove(0);
+            let mut crucible = Crucible::new(&dir.path().join("PLAN.md"), vec![ingot.clone()]);
+            let smith = MockSmith::fixed(response);
+            resmelt_ingot(&mut crucible, &ingot, &smith).await.unwrap();
+            for replacement in crucible.ingots.clone() {
+                assert_eq!(replacement.status, Status::Ore);
+                assert_eq!(replacement.heat, 0);
+                assert_eq!(replacement.smelt, 1);
+                resmelt_ingot(&mut crucible, &replacement, &smith).await
+                    .expect_err("a replacement gets one re-smelt");
+            }
+            assert_eq!(smith.call_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn resmelt_rejects_duplicate_or_colliding_replacement_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        for response in [
+            "(ingot :id \"i1\")\n(ingot :id \"i1\")",
+            "(ingot :id \"i2\")",
+        ] {
+            let ingots = parse_crucible("(ingot :id \"i1\" :status molten :heat 5)\n\
+                (ingot :id \"i2\" :status forged)");
+            let original = ingots[0].clone();
+            let mut crucible = Crucible::new(&dir.path().join("PLAN.md"), ingots);
+            resmelt_ingot(&mut crucible, &original, &MockSmith::fixed(response)).await
+                .expect_err("re-smelt cannot alias another ingot");
+            assert_eq!(crucible.ingots.len(), 2);
+            assert_eq!(crucible.get("i1").unwrap().heat, 5);
+            assert_eq!(crucible.get("i2").unwrap().status, Status::Forged);
+        }
+    }
 }

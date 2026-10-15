@@ -1,0 +1,1 @@
+{"id": "py-pricetag-cache", "lang": "python", "difficulty": "hard", "summary": "Price cache is never invalidated on update; the visible symptom (wrong order totals) points at orders.py."}

@@ -1,0 +1,1 @@
+{"id": "sh-backup-rotate", "lang": "shell", "difficulty": "easy", "summary": "rotate.sh pipes the newest-first listing into head instead of skipping the kept prefix, deleting the newest backups."}

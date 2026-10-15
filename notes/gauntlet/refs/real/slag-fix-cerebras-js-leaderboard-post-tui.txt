@@ -1,0 +1,33 @@
+
+  ░▒▓█ SLAG █▓▒░  v2.9.0
+  survey → plan → forge → assay
+
+── FIX ────────────────────────────────────────────────────────────────────────
+  ░ issue: Leaderboard order is wrong
+  ✓ tests: `npm test` (from package.json scripts.test) exit 0 before any edit
+  ⚒ attempt 1/3 · cerebras::qwen-3.8-27b
+  ✓ read   src/leaderboard.js                                                                                                                                                                                                           15 lines
+  ✓ read 6 files
+  ✓ write  tests/leaderboard.test.js
+  ✓ edit   src/leaderboard.js
+  ✓ run    npm test && node src/demo.js                                                                                                                                                                                                 20 lines
+  ■ Root cause: src/leaderboard.js:8 called `.sort().reverse()` on player objects. Default sort coerces objects to strings (stable no-op here), and `.reverse()` then flipped the input array — which is why the table appeared as reversed
+    signup order. Fix: sort with a points comparator, `sort((a, b) => b.points - a.points)`, keeping the public `topPlayers` signature. Added tests/leaderboard.test.js (node:test, matching style): ranks by points best-first and respects th…
+  ✓ verify: `npm test` exit 0 in 0.2s
+  ✓ reproduced: without the fix `npm test` gives exit 1
+
+── FIX · FIXED ────────────────────────────────────────────────────────────────
+  issue       Leaderboard order is wrong
+  verdict     FIXED in 1 attempt
+  reproduced  With the source change reverted, `npm test` gives exit 1: the new test catches the bug.
+  verified    `npm test` exit 0 · 0.2s
+  changed     src/leaderboard.js        |  2 +-
+              tests/leaderboard.test.js | 35 +++++++++++++++++++++++++++++++++++
+              2 files changed, 36 insertions(+), 1 deletion(-)
+  branch      slag/fix-leaderboard-order-is-wrong @ 2dfef14
+  time        wall 20s · api 19s · tools 0s
+              gather 0.2s · session 19.7s · verify 0.2s · reproduce 0.2s · commit 0.1s
+  spend       -
+
+  review: git show --stat HEAD
+

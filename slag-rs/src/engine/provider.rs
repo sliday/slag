@@ -1,4 +1,4 @@
-//! provider — OpenRouter HTTP client for the native forging engine.
+//! provider: chat-completions client for the native forging engine.
 //!
 //! OpenAI-compatible wire format. Retries 429/5xx with exponential backoff,
 //! fails fast on other 4xx. Provider quirks stay quarantined here; the rest
@@ -15,6 +15,7 @@ use super::{
     CancelFlag, ChatMessage, ChatRequest, EngineEvent, EventTx, FinishReason, NormalizedResponse,
     Provider, RetryPolicy, ToolCall, Usage,
 };
+use crate::config::ProviderPreset;
 use crate::error::{ProviderApiError, ProviderErrorCategory, SlagError};
 
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
@@ -70,7 +71,7 @@ fn timeout_from_env() -> Duration {
 /// Build the HTTP client. `drop_idle_pool` disables connection reuse for
 /// the client that replaces one whose pooled connections went stale.
 fn build_client(timeout: Duration, drop_idle_pool: bool) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder().timeout(timeout).redirect(reqwest::redirect::Policy::none());
     if drop_idle_pool {
         builder = builder.pool_max_idle_per_host(0);
     }
@@ -79,6 +80,9 @@ fn build_client(timeout: Duration, drop_idle_pool: bool) -> reqwest::Client {
 
 /// OpenRouter chat-completions client.
 pub struct OpenRouter {
+    provider: ProviderPreset,
+    quirks: std::sync::atomic::AtomicU8,
+    routes: std::sync::Mutex<Vec<std::sync::Arc<OpenRouter>>>,
     api_key: String,
     base_url: String,
     /// Behind a mutex so a stale-connection retry can swap in a fresh
@@ -106,24 +110,53 @@ pub struct OpenRouter {
 
 impl OpenRouter {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url(api_key, super::OPENROUTER_BASE)
+        Self::with_provider(ProviderPreset::OpenRouter, api_key, super::OPENROUTER_BASE)
     }
 
     /// Base URL override enables wiremock tests and proxies.
     pub fn with_base_url(api_key: impl Into<String>, url: impl Into<String>) -> Self {
+        let provider = crate::config::active_provider().unwrap_or(ProviderPreset::OpenRouter);
+        Self::with_provider(provider, api_key, url)
+    }
+
+    pub fn with_provider(
+        provider: ProviderPreset,
+        api_key: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
         let timeout = timeout_from_env();
         Self {
+            provider,
+            quirks: std::sync::atomic::AtomicU8::new(0),
+            routes: std::sync::Mutex::new(Vec::new()),
             api_key: api_key.into(),
             base_url: url.into().trim_end_matches('/').to_string(),
             http: std::sync::Mutex::new(build_client(timeout, false)),
             timeout,
-            max_attempts: max_attempts_from_env(),
+            max_attempts: if provider == ProviderPreset::OpenRouter {
+                max_attempts_from_env()
+            } else {
+                max_attempts_from_env().min(3)
+            },
             fallback_model: crate::config::fallback_model(),
-            unattended: crate::config::unattended_retry(),
+            unattended: provider == ProviderPreset::OpenRouter && crate::config::unattended_retry(),
             events: std::sync::Mutex::new(None),
             cancel: std::sync::Mutex::new(None),
             models: tokio::sync::Mutex::new(None),
         }
+    }
+
+    fn routed_client(&self, provider: ProviderPreset, key: String, base_url: String) -> std::sync::Arc<Self> {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let mut routes = self.routes.lock().unwrap();
+        if let Some(routed) = routes.iter().find(|r| r.provider == provider && r.api_key == key && r.base_url == base_url) {
+            return routed.clone();
+        }
+        let routed = std::sync::Arc::new(Self::with_provider(provider, key, base_url));
+        *routed.events.lock().unwrap() = self.events.lock().unwrap().clone();
+        *routed.cancel.lock().unwrap() = self.cancel.lock().unwrap().clone();
+        routes.push(routed.clone());
+        routed
     }
 
     #[cfg(test)]
@@ -188,7 +221,17 @@ impl OpenRouter {
     /// the model list is unreachable or the id is unknown — window size is
     /// an optimization for the compaction budget, never a blocker.
     pub async fn context_length(&self, model: &str) -> Option<u64> {
-        self.models_index().await.window(model)
+        let (provider, key, base_url, model) = crate::config::resolve_connection(
+            model, self.provider, &self.api_key, &self.base_url,
+        ).ok()?;
+        if provider != ProviderPreset::OpenRouter {
+            return None;
+        }
+        if provider == self.provider && base_url == self.base_url {
+            self.models_index().await.window(&model)
+        } else {
+            self.routed_client(provider, key, base_url).models_index().await.window(&model)
+        }
     }
 
     /// The `/models` index, fetched at most once per client. Both the
@@ -196,6 +239,9 @@ impl OpenRouter {
     /// A failed fetch still caches (empty windows, disk-cached prices), so
     /// an offline run does not re-fetch on every turn.
     async fn models_index(&self) -> std::sync::Arc<ModelsIndex> {
+        if self.provider != ProviderPreset::OpenRouter {
+            return std::sync::Arc::new(ModelsIndex::default());
+        }
         let mut slot = self.models.lock().await;
         if let Some(index) = slot.as_ref() {
             return index.clone();
@@ -229,8 +275,12 @@ impl OpenRouter {
     async fn attribute(&self, resp: &mut NormalizedResponse, req: &ChatRequest) {
         let ran = resp.model.clone().unwrap_or_else(|| req.model.clone());
         resp.usage.role = Some(req.role);
-        resp.usage.model = Some(ran.clone());
-        if resp.usage.cost.is_none() {
+        resp.usage.model = Some(if self.provider == ProviderPreset::OpenRouter {
+            ran.clone()
+        } else {
+            format!("{}::{ran}", self.provider.name())
+        });
+        if self.provider == ProviderPreset::OpenRouter && resp.usage.cost.is_none() {
             if let Some(cost) = self.models_index().await.prices.estimate(&ran, &resp.usage) {
                 resp.usage.cost = Some(cost);
                 resp.usage.estimated = true;
@@ -243,15 +293,24 @@ impl OpenRouter {
         let mut body = json!({
             "model": req.model,
             "messages": wire_messages(&req.messages),
-            "usage": { "include": true },
         });
+        if self.provider == ProviderPreset::OpenRouter {
+            body["usage"] = json!({ "include": true });
+        } else if let Some(messages) = body["messages"].as_array_mut() {
+            for (message, original) in messages.iter_mut().zip(&req.messages) {
+                message.as_object_mut().unwrap().remove("reasoning_details");
+                replay_provider_metadata(message, original.reasoning_details.as_ref(), self.provider);
+            }
+        }
         // OpenRouter's native fallback routing: when the primary sheds
         // load (429/529-class), the router retries the same request on
         // the fallback inside one round trip — no client-side retry turn
         // needed. The response's `model` field then names the fallback,
         // which the agent already surfaces as a `ModelRouted` event.
-        if let Some(fb) = self.fallback_model.as_deref().filter(|fb| *fb != req.model) {
-            body["models"] = json!([req.model, fb]);
+        if self.provider == ProviderPreset::OpenRouter {
+            if let Some(fb) = self.fallback_model.as_deref().filter(|fb| *fb != req.model) {
+                body["models"] = json!([req.model, fb]);
+            }
         }
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req
@@ -271,18 +330,22 @@ impl OpenRouter {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = json!("auto");
         }
-        // Sent unconditionally on purpose. OpenRouter drops parameters the
-        // chosen model does not support (that is the default; only
-        // `provider.require_parameters` makes them routing constraints), so
-        // asking a non-reasoning model for effort costs nothing. Setting
-        // require_parameters here would instead shrink the auto router's
-        // pool to reasoning models only.
         if let Some(effort) = req.effort {
-            body["reasoning"] = json!({ "effort": effort.as_str() });
+            if self.provider == ProviderPreset::OpenRouter {
+                body["reasoning"] = json!({ "effort": effort.as_str() });
+            } else if let Some(effort) = reasoning_effort(self.provider, &req.model, effort) {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
         if let Some(max) = req.max_tokens {
-            body["max_tokens"] = json!(max);
+            let field = if self.provider == ProviderPreset::OpenAI && openai_reasoning_model(&req.model) {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            body[field] = json!(max);
         }
+        apply_quirks(&mut body, self.quirks.load(std::sync::atomic::Ordering::Relaxed));
         body
     }
 
@@ -365,11 +428,39 @@ impl OpenRouter {
         })
     }
 
-    async fn chat_impl(&self, req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
-        let body = self.build_body(&req);
+    async fn chat_impl(&self, mut req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
+        let requested = req.model.clone();
+        let (provider, key, base_url, model) = crate::config::resolve_connection(
+            &req.model, self.provider, &self.api_key, &self.base_url,
+        )?;
+        req.model = model.clone();
+        let mut response = if provider != self.provider || key != self.api_key || base_url != self.base_url {
+            self.routed_client(provider, key, base_url).chat_direct(req).await?
+        } else {
+            self.chat_direct(req).await?
+        };
+        if requested != model && response.model.as_deref() == Some(model.as_str()) {
+            response.model = Some(requested);
+        }
+        Ok(response)
+    }
+
+    fn error_context(&self, req: &ChatRequest, category: ProviderErrorCategory, detail: &str) -> String {
+        let provider = self.provider.name();
+        let remedy = provider_remedy(self.provider, category, &self.base_url);
+        let separator = if detail.ends_with(['.', '!', '?']) { "" } else { "." };
+        let message = format!("{provider}, role {}, model {}. {detail}{separator} {remedy}", req.role, req.model);
+        if self.api_key.is_empty() { message } else { message.replace(&self.api_key, "[redacted]") }
+    }
+
+    async fn chat_direct(&self, req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
+        crate::config::validate_provider_url(self.provider, &self.base_url)?;
+        let mut body = self.build_body(&req);
+        let mut shape_retries = 0usize;
         let url = format!("{}/chat/completions", self.base_url);
         // Definite-assignment checked: every `break` below writes it first.
         let mut last_err;
+        let mut last_category = ProviderErrorCategory::Network;
         let mut attempts_made = 0usize;
         let mut budget_used = 0usize;
         let mut unattended_waited = Duration::ZERO;
@@ -378,6 +469,9 @@ impl OpenRouter {
         let mut next: Option<RetryPlan> = None;
 
         loop {
+            if let Some(error) = crate::error::provider_run_failure() {
+                return Err(error);
+            }
             let free = match next.take() {
                 Some(plan) => {
                     if !self.wait_out(attempts_made, &plan).await {
@@ -396,14 +490,16 @@ impl OpenRouter {
             }
 
             let client = self.http.lock().unwrap().clone();
-            let sent = client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .header("HTTP-Referer", "https://slag.dev")
-                .header("X-Title", "slag")
-                .json(&body)
-                .send()
-                .await;
+            let mut request = client.post(&url);
+            if !self.api_key.is_empty() {
+                request = request.bearer_auth(&self.api_key);
+            }
+            if self.provider == ProviderPreset::OpenRouter {
+                request = request
+                    .header("HTTP-Referer", "https://slag.dev")
+                    .header("X-Title", "slag");
+            }
+            let sent = request.json(&body).send().await;
 
             let resp = match sent {
                 Ok(resp) => resp,
@@ -414,6 +510,7 @@ impl OpenRouter {
                     if is_stale_connection(&e) {
                         self.rebuild_client();
                     }
+                    last_category = ProviderErrorCategory::Network;
                     last_err = format!("request failed: {e}");
                     match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited, req.retry) {
                         Some(plan) => {
@@ -435,15 +532,16 @@ impl OpenRouter {
                             status: Some(200),
                             category: ProviderErrorCategory::BadResponse,
                             retryable: false,
-                            excerpt: format!("malformed response: {e}"),
+                            excerpt: self.error_context(&req, ProviderErrorCategory::BadResponse, &format!("malformed response: {e}")),
                         }))
                     }
                 };
-                match normalize(api) {
+                match normalize_for_provider(api, self.provider) {
                     // Empty 200s (no choices, no message, no finish_reason)
                     // are upstream hiccups; burn a retry instead of handing
                     // the agent an empty turn.
                     Err(SlagError::ProviderTransient(why)) => {
+                        last_category = ProviderErrorCategory::BadResponse;
                         last_err = format!("empty 200: {why}");
                         match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited, req.retry) {
                             Some(plan) => {
@@ -461,19 +559,45 @@ impl OpenRouter {
                 }
             }
 
+            let rate_limit_header = resp.headers().keys().any(|name|
+                name == reqwest::header::RETRY_AFTER || name.as_str().starts_with("x-ratelimit-"));
             let retry_after_header = parse_retry_after(resp.headers());
             let reset_wait = parse_ratelimit_reset(resp.headers(), now_epoch_ms());
             let code = status.as_u16();
-            let text = resp.text().await.unwrap_or_default();
+            let mut text = resp.text().await.unwrap_or_default();
+            if !self.api_key.is_empty() {
+                text = text.replace(&self.api_key, "[redacted]");
+            }
             let excerpt = excerpt(&text);
-            if retry_hint.unwrap_or_else(|| transient_status(status)) {
+            if matches!(code, 400 | 422) && shape_retries < 3
+                && budget_used < req.retry.attempts.unwrap_or(self.max_attempts) {
+                if let Some(quirk) = rejected_tool_shape(&body, &text) {
+                    self.quirks.fetch_or(quirk, std::sync::atomic::Ordering::Relaxed);
+                    apply_quirks(&mut body, quirk);
+                    shape_retries += 1;
+                    continue;
+                }
+            }
+            if code == 400 && !req.tools.is_empty() && is_tool_validation_error(&text) {
+                let names = req.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(", ");
+                let mut feedback = self.error_context(&req, ProviderErrorCategory::InvalidRequest, &tool_validation_message(&text));
+                feedback.push_str(&format!(" Use only these declared tool names: {names}."));
+                if req.tools.iter().any(|tool| tool.name == "finish") {
+                    feedback.push_str(" To complete the task, call finish with cmd and summary.");
+                }
+                return Err(SlagError::ToolValidation(feedback));
+            }
+            let category = classify_response(code, &text, rate_limit_header);
+            let deterministic = matches!(category, ProviderErrorCategory::Auth | ProviderErrorCategory::Billing | ProviderErrorCategory::InvalidRequest);
+            if !deterministic && retry_hint.unwrap_or_else(|| transient_status(status)) {
                 // Any transient status may carry Retry-After — 429 rate
                 // limits and 502/503 gateway drains alike — so honor it
                 // whenever the server sent one, not only on 429.
+                last_category = category;
                 last_err = format!("{status}: {excerpt}");
                 match self.plan_retry(
                     Some(code),
-                    retry_after_header,
+                    retry_after_header.or_else(|| if code == 429 { parse_retry_after_body(&text) } else { None }),
                     reset_wait,
                     attempts_made,
                     budget_used,
@@ -481,40 +605,105 @@ impl OpenRouter {
                     req.retry,
                 ) {
                     Some(plan) => {
+                        if category == ProviderErrorCategory::RateLimit && plan.delay >= Duration::from_secs(1) {
+                            let message = format!("{}, role {}, model {}: rate limit (429); retry in {:.1}s.",
+                                self.provider.name(), req.role, req.model, plan.delay.as_secs_f64());
+                            if let Some(tx) = self.events.lock().unwrap().as_ref() {
+                                let _ = tx.send(EngineEvent::Warning { message });
+                            } else if !crate::tui::is_quiet() {
+                                eprintln!("    {message}");
+                            }
+                        }
                         next = Some(plan);
                         continue;
                     }
                     None => break,
                 }
             }
-            // Auth and billing failures have a fix; a bare status line does
-            // not tell the user what it is.
-            let remedy = match code {
-                401 | 403 => Some(
-                    "OpenRouter rejected the key. Run `slag key` to set a new one \
-                     (a shell OPENROUTER_API_KEY overrides the saved key)",
-                ),
-                402 => Some("OpenRouter is out of credit. Top up at https://openrouter.ai/credits"),
-                _ => None,
-            };
-            // Classified once, here; the category label leads the Display
-            // string, so the dashboard's Error event reads "credit balance
-            // low" instead of a raw body excerpt.
             return Err(SlagError::ProviderApi(ProviderApiError {
                 status: Some(code),
-                category: classify_status(code),
+                category,
                 retryable: false,
-                excerpt: match remedy {
-                    Some(remedy) => format!("{remedy} [{status}: {excerpt}]"),
-                    None => excerpt,
-                },
+                excerpt: self.error_context(&req, category, &excerpt),
             }));
         }
 
-        Err(SlagError::ProviderTransient(format!(
-            "gave up after {attempts_made} attempts: {last_err}"
-        )))
+        Err(SlagError::ProviderTransient(self.error_context(&req, last_category,
+            &format!("gave up after {attempts_made} attempts: {last_err}"))))
     }
+}
+
+fn openai_reasoning_model(model: &str) -> bool {
+    model == "o1" || model.starts_with("o1-")
+        || model == "o3" || model.starts_with("o3-")
+        || model == "o4" || model.starts_with("o4-")
+        || model.starts_with("gpt-5")
+}
+
+fn reasoning_effort(provider: ProviderPreset, model: &str, effort: super::Effort) -> Option<&'static str> {
+    match provider {
+        ProviderPreset::OpenAI if openai_reasoning_model(model) && !model.starts_with("o1-preview")
+            && !model.starts_with("o1-mini") && !model.contains("-chat-") => Some(effort.as_str()),
+        ProviderPreset::Gemini if model.starts_with("gemini-2.5") => Some(effort.as_str()),
+        ProviderPreset::Gemini if model.starts_with("gemini-3") => Some(match effort {
+            super::Effort::Medium if !model.contains("flash") => "high",
+            _ => effort.as_str(),
+        }),
+        ProviderPreset::Groq | ProviderPreset::Cerebras if model.contains("gpt-oss") => Some(effort.as_str()),
+        ProviderPreset::Xai if model.starts_with("grok-3-mini") => Some(match effort {
+            super::Effort::Low => "low",
+            _ => "high",
+        }),
+        _ => None,
+    }
+}
+
+const OMIT_TOOL_CHOICE: u8 = 1;
+const OMIT_PARALLEL_TOOLS: u8 = 2;
+const OMIT_EMPTY_TOOL_CONTENT: u8 = 4;
+
+fn apply_quirks(body: &mut Value, quirks: u8) {
+    let object = body.as_object_mut().unwrap();
+    if quirks & OMIT_TOOL_CHOICE != 0 {
+        object.remove("tool_choice");
+    }
+    if quirks & OMIT_PARALLEL_TOOLS != 0 {
+        object.remove("parallel_tool_calls");
+    }
+    if quirks & OMIT_EMPTY_TOOL_CONTENT != 0 {
+        if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages {
+                if message["role"] == "assistant"
+                    && message.get("tool_calls").and_then(Value::as_array).is_some_and(|calls| !calls.is_empty())
+                    && message.get("content").is_some_and(|content| content.is_null() || content.as_str() == Some(""))
+                {
+                    message.as_object_mut().unwrap().remove("content");
+                }
+            }
+        }
+    }
+}
+
+fn rejected_tool_shape(body: &Value, error: &str) -> Option<u8> {
+    let error = error.to_lowercase();
+    if !["unsupported", "not supported", "unknown", "unrecognized", "not permitted", "not allowed",
+        "invalid", "must", "cannot", "empty", "null", "required", "extra inputs"].iter().any(|s| error.contains(s)) {
+        return None;
+    }
+    if error.contains("tool_choice") && body.get("tool_choice").is_some() {
+        return Some(OMIT_TOOL_CHOICE);
+    }
+    if error.contains("parallel_tool_calls") && body.get("parallel_tool_calls").is_some() {
+        return Some(OMIT_PARALLEL_TOOLS);
+    }
+    if error.contains("content") && (error.contains("empty") || error.contains("null") || error.contains("tool_call")) {
+        let mut adjusted = body.clone();
+        apply_quirks(&mut adjusted, OMIT_EMPTY_TOOL_CONTENT);
+        if adjusted != *body {
+            return Some(OMIT_EMPTY_TOOL_CONTENT);
+        }
+    }
+    None
 }
 
 /// One planned retry: the wait, which failure it answers, whether it
@@ -545,11 +734,81 @@ fn heartbeat_slices(total: Duration) -> Vec<(u64, Duration)> {
     }
 }
 
+fn provider_remedy(provider: ProviderPreset, category: ProviderErrorCategory, base_url: &str) -> String {
+    match provider {
+        ProviderPreset::Ollama if category == ProviderErrorCategory::Network => return "Start the server with `ollama serve`.".into(),
+        ProviderPreset::LmStudio if category == ProviderErrorCategory::Network => return "Start LM Studio's local server.".into(),
+        _ => {}
+    }
+    match category {
+        ProviderErrorCategory::Auth => match provider.key_env() {
+            Some(env) => format!("Set {env} or run `slag key --provider {}`. The environment key overrides the saved key.", provider.name()),
+            None => "Check the local server's authentication settings.".into(),
+        },
+        ProviderErrorCategory::Billing => {
+            let url = match provider {
+                ProviderPreset::OpenRouter => "https://openrouter.ai/credits",
+                ProviderPreset::OpenAI => "https://platform.openai.com/settings/organization/billing/overview",
+                ProviderPreset::Anthropic => "https://console.anthropic.com/settings/billing",
+                ProviderPreset::Gemini => "https://aistudio.google.com/usage",
+                ProviderPreset::Groq => "https://console.groq.com/settings/billing",
+                ProviderPreset::Cerebras => "https://cloud.cerebras.ai/platform/billing",
+                ProviderPreset::Xai => "https://console.x.ai/team/default/billing",
+                ProviderPreset::Mistral => "https://admin.mistral.ai/organization/billing",
+                ProviderPreset::DeepSeek => "https://platform.deepseek.com/top_up",
+                ProviderPreset::Together => "https://api.together.ai/settings/billing",
+                ProviderPreset::Fireworks => "https://app.fireworks.ai/account/billing",
+                _ => return "Check the server's credits and spend limit.".into(),
+            };
+            format!("Check credits and spend limits at {url}.")
+        }
+        ProviderErrorCategory::InvalidRequest => {
+            let auth = provider.key_env().map(|env| format!(" -H \"Authorization: Bearer ${env}\"" )).unwrap_or_default();
+            format!("Check the model id and request. List models with `curl{auth} {}/models`.", base_url.trim_end_matches('/'))
+        }
+        ProviderErrorCategory::RateLimit => "Wait for the rate limit to reset or reduce parallel calls.".into(),
+        ProviderErrorCategory::Network => "Check the API base URL and network connection.".into(),
+        ProviderErrorCategory::BadResponse => "Check the endpoint's chat-completions response format.".into(),
+        _ => "Retry after the provider restores service.".into(),
+    }
+}
+
+fn classify_response(status: u16, body: &str, rate_limit_header: bool) -> ProviderErrorCategory {
+    let body = body.to_ascii_lowercase();
+    if status == 429 && (rate_limit_header || body.contains("rate limit") || body.contains("try again in")) {
+        return ProviderErrorCategory::RateLimit;
+    }
+    if status == 402 || (matches!(status, 403 | 429) && [
+        "insufficient_quota", "insufficient quota", "insufficient credit", "out of credit",
+        "credits exhausted", "credit balance", "spend limit", "spending limit", "billing limit",
+        "payment required", "exceeded your current quota", "monthly limit", "budget exceeded",
+        "no credits", "credit limit", "run out of credits", "purchase credits", "exhausted its credits",
+        "exhausted your credits", "billing_hard_limit_reached", "daily spend limit",
+    ].iter().any(|text| body.contains(text))) {
+        return ProviderErrorCategory::Billing;
+    }
+    if matches!(status, 400 | 403 | 404 | 422) && [
+        "invalid api key", "invalid_api_key", "incorrect api key", "wrong api key",
+        "missing api key", "authentication", "unauthorized",
+    ].iter().any(|text| body.contains(text)) {
+        return ProviderErrorCategory::Auth;
+    }
+    if matches!(status, 400 | 403 | 404 | 422) && [
+        "model_not_found", "model not found", "invalid model", "model does not exist",
+        "model_not_available", "unknown model",
+    ].iter().any(|text| body.contains(text)) {
+        return ProviderErrorCategory::InvalidRequest;
+    }
+    classify_status(status)
+}
+
 /// Provider error category from an HTTP status, decided exactly once.
 fn classify_status(status: u16) -> ProviderErrorCategory {
     match status {
         401 | 403 => ProviderErrorCategory::Auth,
         402 => ProviderErrorCategory::Billing,
+        408 => ProviderErrorCategory::Network,
+        409 => ProviderErrorCategory::Server,
         429 => ProviderErrorCategory::RateLimit,
         503 | 529 => ProviderErrorCategory::Overloaded,
         500..=599 => ProviderErrorCategory::Server,
@@ -622,18 +881,27 @@ fn should_retry_override(headers: &reqwest::header::HeaderMap) -> Option<bool> {
     }
 }
 
-/// Retry-After in delta-seconds, capped at 60s. The HTTP-date form is rare
-/// enough upstream that the seconds form suffices; unparseable values fall
-/// back to the computed backoff.
+/// Honor Retry-After seconds or an HTTP date, with a 60-second cap.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let secs: u64 = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_secs(secs.min(RETRY_AFTER_CAP_SECS)))
+    parse_retry_after_at(headers, std::time::SystemTime::now())
+}
+
+fn parse_retry_after_body(body: &str) -> Option<Duration> {
+    let pattern = regex::Regex::new(r"(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(?:s\b|seconds?\b)").unwrap();
+    let seconds: f64 = pattern.captures(body)?.get(1)?.as_str().parse().ok()?;
+    Some(Duration::from_secs_f64(seconds.min(RETRY_AFTER_CAP_SECS as f64)))
+}
+
+fn parse_retry_after_at(headers: &reqwest::header::HeaderMap, now: std::time::SystemTime) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let delay = if let Ok(secs) = raw.parse::<u64>() {
+        Duration::from_secs(secs)
+    } else {
+        let date = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+        let target: std::time::SystemTime = date.into();
+        target.duration_since(now).unwrap_or_default()
+    };
+    Some(delay.min(Duration::from_secs(RETRY_AFTER_CAP_SECS)))
 }
 
 /// Process-wide LCG state for retry jitter — enough randomness to spread
@@ -676,18 +944,33 @@ impl Provider for OpenRouter {
         &self,
         req: ChatRequest,
     ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>> {
-        Box::pin(async move { self.chat_impl(req).await })
+        Box::pin(async move {
+            if let Some(error) = crate::error::provider_run_failure() {
+                return Err(error);
+            }
+            let result = self.chat_impl(req).await;
+            if let Err(error) = &result {
+                crate::error::record_provider_failure(error);
+            }
+            crate::error::provider_run_failure().map_or(result, Err)
+        })
     }
 
     /// Wire the heartbeat sink: `ApiRetry` events flow here during
     /// unattended waits.
     fn set_event_sink(&self, tx: EventTx) {
-        *self.events.lock().unwrap() = Some(tx);
+        *self.events.lock().unwrap() = Some(tx.clone());
+        for route in self.routes.lock().unwrap().iter() {
+            route.set_event_sink(tx.clone());
+        }
     }
 
     /// Wire the cancel flag: retry waits abort when it goes up.
     fn set_cancel_flag(&self, f: CancelFlag) {
-        *self.cancel.lock().unwrap() = Some(f);
+        *self.cancel.lock().unwrap() = Some(f.clone());
+        for route in self.routes.lock().unwrap().iter() {
+            route.set_cancel_flag(f.clone());
+        }
     }
 }
 
@@ -720,9 +1003,19 @@ pub fn parse_credits(body: &str) -> Option<Credits> {
 /// Account balance, or `None` when the endpoint is unreachable or the key
 /// is refused. A balance readout never blocks a forge.
 pub async fn fetch_credits(api_key: &str, base_url: &str) -> Option<Credits> {
+    let provider = crate::config::active_provider().ok()?;
+    if provider != ProviderPreset::OpenRouter {
+        eprintln!("{} has no balance endpoint; session spend only.", provider.name());
+        return None;
+    }
+    if api_key.is_empty() {
+        return None;
+    }
+    crate::config::validate_provider_url(ProviderPreset::OpenRouter, base_url).ok()?;
     let url = format!("{}/credits", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let resp = client
@@ -749,9 +1042,13 @@ pub enum KeyCheck {
 /// limits and so requires auth. `/models` is public — it answers 200 for a
 /// bogus key and even for no key at all, which made checking it worthless.
 pub async fn check_key(api_key: &str, base_url: &str) -> KeyCheck {
+    if let Err(error) = crate::config::validate_provider_url(ProviderPreset::OpenRouter, base_url) {
+        return KeyCheck::Rejected(error.to_string());
+    }
     let url = format!("{}/key", base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -794,6 +1091,7 @@ pub async fn fetch_context_length(base_url: &str, model: &str) -> Option<u64> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let resp = client
@@ -823,6 +1121,7 @@ pub async fn fetch_models_body(base_url: &str) -> Option<String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let resp = client
@@ -925,7 +1224,7 @@ fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
             if let Some(id) = &m.tool_call_id {
                 obj["tool_call_id"] = json!(id);
             }
-            if let Some(details) = &m.reasoning_details {
+            if let Some(details) = m.reasoning_details.as_ref().filter(|details| details.get("_slag_provider").is_none()) {
                 obj["reasoning_details"] = details.clone();
             }
             obj
@@ -933,11 +1232,39 @@ fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
         .collect()
 }
 
+fn replay_provider_metadata(message: &mut Value, metadata: Option<&Value>, provider: ProviderPreset) {
+    let Some(metadata) = metadata.filter(|m| m["_slag_provider"] == provider.name()) else {
+        return;
+    };
+    if provider == ProviderPreset::DeepSeek {
+        if let Some(reasoning) = metadata.get("reasoning_content").and_then(Value::as_str) {
+            message["reasoning_content"] = json!(reasoning);
+        }
+    }
+    if provider == ProviderPreset::Gemini {
+        if let Some(extra) = metadata.get("message_extra_content").filter(|extra| !extra.is_null()) {
+            message["extra_content"] = extra.clone();
+        }
+        if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for call in calls {
+                if let Some(extra) = call["id"].as_str()
+                    .and_then(|id| metadata["tool_extra_content"].get(id)) {
+                    call["extra_content"] = extra.clone();
+                }
+            }
+        }
+    }
+}
+
 /// Distinguishes synthesized fallback tool-call ids across responses so a
 /// multi-turn history never replays duplicate ids to strict backends.
 static FALLBACK_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
+    normalize_for_provider(api, ProviderPreset::OpenRouter)
+}
+
+fn normalize_for_provider(api: ApiResponse, provider: ProviderPreset) -> Result<NormalizedResponse, SlagError> {
     // A 200 with no choices, no message, or no finish_reason is an upstream
     // hiccup, not a completion — classify transient so the caller retries.
     let choice = api
@@ -952,6 +1279,8 @@ fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
         .finish_reason
         .ok_or_else(|| SlagError::ProviderTransient("choice missing finish_reason".into()))?;
 
+    let tool_metadata: Vec<Option<Value>> = msg.tool_calls.as_deref().unwrap_or_default()
+        .iter().map(|call| call.extra_content.clone()).collect();
     let seq = FALLBACK_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tool_calls: Vec<ToolCall> = msg
         .tool_calls
@@ -973,9 +1302,25 @@ fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
         _ => FinishReason::Other,
     };
 
+    let reasoning_details = match provider {
+        ProviderPreset::OpenRouter => msg.reasoning_details.clone(),
+        ProviderPreset::DeepSeek => msg.reasoning_content.as_ref().map(|reasoning| json!({
+            "_slag_provider": provider.name(), "reasoning_content": reasoning,
+        })),
+        ProviderPreset::Gemini => {
+            let extras: serde_json::Map<String, Value> = tool_calls.iter().zip(tool_metadata)
+                .filter_map(|(call, extra)| extra.map(|extra| (call.id.clone(), extra))).collect();
+            (!extras.is_empty() || msg.extra_content.is_some()).then(|| json!({
+                "_slag_provider": provider.name(), "tool_extra_content": extras,
+                "message_extra_content": msg.extra_content,
+            }))
+        }
+        _ => None,
+    };
     let reasoning = msg
         .reasoning
         .filter(|s| !s.is_empty())
+        .or(msg.reasoning_content.filter(|s| !s.is_empty()))
         .or_else(|| reasoning_from_details(msg.reasoning_details.as_ref()));
 
     Ok(NormalizedResponse {
@@ -984,7 +1329,7 @@ fn normalize(api: ApiResponse) -> Result<NormalizedResponse, SlagError> {
         tool_calls,
         finish_reason,
         reasoning,
-        reasoning_details: msg.reasoning_details,
+        reasoning_details,
         usage: api.usage.unwrap_or_default(),
     })
 }
@@ -1008,8 +1353,36 @@ fn reasoning_from_details(details: Option<&Value>) -> Option<String> {
     }
 }
 
+fn is_tool_validation_error(text: &str) -> bool {
+    let root = serde_json::from_str::<Value>(text).ok();
+    let error = root.as_ref().map(|root| root.get("error").unwrap_or(root));
+    let code = error.and_then(|error| error.get("code")).and_then(Value::as_str).unwrap_or("");
+    let message = error.and_then(|error| error.get("message")).and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str)).unwrap_or(text).to_ascii_lowercase();
+    code == "tool_use_failed" || message.contains("tool call validation failed")
+        || message.contains("failed to call a function")
+}
+
+fn tool_validation_message(text: &str) -> String {
+    let mut message = excerpt(text);
+    if let Ok(root) = serde_json::from_str::<Value>(text) {
+        let error = root.get("error").unwrap_or(&root);
+        if let Some(generation) = error.get("failed_generation") {
+            let generation = generation.as_str().map(str::to_string).unwrap_or_else(|| generation.to_string());
+            message.push_str(". Rejected tool call: ");
+            message.push_str(&excerpt(&generation));
+        }
+    }
+    message
+}
+
 fn excerpt(text: &str) -> String {
-    let trimmed = text.trim();
+    let parsed = serde_json::from_str::<Value>(text).ok();
+    let message = parsed.as_ref().and_then(|root| {
+        let error = root.get("error").unwrap_or(root);
+        error.get("message").and_then(Value::as_str).or_else(|| error.as_str())
+    });
+    let trimmed = message.unwrap_or(text).trim();
     if trimmed.len() <= BODY_EXCERPT_LEN {
         trimmed.to_string()
     } else {
@@ -1050,6 +1423,10 @@ struct ApiMessage {
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    extra_content: Option<Value>,
+    #[serde(default)]
     reasoning_details: Option<Value>,
 }
 
@@ -1058,6 +1435,8 @@ struct ApiToolCall {
     #[serde(default)]
     id: String,
     function: ApiFunction,
+    #[serde(default)]
+    extra_content: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1090,7 +1469,7 @@ mod tests {
     /// mutating `SLAG_MODEL_FALLBACK` / `SLAG_UNATTENDED_RETRY` cannot
     /// leak into body and retry assertions.
     fn pinned(base_url: &str) -> OpenRouter {
-        OpenRouter::with_base_url("sk-test", base_url)
+        OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", base_url)
             .with_fallback(None)
             .with_unattended(false)
     }
@@ -1255,7 +1634,7 @@ mod tests {
         ]);
         req.messages.push(user);
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let resp = provider.chat(req).await.expect("chat ok");
         assert_eq!(resp.content, "cast a wins");
     }
@@ -1295,7 +1674,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let resp = provider
             .chat(request(vec![spec()], None))
             .await
@@ -1333,7 +1712,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let resp = provider
             .chat(request(vec![], None))
             .await
@@ -1353,7 +1732,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-bad", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-bad", server.uri());
         let err = provider
             .chat(request(vec![], None))
             .await
@@ -1381,7 +1760,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let resp = provider
             .chat(request(vec![], Some(Effort::Medium)))
             .await
@@ -1410,7 +1789,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let resp = provider
             .chat(request(vec![], None))
             .await
@@ -1440,7 +1819,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let resp = provider
             .chat(request(vec![], None))
             .await
@@ -1490,7 +1869,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let err = OpenRouter::with_base_url("sk-bad", &server.uri())
+            let err = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-bad", &server.uri())
                 .chat(request(vec![], None))
                 .await
                 .unwrap_err()
@@ -1567,9 +1946,8 @@ mod tests {
         assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(3)));
         headers.insert("retry-after", "120".parse().unwrap());
         assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(60)));
-        // HTTP-date (unsupported form) falls back to computed backoff.
         headers.insert("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap());
-        assert_eq!(parse_retry_after(&headers), None);
+        assert_eq!(parse_retry_after_at(&headers, std::time::UNIX_EPOCH), Some(Duration::from_secs(60)));
     }
 
     #[test]
@@ -1629,7 +2007,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let started = std::time::Instant::now();
         let resp = provider.chat(request(vec![], None)).await.expect("retry ok");
         assert_eq!(resp.content, "forged");
@@ -1660,7 +2038,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let provider = OpenRouter::with_base_url("sk-test", server.uri());
+            let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
             let resp = provider.chat(request(vec![], None)).await.expect("retry ok");
             assert_eq!(resp.content, "forged", "status {status}");
         }
@@ -1676,7 +2054,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = OpenRouter::with_base_url("sk-test", server.uri())
+        let err = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .chat(request(vec![], None))
             .await
             .expect_err("400 must fail");
@@ -1685,29 +2063,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn x_should_retry_true_retries_a_400() {
+    async fn x_should_retry_true_cannot_retry_an_invalid_request() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(400)
                     .insert_header("x-should-retry", "true")
-                    .set_body_string("flaky 400"),
+                    .set_body_string("invalid request"),
             )
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .expect(1)
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
-        let resp = provider.chat(request(vec![], None)).await.expect("header-driven retry");
-        assert_eq!(resp.content, "forged");
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
+        let error = provider.chat(request(vec![], None)).await.unwrap_err();
+        assert!(error.is_deterministic_provider());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1724,7 +2096,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = OpenRouter::with_base_url("sk-test", server.uri())
+        let err = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .chat(request(vec![], None))
             .await
             .expect_err("header forbids retry");
@@ -1749,7 +2121,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let resp = provider.chat(request(vec![], None)).await.expect("empty 200 retried");
         assert_eq!(resp.content, "forged");
     }
@@ -1764,7 +2136,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = OpenRouter::with_base_url("sk-test", server.uri())
+        let err = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .with_max_attempts(3)
             .chat(request(vec![], None))
             .await
@@ -1795,7 +2167,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = OpenRouter::with_base_url("sk-test", server.uri())
+        let err = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .with_max_attempts(2)
             .chat(request(vec![], None))
             .await
@@ -1819,7 +2191,7 @@ mod tests {
 
         let mut req = request(vec![], None);
         req.retry = RetryPolicy::side();
-        let err = OpenRouter::with_base_url("sk-test", server.uri())
+        let err = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .chat(req)
             .await
             .expect_err("529 with a one-swing policy");
@@ -1838,7 +2210,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = OpenRouter::with_base_url("sk-test", server.uri())
+        let err = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .with_max_attempts(3)
             .chat(request(vec![], None))
             .await
@@ -1917,7 +2289,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = OpenRouter::with_base_url("sk-test", server.uri())
+        let resp = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .chat(request(vec![], None))
             .await
             .expect("chat ok");
@@ -1953,7 +2325,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = OpenRouter::with_base_url("sk-test", server.uri())
+        let resp = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .chat(request(vec![], None))
             .await
             .expect("chat ok");
@@ -1986,7 +2358,7 @@ mod tests {
 
         let mut req = request(vec![], None);
         req.role = crate::engine::Role::Judge;
-        OpenRouter::with_base_url("sk-test", server.uri())
+        OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri())
             .chat(req)
             .await
             .expect("chat ok");
@@ -2058,7 +2430,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         assert_eq!(provider.context_length("qwen/qwen3-coder").await, Some(262144));
         // Second lookup answers from the cache — the mock allows one GET.
         assert_eq!(provider.context_length("qwen/qwen3-coder").await, Some(262144));
@@ -2085,7 +2457,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenRouter::with_base_url("sk-test", server.uri());
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
         let started = std::time::Instant::now();
         let resp = provider.chat(request(vec![], None)).await.expect("retry ok");
         assert_eq!(resp.content, "forged");
@@ -2246,6 +2618,11 @@ mod tests {
 
             let mut heartbeats = 0;
             while let Ok(event) = rx.try_recv() {
+                if let EngineEvent::Warning { message } = &event {
+                    assert_eq!(status, 429);
+                    assert!(message.contains("rate limit (429)"), "{message}");
+                    continue;
+                }
                 let EngineEvent::ApiRetry { attempt, status: s, remaining_secs } = event else {
                     panic!("unexpected event");
                 };
@@ -2514,4 +2891,623 @@ mod tests {
         assert!(!err.retryable());
         assert!(err.to_string().contains("malformed response"), "{err}");
     }
+
+    #[tokio::test]
+    async fn provider_failure_classes_include_context_and_do_not_retry_deterministic_errors() {
+        for (status, body, category, remedy) in [
+            (401, "Wrong API Key", ProviderErrorCategory::Auth, "XAI_API_KEY"),
+            (403, "Your team has exhausted its credits. Purchase credits to continue.", ProviderErrorCategory::Billing, "console.x.ai"),
+            (429, "Spend limit exceeded", ProviderErrorCategory::Billing, "console.x.ai"),
+            (402, "Payment required", ProviderErrorCategory::Billing, "console.x.ai"),
+            (404, "Model nope-model-404 not found", ProviderErrorCategory::InvalidRequest, "/models"),
+            (400, "Invalid request parameter", ProviderErrorCategory::InvalidRequest, "Check the model id"),
+            (400, "Invalid API key", ProviderErrorCategory::Auth, "slag key --provider xai"),
+            (429, "Rate limit exceeded", ProviderErrorCategory::RateLimit, "rate limit"),
+            (503, "Service unavailable", ProviderErrorCategory::Overloaded, "restores service"),
+            (500, "Internal error", ProviderErrorCategory::Server, "restores service"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).insert_header("x-should-retry", "true").set_body_string(body))
+                .expect(1)
+                .mount(&server).await;
+            let deterministic = matches!(category, ProviderErrorCategory::Auth | ProviderErrorCategory::Billing | ProviderErrorCategory::InvalidRequest);
+            let provider = OpenRouter::with_provider(ProviderPreset::Xai, "secret-test-key", server.uri())
+                .with_max_attempts(if deterministic { 3 } else { 1 });
+            let error = provider.chat(request(vec![], None)).await.unwrap_err();
+            let message = error.to_string();
+            if deterministic {
+                let SlagError::ProviderApi(api) = &error else { panic!("{error}") };
+                assert_eq!(api.category, category);
+                assert!(error.is_deterministic_provider());
+                assert!(message.contains(remedy), "{message}");
+            } else {
+                assert!(error.retryable());
+                assert!(!error.is_deterministic_provider());
+            }
+            assert!(message.contains("xai, role smith, model qwen/qwen3-coder"), "{message}");
+            assert!(!message.contains("secret-test-key"));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    const GROQ_TPM_BODY: &str = "Rate limit reached for model openai/gpt-oss-120b ... on tokens per minute (TPM): Limit 8000, Used 6596, Requested 3872. Please try again in 18.5s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing";
+
+    #[tokio::test]
+    async fn groq_tpm_with_billing_url_waits_and_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(GROQ_TPM_BODY))
+            .up_to_n_times(1).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri())
+            .with_unattended(false).with_max_attempts(2);
+        let (tx, mut rx) = super::super::events::channel();
+        provider.set_event_sink(tx);
+        let started = std::time::Instant::now();
+        assert!(provider.chat(request(vec![], None)).await.is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(18_500));
+        let EngineEvent::Warning { message } = rx.try_recv().unwrap() else { panic!("missing throttle status") };
+        assert!(message.contains("groq") && message.contains("rate limit") && message.contains("18.5s"), "{message}");
+        assert!(rx.try_recv().is_err(), "one status line per wait");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_headers_override_billing_text_on_429() {
+        for header in ["retry-after", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(429).insert_header(header, "1").set_body_string("Check billing limits"))
+                .expect(1).mount(&server).await;
+            let provider = pinned(&server.uri()).with_max_attempts(1);
+            let error = provider.chat(request(vec![], None)).await.unwrap_err();
+            assert!(error.retryable(), "{header}: {error}");
+            assert!(!error.is_deterministic_provider(), "{header}: {error}");
+        }
+        assert_eq!(classify_response(429, "https://console.groq.com/settings/billing", false), ProviderErrorCategory::RateLimit);
+    }
+
+    #[test]
+    fn body_retry_delay_preserves_fractions_and_caps_waits() {
+        assert_eq!(parse_retry_after_body(GROQ_TPM_BODY), Some(Duration::from_millis(18_500)));
+        assert_eq!(parse_retry_after_body("Try again in 600s."), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after_body("try again in 1.5 seconds"), Some(Duration::from_millis(1500)));
+        for body in ["try again in NaNs", "try again in -1s", "try again in 18.5sessions", "billing"] {
+            assert_eq!(parse_retry_after_body(body), None, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_errors_remain_billing_without_rate_limit_signals() {
+        for (preset, status, body) in [
+            (ProviderPreset::Xai, 403, "Your team has exhausted its credits. Purchase credits to continue."),
+            (ProviderPreset::OpenAI, 429, r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(preset, "test-key", server.uri()).with_max_attempts(3);
+            let SlagError::ProviderApi(error) = provider.chat(request(vec![], None)).await.unwrap_err() else { panic!("expected billing") };
+            assert_eq!(error.category, ProviderErrorCategory::Billing);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_connection_errors_name_the_provider_and_server_remedy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        for (preset, remedy) in [
+            (ProviderPreset::Ollama, "ollama serve"),
+            (ProviderPreset::LmStudio, "Start LM Studio's local server"),
+        ] {
+            let provider = OpenRouter::with_provider(preset, "", &url).with_max_attempts(1);
+            let message = provider.chat(request(vec![], None)).await.unwrap_err().to_string();
+            assert!(message.contains(preset.name()), "{message}");
+            assert!(message.contains("role smith, model qwen/qwen3-coder"), "{message}");
+            assert!(message.contains(remedy), "{message}");
+        }
+    }
+
+    #[test]
+    fn provider_remedies_cover_each_preset_without_key_values() {
+        for preset in [ProviderPreset::OpenRouter, ProviderPreset::OpenAI, ProviderPreset::Anthropic,
+            ProviderPreset::Gemini, ProviderPreset::Groq, ProviderPreset::Cerebras, ProviderPreset::Xai,
+            ProviderPreset::Mistral, ProviderPreset::DeepSeek, ProviderPreset::Together, ProviderPreset::Fireworks,
+            ProviderPreset::Ollama, ProviderPreset::LmStudio, ProviderPreset::Custom] {
+            let auth = provider_remedy(preset, ProviderErrorCategory::Auth, preset.base_url());
+            if let Some(env) = preset.key_env() {
+                assert!(auth.contains(env), "{auth}");
+                assert!(auth.contains(&format!("slag key --provider {}", preset.name())), "{auth}");
+            }
+            let model = provider_remedy(preset, ProviderErrorCategory::InvalidRequest, "http://localhost:1234/v1");
+            assert!(model.contains("curl"));
+            assert!(model.contains("/models"));
+        }
+    }
+
+    #[tokio::test]
+    async fn credits_skip_network_without_an_account_key() {
+        let server = MockServer::start().await;
+        assert_eq!(fetch_credits("", &server.uri()).await, None);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn presets_gate_router_fields_headers_and_model_lookups() {
+        for preset in [
+            ProviderPreset::OpenRouter, ProviderPreset::OpenAI, ProviderPreset::Anthropic,
+            ProviderPreset::Gemini, ProviderPreset::Groq, ProviderPreset::Cerebras,
+            ProviderPreset::Xai, ProviderPreset::Mistral, ProviderPreset::DeepSeek,
+            ProviderPreset::Together, ProviderPreset::Fireworks, ProviderPreset::Ollama,
+            ProviderPreset::LmStudio, ProviderPreset::Custom,
+        ] {
+            let server = MockServer::start().await;
+            let mut response = ok_body();
+            if preset == ProviderPreset::OpenRouter {
+                response["usage"] = json!({"cost": 0.001});
+            }
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&server).await;
+            let key = if preset.key_optional() { "" } else { "test-key" };
+            let provider = OpenRouter::with_provider(preset, key, server.uri())
+                .with_fallback(Some("fallback-model")).with_unattended(false);
+            let mut req = request(vec![spec()], Some(Effort::High));
+            req.model = preset.default_model().into();
+            req.messages.push(ChatMessage::assistant("analysis", None)
+                .with_reasoning_details(Some(json!([{"text": "router-only"}]))));
+            provider.chat(req).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1, "{} made an extra request", preset.name());
+            let sent = &requests[0];
+            let body: Value = serde_json::from_slice(&sent.body).unwrap();
+            assert_eq!(body["model"], preset.default_model());
+            assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+            assert!(body.get("parallel_tool_calls").is_none());
+            if preset == ProviderPreset::OpenRouter {
+                assert!(sent.headers.contains_key("HTTP-Referer"));
+                assert!(sent.headers.contains_key("X-Title"));
+                assert!(body.get("usage").is_some());
+                assert!(body.get("models").is_some());
+                assert!(body.get("reasoning").is_some());
+                assert!(body["messages"][2].get("reasoning_details").is_some());
+            } else {
+                assert!(!sent.headers.contains_key("HTTP-Referer"), "{}", preset.name());
+                assert!(!sent.headers.contains_key("X-Title"));
+                assert!(body.get("usage").is_none());
+                assert!(body.get("models").is_none());
+                assert!(body.get("reasoning").is_none());
+                assert!(body["messages"][2].get("reasoning_details").is_none());
+                assert_eq!(provider.context_length(preset.default_model()).await, None);
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
+            assert_eq!(sent.headers.contains_key("Authorization"), !key.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_and_token_limits_match_supported_models() {
+        for (preset, model, effort) in [
+            (ProviderPreset::OpenAI, "gpt-5", Some("medium")),
+            (ProviderPreset::OpenAI, "o3-mini", Some("medium")),
+            (ProviderPreset::OpenAI, "gpt-4.1-mini", None),
+            (ProviderPreset::OpenAI, "gpt-5-chat-latest", None),
+            (ProviderPreset::OpenAI, "o1-mini", None),
+            (ProviderPreset::Gemini, "gemini-2.5-flash", Some("medium")),
+            (ProviderPreset::Gemini, "gemini-3-pro-preview", Some("high")),
+            (ProviderPreset::Groq, "openai/gpt-oss-20b", Some("medium")),
+            (ProviderPreset::Groq, "llama-3.3-70b-versatile", None),
+            (ProviderPreset::Cerebras, "gpt-oss-120b", Some("medium")),
+            (ProviderPreset::Cerebras, "llama3.1-8b", None),
+            (ProviderPreset::Xai, "grok-3-mini", Some("high")),
+            (ProviderPreset::Anthropic, "claude-sonnet-4-5", None),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(preset, "test-key", server.uri());
+            let mut req = request(vec![spec()], Some(Effort::Medium));
+            req.model = model.into();
+            req.max_tokens = Some(32);
+            provider.chat(req).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), effort, "{model}");
+            assert!(body.get("reasoning").is_none());
+            let field = if preset == ProviderPreset::OpenAI && openai_reasoning_model(model) {
+                assert!(body.get("max_tokens").is_none());
+                "max_completion_tokens"
+            } else {
+                assert!(body.get("max_completion_tokens").is_none());
+                "max_tokens"
+            };
+            assert_eq!(body[field], 32);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_tool_choice_retries_once_and_caches_the_quirk() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"tool_choice": "auto"})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "tool_choice is not supported"}
+            })))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(|r: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&r.body).unwrap();
+                body.get("tool_choice").is_none() && body["tools"][0]["function"]["name"] == "read_file"
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(2).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Cerebras, "test-key", server.uri());
+        provider.chat(request(vec![spec()], None)).await.unwrap();
+        provider.chat(request(vec![spec()], None)).await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rejected_empty_assistant_content_keeps_tool_calls_and_results() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(|r: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&r.body).unwrap();
+                body["messages"][2].get("content").is_some()
+            })
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "error": {"message": "assistant content must not be empty with tool_calls"}
+            })))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(|r: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&r.body).unwrap();
+                body["messages"][2].get("content").is_none()
+                    && body["messages"][2]["tool_calls"][0]["id"] == "call_1"
+                    && body["messages"][3]["tool_call_id"] == "call_1"
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Custom, "", server.uri());
+        let mut req = request(vec![spec()], None);
+        req.messages.push(ChatMessage::assistant("", Some(vec![ToolCall {
+            id: "call_1".into(), name: "read_file".into(), arguments: "{}".into(),
+        }])));
+        req.messages.push(ChatMessage::tool_result("call_1", "ok"));
+        provider.chat(req).await.unwrap();
+    }
+
+    #[test]
+    fn tool_shape_fallback_only_removes_the_rejected_fields() {
+        let mut body = body_builder().build_body(&request(vec![spec()], None));
+        body["parallel_tool_calls"] = json!(true);
+        let tools = body["tools"].clone();
+        let quirk = rejected_tool_shape(&body, "unknown parameter parallel_tool_calls").unwrap();
+        apply_quirks(&mut body, quirk);
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(rejected_tool_shape(&body, "invalid tool argument"), None);
+        assert_eq!(rejected_tool_shape(&body, "unknown parameter parallel_tool_calls"), None);
+    }
+
+    #[tokio::test]
+    async fn tool_validation_errors_return_feedback_without_transport_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": "Tool call validation failed: missing pattern secret-test-key",
+                    "code": "tool_use_failed",
+                    "failed_generation": "{\"name\":\"grep\",\"arguments\":{}}"
+                }
+            })))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "secret-test-key", server.uri());
+        let mut finish = spec();
+        finish.name = "finish".into();
+        let error = provider.chat(request(vec![spec(), finish], None)).await.unwrap_err();
+        let SlagError::ToolValidation(message) = error else { panic!("expected tool validation error") };
+        assert!(message.contains("missing pattern [redacted]"));
+        assert!(message.contains("grep"));
+        assert!(message.contains("Use only these declared tool names: read_file, finish."));
+        assert!(message.contains("To complete the task, call finish with cmd and summary."));
+        assert!(!message.contains("secret-test-key"));
+    }
+
+    #[tokio::test]
+    async fn plain_text_tool_validation_errors_return_feedback() {
+        for message in ["Tool call validation failed: missing pattern", "Failed to call a function: missing pattern"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(400).set_body_string(message))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri());
+            let error = provider.chat(request(vec![spec()], None)).await.unwrap_err();
+            let SlagError::ToolValidation(feedback) = error else { panic!("expected tool validation error") };
+            assert!(feedback.contains(message));
+            assert!(feedback.contains("groq, role smith, model qwen/qwen3-coder"));
+        }
+        assert!(!is_tool_validation_error("invalid tool schema: missing required property"));
+    }
+
+    #[tokio::test]
+    async fn tool_validation_requires_declared_tools_and_a_400() {
+        for (status, tools) in [(400, vec![]), (401, vec![spec()]), (422, vec![spec()])] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "error": {"message": "Tool call validation failed", "code": "tool_use_failed"}
+                })))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri());
+            assert!(matches!(provider.chat(request(tools, None)).await.unwrap_err(), SlagError::ProviderApi(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_do_not_follow_redirects() {
+        let server = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", destination.uri()))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "secret-test-key", server.uri());
+        assert!(provider.chat(request(vec![], None)).await.is_err());
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrelated_invalid_requests_fail_without_shape_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "invalid tool schema: missing required property"}
+            })))
+            .expect(1).mount(&server).await;
+        let error = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri())
+            .chat(request(vec![spec()], None)).await.unwrap_err();
+        assert!(error.to_string().contains("invalid tool schema: missing required property"));
+    }
+
+    #[tokio::test]
+    async fn rejected_shapes_respect_the_side_request_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "tool_choice is not supported"}
+            })))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri());
+        let mut req = request(vec![spec()], None);
+        req.retry = RetryPolicy::side();
+        let error = provider.chat(req).await.unwrap_err();
+        assert!(error.to_string().contains("tool_choice is not supported"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_shape_rejections_stop_after_the_field_is_removed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "tool_choice is not supported"}
+            })))
+            .expect(2).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri());
+        let error = provider.chat(request(vec![spec()], None)).await.unwrap_err();
+        assert!(error.to_string().contains("tool_choice is not supported"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generic_errors_show_readable_messages_and_redact_keys() {
+        for status in [401, 402, 422] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "error": {"message": "rejected secret-test-key: check the account"}
+                })))
+                .expect(1).mount(&server).await;
+            let error = OpenRouter::with_provider(ProviderPreset::OpenAI, "secret-test-key", server.uri())
+                .chat(request(vec![], None)).await.unwrap_err().to_string();
+            assert!(error.contains("rejected [redacted]: check the account"), "{error}");
+            assert!(!error.contains("secret-test-key"));
+            assert!(!error.contains("OpenRouter"));
+            assert!(!error.contains("openrouter.ai"));
+            assert!(!error.contains("\"error\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_model_strips_only_the_explicit_provider_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"model": "openai/gpt-oss-20b"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1).mount(&server).await;
+        let mut req = request(vec![spec()], None);
+        req.model = "groq::openai/gpt-oss-20b".into();
+        OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri())
+            .chat(req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn qualified_response_names_suppress_false_routing_and_namespace_usage() {
+        for returned in ["gpt-4.1-mini", "gpt-4.1-mini-2025-04-14"] {
+            let server = MockServer::start().await;
+            let mut body = ok_body();
+            body["model"] = json!(returned);
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1).mount(&server).await;
+            let mut req = request(vec![], None);
+            req.model = "openai::gpt-4.1-mini".into();
+            let response = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri())
+                .chat(req).await.unwrap();
+            let displayed = if returned == "gpt-4.1-mini" { "openai::gpt-4.1-mini" } else { returned };
+            assert_eq!(response.model.as_deref(), Some(displayed));
+            assert_eq!(response.usage.model, Some(format!("openai::{returned}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_thinking_metadata_survives_tool_round_trips() {
+        for preset in [ProviderPreset::DeepSeek, ProviderPreset::Gemini] {
+            let server = MockServer::start().await;
+            let mut message = json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [
+                    {"type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                ],
+            });
+            if preset == ProviderPreset::DeepSeek {
+                message["reasoning_content"] = json!("Inspect both files first.");
+            } else {
+                message["tool_calls"][0]["extra_content"] = json!({"google": {"thought_signature": "opaque-signature"}});
+                message["extra_content"] = json!({"google": {"thought_signature": "message-signature"}});
+            }
+            Mock::given(method("POST"))
+                .and(|r: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&r.body).unwrap();
+                    body["messages"].as_array().unwrap().len() == 2
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": message, "finish_reason": "tool_calls"}]
+                })))
+                .expect(1).mount(&server).await;
+            Mock::given(method("POST"))
+                .and(move |r: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&r.body).unwrap();
+                    let assistant = &body["messages"][2];
+                    if assistant.get("reasoning_details").is_some()
+                        || assistant["tool_calls"].as_array().is_none_or(|calls| calls.len() != 2) {
+                        return false;
+                    }
+                    if preset == ProviderPreset::DeepSeek {
+                        assistant["reasoning_content"] == "Inspect both files first."
+                            && assistant.get("extra_content").is_none()
+                    } else {
+                        assistant.get("reasoning_content").is_none()
+                            && assistant["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "opaque-signature"
+                            && assistant["tool_calls"][1].get("extra_content").is_none()
+                            && assistant["extra_content"]["google"]["thought_signature"] == "message-signature"
+                    }
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+                .expect(1).mount(&server).await;
+            let provider = OpenRouter::with_provider(preset, "test-key", server.uri());
+            let first = provider.chat(request(vec![spec()], None)).await.unwrap();
+            let assistant = ChatMessage::assistant(first.content, Some(first.tool_calls.clone()))
+                .with_reasoning_details(first.reasoning_details.clone());
+            let mut followup = request(vec![spec()], None);
+            followup.messages.push(assistant.clone());
+            for call in &first.tool_calls {
+                followup.messages.push(ChatMessage::tool_result(&call.id, "file text"));
+            }
+            let result = provider.chat(followup).await.unwrap();
+            assert_eq!(result.content, "forged");
+            let mut other_request = request(vec![spec()], None);
+            other_request.messages.push(assistant);
+            for other_provider in [ProviderPreset::OpenAI, ProviderPreset::OpenRouter] {
+                let other = OpenRouter::with_provider(other_provider, "test-key", "http://localhost:0")
+                    .build_body(&other_request);
+                assert!(other["messages"][2].get("reasoning_details").is_none());
+                assert!(other["messages"][2].get("reasoning_content").is_none());
+                assert!(other["messages"][2].get("extra_content").is_none());
+                assert!(other["messages"][2]["tool_calls"][0].get("extra_content").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_retry_after_waits_and_stops_at_the_attempt_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1")
+                .set_body_json(json!({"error": {"message": "rate limit"}})))
+            .expect(2).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri())
+            .with_max_attempts(2);
+        let started = std::time::Instant::now();
+        let error = provider.chat(request(vec![spec()], None)).await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(error.to_string().contains("gave up after 2 attempts"));
+        assert!(error.to_string().contains("rate limit"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retry_after_http_dates_use_the_request_clock_and_cap_the_delay() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_445_412_480);
+        assert_eq!(parse_retry_after_at(&headers, at - Duration::from_secs(5)), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after_at(&headers, at - Duration::from_secs(90)), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after_at(&headers, at + Duration::from_secs(1)), Some(Duration::ZERO));
+        headers.insert("retry-after", "invalid".parse().unwrap());
+        assert_eq!(parse_retry_after_at(&headers, at), None);
+    }
+
+    #[test]
+    fn routed_clients_reuse_connections_and_quirks_and_receive_sinks() {
+        let provider = body_builder();
+        let first = provider.routed_client(ProviderPreset::Groq, "test-key".into(), "http://localhost:1".into());
+        first.quirks.store(OMIT_TOOL_CHOICE, std::sync::atomic::Ordering::Relaxed);
+        let second = provider.routed_client(ProviderPreset::Groq, "test-key".into(), "http://localhost:1".into());
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(second.quirks.load(std::sync::atomic::Ordering::Relaxed), OMIT_TOOL_CHOICE);
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        provider.set_event_sink(tx);
+        provider.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        assert!(first.has_event_sink());
+        assert!(first.has_cancel_flag());
+    }
+
+    #[tokio::test]
+    #[ignore = "uses provider keys and spends a small amount on seven tool calls"]
+    async fn live_provider_tool_smoke() {
+        for preset in [
+            ProviderPreset::OpenRouter, ProviderPreset::OpenAI, ProviderPreset::Cerebras,
+            ProviderPreset::Groq, ProviderPreset::Gemini, ProviderPreset::Xai, ProviderPreset::Mistral,
+        ] {
+            let Some(key) = preset.key_env().and_then(|env| std::env::var(env).ok()).filter(|key| !key.trim().is_empty()) else {
+                println!("SMOKE {} SKIP key absent", preset.name());
+                continue;
+            };
+            let provider = OpenRouter::with_provider(preset, key, preset.base_url())
+                .with_max_attempts(1).with_timeout(Duration::from_secs(60))
+                .with_unattended(false).with_fallback(None);
+            let tool = ToolSpec {
+                name: "ping".into(), description: "Return the supplied value".into(),
+                parameters: json!({"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}),
+            };
+            let model = if preset == ProviderPreset::OpenRouter { "openai/gpt-4.1-mini" } else { preset.default_model() };
+            let req = ChatRequest {
+                model: model.into(),
+                messages: vec![ChatMessage::user("Call ping with value pong. Use the tool once. Do not answer with text.")],
+                tools: vec![tool], effort: None, max_tokens: Some(256),
+                role: crate::engine::Role::Smith, retry: RetryPolicy::side(),
+            };
+            let started = std::time::Instant::now();
+            match provider.chat(req).await {
+                Ok(response) if response.tool_calls.iter().any(|call| call.name == "ping") => {
+                    println!("SMOKE {} PASS {}ms", preset.name(), started.elapsed().as_millis());
+                }
+                Ok(_) => println!("SMOKE {} FAIL no tool call {}ms", preset.name(), started.elapsed().as_millis()),
+                Err(error) => println!("SMOKE {} FAIL {}ms {}", preset.name(), started.elapsed().as_millis(), error),
+            }
+        }
+    }
+
 }

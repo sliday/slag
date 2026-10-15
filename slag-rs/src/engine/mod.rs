@@ -1,6 +1,6 @@
 //! engine — slag's native forging engine.
 //!
-//! OpenRouter-backed agentic loop. This module replaces external CLI smiths.
+//! Agent loop with OpenAI-compatible providers. This module replaces external CLI smiths.
 //! Shared contracts live here; submodules implement them.
 #![allow(dead_code)]
 
@@ -25,7 +25,7 @@ use crate::error::SlagError;
 
 pub const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
 
-/// Reasoning effort forwarded to OpenRouter's unified `reasoning` param.
+/// Reasoning effort for the provider's supported request fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -74,9 +74,9 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// Raw OpenRouter reasoning blocks. Anthropic/Gemini reasoning models
-    /// require these replayed verbatim with the assistant tool_calls
-    /// message, or the follow-up request is rejected.
+    /// Provider metadata for assistant tool calls. OpenRouter uses raw
+    /// reasoning blocks. Other providers use a tagged carrier for native
+    /// reasoning text and tool signatures.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reasoning_details: Option<serde_json::Value>,
 }
@@ -211,7 +211,7 @@ pub struct NormalizedResponse {
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
     pub reasoning: Option<String>,
-    /// Raw reasoning blocks, preserved for replay (see `ChatMessage`).
+    /// Provider metadata for replay (see `ChatMessage`).
     pub reasoning_details: Option<serde_json::Value>,
     pub usage: Usage,
 }

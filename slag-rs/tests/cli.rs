@@ -105,5 +105,8 @@ fn help_lists_the_key_subcommand() {
         .assert()
         .success()
         .stdout(contains("key"))
-        .stdout(contains("OpenRouter key"));
+        .stdout(contains("selected provider key"))
+        .stdout(contains("selected provider's default model"))
+        .stdout(contains("provider::model"))
+        .stdout(contains("provider balance when available"));
 }

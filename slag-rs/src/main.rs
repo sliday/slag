@@ -12,6 +12,7 @@ mod pipeline;
 mod progress;
 mod proof;
 mod render;
+mod replay;
 mod sexp;
 mod shutdown;
 mod smith;
@@ -42,6 +43,10 @@ async fn main() {
             fg(tui::BRIGHT),
             reset()
         );
+    }
+
+    if let Some(provider) = &cli.provider {
+        std::env::set_var("SLAG_PROVIDER", provider);
     }
 
     // Model flags override env; EngineConfig::load reads env downstream.
@@ -95,6 +100,26 @@ async fn main() {
         }
         Some(Command::Rewind { ingot, heat }) => cli::show_rewind(ingot.as_deref(), heat),
         Some(Command::Hooks { action: cli::HooksAction::List }) => cli::show_hooks(),
+        Some(Command::Fix(args)) => {
+            pipeline::fix::run(args, cli.tui, cli.trace.clone(), cli.temper > 0).await
+        }
+        Some(Command::Replay { file, speed, tui, at, hold, size, points }) => {
+            match size.as_deref().map(replay::parse_size).transpose() {
+                Ok(size) => {
+                    replay::run(replay::Opts {
+                        file,
+                        speed,
+                        tui: tui || cli.tui,
+                        at,
+                        hold,
+                        size,
+                        points,
+                    })
+                    .await
+                }
+                Err(e) => Err(error::SlagError::Other(anyhow::anyhow!(e))),
+            }
+        }
         None => {
             // A lone bare word reaches here because `commission` is a
             // trailing var-arg: clap has no subcommand to match, so the
@@ -126,7 +151,13 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("\n  {}✗{} {e}\n", fg(tui::WARM), reset());
+        // The assay above already printed the gap in full; the last line
+        // only has to say how the run ended.
+        let line = match &e {
+            error::SlagError::GoalNotMet(_) => "goal not met; the gap is above".to_string(),
+            other => other.to_string(),
+        };
+        eprintln!("\n  {}✗{} {line}\n", fg(tui::WARM), reset());
         resume_hint();
         std::process::exit(1);
     }
@@ -186,6 +217,7 @@ async fn forge(
     }
 
     let config = EngineConfig::resolve().await?;
+    let _provider_run = error::ProviderRunGuard::begin();
     // Only a forge writes logs. `slag key` run from $HOME should not leave
     // an empty ~/logs behind.
     let _ = std::fs::create_dir_all(config::LOG_DIR);
@@ -213,7 +245,7 @@ async fn forge(
     if let Some(path) = session {
         let _ = std::fs::remove_file(path);
     }
-    result
+    error::provider_run_failure().map_or(result, Err)
 }
 
 /// `slag key [KEY]` — the whole configuration surface. With a key it
@@ -221,24 +253,39 @@ async fn forge(
 /// onboards when there is nothing to report. Passing the key as an
 /// argument leaks it into shell history, so the bare form prompts.
 async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
+    let provider = config::active_provider()?;
+    println!("  provider: {}", provider.name());
     if let Some(key) = key {
-        config::verify_and_store(key.trim()).await?;
+        config::verify_and_store_for_provider(provider, key.trim()).await?;
         // Saving into a shell that exports its own key stores something
         // slag will never read. Warn instead of letting the next run 401.
-        if matches!(config::key_status(), Some((config::KeySource::Env, _))) {
-            tui::key_shadowed();
+        if matches!(config::key_status_for_provider(provider), Some((config::KeySource::Env, _))) {
+            if provider == config::ProviderPreset::OpenRouter {
+                tui::key_shadowed();
+            } else {
+                println!("  The environment key overrides the stored key.");
+            }
         }
         return Ok(());
     }
 
-    let status = config::key_status();
-    if status.is_none() && std::io::stdin().is_terminal() {
-        config::onboard().await?;
+    let status = config::key_status_for_provider(provider);
+    if status.is_none() && !provider.key_optional() && std::io::stdin().is_terminal() {
+        config::onboard_provider(provider).await?;
         return Ok(());
     }
-    let source = status
-        .as_ref()
-        .map(|(src, key)| (src.label(), config::mask_key(key)));
+    let source = status.as_ref().map(|(src, _)| {
+        let label = match src {
+            config::KeySource::Env if provider == config::ProviderPreset::Custom
+                && std::env::var("CUSTOM_API_KEY").map(|key| key.trim().is_empty()).unwrap_or(true) => "SLAG_API_KEY",
+            config::KeySource::Env => provider.key_env().unwrap_or("SLAG_API_KEY"),
+            config::KeySource::File => "config file",
+        };
+        (label, "present".to_string())
+    });
+    if provider.key_optional() && status.is_none() {
+        println!("  key: optional, none set");
+    }
 
     // Models only resolve once a key exists; without one, show the defaults
     // the user will get rather than an empty panel.
@@ -251,8 +298,8 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
             cfg.model_judge.clone(),
         ),
         None => {
-            let auto = config::AUTO_MODEL.to_string();
-            (auto.clone(), auto.clone(), auto.clone(), auto)
+            let model = provider.default_model().to_string();
+            (model.clone(), model.clone(), model.clone(), model)
         }
     };
 
@@ -274,7 +321,18 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
         ("duel", duel_state, None),
     ];
 
-    tui::key_panel(source, &models);
+    if provider == config::ProviderPreset::OpenRouter {
+        tui::key_panel(source, &models);
+    } else {
+        if let Some((source, _)) = source {
+            println!("  key: present ({source})");
+        } else if !provider.key_optional() {
+            println!("  key: missing ({})", provider.key_env().unwrap_or("SLAG_API_KEY"));
+        }
+        for (role, model, _) in models {
+            println!("  {role}: {model}");
+        }
+    }
     Ok(())
 }
 
@@ -313,16 +371,31 @@ async fn run_pipeline(
     connect_mcp().await;
 
     if !(tui_flag && std::io::stdin().is_terminal()) {
-        // `--trace` without `--tui` is the useful headless case: no
-        // dashboard holds the channel, so the trace sink takes it.
-        let (hooks, sink) = render::trace::attach(EngineHooks::default(), trace);
+        // Headless: the recording session holds the event channel, and its
+        // stream view draws the whole run from it, as the dashboard does.
+        // The pipeline goes quiet so nothing prints twice; a replay of the
+        // tape then draws exactly what this run drew.
+        let tape = render::tape::Session::open(
+            Some(render::tape::default_path()),
+            Some(Box::new(render::stream::Stream::live())),
+        );
+        tui::set_presenter(true);
+        tui::set_quiet(true);
+        let hooks = tape.attach(EngineHooks::default());
+        let (hooks, sink) = render::trace::attach(hooks, trace);
         let result =
             pipeline::run(commission, config, anvils, hooks, temper).await;
         if let Some(sink) = sink {
             let _ = sink.await;
         }
+        tape.close().await;
+        tui::set_quiet(false);
+        tui::set_presenter(false);
         return result;
     }
+
+    // The dashboard holds the event channel; the tape only listens.
+    let tape = render::tape::Session::open(Some(render::tape::default_path()), None);
 
     // One pass per commission. A finished forge is not a full stop: the
     // dashboard hands back whatever the operator typed at the end, and
@@ -334,11 +407,11 @@ async fn run_pipeline(
     let mut commission: Option<String> = commission.map(str::to_string);
     let result = loop {
         let (tx, rx) = engine::events::channel();
-        let hooks = EngineHooks {
+        let hooks = tape.attach(EngineHooks {
             events: Some(tx),
             steer: Some(steer.clone()),
             cancel: Some(cancel.clone()),
-        };
+        });
         // Tee before the dashboard: the trace needs the same stream, and
         // the dashboard must not lose an event to get it.
         let (hooks, trace_sink) = render::trace::attach(hooks, trace.clone());
@@ -373,6 +446,10 @@ async fn run_pipeline(
         }
         tui::set_quiet(false);
 
+        if error::provider_run_failure().is_some() {
+            break Err(error::SlagError::Cancelled);
+        }
+
         match next {
             // A fresh commission re-enters the pipeline from the top:
             // survey, found, forge. The prior run's report is printed
@@ -382,7 +459,7 @@ async fn run_pipeline(
                 // the next forge is about to reuse the screen. Print the
                 // report now or it is lost between passes.
                 if !matches!(result, Err(error::SlagError::Cancelled)) {
-                    let _ = pipeline::assay::show();
+                    print_assay();
                 }
                 commission = Some(next);
             }
@@ -394,58 +471,101 @@ async fn run_pipeline(
     // reprint the final report on the real terminal. A cracked run needs
     // it most, so only a cancel (nothing to report) skips it.
     if !matches!(result, Err(error::SlagError::Cancelled)) {
-        let _ = pipeline::assay::show();
+        print_assay();
     }
+    tape.close().await;
 
     result
 }
 
+/// The assay in the stream view's words, on the real terminal. The pipeline
+/// still records its marks for the tape (`assay::show` with color off goes
+/// nowhere while quiet), so a replay sees the same report.
+fn print_assay() {
+    for line in render::echo::assay_report(tui::width()) {
+        println!("{line}");
+    }
+}
+
 fn show_status() -> Result<(), error::SlagError> {
     tui::show_banner();
+    let width = tui::width();
+    let label = |name: &str| tui::dim(&format!("{name:<10}"));
 
     let crucible_path = Path::new(config::CRUCIBLE);
     if !crucible_path.exists() {
-        println!("\n  No crucible found. Run `slag \"Your Commission\"` to start.\n");
+        println!();
+        println!(
+            "  No crucible found here. Start one with {}slag \"describe what to build\"{}",
+            fg(tui::HOT),
+            reset()
+        );
+        println!();
         return Ok(());
     }
 
     let crucible = crucible::Crucible::load(crucible_path)?;
     let counts = crucible.counts();
-
-    let ore_path = Path::new(config::ORE_FILE);
-    if ore_path.exists() {
-        let ore = std::fs::read_to_string(ore_path)?;
-        let commission = ore.lines().last().unwrap_or("(unknown)");
-        println!(
-            "\n  {}Commission:{} {}",
-            fg(tui::HOT),
-            reset(),
-            tui::truncate(commission, 50)
-        );
-    }
-
-    let has_bp = Path::new(config::BLUEPRINT).exists();
-    println!(
-        "  {}Blueprint: {}{}",
-        fg(tui::COLD),
-        if has_bp { "yes" } else { "no" },
-        reset()
-    );
-
-    print!("  ");
-    tui::ingot_status_line(&counts);
     println!();
-    tui::temper_bar(&counts);
 
-    if counts.cracked > 0 {
-        println!("\n  {}Cracked:{}", fg(tui::WARM), reset());
-        for ingot in &crucible.ingots {
-            if ingot.status == sexp::Status::Cracked {
-                println!("    {}✗{} [{}] {}", fg(tui::WARM), reset(), ingot.id, ingot.work);
-            }
+    if let Ok(ore) = std::fs::read_to_string(config::ORE_FILE) {
+        if let Some(commission) = dashboard::commission_line(&ore) {
+            println!("  {}  {}", label("commission"), tui::clip(&commission, width.saturating_sub(14)));
         }
     }
+    let blueprint = match std::fs::read_to_string(config::BLUEPRINT) {
+        Ok(doc) => format!("{} · {} lines", config::BLUEPRINT, doc.lines().count()),
+        Err(_) => tui::dim("not drafted yet"),
+    };
+    println!("  {}  {blueprint}", label("blueprint"));
+    println!("  {}  {} · {} ingots", label("crucible"), config::CRUCIBLE, counts.total);
+    println!("{}", tui::counts_text(&counts, width));
+    println!();
 
+    // Every ingot, one row each: this is the one screen that shows them all.
+    let shown = 20;
+    let id_w = crucible.ingots.iter().map(|i| i.id.chars().count()).max().unwrap_or(2);
+    for ingot in crucible.ingots.iter().take(shown) {
+        let (glyph, color) = match ingot.status {
+            sexp::Status::Forged => ("✓", tui::PURE),
+            sexp::Status::Cracked => ("✗", tui::WARM),
+            sexp::Status::Molten => ("⚒", tui::HOT),
+            sexp::Status::Ore => ("·", tui::COLD),
+        };
+        let heat = if ingot.heat > 1 { format!("heat {}", ingot.heat) } else { String::new() };
+        let room = width.saturating_sub(id_w + 10 + heat.chars().count());
+        let title = render::echo::title(&ingot.work);
+        let left = format!(
+            "    {} {}  {}",
+            tui::paint(color, glyph),
+            tui::paint(if ingot.status == sexp::Status::Ore { tui::COLD } else { tui::PURE }, &format!("{:<id_w$}", ingot.id)),
+            tui::clip(&title, room)
+        );
+        println!("{}", tui::spread(&left, &tui::paint(color, &heat), width));
+    }
+    if crucible.ingots.len() > shown {
+        println!("    {}", tui::dim(&format!("… {} more in {}", crucible.ingots.len() - shown, config::CRUCIBLE)));
+    }
+
+    // What to do next, when there is something to do.
+    println!();
+    if counts.ore + counts.molten > 0 {
+        println!(
+            "  {}  {}slag resume{}  {}",
+            label("next"),
+            fg(tui::HOT),
+            reset(),
+            tui::dim(&format!("forges the {} left", counts.ore + counts.molten))
+        );
+    } else if counts.cracked > 0 {
+        println!(
+            "  {}  {}",
+            label("next"),
+            tui::dim(&format!("read why they cracked in {}/, or commission a fix", config::LOG_DIR))
+        );
+    } else {
+        println!("  {}  {}", label("next"), tui::dim("every ingot forged; commission the next change"));
+    }
     println!();
     Ok(())
 }

@@ -1,0 +1,12 @@
+diff --git a/src/lexer.rs b/src/lexer.rs
+index 838208b..9d6873c 100644
+--- a/src/lexer.rs
++++ b/src/lexer.rs
+@@ -30,6 +30,7 @@ pub fn lex(src: &str) -> Vec<Token> {
+                 while let Some(&c2) = chars.peek() {
+                     chars.next();
+                     if c2 == '\n' {
++                        line += 1;
+                         break;
+                     }
+                 }

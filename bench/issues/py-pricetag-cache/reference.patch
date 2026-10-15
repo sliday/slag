@@ -1,0 +1,9 @@
+diff --git a/shop/pricing.py b/shop/pricing.py
+index 1cc8aa8..1c1394a 100644
+--- a/shop/pricing.py
++++ b/shop/pricing.py
+@@ -21,3 +21,4 @@ class PriceBook:
+     def update_price(self, sku, new_price):
+         """Change the price of `sku` in the catalog."""
+         self.catalog.set_price(sku, new_price)
++        self._cache.pop(sku, None)

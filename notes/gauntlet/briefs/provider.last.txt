@@ -1,0 +1,57 @@
+Committed on `gauntlet/provider`:
+
+- `7174847` provider retry fixes.
+- `eed67e6` provider-agnostic help text.
+
+Rate-limit signals now override billing words on 429. Body delays preserve fractions and cap at 60 seconds. Wiremock tests preserve xAI billing and OpenAI `insufficient_quota` classification.
+
+**929 tests passed; 1 ignored.** Clippy completed with warnings. The worktree is clean.
+
+Live verification did **not** reach FORGED:
+
+| Attempt | Wall time | Result |
+|---|---:|---|
+| First | 650.01 s | Test timeout after repeated undeclared tool names |
+| Final | 124.42 s | One ingot forged, then Groq’s daily quota blocked completion |
+
+Groq reported **198,764 of 200,000 daily tokens used**. I stopped live calls.
+
+The final run printed:
+
+```text
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 20.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 1.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 17.0s.
+```
+
+Reported tokens imply about **$0.015**, using [Groq’s published prices](https://console.groq.com/docs/model/openai/gpt-oss-120b). This estimate excludes unreported failed generations.
+
+Files changed:
+
+- `slag-rs/src/engine/provider.rs`
+- `slag-rs/src/cli.rs`
+- `slag-rs/tests/cli.rs`
+
+Verification commands:
+
+```sh
+cd slag-rs
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --all-targets
+cd ..
+git diff --check
+```
+
+Live command used scratch directories and the default Groq model:
+
+```sh
+slag --provider groq --anvils 1 --temper 0 \
+  "write hello.py that prints hello and a unittest for it"
+```
+
+ASK: Fix Groq throttles and help text, verify FORGED live, and commit.
+🟩Got 🟩Had 🟨Did — Live FORGED verification remains blocked by Groq’s daily quota.
+🧠 High

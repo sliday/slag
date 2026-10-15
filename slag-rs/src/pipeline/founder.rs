@@ -40,7 +40,7 @@ pub async fn extend(smith: &dyn Smith) -> Result<usize, SlagError> {
     spinner.finish_and_clear();
     log_to_file("FOUNDER_ADDENDUM_RAW", &raw);
 
-    let mut ingots = crucible::parse_ingot_lines(&raw);
+    let mut ingots = parse_new_ingots(&raw);
     if ingots.is_empty() {
         // Same summary-instead-of-ingots trap as the cold found. Here an
         // empty answer is legitimate, so this only rules out the case
@@ -48,7 +48,7 @@ pub async fn extend(smith: &dyn Smith) -> Result<usize, SlagError> {
         let retry = format!("{prompt}\n\n{}", flux::SEXP_ONLY_REMINDER);
         if let Ok(raw) = smith.invoke(&retry).await {
             log_to_file("FOUNDER_ADDENDUM_RAW_RETRY", &raw);
-            ingots = crucible::parse_ingot_lines(&raw);
+            ingots = parse_new_ingots(&raw);
         }
     }
     // No ingots is a legitimate answer here, unlike a cold found: the
@@ -120,12 +120,12 @@ pub async fn run_with_guidance(
     // themselves were expected. Nothing parses, and the run dies on
     // NoIngots -- at random, depending on whether the model happened to
     // explore. Ask once more, plainly, before giving up on the run.
-    let mut ingots = crucible::parse_ingot_lines(&raw);
+    let mut ingots = parse_new_ingots(&raw);
     if ingots.is_empty() {
         let retry = format!("{prompt}\n\n{}", flux::SEXP_ONLY_REMINDER);
         let raw = smith.invoke(&retry).await.map_err(|e| SlagError::FounderFailed(e.to_string()))?;
         log_to_file("FOUNDER_RAW_RETRY", &raw);
-        ingots = crucible::parse_ingot_lines(&raw);
+        ingots = parse_new_ingots(&raw);
     }
     if ingots.is_empty() {
         return Err(SlagError::NoIngots);
@@ -203,6 +203,16 @@ fn with_briefing_rules(base: &str) -> String {
     format!("{base}\n\n{BRIEFING_RULES}")
 }
 
+fn parse_new_ingots(raw: &str) -> Vec<crate::sexp::Ingot> {
+    let mut ingots = crucible::parse_ingot_lines(raw);
+    for ingot in &mut ingots {
+        ingot.status = crate::sexp::Status::Ore;
+        ingot.heat = 0;
+        ingot.smelt = 0;
+    }
+    ingots
+}
+
 fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
@@ -211,6 +221,21 @@ fn log_to_file(label: &str, content: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn model_status_cannot_certify_new_work() {
+        for status in ["ore", "molten", "forged", "cracked"] {
+            let raw = format!(
+                "(ingot :id \"i1\" :status {status} :heat 99 :smelt 9 :proof \"test -f app.py\")"
+            );
+            let ingots = parse_new_ingots(&raw);
+            assert_eq!(ingots.len(), 1);
+            assert_eq!(ingots[0].status, crate::sexp::Status::Ore);
+            assert_eq!(ingots[0].heat, 0);
+            assert_eq!(ingots[0].smelt, 0);
+            assert_eq!(ingots[0].proof, "test -f app.py");
+        }
+    }
 
     #[test]
     fn latest_addendum_reads_the_newest_request_only() {

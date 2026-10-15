@@ -1,0 +1,31 @@
+Committed on `gauntlet/loop`:
+
+- `a97d137` — `founder: require forge proof for newly cast ingots`
+- `6b2d0f6` — `tools: skip slag scratch paths in broad file searches`
+
+The founder trusted model lifecycle fields before saving ingots ([founder.rs:123](/Users/stas/Playground/slag/.claude/worktrees/lane-loop/slag-rs/src/pipeline/founder.rs:123)). New ingots now enter as ore with heat and smelt zero, including retries and extensions. I kept founder writes as preparatory work because the forge must run proof before certification.
+
+Broad file searches traversed the heap without exclusions ([tools.rs:1360](/Users/stas/Playground/slag/.claude/worktrees/lane-loop/slag-rs/src/engine/tools.rs:1360)). Searches now prune root `logs/`, `.git`, and `slag-anvil-*` paths before traversal. Explicit heap paths remain available, and application directories such as `src/logs/` remain searchable.
+
+Changed files under `slag-rs/`:
+
+- `src/pipeline/founder.rs`
+- `src/engine/tools.rs`
+- `tests/forge_loop.rs`
+
+**914 tests passed; one existing test remained ignored.** Mock regressions cover forge proof, extensions, explicit heap access, and forced shell fallbacks. Clippy passed with existing warnings.
+
+```sh
+cd /Users/stas/Playground/slag/.claude/worktrees/lane-loop/slag-rs
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --all-targets
+git diff HEAD --check
+```
+
+One earlier full run failed `pipeline::fix::tests::reproduction_reverts_the_source_and_puts_the_fix_back`. It passed alone and in the final full run. I left that builder’s files untouched.
+
+Clean worktree. No push.
+
+ASK: Fix founder certification and heap discovery, test both, and commit.
+🟩Got 🟩Had 🟩Did
+🧠 —

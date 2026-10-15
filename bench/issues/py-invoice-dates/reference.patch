@@ -1,0 +1,17 @@
+diff --git a/billdate/dates.py b/billdate/dates.py
+index e034a8d..3356c14 100644
+--- a/billdate/dates.py
++++ b/billdate/dates.py
+@@ -10,7 +10,11 @@ def add_months(d, months=1):
+     When the target month is shorter than the day of `d`, the result
+     falls back to the last day of the target month.
+     """
+-    return d.replace(month=d.month + months)
++    total = d.year * 12 + (d.month - 1) + months
++    year, month = divmod(total, 12)
++    month += 1
++    day = min(d.day, calendar.monthrange(year, month)[1])
++    return date(year, month, day)
+ 
+ 
+ def next_invoice_date(after=None):

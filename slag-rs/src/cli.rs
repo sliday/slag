@@ -47,21 +47,24 @@ pub struct Cli {
     #[arg(long, default_value_t = crate::config::MAX_ANVILS)]
     pub anvils: usize,
 
-    /// Route every role through openrouter/auto, ignoring models pinned in
-    /// the environment or config file. This is already the default; the
-    /// flag exists to override those pins. Explicit model flags still win.
+    /// Reset all roles to the selected provider's default model.
+    /// Ignore environment and config model settings. Explicit model flags take precedence.
     #[arg(long)]
     pub auto: bool,
 
-    /// Worker model, any OpenRouter id (overrides SLAG_MODEL_BASE)
+    /// Chat-completions provider (overrides SLAG_PROVIDER)
+    #[arg(long, global = true, value_name = "NAME")]
+    pub provider: Option<String>,
+
+    /// Worker model ID or provider::model (overrides SLAG_MODEL_BASE)
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Planner model for grade>=3 ingots (overrides SLAG_MODEL_PLAN)
+    /// Planner model ID or provider::model, also for grade>=3 ingots (overrides SLAG_MODEL_PLAN)
     #[arg(long, value_name = "MODEL")]
     pub plan_model: Option<String>,
 
-    /// Duel judge model (overrides SLAG_MODEL_JUDGE)
+    /// Duel judge model ID or provider::model (overrides SLAG_MODEL_JUDGE)
     #[arg(long, value_name = "MODEL")]
     pub judge_model: Option<String>,
 
@@ -79,7 +82,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Show or set the OpenRouter key (the only setup slag needs)
+    /// Show or set the selected provider key; choose it with --provider
     Key {
         /// Key to verify and save; omit to show the current setup
         #[arg(value_name = "KEY")]
@@ -126,14 +129,94 @@ pub enum Command {
         heat: Option<u8>,
     },
 
-    /// Session spend beside the OpenRouter account balance
+    /// Show session spend and the provider balance when available
     Cost,
+
+    /// Play a recorded run (logs/tape-*.jsonl, or any engine-*.jsonl)
+    /// through the live renderers. Needs no key and no network.
+    Replay {
+        /// Tape or event log to play
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Playback speed; long waits are capped before scaling
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// Play in the full-screen dashboard instead of the stream view
+        #[arg(long)]
+        tui: bool,
+        /// Stop at a moment and hold the frame: start, survey, plan, forge,
+        /// anvils, retry, crack, warden, assay, or an offset (12s, 40%)
+        #[arg(long, value_name = "POINT")]
+        at: Option<String>,
+        /// Seconds to hold the last frame (default: until a key, when --at)
+        #[arg(long, value_name = "SECS")]
+        hold: Option<f64>,
+        /// Draw off-screen at this size and print the frame as text
+        #[arg(long, value_name = "WxH")]
+        size: Option<String>,
+        /// List the moments this tape has, with their offsets
+        #[arg(long)]
+        points: bool,
+    },
 
     /// Lifecycle hooks: the event contract and what is configured
     Hooks {
         #[command(subcommand)]
         action: HooksAction,
     },
+
+    /// Fix an issue in the current repository: reproduce it, fix it, run
+    /// the tests, and commit the result on a new branch
+    Fix(FixArgs),
+}
+
+/// `slag fix`. One agent session per attempt, verified by commands slag
+/// runs itself. No PRD, blueprint, or plan touches the repository.
+#[derive(clap::Args, Debug, Clone)]
+pub struct FixArgs {
+    /// The issue: free text, a GitHub issue number (`123` or `#123`) in
+    /// this repository, or a GitHub issue URL
+    #[arg(value_name = "ISSUE")]
+    pub issue: Vec<String>,
+
+    /// Read the issue text from a file
+    #[arg(long, value_name = "PATH")]
+    pub issue_file: Option<PathBuf>,
+
+    /// The repository's test command. Detected from the manifests when
+    /// omitted (package.json, Cargo.toml, go.mod, Python tests, Makefile)
+    #[arg(long, value_name = "CMD")]
+    pub test: Option<String>,
+
+    /// Attempts before giving up. Attempt 2 onward runs on the plan model
+    /// and starts from the failure slag observed
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    pub tries: u8,
+
+    /// Push the branch and open a draft pull request with `gh`
+    #[arg(long, conflicts_with = "no_commit")]
+    pub pr: bool,
+
+    /// Leave the fix in the working tree: no branch, no commit
+    #[arg(long)]
+    pub no_commit: bool,
+
+    /// After the tests pass, have the warden judge the fix against the
+    /// issue. A failing verdict counts as a failed attempt
+    #[arg(long)]
+    pub temper: bool,
+
+    /// Worker model for the first attempt (overrides SLAG_MODEL_BASE)
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Model for retries and the warden (overrides SLAG_MODEL_PLAN)
+    #[arg(long, value_name = "MODEL")]
+    pub plan_model: Option<String>,
+
+    /// Full-screen dashboard
+    #[arg(long)]
+    pub tui: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -171,8 +254,10 @@ impl Cli {
 }
 
 /// The subcommands slag answers to, for the message a suspect verb earns.
-pub const SUBCOMMANDS: &[&str] =
-    &["key", "status", "runs", "insights", "ps", "resume", "update", "rewind", "cost", "hooks"];
+pub const SUBCOMMANDS: &[&str] = &[
+    "key", "status", "runs", "insights", "ps", "resume", "update", "rewind", "cost", "hooks",
+    "fix", "replay",
+];
 
 /// The closest subcommand to a typo, when one is close enough to name.
 /// Two edits covers the ordinary slips -- a dropped letter, a doubled one,

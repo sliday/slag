@@ -183,12 +183,12 @@ pub struct IngotAccum {
 }
 
 impl IngotAccum {
-    fn new() -> Self {
-        Self { tokens: 0, cost: None, started: Instant::now(), ctx: None }
+    fn new(now: Instant) -> Self {
+        Self { tokens: 0, cost: None, started: now, ctx: None }
     }
 
-    fn reset(&mut self) {
-        *self = Self::new();
+    fn reset(&mut self, now: Instant) {
+        *self = Self::new(now);
     }
 
     fn add(&mut self, usage: &Usage) {
@@ -198,11 +198,11 @@ impl IngotAccum {
         }
     }
 
-    /// The ` · 42s · 118k tok · $0.31` tail.
-    fn tail(&self) -> String {
+    /// The ` · 42s · 118k tok · $0.31` tail, timed against `now`.
+    fn tail(&self, now: Instant) -> String {
         let mut s = format!(
             " · {}s · {} tok",
-            self.started.elapsed().as_secs(),
+            now.saturating_duration_since(self.started).as_secs(),
             fmt_tokens(self.tokens)
         );
         if let Some(cost) = self.cost {
@@ -235,33 +235,99 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// Tool verb + subject, Claude Code style: `Run(cargo)`, `Read(src/x.rs)`.
+/// Tool verb and subject for a card: `run  cargo test --all`,
+/// `read  src/x.rs`. Lowercase verbs in one column read as a list, and the
+/// subject is the whole command or path, clipped only by the width.
 fn classify(name: &str, args: &str) -> (String, Option<String>) {
     let (verb, key) = match name {
-        "bash" => ("Run", Some("command")),
-        "read_file" => ("Read", Some("path")),
-        "write_file" => ("Write", Some("path")),
-        "edit_file" => ("Update", Some("path")),
-        "grep" | "glob" => ("Search", Some("pattern")),
-        "recipe_view" => ("Recipe", Some("name")),
-        "finish" => ("Done", None),
+        "bash" => ("run", Some("command")),
+        "read_file" => ("read", Some("path")),
+        "write_file" => ("write", Some("path")),
+        "edit_file" => ("edit", Some("path")),
+        "grep" | "glob" => ("search", Some("pattern")),
+        "recipe_view" => ("recipe", Some("name")),
+        "finish" => ("finishing", None),
         other => (other, None),
     };
+    let verb = match verb.strip_prefix("mcp__") {
+        // `mcp__github__search_issues` reads as `github.search_issues`.
+        Some(rest) => rest.replacen("__", ".", 1),
+        None => verb.to_string(),
+    };
     let arg = key.and_then(|k| extract_str_field(args, k)).map(|v| {
-        if name == "bash" {
-            v.split_whitespace().next().unwrap_or(&v).to_string()
-        } else {
-            v
+        // A grep is a pattern somewhere; the path is half the question.
+        match (name, extract_str_field(args, "path")) {
+            ("grep", Some(path)) => format!("{v}  in {path}"),
+            _ => v,
         }
     });
     // A named field that failed to parse falls back to the raw preview, so
     // the card never shows an empty subject for a tool that has one.
     let arg = match (key, arg) {
         (Some(_), Some(v)) => Some(v),
-        (Some(_), None) if !args.trim().is_empty() => Some(preview(args, 40)),
+        (Some(_), None) if !args.trim().is_empty() => Some(preview(args, 60)),
+        (None, _) if name != "finish" && !args.trim().is_empty() && args.trim() != "{}" => {
+            Some(preview(args, 60))
+        }
         _ => None,
     };
-    (verb.to_string(), arg)
+    (verb, arg)
+}
+
+/// An error that stops the whole run: a provider refusing the key, the
+/// account, or the request. It has one owner, the last line `main` prints,
+/// so the live views leave it out rather than say it twice.
+pub(crate) fn is_fatal_provider(message: &str) -> bool {
+    crate::error::SlagError::Provider(message.to_string()).is_deterministic_provider()
+}
+
+/// A judge's report (`VERDICT: pass … EVIDENCE: …`) as one readable
+/// clause: whether it passed, and the evidence or the gap that says why.
+/// `None` for a summary that is not a verdict.
+pub(crate) fn verdict_gist(summary: &str) -> Option<(bool, String)> {
+    if !summary.contains("VERDICT") {
+        return None;
+    }
+    let v = crate::pipeline::warden::parse_verdict(summary);
+    let why = if v.fulfilled { v.evidence } else { v.gap };
+    Some((v.fulfilled, if why.is_empty() { "no reason given".to_string() } else { why }))
+}
+
+/// A finish summary that is really a document (a planning pass ends on
+/// what it wrote) as one line about it: S-expression ingots, a re-smelt's
+/// rewrite, or a markdown heading. `None` for an ordinary summary.
+pub(crate) fn finish_gist(summary: &str) -> Option<String> {
+    let ingots = summary.matches("(ingot ").count();
+    if summary.trim_start().starts_with("REWRITE") || summary.trim_start().starts_with("SPLIT") {
+        let ids: Vec<&str> = summary
+            .match_indices(":id \"")
+            .filter_map(|(at, m)| summary[at + m.len()..].split('"').next())
+            .collect();
+        let verb = if summary.trim_start().starts_with("SPLIT") { "split into" } else { "rewrote" };
+        return Some(format!("re-smelt {verb} {}", ids.join(" · ")));
+    }
+    if ingots > 0 {
+        let noun = if ingots == 1 { "ingot" } else { "ingots" };
+        return Some(format!("mold cast · {ingots} {noun}"));
+    }
+    let first = summary.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if first.starts_with('#') {
+        let heading = first.trim_start_matches('#').trim();
+        let lines = summary.lines().count();
+        return Some(format!("document drafted · {lines} lines · {}", preview(heading, 120)));
+    }
+    None
+}
+
+/// The verb and subject a card shows for a tool call, for any view that
+/// lists calls (the dashboard feed uses the same words as the stream).
+pub(crate) fn tool_label(name: &str, args: &str) -> (String, Option<String>) {
+    classify(name, args)
+}
+
+/// A failed tool's error without its wrapper, for any view.
+pub(crate) fn tool_error(name: &str, preview_text: &str) -> String {
+    error_gist(name, preview_text)
 }
 
 /// Pull `"key": "value"` out of an argument preview that is JSON in
@@ -298,21 +364,74 @@ fn extract_str_field(json_ish: &str, key: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Collapsed-streak summary: `Ran 4 commands`, `Read 3 files`.
+/// Collapsed-streak summary: `ran 4 commands`, `read 3 files`.
 fn streak_summary(verb: &str, n: usize) -> String {
     match verb {
-        "Run" => format!("Ran {n} commands"),
-        "Read" => format!("Read {n} files"),
-        "Write" => format!("Wrote {n} files"),
-        "Update" => format!("Updated {n} files"),
-        "Search" => format!("Ran {n} searches"),
-        "Recipe" => format!("Viewed {n} recipes"),
-        _ => format!("{n} × {verb}"),
+        "run" => format!("ran {n} commands"),
+        "read" => format!("read {n} files"),
+        "write" => format!("wrote {n} files"),
+        "edit" => format!("edited {n} files"),
+        "search" => format!("ran {n} searches"),
+        "recipe" => format!("viewed {n} recipes"),
+        _ => format!("{verb} × {n}"),
     }
 }
 
 fn line(color: Color, icon: &str, msg: &str) -> String {
     format!("  {} {msg}", paint(color, icon))
+}
+
+/// A tool's error, minus the wrapper that names the tool twice:
+/// `tool error: write_file: missing …` → `missing …`.
+fn error_gist(name: &str, preview_text: &str) -> String {
+    let first = preview_text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+    let mut t = first.strip_prefix("tool error:").map(str::trim_start).unwrap_or(first);
+    if let Some(rest) = t.strip_prefix(name).and_then(|r| r.strip_prefix(':')) {
+        t = rest.trim_start();
+    }
+    t.to_string()
+}
+
+/// `text` broken to `width` under a hanging indent, at most `max` lines,
+/// the last one clipped with an ellipsis when the text runs longer.
+fn wrap_hanging(head: &str, text: &str, width: usize, indent: usize, max: usize) -> Vec<String> {
+    let head_w = crate::tui::visible_len(head);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut room = width.saturating_sub(head_w).max(10);
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        let need = if cur.is_empty() { w.chars().count() } else { cur.chars().count() + 1 + w.chars().count() };
+        if need > room && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            room = width.saturating_sub(indent).max(10);
+            if out.len() == max {
+                break;
+            }
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(w);
+        i += 1;
+    }
+    let cut = i < words.len();
+    if out.len() < max && !cur.is_empty() {
+        out.push(cur);
+    }
+    if cut {
+        let budget = if out.len() == 1 { width.saturating_sub(head_w) } else { width.saturating_sub(indent) };
+        if let Some(last) = out.last_mut() {
+            *last = preview(&format!("{last} {}", words[i..].join(" ")), budget.max(4));
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(n, l)| if n == 0 { format!("{head}{l}") } else { format!("{}{l}", " ".repeat(indent)) })
+        .collect()
 }
 
 /// An emitted ToolCallStart waiting for its ToolResult.
@@ -327,21 +446,20 @@ struct PendingCall {
 impl PendingCall {
     fn label(&self) -> String {
         match &self.arg {
-            Some(arg) => format!("{}({arg})", self.verb),
+            Some(arg) => format!("{} {arg}", self.verb),
             None => self.verb.clone(),
         }
     }
 }
 
-/// A rendered tool card: header + result fold, held briefly by the
-/// batch-collapse logic before printing. `ok` exempts failures from
-/// collapsing — a ✗ card must always print with its error fold.
+/// A rendered tool card, held briefly by the batch-collapse logic before
+/// printing. `ok` exempts failures from collapsing: a ✗ card always
+/// prints, with its error on the same line.
 #[derive(Debug, Clone)]
 struct Card {
     verb: String,
     ok: bool,
-    header: String,
-    fold: String,
+    line: String,
 }
 
 /// Stateful card renderer: pairs tool calls with results, drives the
@@ -349,10 +467,10 @@ struct Card {
 /// it never touches a terminal; `apply_ops` does.
 pub struct RenderState {
     tty: bool,
-    /// Terminal columns for live-line clamping; 0 = unclamped. A live line
-    /// longer than the terminal wraps, and `\r` + clear-to-EOL then only
-    /// reach the last physical row — the wrapped first row would be left
-    /// behind as a permanent junk line.
+    /// Terminal columns every line is clipped to; 0 = unclamped. A live
+    /// line longer than the terminal wraps, and `\r` + clear-to-EOL then
+    /// only reach the last physical row: the wrapped first row would be
+    /// left behind as a permanent junk line.
     width: usize,
     pending: VecDeque<PendingCall>,
     live_shown: bool,
@@ -368,6 +486,17 @@ pub struct RenderState {
     /// Second card of a possible streak, held until we know whether the
     /// third arrives (3+ collapse) or the streak breaks (print it).
     held: Option<Card>,
+    /// The clock every elapsed figure is read against: the wall clock live,
+    /// the tape's clock in a replay. Set by each `feed_at`.
+    now: Instant,
+    /// Whether ingot lifecycle events (start, heat, done, duel) print lines
+    /// of their own. The stream view turns this off: its echo prints the
+    /// forge's skeleton, with more to say about each moment.
+    lifecycle: bool,
+    /// A footer outside this state shows the live activity (see
+    /// `activity`), so narration never prints while a call is open and no
+    /// `RewriteLive` is ever emitted.
+    footer: bool,
 }
 
 impl RenderState {
@@ -377,6 +506,7 @@ impl RenderState {
         } else {
             0
         };
+        let now = Instant::now();
         Self {
             tty,
             width,
@@ -386,17 +516,37 @@ impl RenderState {
             narrate: None,
             routed_pending: None,
             last_routed: None,
-            accum: IngotAccum::new(),
+            accum: IngotAccum::new(now),
             streak_verb: None,
             streak_count: 0,
             held: None,
+            now,
+            lifecycle: true,
+            footer: false,
         }
     }
 
-    /// Override the live-line width clamp (tests; `new` asks the terminal).
+    /// Leave ingot lifecycle lines to whoever prints the forge's skeleton.
+    pub fn without_lifecycle(mut self) -> Self {
+        self.lifecycle = false;
+        self
+    }
+
+    /// Hand the live line to an external footer: no `RewriteLive`, and
+    /// narration waits in `activity` while a call is open.
+    pub fn with_footer(mut self, on: bool) -> Self {
+        self.footer = on;
+        self
+    }
+
+    /// Override the width clamp (tests, replays; `new` asks the terminal).
     pub fn with_live_width(mut self, width: usize) -> Self {
         self.width = width;
         self
+    }
+
+    pub fn set_width(&mut self, width: usize) {
+        self.width = width;
     }
 
     /// Session totals for the current ingot.
@@ -404,7 +554,47 @@ impl RenderState {
         &self.accum
     }
 
+    /// What the smiths are doing right now, for a footer: the oldest open
+    /// call (or the latest narration while one is open) and how long that
+    /// call has run.
+    pub fn activity(&self) -> Option<(String, std::time::Duration)> {
+        self.activity_at(self.now)
+    }
+
+    /// `activity`, timed against `now` (a footer ticks between events).
+    pub fn activity_at(&self, now: Instant) -> Option<(String, std::time::Duration)> {
+        let call = self.pending.front()?;
+        let label = self.narrate.clone().unwrap_or_else(|| call.label());
+        Some((label, now.saturating_duration_since(call.started)))
+    }
+
+    /// Columns a printed line may use.
+    fn room(&self) -> usize {
+        if self.width == 0 {
+            240
+        } else {
+            self.width
+        }
+    }
+
     pub fn feed(&mut self, event: &EngineEvent) -> Vec<RenderOp> {
+        self.feed_at(event, Instant::now())
+    }
+
+    /// Print anything a streak is holding, so a line from outside (a phase
+    /// rule, an ingot's verdict) lands after the cards that preceded it.
+    pub fn flush(&mut self) -> Vec<RenderOp> {
+        let mut prints = Vec::new();
+        self.flush_streak(&mut prints);
+        self.assemble(prints)
+    }
+
+    /// `feed` against an explicit clock, so a replay times every figure
+    /// from the tape rather than from how fast it is being played.
+    pub fn feed_at(&mut self, event: &EngineEvent, now: Instant) -> Vec<RenderOp> {
+        self.now = now.max(self.now);
+        let now = self.now;
+        let width = self.room();
         let mut prints: Vec<String> = Vec::new();
         match event {
             // Demoted to live-line metadata: no own lines.
@@ -428,75 +618,112 @@ impl RenderState {
                     name: name.clone(),
                     verb,
                     arg,
-                    started: Instant::now(),
+                    started: now,
                 });
             }
-            EngineEvent::ToolResult { name, ok, preview: p, .. } => {
-                let card = self.build_card(name, *ok, p);
-                self.push_card(card, &mut prints);
+            EngineEvent::ToolResult { name, ok, preview: p, lines, ms, .. } => {
+                // `finish` says nothing a card could add: its summary
+                // arrives as its own line right after.
+                if name == "finish" && *ok {
+                    self.take_pending(name);
+                } else {
+                    let card = self.build_card(name, *ok, p, *lines, *ms);
+                    self.push_card(card, &mut prints);
+                }
                 self.narrate = None;
             }
 
             EngineEvent::Narrate { text } => {
-                if self.tty && !self.pending.is_empty() {
+                if (self.tty || self.footer) && !self.pending.is_empty() {
                     self.narrate = Some(preview(text, 90));
+                } else if let Some(word) = crate::render::echo::warden_word(text) {
+                    self.flush_streak(&mut prints);
+                    prints.extend(warden_lines(text, word, width));
                 } else {
                     self.flush_streak(&mut prints);
-                    prints.push(line(COLD, "◈", &dim(&preview(text, 110))));
+                    prints.push(line(COLD, "◈", &dim(&preview(text, width.saturating_sub(4)))));
                 }
             }
 
             // Kept lines. Each breaks any card streak so order stays true.
             EngineEvent::Steer { text } => {
                 self.flush_streak(&mut prints);
-                prints.push(line(BRIGHT, "↪", &format!("steer: {}", preview(text, 80))));
+                let head = format!("  {} {}  ", paint(BRIGHT, "↪"), paint(BRIGHT, "steer"));
+                prints.extend(wrap_hanging(&head, text, width, 11, 2));
             }
             EngineEvent::Finish { summary } => {
                 self.flush_streak(&mut prints);
-                prints.push(line(PURE, "■", &preview(summary, 120)));
+                // A judge's report reads as its verdict, not as the raw
+                // `VERDICT: … GAP: … EVIDENCE: …` block it arrives in.
+                if let Some((pass, why)) = verdict_gist(summary) {
+                    let (word, color) = if pass { ("pass", PURE) } else { ("fail", WARM) };
+                    let head = format!("  {} {}  ", paint(color, "⚖"), paint(color, &format!("judged {word}")));
+                    prints.extend(wrap_hanging(&head, &why, width, 4, 2));
+                } else if let Some(gist) = finish_gist(summary) {
+                    prints.push(line(PURE, "■", &dim(&preview(&gist, width.saturating_sub(4)))));
+                } else {
+                    let head = format!("  {} ", paint(PURE, "■"));
+                    prints.extend(wrap_hanging(&head, summary, width, 4, 2));
+                }
+            }
+            EngineEvent::Error { message } if is_fatal_provider(message) => {
+                self.flush_streak(&mut prints);
             }
             EngineEvent::Error { message } => {
                 self.flush_streak(&mut prints);
-                prints.push(line(WARM, "✗", &preview(message, 120)));
+                let head = format!("  {} ", paint(WARM, "✗"));
+                prints.extend(
+                    wrap_hanging(&head, message, width, 4, 2).into_iter().map(|l| paint(WARM, &l)),
+                );
             }
             EngineEvent::Warning { message } => {
                 self.flush_streak(&mut prints);
-                prints.push(line(BRIGHT, "⚠", &preview(message, 110)));
+                prints.extend(warning_lines(message, width));
             }
             EngineEvent::ApiRetry { attempt, status, remaining_secs } => {
                 self.flush_streak(&mut prints);
                 prints.push(line(
                     BRIGHT,
-                    "⏳",
-                    &dim(&format!("api retry {attempt} · {status} · {remaining_secs}s left")),
+                    "⟳",
+                    &dim(&format!("api {status} · retry {attempt} · {remaining_secs}s left")),
                 ));
             }
             EngineEvent::IngotStart { id, work } => {
                 self.flush_streak(&mut prints);
-                self.accum.reset();
-                prints.push(line(HOT, "🧱", &format!("[{id}] {}", preview(work, 60))));
+                self.accum.reset(now);
+                if self.lifecycle {
+                    prints.push(line(HOT, "▣", &format!("{id}  {}", preview(work, width.saturating_sub(id.len() + 6)))));
+                }
             }
             EngineEvent::HeatTick { id, heat } => {
                 self.flush_streak(&mut prints);
-                prints.push(line(WARM, "🔥", &format!("[{id}] heat {heat}")));
+                if self.lifecycle {
+                    prints.push(line(WARM, "⚒", &format!("{id} heat {heat}")));
+                }
             }
             EngineEvent::IngotDone { id, ok } => {
                 self.flush_streak(&mut prints);
-                let (color, icon, word) =
-                    if *ok { (PURE, "✅", "forged") } else { (WARM, "❌", "cracked") };
-                prints.push(line(
-                    color,
-                    icon,
-                    &format!("[{id}] {word}{}", dim(&self.accum.tail())),
-                ));
+                if self.lifecycle {
+                    let (color, icon, word) =
+                        if *ok { (PURE, "✓", "forged") } else { (WARM, "✗", "cracked") };
+                    prints.push(line(
+                        color,
+                        icon,
+                        &format!("{id} {word}{}", dim(&self.accum.tail(now))),
+                    ));
+                }
             }
             EngineEvent::DuelRound { id, round } => {
                 self.flush_streak(&mut prints);
-                prints.push(line(BRIGHT, "⚔", &format!("[{id}] duel round {round}")));
+                if self.lifecycle {
+                    prints.push(line(BRIGHT, "⚔", &format!("{id} duel round {round}")));
+                }
             }
             EngineEvent::DuelVerdict { id, winner, margin } => {
                 self.flush_streak(&mut prints);
-                prints.push(line(PURE, "⚖", &format!("[{id}] cast {winner} wins by {margin}")));
+                if self.lifecycle {
+                    prints.push(line(PURE, "⚖", &format!("{id} cast {winner} wins by {margin}")));
+                }
             }
             // A hook's start is JSONL-only: the finish line carries the
             // verdict and the duration, and printing both would double
@@ -527,7 +754,7 @@ impl RenderState {
     /// live line before printing over it, re-render it after when a call
     /// is still unresolved.
     fn assemble(&mut self, prints: Vec<String>) -> Vec<RenderOp> {
-        let live_next = self.tty && !self.pending.is_empty();
+        let live_next = self.tty && !self.footer && !self.pending.is_empty();
         let mut ops = Vec::new();
         if self.live_shown && (!prints.is_empty() || !live_next) {
             ops.push(RenderOp::ClearLive);
@@ -549,17 +776,8 @@ impl RenderState {
         // Label and elapsed must describe the SAME call — the oldest
         // unresolved one — or the line pairs a fresh call's name with a
         // stale call's timer.
-        let mut label = self
-            .narrate
-            .clone()
-            .or_else(|| self.pending.front().map(PendingCall::label))
-            .unwrap_or_default();
-        let secs = self
-            .pending
-            .front()
-            .map(|c| c.started.elapsed().as_secs())
-            .unwrap_or(0);
-        let mut meta = format!(" · {secs}s · {} tok", fmt_tokens(self.accum.tokens));
+        let (mut label, took) = self.activity().unwrap_or_default();
+        let mut meta = format!(" · {}s · {} tok", took.as_secs(), fmt_tokens(self.accum.tokens));
         if let Some(cost) = self.accum.cost {
             meta.push_str(&format!(" · ${cost:.2}"));
         }
@@ -594,42 +812,69 @@ impl RenderState {
         }
     }
 
-    fn build_card(&mut self, name: &str, ok: bool, result_preview: &str) -> Card {
-        let (verb, label) = match self.take_pending(name) {
-            Some(call) => (call.verb.clone(), call.label()),
+    /// One line per call: `  ✓ read   src/x.rs            42 lines`. A
+    /// success is quiet (dim glyph, dim meta); a failure is the one card
+    /// worth reading, so its error rides the same line in WARM.
+    fn build_card(&mut self, name: &str, ok: bool, result_preview: &str, lines: usize, ms: u64) -> Card {
+        let (verb, arg) = match self.take_pending(name) {
+            Some(call) => (call.verb.clone(), call.arg.clone()),
             // Unmatched result (start line lost): render from the name.
-            None => {
-                let (verb, _) = classify(name, "");
-                (verb.clone(), verb)
+            None => classify(name, ""),
+        };
+        let width = self.room();
+        let col = verb.chars().count().max(6);
+        let lead = 4 + col + 1;
+        let mut meta = String::new();
+        if ok {
+            let mut parts = Vec::new();
+            if matches!(verb.as_str(), "read" | "run" | "search") && lines > 1 {
+                parts.push(format!("{lines} lines"));
             }
-        };
-        let mut header = format!("  {} {}", paint(HOT, "⏺"), paint(PURE, &label));
-        if let Some(routed) = self.routed_pending.take() {
-            header.push_str(&dim(&format!(" · {routed}")));
-        }
-        let fold = if ok {
-            format!("    {}", dim("└ ok"))
+            if ms >= 1000 {
+                parts.push(format!("{:.1}s", ms as f64 / 1000.0));
+            }
+            if let Some(routed) = self.routed_pending.take() {
+                parts.push(routed);
+            }
+            meta = parts.join(" · ");
         } else {
-            let first = result_preview.lines().next().unwrap_or("");
-            format!(
-                "    {} {}",
-                dim("└"),
-                paint(WARM, &format!("✗ {}", preview(first, 80)))
-            )
+            self.routed_pending = None;
+        }
+        let subject_room = if ok {
+            width.saturating_sub(lead + meta.chars().count() + 2)
+        } else {
+            width.saturating_sub(lead).saturating_mul(3) / 5
         };
-        Card { verb, ok, header, fold }
+        let subject = arg.map(|a| preview(&a, subject_room.max(8))).unwrap_or_default();
+        let (glyph, gcolor) = if ok { ("✓", COLD) } else { ("✗", WARM) };
+        let mut text = format!(
+            "  {} {} {}",
+            paint(gcolor, glyph),
+            if ok { dim(&format!("{verb:<col$}")) } else { paint(WARM, &format!("{verb:<col$}")) },
+            subject
+        );
+        if ok {
+            text = crate::tui::spread(&text, &dim(&meta), width);
+        } else {
+            let used = lead + subject.chars().count();
+            let gist = error_gist(name, result_preview);
+            let room = width.saturating_sub(used + 3);
+            if room > 6 {
+                text.push_str(&format!(" {} {}", dim("—"), paint(WARM, &preview(&gist, room))));
+            }
+        }
+        Card { verb, ok, line: text }
     }
 
     /// Streak-aware card emission. First card of a verb prints at once;
     /// the second is held; from the third on the streak is collapsing and
     /// resolves to one summary line when it breaks. Failures never join a
-    /// streak: their card and error fold always print, so an unattended
-    /// forge can never summarize failing commands into an all-green line.
+    /// streak: their card always prints, so an unattended forge can never
+    /// summarize failing commands into an all-green line.
     fn push_card(&mut self, card: Card, prints: &mut Vec<String>) {
         if !card.ok {
             self.flush_streak(prints);
-            prints.push(card.header);
-            prints.push(card.fold);
+            prints.push(card.line);
             return;
         }
         if self.streak_verb.as_deref() == Some(card.verb.as_str()) {
@@ -643,8 +888,7 @@ impl RenderState {
             self.flush_streak(prints);
             self.streak_verb = Some(card.verb.clone());
             self.streak_count = 1;
-            prints.push(card.header);
-            prints.push(card.fold);
+            prints.push(card.line);
         }
     }
 
@@ -653,17 +897,65 @@ impl RenderState {
             let verb = self.streak_verb.as_deref().unwrap_or_default();
             prints.push(format!(
                 "  {} {}",
-                paint(HOT, "⏺"),
+                paint(COLD, "✓"),
                 dim(&streak_summary(verb, self.streak_count))
             ));
         } else if let Some(held) = self.held.take() {
-            prints.push(held.header);
-            prints.push(held.fold);
+            prints.push(held.line);
         }
         self.held = None;
         self.streak_verb = None;
         self.streak_count = 0;
     }
+}
+
+/// A warning, read for what it is. The warden's verdicts and the forge's
+/// own housekeeping each have a shape worth more than a bare `!`.
+fn warning_lines(message: &str, width: usize) -> Vec<String> {
+    if let Some(word) = crate::render::echo::warden_word(message) {
+        return warden_lines(message, word, width);
+    }
+    if let Some(rest) = message.strip_prefix("warden rejected the ") {
+        let (doc, gap) = rest.split_once(": ").unwrap_or((rest, ""));
+        let head = format!(
+            "  {} {}  ",
+            paint(BRIGHT, "!"),
+            paint(BRIGHT, &format!("warden sent back the {}", doc.to_lowercase()))
+        );
+        return wrap_hanging(&head, gap, width, 4, 3);
+    }
+    // `[i2] rewound 3 file(s) to attempt start for a clean retry` follows
+    // every failed heat. The heat's own ✗ line already says it failed and
+    // a retry is coming; the rewind is housekeeping the logs keep.
+    if let Some((id, rest)) = message.strip_prefix('[').and_then(|m| m.split_once("] ")) {
+        if rest.starts_with("rewound ") {
+            return Vec::new();
+        }
+        if rest.starts_with("transient provider error") {
+            return vec![line(BRIGHT, "⟳", &dim(&preview(&format!("{id} {rest}"), width.saturating_sub(4))))];
+        }
+    }
+    let head = format!("  {} ", paint(BRIGHT, "!"));
+    wrap_hanging(&head, message, width, 4, 2).into_iter().map(|l| paint(BRIGHT, &l)).collect()
+}
+
+/// The warden's word on the goal: `✓ warden · round 1  goal met — …` or
+/// `✗ warden · round 1  <gap>`, wrapped under itself.
+fn warden_lines(message: &str, word: &str, width: usize) -> Vec<String> {
+    let round = message
+        .strip_prefix("warden round ")
+        .and_then(|r| r.split(':').next())
+        .unwrap_or("?");
+    let met = word.starts_with("goal met");
+    let (glyph, color) = if met { ("✓", PURE) } else { ("✗", WARM) };
+    let head = format!(
+        "  {} {} {}  ",
+        paint(color, glyph),
+        paint(color, "warden"),
+        dim(&format!("round {round}"))
+    );
+    let body = if met { word.to_string() } else { format!("goal not met — {word}") };
+    wrap_hanging(&head, &body, width, 4, 3)
 }
 
 /// Cross-narrator live-line state. Parallel anvils each spawn their own
@@ -677,7 +969,7 @@ static STDERR_LIVE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Apply render ops to stderr. The only place the narrator touches a
 /// terminal; IO errors are swallowed (display must never kill the forge).
-fn apply_ops(ops: &[RenderOp]) {
+pub(crate) fn apply_ops(ops: &[RenderOp]) {
     let mut live = STDERR_LIVE.lock().unwrap_or_else(|p| p.into_inner());
     let mut err = std::io::stderr().lock();
     write_ops(ops, &mut err, &mut live);
@@ -999,63 +1291,70 @@ mod tests {
 
         let ops = state.feed(&result("bash", true, "221 passed"));
         let lines = printed(&ops);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains('⏺') && lines[0].contains("Run(cargo)"), "{}", lines[0]);
-        assert!(lines[1].contains("└ ok"), "{}", lines[1]);
+        // One line per call: the verdict glyph, the verb, the whole command.
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains('✓') && lines[0].contains("run"), "{}", lines[0]);
+        assert!(lines[0].contains("cargo test --all"), "{}", lines[0]);
     }
 
     #[test]
     fn failed_result_folds_first_error_line() {
         let mut state = RenderState::new(false);
         state.feed(&start("edit_file", r#"{"path": "src/x.rs"}"#));
-        let ops = state.feed(&result("edit_file", false, "no match for old_string"));
+        let ops = state.feed(&result("edit_file", false, "tool error: edit_file: no match for old_string"));
         let lines = printed(&ops);
-        assert!(lines[0].contains("Update(src/x.rs)"), "{}", lines[0]);
-        assert!(lines[1].contains('└') && lines[1].contains("✗ no match for old_string"));
+        // The failure and its reason share one line, minus the wrapper
+        // that names the tool twice.
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains('✗') && lines[0].contains("edit") && lines[0].contains("src/x.rs"));
+        assert!(lines[0].contains("— ") && lines[0].contains("no match for old_string"), "{}", lines[0]);
+        assert!(!lines[0].contains("tool error"), "{}", lines[0]);
     }
 
     #[test]
     fn classify_maps_verbs_and_extracts_subjects() {
         assert_eq!(
             classify("bash", r#"{"command": "cargo test --all"}"#),
-            ("Run".into(), Some("cargo".into()))
+            ("run".into(), Some("cargo test --all".into()))
         );
         assert_eq!(
             classify("read_file", r#"{"path": "src/main.rs"}"#),
-            ("Read".into(), Some("src/main.rs".into()))
+            ("read".into(), Some("src/main.rs".into()))
         );
         assert_eq!(
             classify("write_file", r#"{"path": "a.txt", "content": "hi"}"#),
-            ("Write".into(), Some("a.txt".into()))
+            ("write".into(), Some("a.txt".into()))
         );
         assert_eq!(
             classify("grep", r#"{"pattern": "fn main", "path": "."}"#),
-            ("Search".into(), Some("fn main".into()))
+            ("search".into(), Some("fn main  in .".into()))
         );
         assert_eq!(
             classify("recipe_view", r#"{"name": "deploy"}"#),
-            ("Recipe".into(), Some("deploy".into()))
+            ("recipe".into(), Some("deploy".into()))
         );
-        assert_eq!(classify("finish", r#"{"summary": "done"}"#), ("Done".into(), None));
-        // Unknown tools pass their name through as the verb.
+        assert_eq!(classify("finish", r#"{"summary": "done"}"#), ("finishing".into(), None));
+        // Unknown tools pass their name through as the verb, and an MCP
+        // tool reads as server.tool.
         assert_eq!(classify("mystery", "{}").0, "mystery");
+        assert_eq!(classify("mcp__github__search", "{}").0, "github.search");
     }
 
     #[test]
     fn classify_tolerates_truncated_json_previews() {
         // `preview` cuts at 80 chars and appends `…` — mid-string.
         let (verb, arg) = classify("write_file", r#"{"path": "src/core/rng.ts", "content": "export function ra…"#);
-        assert_eq!(verb, "Write");
+        assert_eq!(verb, "write");
         assert_eq!(arg.as_deref(), Some("src/core/rng.ts"));
 
         // Truncated inside the value itself: take what survived the cut.
         let (verb, arg) = classify("read_file", r#"{"path": "src/very/deep/mo…"#);
-        assert_eq!(verb, "Read");
+        assert_eq!(verb, "read");
         assert_eq!(arg.as_deref(), Some("src/very/deep/mo"));
 
         // Unparseable garbage: fall back to the raw preview.
         let (verb, arg) = classify("bash", "not json at all");
-        assert_eq!(verb, "Run");
+        assert_eq!(verb, "run");
         assert_eq!(arg.as_deref(), Some("not json at all"));
     }
 
@@ -1083,14 +1382,14 @@ mod tests {
         let lines = printed(&feed_all(&mut state, &events));
         let joined = lines.join("\n");
         // First card prints fully; cards 2-4 collapse into the summary.
-        assert!(joined.contains("Run(ls)"), "{joined}");
-        for held in ["Run(pwd)", "Run(date)", "Run(whoami)"] {
+        assert!(joined.contains("ls"), "{joined}");
+        for held in ["pwd", "date", "whoami"] {
             assert!(!joined.contains(held), "{held} should be collapsed\n{joined}");
         }
-        assert!(joined.contains("Ran 4 commands"), "{joined}");
+        assert!(joined.contains("ran 4 commands"), "{joined}");
         // The summary lands when the streak breaks — before the Read card.
-        let summary_at = lines.iter().position(|l| l.contains("Ran 4 commands")).unwrap();
-        let read_at = lines.iter().position(|l| l.contains("Read(a.rs)")).unwrap();
+        let summary_at = lines.iter().position(|l| l.contains("ran 4 commands")).unwrap();
+        let read_at = lines.iter().position(|l| l.contains("a.rs")).unwrap();
         assert!(summary_at < read_at);
     }
 
@@ -1113,10 +1412,10 @@ mod tests {
         // failures would show an all-green summary while the smith flails.
         let fails = lines
             .iter()
-            .filter(|l| l.contains("✗ 2 tests failed"))
+            .filter(|l| l.contains('✗') && l.contains("2 tests failed"))
             .count();
         assert_eq!(fails, 2, "{joined}");
-        assert!(!joined.contains("Ran 4 commands"), "{joined}");
+        assert!(!joined.contains("ran 4 commands"), "{joined}");
     }
 
     #[test]
@@ -1209,8 +1508,8 @@ mod tests {
             result("read_file", true, "content"),
         ];
         let joined = printed(&feed_all(&mut state, &events)).join("\n");
-        assert!(joined.contains("Run(ls)") && joined.contains("Run(pwd)"), "{joined}");
-        assert!(!joined.contains("Ran 2"), "{joined}");
+        assert!(joined.contains("ls") && joined.contains("pwd"), "{joined}");
+        assert!(!joined.contains("ran 2"), "{joined}");
     }
 
     #[test]
@@ -1222,7 +1521,38 @@ mod tests {
         let mid = state.feed(&result("bash", true, "ok"));
         assert!(printed(&mid).is_empty(), "second card is held until the streak resolves");
         let joined = printed(&state.finish()).join("\n");
-        assert!(joined.contains("Run(pwd)"), "{joined}");
+        assert!(joined.contains("pwd"), "{joined}");
+    }
+
+    #[test]
+    fn a_judges_report_reads_as_its_verdict() {
+        let mut state = RenderState::new(false);
+        let lines = printed(&state.feed(&EngineEvent::Finish {
+            summary: "VERDICT: fail\nGAP: no test covers the CLI\nEVIDENCE: ran it".into(),
+        }));
+        let text = lines.join("\n");
+        assert!(text.contains("judged fail") && text.contains("no test covers the CLI"), "{text}");
+        assert!(!text.contains("VERDICT"), "{text}");
+        assert_eq!(verdict_gist("all done"), None);
+    }
+
+    #[test]
+    fn a_document_summary_condenses_to_one_line() {
+        let rewrite = r#"REWRITE: (ingot :id "i1" :status ore :work "x")"#;
+        assert_eq!(finish_gist(rewrite).as_deref(), Some("re-smelt rewrote i1"));
+        let cast = r#"(ingot :id "i1") (ingot :id "i2")"#;
+        assert_eq!(finish_gist(cast).as_deref(), Some("mold cast · 2 ingots"));
+        assert!(finish_gist("# BLUEPRINT\nbody").unwrap().starts_with("document drafted · 2 lines"));
+        assert_eq!(finish_gist("Wrote the CLI and its tests."), None);
+    }
+
+    #[test]
+    fn a_fatal_provider_error_is_left_to_the_final_line() {
+        let mut state = RenderState::new(false);
+        let fatal = "provider error: invalid key (401): openai, role surveyor, model m. Set OPENAI_API_KEY";
+        assert!(printed(&state.feed(&EngineEvent::Error { message: fatal.into() })).is_empty());
+        let other = printed(&state.feed(&EngineEvent::Error { message: "edit failed".into() }));
+        assert!(other.iter().any(|l| l.contains("edit failed")), "{other:?}");
     }
 
     #[test]
@@ -1251,7 +1581,7 @@ mod tests {
 
         let ops = state.feed(&start("bash", r#"{"command": "cargo build"}"#));
         assert!(matches!(&ops[..], [RenderOp::RewriteLive(live)]
-            if live.contains("Run(cargo)") && live.contains("tok")));
+            if live.contains("run cargo build") && live.contains("tok")));
 
         // Tokens update the live line in place — no printed line.
         let usage = Usage { total_tokens: 1500, cost: Some(0.02), ..Default::default() };
@@ -1268,7 +1598,7 @@ mod tests {
         let ops = state.feed(&result("bash", true, "ok"));
         assert_eq!(ops[0], RenderOp::ClearLive);
         assert!(!ops.iter().any(|op| matches!(op, RenderOp::RewriteLive(_))));
-        assert!(printed(&ops)[0].contains("Run(cargo)"));
+        assert!(printed(&ops)[0].contains("cargo build"));
     }
 
     #[test]
@@ -1314,7 +1644,7 @@ mod tests {
             usage: Usage { total_tokens: 118_000, cost: Some(0.31), ..Default::default() },
         });
         let done = printed(&state.feed(&EngineEvent::IngotDone { id: "i3".into(), ok: true }));
-        assert!(done[0].contains("[i3] forged"), "{}", done[0]);
+        assert!(done[0].contains("i3 forged"), "{}", done[0]);
         assert!(done[0].contains("118k tok"), "{}", done[0]);
         assert!(done[0].contains("$0.31"), "{}", done[0]);
         assert!(done[0].contains('s'), "{}", done[0]);
@@ -1322,7 +1652,7 @@ mod tests {
         // Next ingot starts from zero — no bleed-through.
         state.feed(&EngineEvent::IngotStart { id: "i4".into(), work: "next".into() });
         let done = printed(&state.feed(&EngineEvent::IngotDone { id: "i4".into(), ok: false }));
-        assert!(done[0].contains("[i4] cracked"), "{}", done[0]);
+        assert!(done[0].contains("i4 cracked"), "{}", done[0]);
         assert!(done[0].contains("0 tok"), "{}", done[0]);
         assert!(!done[0].contains('$'), "{}", done[0]);
     }
@@ -1371,20 +1701,20 @@ mod tests {
     fn kept_events_still_print_their_lines() {
         let mut state = RenderState::new(false);
         let cases: [(EngineEvent, &str); 7] = [
-            (EngineEvent::Steer { text: "focus".into() }, "steer: focus"),
+            (EngineEvent::Steer { text: "focus".into() }, "focus"),
             (EngineEvent::Warning { message: "spend at 80%".into() }, "spend at 80%"),
             (EngineEvent::Error { message: "cracked".into() }, "cracked"),
-            (EngineEvent::HeatTick { id: "i1".into(), heat: 2 }, "[i1] heat 2"),
-            (EngineEvent::DuelRound { id: "i1".into(), round: 1 }, "[i1] duel round 1"),
+            (EngineEvent::HeatTick { id: "i1".into(), heat: 2 }, "i1 heat 2"),
+            (EngineEvent::DuelRound { id: "i1".into(), round: 1 }, "i1 duel round 1"),
             (
                 EngineEvent::DuelVerdict { id: "i1".into(), winner: 'a', margin: 3 },
-                "[i1] cast a wins by 3",
+                "i1 cast a wins by 3",
             ),
             // Heartbeats print their own line — an unattended forge waiting
             // out a rate limit must not look frozen in the logs.
             (
                 EngineEvent::ApiRetry { attempt: 2, status: 429, remaining_secs: 240 },
-                "api retry 2 · 429 · 240s left",
+                "api 429 · retry 2 · 240s left",
             ),
         ];
         for (event, needle) in cases {
@@ -1461,8 +1791,8 @@ mod tests {
                 _ => None,
             })
             .expect("live line");
-        assert!(live.contains("Run(cargo)"), "{live}");
-        assert!(!live.contains("Read(src/x.rs)"), "{live}");
+        assert!(live.contains("run cargo build"), "{live}");
+        assert!(!live.contains("src/x.rs"), "{live}");
     }
 
     #[test]
@@ -1476,7 +1806,7 @@ mod tests {
         let clear_at = ops.iter().position(|op| matches!(op, RenderOp::ClearLive));
         let print_at = ops
             .iter()
-            .position(|op| matches!(op, RenderOp::Print(s) if s.contains("[i1] forged")));
+            .position(|op| matches!(op, RenderOp::Print(s) if s.contains("i1 forged")));
         assert!(clear_at.is_some() && print_at.is_some(), "{ops:?}");
         assert!(clear_at < print_at, "clear must precede the footer: {ops:?}");
     }

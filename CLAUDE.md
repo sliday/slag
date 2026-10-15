@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **slag** is a Rust task orchestrator that uses metallurgical metaphors to manage AI-powered development workflows. It breaks requirements into S-expression "ingots" and forges them through an agent loop with automatic retry and proof-based verification.
 
-slag is OpenRouter-only. There is no Claude CLI dependency and no vendor SDK: the engine speaks the OpenRouter chat-completions API directly. The single prerequisite is an OpenRouter key.
+slag uses OpenAI-compatible chat completions. OpenRouter stays the default. Cloud providers use their own keys; Ollama and LM Studio need no key. The engine needs no Claude CLI or vendor SDK.
 
 The repo has three layers:
 
@@ -52,7 +52,7 @@ The repo has three layers:
 | `main.rs` | Entry point, subcommand dispatch, key gate before any forge |
 | `cli.rs` | clap definitions for flags and subcommands |
 | `config.rs` | `EngineConfig`, key storage and verification, model resolution |
-| `engine/` | OpenRouter provider, agent loop, tools, judge, recipes, events, MCP client |
+| `engine/` | Chat-completions provider, agent loop, tools, judge, recipes, events, MCP client |
 | `smith/` | `NativeSmith` factories (`make_smith`, `make_plan_smith`, `make_base_smith`) |
 | `pipeline/` | surveyor, founder, forge, duel, resmelt, assay |
 | `anvil/` | Worktree helpers. The parallel fan-out itself lives in `pipeline/forge.rs` |
@@ -74,9 +74,38 @@ The repo has three layers:
 
 ### Configuration
 
-The key is the only required setup. Bare `slag key` prompts for one when none exists and stdin is a TTY, and otherwise prints the status panel; `slag key <KEY>` verifies and stores the argument, which is the form that leaks into shell history. `OPENROUTER_API_KEY` in the environment overrides the stored one. Storage is `~/.config/slag/config.toml` at mode 0600, or `$SLAG_CONFIG_DIR/config.toml`.
+Select the default provider with `--provider NAME`, `SLAG_PROVIDER`, or `provider = "NAME"` in `config.toml`. Precedence is flag, then environment, then file, then `openrouter`.
 
-Every model role defaults to `config::AUTO_MODEL` (`openrouter/auto`). Per-role overrides resolve flag, then env, then config file:
+Presets supply these API roots, key variables, and default models:
+
+| Provider | Base URL | Key environment variable | Default model |
+|----------|----------|--------------------------|---------------|
+| openrouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `openrouter/auto` |
+| openai | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `gpt-4.1-mini` |
+| anthropic | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
+| gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | `gemini-flash-latest` |
+| groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
+| cerebras | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `qwen-3.8-27b` |
+| xai | `https://api.x.ai/v1` | `XAI_API_KEY` | `grok-4.3` |
+| mistral | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `mistral-small-latest` |
+| deepseek | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
+| together | `https://api.together.ai/v1` | `TOGETHER_API_KEY` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
+| fireworks | `https://api.fireworks.ai/inference/v1` | `FIREWORKS_API_KEY` | `accounts/fireworks/models/glm-5p3-flash` |
+| ollama | `http://localhost:11434/v1` | None | `qwen3:8b` |
+| lmstudio | `http://localhost:1234/v1` | None | `local-model` |
+| custom | Set `base_url` | `CUSTOM_API_KEY` or `SLAG_API_KEY`, optional | `default` |
+
+Use a loaded model ID for LM Studio or custom servers. Install the Ollama model before use. Anthropic's preset uses its evaluation compatibility layer, which ignores strict tool schemas and hoists system messages.
+
+Override any API root with `SLAG_BASE_URL` or `base_url`. Keep `/chat/completions` off the root. `SLAG_OPENROUTER_BASE` overrides OpenRouter only. Provider-specific overrides use `SLAG_<PROVIDER>_BASE_URL` or `<provider>_base_url`.
+
+Endpoint precedence is provider environment, generic environment, OpenRouter alias, provider file, generic file, then preset. Provider-specific overrides let mixed roles use separate proxies. slag rejects foreign preset hosts before authentication and does not follow HTTP redirects.
+
+`slag key` shows the active provider and key presence without key values. It prompts for a missing required key on a terminal. `slag key --provider NAME KEY` stores a named provider's key. Only OpenRouter uses the OpenRouter key-check endpoint.
+
+Storage stays `~/.config/slag/config.toml` at mode 0600, or `$SLAG_CONFIG_DIR/config.toml`. Each provider uses `<provider>_api_key`. Its standard environment key takes precedence over the stored key. Local providers need no key; custom keys stay optional.
+
+Per-role model overrides resolve flag, then environment, then file, then the provider's default:
 
 | Role | Env | `config.toml` key | Flag |
 |------|-----|-------------------|------|
@@ -85,7 +114,13 @@ Every model role defaults to `config::AUTO_MODEL` (`openrouter/auto`). Per-role 
 | duel cast B | `SLAG_MODEL_ALT` | `model_alt` | |
 | judge | `SLAG_MODEL_JUDGE` | `model_judge` | `--judge-model` |
 
-The env and file spellings are separate lookups in `config::EngineConfig::load`. `parse_config_lines` only ever matches the lowercase keys, so an uppercase name in the file is dead text. The file understands eight top-level keys: `openrouter_api_key`, `model_base`, `model_plan`, `model_alt`, `model_judge`, `duel`, `duel_rounds`, `screenshot_cmd`.
+Use `provider::model` to route one role through another provider, such as `model_plan = "openai::gpt-4.1-mini"`. Bare model IDs use the default provider. Existing OpenRouter IDs such as `openai/gpt-5` keep their meaning. Set the key for each provider you name.
+
+`--auto` resets roles to the selected provider's default. Explicit model flags take precedence. File keys stay lowercase; environment names stay uppercase. Bare `openrouter/auto` also uses the selected provider's default. Use `openrouter::openrouter/auto` for OpenRouter routing.
+
+OpenRouter keeps its reasoning object, `reasoning_details` replay, attribution headers, pricing lookup, and native fallback routing. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. The agent recovers standalone JSON against declared tool schemas and rejects prose or code fences. It returns provider tool-validation errors to the model, with a limit of three consecutive failures.
+
+Other providers receive supported reasoning fields or omit them. `slag cost` shows session spend and a one-line balance note for non-OpenRouter providers. Spend caps depend on reported response costs outside OpenRouter.
 
 ### MCP servers
 
@@ -99,7 +134,7 @@ github = "gh-mcp --stdio"
 
 `engine/mcp.rs` spawns each server once per process at forge start, handshakes it (`initialize` → `notifications/initialized` → `tools/list`), and re-exports its tools as `mcp__<server>__<tool>` beside the native eight. `ToolBox::all_specs()` is natives plus MCP; `ToolBox::specs()` stays natives-only. A server that will not spawn or handshake inside 15s is named in a warning and skipped, never fatal. Recipes gate on these names through `requires_tools` unchanged. Scope is stdio only: no HTTP, no SSE, no OAuth.
 
-Env-only knobs: `SLAG_DUEL` (auto/on/off), `SLAG_DUEL_ROUNDS`, `SLAG_REASONING_EFFORT`, `SLAG_SCREENSHOT_CMD`, `SLAG_OPENROUTER_BASE`, `SLAG_CONFIG_DIR`, `SLAG_CHAR_BUDGET` (agent.rs compaction budget), plus `NO_COLOR` and `COLORTERM` in `tui.rs`.
+Other environment knobs include `SLAG_DUEL`, `SLAG_DUEL_ROUNDS`, `SLAG_REASONING_EFFORT`, `SLAG_SCREENSHOT_CMD`, `SLAG_CONFIG_DIR`, and `SLAG_CHAR_BUDGET` (agent compaction budget). `tui.rs` also reads `NO_COLOR` and `COLORTERM`.
 
 Behavior constants in `config.rs`: `MAX_ANVILS = 3` (parallel ingot slots), `HIGH_GRADE = 3` (plan-model threshold), `MAX_ITERATE = 3` (self-iteration rounds).
 
@@ -113,7 +148,7 @@ cargo test              # keep this green
 cargo build --release
 ```
 
-Binary surface: `slag "commission"`, `slag key [KEY]`, `slag status`, `slag resume`, `slag update`. Flags: `--tui`, `--anvils N`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--worktree` (parses, warns, not implemented).
+Binary surface: `slag "commission"`, `slag key [KEY]`, `slag status`, `slag resume`, `slag update`. Flags: `--tui`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--worktree` (parses, warns, not implemented).
 
 ## Website (website/)
 
