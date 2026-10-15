@@ -287,6 +287,19 @@ impl DashState {
     }
 }
 
+/// The one ingot on an anvil, when there is exactly one: the only case in
+/// which a turn or a token can be pinned to an ingot with certainty. The
+/// last ingot *started* is not it: in a parallel batch it outlives its
+/// siblings' turns and would take credit for them.
+fn sole_forging(state: &DashState) -> Option<&str> {
+    let mut forging = state
+        .ingots
+        .iter()
+        .filter(|r| matches!(r.status, IngotStatus::Forging | IngotStatus::Duel(_)));
+    let first = forging.next()?;
+    forging.next().is_none().then_some(first.id.as_str())
+}
+
 fn forging_count(state: &DashState) -> usize {
     state
         .ingots
@@ -334,7 +347,7 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
                 state.turn_row = None;
                 return;
             }
-            let head = match &state.ingot {
+            let head = match sole_forging(state) {
                 Some(ingot) => format!("⚒ {ingot} · turn {turn}"),
                 None => format!("⚒ turn {turn}"),
             };
@@ -614,13 +627,10 @@ pub(crate) fn forge_status(state: &DashState, now: Instant) -> Option<String> {
     }
     let elapsed = now.saturating_duration_since(started);
     let mut s = format!("⚒ {}…", tui::forge_verb(state.turn));
-    match forging_count(state) {
-        0 | 1 => {
-            if let Some(ingot) = &state.ingot {
-                s.push_str(&format!(" {ingot} ·"));
-            }
-        }
-        n => s.push_str(&format!(" {n} anvils ·")),
+    match (forging_count(state), sole_forging(state)) {
+        (_, Some(ingot)) => s.push_str(&format!(" {ingot} ·")),
+        (n, None) if n > 1 => s.push_str(&format!(" {n} anvils ·")),
+        _ => {}
     }
     s.push_str(&format!(" {}s · {} tok", elapsed.as_secs(), tui::tokens(state.turn_tokens)));
     if let Some(rate) = crate::progress::token_rate(state.turn_tokens, elapsed) {
@@ -2125,6 +2135,17 @@ mod tests {
         apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
         let head = &state.feed.back().unwrap().text;
         assert!(head.contains("i3 · turn 1"), "the ingot is named: {head}");
+    }
+
+    #[test]
+    fn a_turn_is_credited_to_the_ingot_still_forging_not_the_last_started() {
+        let mut state = DashState::default();
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i1".into(), work: "a".into() });
+        apply_event(&mut state, EngineEvent::IngotStart { id: "i2".into(), work: "b".into() });
+        apply_event(&mut state, EngineEvent::IngotDone { id: "i2".into(), ok: true });
+        apply_event(&mut state, EngineEvent::TurnStart { turn: 4 });
+        let head = &state.feed.back().unwrap().text;
+        assert!(head.contains("i1 · turn 4"), "{head}");
     }
 
     #[test]
