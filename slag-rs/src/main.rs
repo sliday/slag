@@ -99,6 +99,9 @@ async fn main() {
         }
         Some(Command::Rewind { ingot, heat }) => cli::show_rewind(ingot.as_deref(), heat),
         Some(Command::Hooks { action: cli::HooksAction::List }) => cli::show_hooks(),
+        Some(Command::Fix(args)) => {
+            pipeline::fix::run(args, cli.tui, cli.trace.clone(), cli.temper > 0).await
+        }
         None => {
             // A lone bare word reaches here because `commission` is a
             // trailing var-arg: clap has no subcommand to match, so the

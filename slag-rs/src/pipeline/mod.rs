@@ -5,6 +5,7 @@ pub mod duel;
 pub mod resmelt;
 pub mod assay;
 pub mod warden;
+pub mod fix;
 
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 
