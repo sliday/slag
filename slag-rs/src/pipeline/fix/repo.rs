@@ -282,9 +282,13 @@ pub fn kill_running() {
     }
 }
 
+/// The shell's builtin `kill`, not the binary: procps `kill` reads
+/// `-KILL -<pid>` as a kill of every process the user can signal, so a
+/// timed-out test took the whole session down on Linux.
 fn kill_group(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", &format!("-{pid}")])
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -9 -{pid}"))
         .stderr(Stdio::null())
         .status();
 }
@@ -888,6 +892,18 @@ mod tests {
         let slow = run("sleep 5", dir.path(), Duration::from_millis(200)).await;
         assert!(slow.timed_out && slow.unusable() && !slow.ok());
         assert!(slow.status().starts_with("timed out"), "{}", slow.status());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_kills_only_its_own_process_group() {
+        let mut bystander = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let slow = run("sleep 5", dir.path(), Duration::from_millis(200)).await;
+        let alive = bystander.try_wait().unwrap().is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(slow.timed_out);
+        assert!(alive, "the timeout's kill reached a process outside its group");
     }
 
     /// The session can rewrite a test script; slag still runs it in the
