@@ -129,6 +129,225 @@ pub fn project_path(filename: &str) -> PathBuf {
 /// Each role still takes an env/file/flag override.
 pub const AUTO_MODEL: &str = "openrouter/auto";
 
+/// Chat-completions endpoint presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPreset {
+    OpenRouter,
+    OpenAI,
+    Anthropic,
+    Gemini,
+    Groq,
+    Cerebras,
+    Xai,
+    Mistral,
+    DeepSeek,
+    Together,
+    Fireworks,
+    Ollama,
+    LmStudio,
+    Custom,
+}
+
+impl ProviderPreset {
+    pub fn parse(name: &str) -> Result<Self, SlagError> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "openrouter" => Ok(Self::OpenRouter),
+            "openai" => Ok(Self::OpenAI),
+            "anthropic" => Ok(Self::Anthropic),
+            "gemini" => Ok(Self::Gemini),
+            "groq" => Ok(Self::Groq),
+            "cerebras" => Ok(Self::Cerebras),
+            "xai" => Ok(Self::Xai),
+            "mistral" => Ok(Self::Mistral),
+            "deepseek" => Ok(Self::DeepSeek),
+            "together" => Ok(Self::Together),
+            "fireworks" => Ok(Self::Fireworks),
+            "ollama" => Ok(Self::Ollama),
+            "lmstudio" => Ok(Self::LmStudio),
+            "custom" => Ok(Self::Custom),
+            _ => Err(SlagError::Config(format!("unknown provider {name:?}"))),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::OpenAI => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+            Self::Groq => "groq",
+            Self::Cerebras => "cerebras",
+            Self::Xai => "xai",
+            Self::Mistral => "mistral",
+            Self::DeepSeek => "deepseek",
+            Self::Together => "together",
+            Self::Fireworks => "fireworks",
+            Self::Ollama => "ollama",
+            Self::LmStudio => "lmstudio",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn base_url(self) -> &'static str {
+        match self {
+            Self::OpenRouter => crate::engine::OPENROUTER_BASE,
+            Self::OpenAI => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com/v1",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+            Self::Groq => "https://api.groq.com/openai/v1",
+            Self::Cerebras => "https://api.cerebras.ai/v1",
+            Self::Xai => "https://api.x.ai/v1",
+            Self::Mistral => "https://api.mistral.ai/v1",
+            Self::DeepSeek => "https://api.deepseek.com",
+            Self::Together => "https://api.together.ai/v1",
+            Self::Fireworks => "https://api.fireworks.ai/inference/v1",
+            Self::Ollama => "http://localhost:11434/v1",
+            Self::LmStudio => "http://localhost:1234/v1",
+            Self::Custom => "",
+        }
+    }
+
+    pub fn key_env(self) -> Option<&'static str> {
+        match self {
+            Self::OpenRouter => Some("OPENROUTER_API_KEY"),
+            Self::OpenAI => Some("OPENAI_API_KEY"),
+            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            Self::Gemini => Some("GEMINI_API_KEY"),
+            Self::Groq => Some("GROQ_API_KEY"),
+            Self::Cerebras => Some("CEREBRAS_API_KEY"),
+            Self::Xai => Some("XAI_API_KEY"),
+            Self::Mistral => Some("MISTRAL_API_KEY"),
+            Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
+            Self::Together => Some("TOGETHER_API_KEY"),
+            Self::Fireworks => Some("FIREWORKS_API_KEY"),
+            Self::Ollama | Self::LmStudio => None,
+            Self::Custom => Some("CUSTOM_API_KEY"),
+        }
+    }
+
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenRouter => AUTO_MODEL,
+            Self::OpenAI => "gpt-4.1-mini",
+            Self::Anthropic => "claude-sonnet-4-5",
+            Self::Gemini => "gemini-flash-latest",
+            Self::Groq => "openai/gpt-oss-20b",
+            Self::Cerebras => "gpt-oss-120b",
+            Self::Xai => "grok-4.3",
+            Self::Mistral => "mistral-small-latest",
+            Self::DeepSeek => "deepseek-flash",
+            Self::Together => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            Self::Fireworks => "accounts/fireworks/models/glm-5p3-flash",
+            Self::Ollama => "qwen3:8b",
+            Self::LmStudio => "local-model",
+            Self::Custom => "default",
+        }
+    }
+
+    pub fn key_optional(self) -> bool {
+        matches!(self, Self::Ollama | Self::LmStudio | Self::Custom)
+    }
+}
+
+pub fn active_provider() -> Result<ProviderPreset, SlagError> {
+    ProviderPreset::parse(&env_or_file("SLAG_PROVIDER", "provider")
+        .unwrap_or_else(|| "openrouter".into()))
+}
+
+pub fn key_for_provider(provider: ProviderPreset) -> Option<String> {
+    key_status_for_provider(provider).map(|(_, key)| key)
+}
+
+pub fn key_status_for_provider(provider: ProviderPreset) -> Option<(KeySource, String)> {
+    if let Some(key) = provider.key_env().and_then(env_nonempty) {
+        return Some((KeySource::Env, key));
+    }
+    if provider == ProviderPreset::Custom {
+        if let Some(key) = env_nonempty("SLAG_API_KEY") {
+            return Some((KeySource::Env, key));
+        }
+    }
+    let entries = config_entries();
+    file_value(&entries, &format!("{}_api_key", provider.name()))
+        .map(|key| (KeySource::File, key))
+}
+
+pub fn provider_base_url(provider: ProviderPreset) -> String {
+    let entries = config_entries();
+    env_nonempty(&format!("SLAG_{}_BASE_URL", provider.name().to_ascii_uppercase()))
+        .or_else(|| env_nonempty("SLAG_BASE_URL"))
+        .or_else(|| env_nonempty("SLAG_OPENROUTER_BASE"))
+        .or_else(|| file_value(&entries, &format!("{}_base_url", provider.name())))
+        .or_else(|| file_value(&entries, "base_url"))
+        .unwrap_or_else(|| provider.base_url().into())
+        .trim_end_matches('/').to_string()
+}
+
+pub fn provider_for_model(model: &str) -> Result<Option<(ProviderPreset, String)>, SlagError> {
+    let Some((name, model)) = model.split_once("::") else {
+        return Ok(None);
+    };
+    let provider = ProviderPreset::parse(name)?;
+    if model.trim().is_empty() {
+        return Err(SlagError::Config(format!("no model after {}::", provider.name())));
+    }
+    Ok(Some((provider, model.to_string())))
+}
+
+pub fn resolve_connection(
+    model: &str,
+    fallback: ProviderPreset,
+    key: &str,
+    base_url: &str,
+) -> Result<(ProviderPreset, String, String, String), SlagError> {
+    let (provider, model) = provider_for_model(model)?
+        .unwrap_or_else(|| (fallback, model.to_string()));
+    let (key, base_url) = if provider == fallback {
+        (key.to_string(), base_url.to_string())
+    } else {
+        (key_for_provider(provider).unwrap_or_default(), provider_base_url(provider))
+    };
+    if key.is_empty() && !provider.key_optional() {
+        return Err(missing_key(provider));
+    }
+    if base_url.is_empty() {
+        return Err(SlagError::Config(format!(
+            "{} requires base_url or SLAG_BASE_URL", provider.name()
+        )));
+    }
+    Ok((provider, key, base_url, model))
+}
+
+fn missing_key(provider: ProviderPreset) -> SlagError {
+    SlagError::Config(format!(
+        "no {} key. Set {}, or run `slag key --provider {}`",
+        provider.name(), provider.key_env().unwrap_or("SLAG_API_KEY"), provider.name()
+    ))
+}
+
+fn config_entries() -> Vec<(String, String)> {
+    config_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|c| parse_config_lines(&c))
+        .unwrap_or_default()
+}
+
+fn role_model(entries: &[(String, String)], env: &str, file: &str, provider: ProviderPreset) -> String {
+    let model = env_nonempty(env)
+        .or_else(|| file_value(entries, file))
+        .unwrap_or_else(|| provider.default_model().to_string());
+    let model = if provider != ProviderPreset::OpenRouter && model == AUTO_MODEL {
+        provider.default_model().to_string()
+    } else {
+        model
+    };
+    if provider != ProviderPreset::OpenRouter && !model.contains("::") {
+        format!("{}::{model}", provider.name())
+    } else {
+        model
+    }
+}
+
 /// Twin-cast duel gate. Auto duels only high grades; On/Off force it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuelMode {
@@ -159,42 +378,52 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    /// Resolve config, onboarding the user when no key exists yet.
-    /// The one prerequisite slag has: an OpenRouter key.
+    /// Resolve the provider and validate the keys for the model roles.
     pub async fn resolve() -> Result<Self, SlagError> {
-        if let Some(cfg) = Self::load() {
-            return Ok(cfg);
+        let provider = active_provider()?;
+        let mut cfg = match Self::load() {
+            Some(cfg) => cfg,
+            None => {
+                onboard_provider(provider).await?;
+                Self::load().ok_or_else(|| SlagError::Config("key stored but config still unreadable".into()))?
+            }
+        };
+        let models = [&cfg.model_base, &cfg.model_plan, &cfg.model_alt, &cfg.model_judge];
+        let mut uses_active = false;
+        for model in models {
+            let role_provider = provider_for_model(model)?.map(|(provider, _)| provider).unwrap_or(provider);
+            uses_active |= role_provider == provider;
         }
-        onboard().await?;
-        Self::load().ok_or_else(|| SlagError::Config("key stored but config still unreadable".into()))
+        if cfg.api_key.is_empty() && !provider.key_optional() && uses_active {
+            onboard_provider(provider).await?;
+            cfg = Self::load().ok_or_else(|| SlagError::Config("key stored but config still unreadable".into()))?;
+        }
+        for model in [&cfg.model_base, &cfg.model_plan, &cfg.model_alt, &cfg.model_judge] {
+            cfg.connection_for_model(model)?;
+        }
+        Ok(cfg)
     }
 
-    /// Resolve engine config. Returns None when no API key is available
-    /// anywhere (caller onboards instead).
+    /// Resolve config without a prompt. Preserve OpenRouter's absent-key result.
     pub fn load() -> Option<Self> {
-        let entries = config_file_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|c| parse_config_lines(&c))
-            .unwrap_or_default();
+        let entries = config_entries();
+        let provider = active_provider().ok()?;
+        let api_key = key_for_provider(provider).unwrap_or_default();
 
-        let api_key = env_nonempty("OPENROUTER_API_KEY")
-            .or_else(|| file_value(&entries, "openrouter_api_key"))?;
+        let model_base = role_model(&entries, "SLAG_MODEL_BASE", "model_base", provider);
+        let model_plan = role_model(&entries, "SLAG_MODEL_PLAN", "model_plan", provider);
+        let model_alt = role_model(&entries, "SLAG_MODEL_ALT", "model_alt", provider);
+        let model_judge = role_model(&entries, "SLAG_MODEL_JUDGE", "model_judge", provider);
 
-        let model_base = env_nonempty("SLAG_MODEL_BASE")
-            .or_else(|| file_value(&entries, "model_base"))
-            .unwrap_or_else(|| AUTO_MODEL.to_string());
-
-        let model_plan = env_nonempty("SLAG_MODEL_PLAN")
-            .or_else(|| file_value(&entries, "model_plan"))
-            .unwrap_or_else(|| AUTO_MODEL.to_string());
-
-        let model_alt = env_nonempty("SLAG_MODEL_ALT")
-            .or_else(|| file_value(&entries, "model_alt"))
-            .unwrap_or_else(|| AUTO_MODEL.to_string());
-
-        let model_judge = env_nonempty("SLAG_MODEL_JUDGE")
-            .or_else(|| file_value(&entries, "model_judge"))
-            .unwrap_or_else(|| AUTO_MODEL.to_string());
+        let uses_active = [&model_base, &model_plan, &model_alt, &model_judge]
+            .iter()
+            .any(|model| match provider_for_model(model) {
+                Ok(Some((role_provider, _))) => role_provider == provider,
+                _ => true,
+            });
+        if api_key.is_empty() && provider == ProviderPreset::OpenRouter && uses_active {
+            return None;
+        }
 
         let duel = env_nonempty("SLAG_DUEL")
             .or_else(|| file_value(&entries, "duel"))
@@ -222,8 +451,7 @@ impl EngineConfig {
                 _ => None,
             });
 
-        let base_url = env_nonempty("SLAG_OPENROUTER_BASE")
-            .unwrap_or_else(|| crate::engine::OPENROUTER_BASE.to_string());
+        let base_url = provider_base_url(provider);
 
         Some(Self {
             api_key,
@@ -237,6 +465,13 @@ impl EngineConfig {
             duel_rounds_override,
             screenshot_cmd,
         })
+    }
+
+    pub fn connection_for_model(
+        &self,
+        model: &str,
+    ) -> Result<(ProviderPreset, String, String, String), SlagError> {
+        resolve_connection(model, active_provider()?, &self.api_key, &self.base_url)
     }
 
     /// Select model by ingot grade: high grades get the plan/reasoning model.
@@ -347,6 +582,10 @@ fn is_taste_dominant(work: &str) -> bool {
 /// Persist the OpenRouter key to the config file (0o600 on unix).
 /// Preserves any other keys already present in the file.
 pub fn store_key(key: &str) -> Result<PathBuf, SlagError> {
+    store_key_for_provider(ProviderPreset::OpenRouter, key)
+}
+
+pub fn store_key_for_provider(provider: ProviderPreset, key: &str) -> Result<PathBuf, SlagError> {
     let dir = config_dir()
         .ok_or_else(|| SlagError::Config("cannot resolve config dir: $HOME not set".into()))?;
     std::fs::create_dir_all(&dir)?;
@@ -355,9 +594,10 @@ pub fn store_key(key: &str) -> Result<PathBuf, SlagError> {
     let mut entries = std::fs::read_to_string(&path)
         .map(|c| parse_config_lines(&c))
         .unwrap_or_default();
-    match entries.iter_mut().find(|(k, _)| k == "openrouter_api_key") {
+    let file_key = format!("{}_api_key", provider.name());
+    match entries.iter_mut().find(|(k, _)| k == &file_key) {
         Some(entry) => entry.1 = key.to_string(),
-        None => entries.push(("openrouter_api_key".to_string(), key.to_string())),
+        None => entries.push((file_key, key.to_string())),
     }
 
     write_entries(&path, &entries)?;
@@ -441,7 +681,7 @@ pub fn mask_key(key: &str) -> String {
 
 /// The base URL a key is checked against; honours the test/proxy override.
 pub fn base_url() -> String {
-    env_nonempty("SLAG_OPENROUTER_BASE").unwrap_or_else(|| crate::engine::OPENROUTER_BASE.to_string())
+    provider_base_url(ProviderPreset::OpenRouter)
 }
 
 /// Interactive key onboarding: read, verify against OpenRouter, then store.
@@ -494,6 +734,34 @@ pub async fn verify_and_store(key: &str) -> Result<PathBuf, SlagError> {
     let path = store_key(key)?;
     crate::tui::key_saved(&path);
     Ok(path)
+}
+
+pub async fn verify_and_store_for_provider(
+    provider: ProviderPreset,
+    key: &str,
+) -> Result<PathBuf, SlagError> {
+    if provider == ProviderPreset::OpenRouter {
+        return verify_and_store(key).await;
+    }
+    if key.trim().is_empty() {
+        return Err(SlagError::Config("no key entered".into()));
+    }
+    let path = store_key_for_provider(provider, key)?;
+    crate::tui::key_saved(&path);
+    Ok(path)
+}
+
+pub async fn onboard_provider(provider: ProviderPreset) -> Result<String, SlagError> {
+    if provider == ProviderPreset::OpenRouter {
+        return onboard().await;
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(missing_key(provider));
+    }
+    println!("  Enter the {} API key:", provider.name());
+    let key = read_key_line()?;
+    verify_and_store_for_provider(provider, &key).await?;
+    Ok(key)
 }
 
 /// Read one key from stdin, rejecting blanks before any network call.
@@ -702,12 +970,216 @@ mod tests {
         "SLAG_MAX_COST_RUN",
         "SLAG_MODEL_FALLBACK",
         "SLAG_UNATTENDED_RETRY",
+        "SLAG_PROVIDER",
+        "SLAG_BASE_URL",
+        "SLAG_API_KEY",
+        "CUSTOM_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GROQ_API_KEY",
+        "CEREBRAS_API_KEY",
+        "XAI_API_KEY",
+        "MISTRAL_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "TOGETHER_API_KEY",
+        "FIREWORKS_API_KEY",
+        "SLAG_CEREBRAS_BASE_URL",
     ];
 
     fn clear_engine_env() {
         for var in ENGINE_VARS {
             std::env::remove_var(var);
         }
+    }
+
+    #[test]
+    fn provider_presets_define_endpoints_keys_and_defaults() {
+        for (name, key, model) in [
+            ("openrouter", Some("OPENROUTER_API_KEY"), AUTO_MODEL),
+            ("openai", Some("OPENAI_API_KEY"), "gpt-4.1-mini"),
+            ("anthropic", Some("ANTHROPIC_API_KEY"), "claude-sonnet-4-5"),
+            ("gemini", Some("GEMINI_API_KEY"), "gemini-flash-latest"),
+            ("groq", Some("GROQ_API_KEY"), "openai/gpt-oss-20b"),
+            ("cerebras", Some("CEREBRAS_API_KEY"), "gpt-oss-120b"),
+            ("xai", Some("XAI_API_KEY"), "grok-4.3"),
+            ("mistral", Some("MISTRAL_API_KEY"), "mistral-small-latest"),
+            ("deepseek", Some("DEEPSEEK_API_KEY"), "deepseek-flash"),
+            ("together", Some("TOGETHER_API_KEY"), "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+            ("fireworks", Some("FIREWORKS_API_KEY"), "accounts/fireworks/models/glm-5p3-flash"),
+            ("ollama", None, "qwen3:8b"),
+            ("lmstudio", None, "local-model"),
+            ("custom", Some("CUSTOM_API_KEY"), "default"),
+        ] {
+            let preset = ProviderPreset::parse(name).unwrap();
+            assert_eq!(preset.name(), name);
+            assert_eq!(preset.key_env(), key);
+            assert_eq!(preset.default_model(), model);
+            assert_eq!(preset.key_optional(), matches!(name, "ollama" | "lmstudio" | "custom"));
+            if name != "custom" {
+                assert!(preset.base_url().starts_with("http"));
+            }
+        }
+        assert!(ProviderPreset::parse("unknown").is_err());
+        assert_eq!(ProviderPreset::parse(" OpenAI ").unwrap(), ProviderPreset::OpenAI);
+    }
+
+    #[test]
+    fn provider_env_overrides_file_and_models_use_qualified_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::fs::write(dir.path().join("config.toml"),
+            "provider = openai\nopenai_api_key = file-openai\ncerebras_api_key = file-cerebras\nbase_url = http://file/v1\n").unwrap();
+        let cfg = EngineConfig::load().unwrap();
+        assert_eq!(active_provider().unwrap(), ProviderPreset::OpenAI);
+        assert_eq!(cfg.model_base, "openai::gpt-4.1-mini");
+        assert_eq!(cfg.base_url, "http://file/v1");
+        std::env::set_var("SLAG_PROVIDER", "cerebras");
+        std::env::set_var("CEREBRAS_API_KEY", "env-cerebras");
+        std::env::set_var("SLAG_BASE_URL", "http://env/v1/");
+        std::env::set_var("SLAG_MODEL_PLAN", "openai::gpt-4.1-mini");
+        let cfg = EngineConfig::load().unwrap();
+        assert_eq!(cfg.api_key, "env-cerebras");
+        assert_eq!(cfg.model_base, "cerebras::gpt-oss-120b");
+        assert_eq!(cfg.model_plan, "openai::gpt-4.1-mini");
+        assert_eq!(cfg.model_alt, cfg.model_base);
+        assert_eq!(cfg.model_judge, cfg.model_base);
+        assert_eq!(cfg.base_url, "http://env/v1");
+        clear_engine_env();
+    }
+
+    #[test]
+    fn named_provider_endpoints_override_the_global_alias() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::env::set_var("SLAG_OPENROUTER_BASE", "http://legacy/v1");
+        assert_eq!(provider_base_url(ProviderPreset::Cerebras), "http://legacy/v1");
+        std::env::set_var("SLAG_BASE_URL", "http://global/v1");
+        assert_eq!(provider_base_url(ProviderPreset::Cerebras), "http://global/v1");
+        std::env::set_var("SLAG_CEREBRAS_BASE_URL", "http://cerebras/v1");
+        assert_eq!(provider_base_url(ProviderPreset::Cerebras), "http://cerebras/v1");
+        clear_engine_env();
+    }
+
+    #[test]
+    fn mixed_role_connections_keep_openrouter_ids_and_select_named_keys() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::env::set_var("OPENROUTER_API_KEY", "router-key");
+        std::env::set_var("OPENAI_API_KEY", "openai-key");
+        std::env::set_var("CEREBRAS_API_KEY", "cerebras-key");
+        std::env::set_var("SLAG_MODEL_BASE", "cerebras::gpt-oss-120b");
+        std::env::set_var("SLAG_MODEL_PLAN", "openai::gpt-4.1-mini");
+        let cfg = EngineConfig::load().unwrap();
+        let (provider, key, base, model) = cfg.connection_for_model(&cfg.model_base).unwrap();
+        assert_eq!((provider, key.as_str(), base.as_str(), model.as_str()),
+            (ProviderPreset::Cerebras, "cerebras-key", ProviderPreset::Cerebras.base_url(), "gpt-oss-120b"));
+        let (provider, key, _, model) = cfg.connection_for_model(&cfg.model_plan).unwrap();
+        assert_eq!((provider, key.as_str(), model.as_str()),
+            (ProviderPreset::OpenAI, "openai-key", "gpt-4.1-mini"));
+        let (provider, key, _, model) = cfg.connection_for_model("openai/gpt-5").unwrap();
+        assert_eq!((provider, key.as_str(), model.as_str()),
+            (ProviderPreset::OpenRouter, "router-key", "openai/gpt-5"));
+        assert!(cfg.connection_for_model("unknown::model").is_err());
+        assert!(cfg.connection_for_model("openai::").is_err());
+        assert!(cfg.connection_for_model("groq::model").unwrap_err().to_string().contains("GROQ_API_KEY"));
+        clear_engine_env();
+    }
+
+    #[tokio::test]
+    async fn missing_non_openrouter_key_keeps_config_readable_and_fails_before_network() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::env::set_var("SLAG_PROVIDER", "cerebras");
+        std::env::set_var("SLAG_MODEL_PLAN", "openai::gpt-4.1-mini");
+        let server = wiremock::MockServer::start().await;
+        std::env::set_var("SLAG_BASE_URL", server.uri());
+        let cfg = EngineConfig::load().expect("key status and cost can read config without a key");
+        assert!(cfg.api_key.is_empty());
+        assert_eq!(cfg.model_plan, "openai::gpt-4.1-mini");
+        assert!(cfg.connection_for_model(&cfg.model_base).unwrap_err().to_string().contains("CEREBRAS_API_KEY"));
+        if !std::io::stdin().is_terminal() {
+            let error = EngineConfig::resolve().await.err().expect("forge requires a key");
+            assert!(error.to_string().contains("CEREBRAS_API_KEY"));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        clear_engine_env();
+    }
+
+    #[test]
+    fn local_and_custom_configs_accept_no_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        for name in ["ollama", "lmstudio"] {
+            std::env::set_var("SLAG_PROVIDER", name);
+            let cfg = EngineConfig::load().unwrap();
+            assert!(cfg.api_key.is_empty());
+            assert!(cfg.connection_for_model(&cfg.model_base).is_ok());
+        }
+        std::env::set_var("SLAG_PROVIDER", "custom");
+        let cfg = EngineConfig::load().unwrap();
+        assert!(cfg.connection_for_model(&cfg.model_base).unwrap_err().to_string().contains("base_url"));
+        std::env::set_var("SLAG_BASE_URL", "http://custom/v1");
+        let cfg = EngineConfig::load().unwrap();
+        assert!(cfg.connection_for_model(&cfg.model_base).is_ok());
+        std::env::set_var("SLAG_API_KEY", "custom-key");
+        assert_eq!(key_for_provider(ProviderPreset::Custom).as_deref(), Some("custom-key"));
+        clear_engine_env();
+    }
+
+    #[test]
+    fn all_qualified_roles_do_not_need_an_unused_active_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        for var in ["SLAG_MODEL_BASE", "SLAG_MODEL_PLAN", "SLAG_MODEL_ALT", "SLAG_MODEL_JUDGE"] {
+            std::env::set_var(var, "ollama::qwen3:8b");
+        }
+        let cfg = EngineConfig::load().unwrap();
+        assert!(cfg.api_key.is_empty());
+        assert!(cfg.connection_for_model(&cfg.model_base).is_ok());
+        clear_engine_env();
+    }
+
+    #[test]
+    fn non_openrouter_auto_uses_its_preset_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::env::set_var("SLAG_PROVIDER", "ollama");
+        std::env::set_var("SLAG_MODEL_BASE", AUTO_MODEL);
+        std::env::set_var("SLAG_MODEL_PLAN", "openrouter::openrouter/auto");
+        let cfg = EngineConfig::load().unwrap();
+        assert_eq!(cfg.model_base, "ollama::qwen3:8b");
+        assert_eq!(cfg.model_plan, "openrouter::openrouter/auto");
+        clear_engine_env();
+    }
+
+    #[tokio::test]
+    async fn named_key_storage_never_calls_the_openrouter_key_endpoint() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        let server = wiremock::MockServer::start().await;
+        std::env::set_var("SLAG_OPENROUTER_BASE", server.uri());
+        verify_and_store_for_provider(ProviderPreset::Cerebras, "named-key").await.unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(key_for_provider(ProviderPreset::Cerebras).as_deref(), Some("named-key"));
+        assert!(key_for_provider(ProviderPreset::OpenRouter).is_none());
+        clear_engine_env();
     }
 
     #[test]

@@ -336,4 +336,68 @@ mod tests {
         assert!(smith.hooks.steer.is_none(), "casts must not consume dashboard steers");
         assert!(smith.hooks.cancel.is_some());
     }
+
+    #[test]
+    fn plan_and_work_roles_use_separate_providers_without_router_calls() {
+        let (_guard, _dir) = crate::config::isolated_config_dir();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use wiremock::matchers::{any, body_partial_json, header, method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let plan = MockServer::start().await;
+            let work = MockServer::start().await;
+            let router = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0).mount(&router).await;
+            for (server, key, model, answer) in [
+                (&plan, "plan-key", "gpt-4.1-mini", "planned"),
+                (&work, "work-key", "gpt-oss-120b", "forged"),
+            ] {
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .and(header("Authorization", format!("Bearer {key}")))
+                    .and(body_partial_json(serde_json::json!({"model": model})))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": answer}, "finish_reason": "stop"}],
+                    })))
+                    .expect(1).mount(server).await;
+            }
+            let vars = [
+                ("OPENAI_API_KEY", "plan-key".to_string()),
+                ("CEREBRAS_API_KEY", "work-key".to_string()),
+                ("SLAG_OPENAI_BASE_URL", plan.uri()),
+                ("SLAG_CEREBRAS_BASE_URL", work.uri()),
+            ];
+            let previous: Vec<_> = vars.iter().map(|(name, _)| (*name, std::env::var_os(name))).collect();
+            for (name, value) in &vars {
+                std::env::set_var(name, value);
+            }
+            let mut config = cfg();
+            config.base_url = router.uri();
+            config.model_base = "cerebras::gpt-oss-120b".into();
+            config.model_plan = "openai::gpt-4.1-mini".into();
+            let hooks = EngineHooks::default();
+            let planner = NativeSmith::plan(config.clone(), PathBuf::from("."), &hooks);
+            let worker = NativeSmith::forge(config, "rust", 1, PathBuf::from("."), &hooks);
+            let planned = planner.invoke("Return planned.").await;
+            let forged = worker.invoke("Return forged.").await;
+            for (name, value) in previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            assert_eq!(planned.unwrap(), "planned");
+            assert_eq!(forged.unwrap(), "forged");
+            assert!(router.received_requests().await.unwrap().is_empty());
+            for server in [&plan, &work] {
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(!requests[0].headers.contains_key("HTTP-Referer"));
+                let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+                assert!(body.get("reasoning").is_none());
+            }
+        });
+    }
 }

@@ -53,6 +53,10 @@ pub struct Cli {
     #[arg(long)]
     pub auto: bool,
 
+    /// Chat-completions provider (overrides SLAG_PROVIDER)
+    #[arg(long, global = true, value_name = "NAME")]
+    pub provider: Option<String>,
+
     /// Worker model, any OpenRouter id (overrides SLAG_MODEL_BASE)
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
@@ -79,7 +83,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Show or set the OpenRouter key (the only setup slag needs)
+    /// Show or set the active provider key (default: OpenRouter key)
     Key {
         /// Key to verify and save; omit to show the current setup
         #[arg(value_name = "KEY")]

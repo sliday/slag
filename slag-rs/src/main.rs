@@ -44,6 +44,10 @@ async fn main() {
         );
     }
 
+    if let Some(provider) = &cli.provider {
+        std::env::set_var("SLAG_PROVIDER", provider);
+    }
+
     // Model flags override env; EngineConfig::load reads env downstream.
     // --auto first, so explicit model flags win over it.
     if cli.auto {
@@ -221,24 +225,39 @@ async fn forge(
 /// onboards when there is nothing to report. Passing the key as an
 /// argument leaks it into shell history, so the bare form prompts.
 async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
+    let provider = config::active_provider()?;
+    println!("  provider: {}", provider.name());
     if let Some(key) = key {
-        config::verify_and_store(key.trim()).await?;
+        config::verify_and_store_for_provider(provider, key.trim()).await?;
         // Saving into a shell that exports its own key stores something
         // slag will never read. Warn instead of letting the next run 401.
-        if matches!(config::key_status(), Some((config::KeySource::Env, _))) {
-            tui::key_shadowed();
+        if matches!(config::key_status_for_provider(provider), Some((config::KeySource::Env, _))) {
+            if provider == config::ProviderPreset::OpenRouter {
+                tui::key_shadowed();
+            } else {
+                println!("  The environment key overrides the stored key.");
+            }
         }
         return Ok(());
     }
 
-    let status = config::key_status();
-    if status.is_none() && std::io::stdin().is_terminal() {
-        config::onboard().await?;
+    let status = config::key_status_for_provider(provider);
+    if status.is_none() && !provider.key_optional() && std::io::stdin().is_terminal() {
+        config::onboard_provider(provider).await?;
         return Ok(());
     }
-    let source = status
-        .as_ref()
-        .map(|(src, key)| (src.label(), config::mask_key(key)));
+    let source = status.as_ref().map(|(src, _)| {
+        let label = match src {
+            config::KeySource::Env if provider == config::ProviderPreset::Custom
+                && std::env::var("CUSTOM_API_KEY").map(|key| key.trim().is_empty()).unwrap_or(true) => "SLAG_API_KEY",
+            config::KeySource::Env => provider.key_env().unwrap_or("SLAG_API_KEY"),
+            config::KeySource::File => "config file",
+        };
+        (label, "present".to_string())
+    });
+    if provider.key_optional() && status.is_none() {
+        println!("  key: optional, none set");
+    }
 
     // Models only resolve once a key exists; without one, show the defaults
     // the user will get rather than an empty panel.
@@ -251,8 +270,8 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
             cfg.model_judge.clone(),
         ),
         None => {
-            let auto = config::AUTO_MODEL.to_string();
-            (auto.clone(), auto.clone(), auto.clone(), auto)
+            let model = provider.default_model().to_string();
+            (model.clone(), model.clone(), model.clone(), model)
         }
     };
 
@@ -274,7 +293,18 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
         ("duel", duel_state, None),
     ];
 
-    tui::key_panel(source, &models);
+    if provider == config::ProviderPreset::OpenRouter {
+        tui::key_panel(source, &models);
+    } else {
+        if let Some((source, _)) = source {
+            println!("  key: present ({source})");
+        } else if !provider.key_optional() {
+            println!("  key: missing ({})", provider.key_env().unwrap_or("SLAG_API_KEY"));
+        }
+        for (role, model, _) in models {
+            println!("  {role}: {model}");
+        }
+    }
     Ok(())
 }
 
