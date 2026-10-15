@@ -22,7 +22,7 @@ use super::transcript::{self, TranscriptWriter};
 use super::{
     emit, stats, CancelFlag, CancelReason, Cancellation, ChatMessage, ChatRequest, Effort,
     EngineEvent, EventTx, FinishReason, NormalizedResponse, Provider, RetryPolicy, Role,
-    SteerQueue, ToolCall, ToolOutcome, Usage,
+    SteerQueue, ToolCall, ToolOutcome, ToolSpec, Usage,
 };
 use crate::error::SlagError;
 
@@ -163,6 +163,9 @@ fn compact_to_tokens(
 /// Provider rejection caused by the request exceeding the model's context
 /// window (OpenRouter surfaces these as 400s with varying phrasings).
 pub(crate) fn is_context_overflow(e: &SlagError) -> bool {
+    if matches!(e, SlagError::ToolValidation(_)) {
+        return false;
+    }
     let s = e.to_string().to_lowercase();
     [
         "context length",
@@ -239,6 +242,96 @@ fn shrunk_output_cap(e: &SlagError) -> Option<u32> {
     let (input, _output, limit) = parse_overflow_tokens(&e.to_string())?;
     let room = limit.saturating_sub(input).saturating_sub(OUTPUT_SHRINK_BUFFER);
     (room >= MIN_SHRUNK_OUTPUT_TOKENS).then_some(room.min(u32::MAX as u64) as u32)
+}
+
+/// Recover only complete JSON tool payloads that match a declared schema.
+fn content_tool_calls(content: &str, specs: &[ToolSpec], turn: usize) -> Option<Vec<ToolCall>> {
+    use serde_json::Value;
+    let value: Value = serde_json::from_str(content.trim()).ok()?;
+    let object = value.as_object()?;
+    let payloads: Vec<&Value> = if object.len() == 1 && object.contains_key("tool_calls") {
+        object.get("tool_calls")?.as_array()?.iter().collect()
+    } else {
+        vec![&value]
+    };
+    if payloads.is_empty() {
+        return None;
+    }
+    payloads.into_iter().enumerate().map(|(index, payload)| {
+        let obj = payload.as_object()?;
+        let named = if obj.contains_key("function") {
+            if obj.keys().any(|k| !["function", "id", "type"].contains(&k.as_str())) {
+                return None;
+            }
+            payload.get("function")
+        } else if obj.contains_key("name") && obj.contains_key("arguments") {
+            Some(payload)
+        } else {
+            None
+        };
+        let (spec, args) = if let Some(named) = named {
+            let named = named.as_object()?;
+            if named.len() != 2 {
+                return None;
+            }
+            let name = named.get("name")?.as_str()?;
+            let spec = specs.iter().find(|s| s.name == name)?;
+            let raw = named.get("arguments")?;
+            let args = if let Some(text) = raw.as_str() {
+                serde_json::from_str(text).ok()?
+            } else {
+                raw.clone()
+            };
+            if !tool_args_match(&args, &spec.parameters) {
+                return None;
+            }
+            (spec, args)
+        } else {
+            let mut matches = specs.iter().filter(|s| tool_args_match(payload, &s.parameters));
+            let spec = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            (spec, payload.clone())
+        };
+        Some(ToolCall {
+            id: format!("content_{turn}_{index}"),
+            name: spec.name.clone(),
+            arguments: args.to_string(),
+        })
+    }).collect()
+}
+
+fn tool_args_match(value: &serde_json::Value, schema: &serde_json::Value) -> bool {
+    if schema.get("enum").and_then(|v| v.as_array()).is_some_and(|v| !v.contains(value)) {
+        return false;
+    }
+    if ["anyOf", "oneOf", "allOf", "$ref", "not"].iter().any(|key| schema.get(key).is_some()) {
+        return false;
+    }
+    match schema.get("type").and_then(|t| t.as_str()) {
+        Some("object") => {
+            let Some(object) = value.as_object() else { return false };
+            let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else { return false };
+            if object.is_empty() || object.iter().any(|(key, val)| {
+                properties.get(key).is_none_or(|property| !tool_args_match(val, property))
+            }) {
+                return false;
+            }
+            schema.get("required").and_then(|r| r.as_array()).is_none_or(|required| {
+                required.iter().all(|key| key.as_str().is_some_and(|key| object.contains_key(key)))
+            })
+        }
+        Some("string") => value.is_string(),
+        Some("integer") => value.is_i64() || value.is_u64(),
+        Some("number") => value.is_number(),
+        Some("boolean") => value.is_boolean(),
+        Some("null") => value.is_null(),
+        Some("array") => value.as_array().is_some_and(|items| {
+            schema.get("items").is_some_and(|item| items.iter().all(|v| tool_args_match(v, item)))
+        }),
+        _ => false,
+    }
 }
 
 /// One smith session: a provider, a toolbox, a model, and a turn budget.
@@ -477,6 +570,7 @@ impl ForgeAgent {
         let mut out_tokens: Option<u32> = None;
         let mut escalated = false;
         let mut nudges = 0usize;
+        let mut tool_validation_errors = 0usize;
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
@@ -516,16 +610,29 @@ impl ForgeAgent {
             // cannot ride along. Retries that deliberately carry the
             // partial (the continuation nudge) append past the mark.
             let committed = messages.len();
-            let resp = match self
+            let mut resp = match self
                 .chat_shrinking(&mut messages, true, &mut token_budget, &mut anchor, &mut out_tokens, tw)
                 .await
             {
                 Ok(resp) => resp,
+                Err(SlagError::ToolValidation(message)) => {
+                    tool_validation_errors += 1;
+                    if tool_validation_errors >= 3 {
+                        return Err(SlagError::ToolValidation(message));
+                    }
+                    messages.push(ChatMessage::user(format!(
+                        "Tool error from provider: {message}\nRetry with a corrected declared tool call. \
+                         Supply all required arguments with the declared types."
+                    )));
+                    record_msg(tw, messages.last().unwrap());
+                    continue;
+                }
                 Err(e) => {
                     emit(&self.events, EngineEvent::Error { message: e.to_string() });
                     return Err(e);
                 }
             };
+            tool_validation_errors = 0;
             // Re-anchor on the provider's own count: prompt_tokens is exact
             // for everything just sent; chars/4 only ever covers the delta.
             if resp.usage.prompt_tokens > 0 {
@@ -548,6 +655,16 @@ impl ForgeAgent {
             emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
             self.track_spend(&resp.usage);
 
+            if resp.tool_calls.is_empty() && resp.finish_reason != FinishReason::Length {
+                let specs = self.request(Vec::new(), true, out_tokens).tools;
+                if let Some(calls) = content_tool_calls(&resp.content, &specs, turn) {
+                    emit(&self.events, EngineEvent::Warning {
+                        message: "recovered declared tool call from assistant JSON".into(),
+                    });
+                    resp.tool_calls = calls;
+                    resp.content.clear();
+                }
+            }
             if resp.tool_calls.is_empty() {
                 if resp.finish_reason == FinishReason::Length {
                     if !escalated {
@@ -1325,6 +1442,112 @@ mod tests {
         ForgeAgent::new(provider, ToolBox::new(root), "test/model")
             .with_cost_cap(None)
             .with_run_cap(None)
+    }
+
+    #[test]
+    fn content_tools_require_complete_unambiguous_declared_json() {
+        let specs = ToolBox::specs();
+        let finish = r#"{"cmd":"python3 -m unittest","summary":"Done"}"#;
+        let calls = content_tool_calls(finish, &specs, 1).unwrap();
+        assert_eq!(calls[0].name, "finish");
+        for text in [
+            format!("Done: {finish}"),
+            format!("```json\n{finish}\n```"),
+            format!("{finish}\nThat is an example."),
+            r#"{"cmd":"true","summary":42}"#.into(),
+            r#"{"cmd":"true","summary":"Done","extra":true}"#.into(),
+            r#"{"pattern":"hello"}"#.into(),
+            r#"{"name":"grep","arguments":{"path":"."}}"#.into(),
+            r#"{"name":"undeclared","arguments":{"summary":"Done"}}"#.into(),
+            r#"{"name":"bash","arguments":{"command":"true","timeout":"10"}}"#.into(),
+            r#"{"name":"grep","arguments":{"pattern":"x","output_mode":"invalid"}}"#.into(),
+        ] {
+            assert!(content_tool_calls(&text, &specs, 1).is_none(), "{text}");
+        }
+        let mut no_finish = specs.clone();
+        no_finish.retain(|s| s.name != "finish");
+        assert!(content_tool_calls(finish, &no_finish, 1).is_none());
+    }
+
+    #[test]
+    fn content_tools_accept_named_calls_and_batches() {
+        let text = r#"{"tool_calls":[{"function":{"name":"grep","arguments":"{\"pattern\":\"hello\"}"},"type":"function","id":"x"},{"name":"finish","arguments":{"summary":"Done","cmd":"true"}}]}"#;
+        let calls = content_tool_calls(text, &ToolBox::specs(), 3).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "grep");
+        assert_eq!(calls[1].id, "content_3_1");
+        assert!(content_tool_calls(r#"{"tool_calls":[]}"#, &ToolBox::specs(), 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn content_finish_dispatches_and_preserves_verification_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![resp_text(
+            r#"{"cmd":"python3 -m unittest","summary":"Done"}"#,
+            FinishReason::Stop,
+        )]);
+        let result = agent(provider.clone(), dir.path())
+            .run("system".into(), "task".into()).await.unwrap();
+        assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn content_write_dispatches_and_replays_a_valid_tool_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            resp_text(r#"{"name":"write_file","arguments":{"path":"hello.py","content":"print('hello')\n"}}"#, FinishReason::Stop),
+            resp_text("Done", FinishReason::Stop),
+        ]);
+        agent(provider.clone(), dir.path()).run("system".into(), "task".into()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("hello.py")).unwrap(), "print('hello')\n");
+        let requests = provider.requests();
+        let messages = &requests[1].messages;
+        let call = messages[2].tool_calls.as_ref().unwrap().first().unwrap();
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some(call.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn tool_validation_error_reaches_model_without_invalid_tool_transcript() {
+        struct ValidationProvider {
+            requests: Mutex<Vec<ChatRequest>>,
+            failures: usize,
+        }
+        impl Provider for ValidationProvider {
+            fn chat(&self, req: ChatRequest) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>> {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(req);
+                let invalid = requests.len() <= self.failures;
+                Box::pin(async move {
+                    if invalid {
+                        Err(SlagError::ToolValidation("grep requires pattern".into()))
+                    } else {
+                        Ok(resp_tools(vec![tc("finish", "finish", serde_json::json!({"summary":"Done", "cmd":"true"}))]))
+                    }
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ValidationProvider { requests: Mutex::new(Vec::new()), failures: 1 });
+        let result = ForgeAgent::new(provider.clone(), ToolBox::new(dir.path()), "test/model")
+            .with_cost_cap(None).with_run_cap(None)
+            .run("system".into(), "task".into()).await.unwrap();
+        assert!(result.contains("CMD: true"));
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let correction = requests[1].messages.last().unwrap();
+        assert_eq!(correction.role, "user");
+        assert!(correction.content.contains("Tool error from provider: grep requires pattern"));
+        assert!(requests[1].messages.iter().all(|m| m.tool_calls.is_none() && m.tool_call_id.is_none()));
+        drop(requests);
+
+        let repeating = Arc::new(ValidationProvider { requests: Mutex::new(Vec::new()), failures: usize::MAX });
+        let error = ForgeAgent::new(repeating.clone(), ToolBox::new(dir.path()), "test/model")
+            .with_cost_cap(None).with_run_cap(None)
+            .run("system".into(), "task".into()).await.unwrap_err();
+        assert!(matches!(error, SlagError::ToolValidation(_)));
+        assert_eq!(repeating.requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -2112,6 +2335,9 @@ mod tests {
         }
         assert!(!is_context_overflow(&SlagError::Provider("429: rate limited".into())));
         assert!(!is_context_overflow(&SlagError::Provider("500: internal".into())));
+        assert!(!is_context_overflow(&SlagError::ToolValidation(
+            "Tool call validation failed: context length argument is missing".into(),
+        )));
     }
 
     #[tokio::test]
