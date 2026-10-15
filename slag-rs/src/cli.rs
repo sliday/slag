@@ -47,9 +47,8 @@ pub struct Cli {
     #[arg(long, default_value_t = crate::config::MAX_ANVILS)]
     pub anvils: usize,
 
-    /// Route every role through openrouter/auto, ignoring models pinned in
-    /// the environment or config file. This is already the default; the
-    /// flag exists to override those pins. Explicit model flags still win.
+    /// Reset all roles to the selected provider's default model.
+    /// Ignore environment and config model settings. Explicit model flags take precedence.
     #[arg(long)]
     pub auto: bool,
 
@@ -57,15 +56,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub provider: Option<String>,
 
-    /// Worker model, any OpenRouter id (overrides SLAG_MODEL_BASE)
+    /// Worker model ID or provider::model (overrides SLAG_MODEL_BASE)
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Planner model for grade>=3 ingots (overrides SLAG_MODEL_PLAN)
+    /// Planner model ID or provider::model, also for grade>=3 ingots (overrides SLAG_MODEL_PLAN)
     #[arg(long, value_name = "MODEL")]
     pub plan_model: Option<String>,
 
-    /// Duel judge model (overrides SLAG_MODEL_JUDGE)
+    /// Duel judge model ID or provider::model (overrides SLAG_MODEL_JUDGE)
     #[arg(long, value_name = "MODEL")]
     pub judge_model: Option<String>,
 
@@ -83,7 +82,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Show or set the active provider key (default: OpenRouter key)
+    /// Show or set the selected provider key; choose it with --provider
     Key {
         /// Key to verify and save; omit to show the current setup
         #[arg(value_name = "KEY")]
@@ -130,7 +129,7 @@ pub enum Command {
         heat: Option<u8>,
     },
 
-    /// Session spend beside the OpenRouter account balance
+    /// Show session spend and the provider balance when available
     Cost,
 
     /// Lifecycle hooks: the event contract and what is configured
