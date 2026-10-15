@@ -445,6 +445,14 @@ impl OpenRouter {
         Ok(response)
     }
 
+    fn error_context(&self, req: &ChatRequest, category: ProviderErrorCategory, detail: &str) -> String {
+        let provider = self.provider.name();
+        let remedy = provider_remedy(self.provider, category, &self.base_url);
+        let separator = if detail.ends_with(['.', '!', '?']) { "" } else { "." };
+        let message = format!("{provider}, role {}, model {}. {detail}{separator} {remedy}", req.role, req.model);
+        if self.api_key.is_empty() { message } else { message.replace(&self.api_key, "[redacted]") }
+    }
+
     async fn chat_direct(&self, req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
         crate::config::validate_provider_url(self.provider, &self.base_url)?;
         let mut body = self.build_body(&req);
@@ -452,6 +460,7 @@ impl OpenRouter {
         let url = format!("{}/chat/completions", self.base_url);
         // Definite-assignment checked: every `break` below writes it first.
         let mut last_err;
+        let mut last_category = ProviderErrorCategory::Network;
         let mut attempts_made = 0usize;
         let mut budget_used = 0usize;
         let mut unattended_waited = Duration::ZERO;
@@ -460,6 +469,9 @@ impl OpenRouter {
         let mut next: Option<RetryPlan> = None;
 
         loop {
+            if let Some(error) = crate::error::provider_run_failure() {
+                return Err(error);
+            }
             let free = match next.take() {
                 Some(plan) => {
                     if !self.wait_out(attempts_made, &plan).await {
@@ -498,6 +510,7 @@ impl OpenRouter {
                     if is_stale_connection(&e) {
                         self.rebuild_client();
                     }
+                    last_category = ProviderErrorCategory::Network;
                     last_err = format!("request failed: {e}");
                     match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited, req.retry) {
                         Some(plan) => {
@@ -519,7 +532,7 @@ impl OpenRouter {
                             status: Some(200),
                             category: ProviderErrorCategory::BadResponse,
                             retryable: false,
-                            excerpt: format!("malformed response: {e}"),
+                            excerpt: self.error_context(&req, ProviderErrorCategory::BadResponse, &format!("malformed response: {e}")),
                         }))
                     }
                 };
@@ -528,6 +541,7 @@ impl OpenRouter {
                     // are upstream hiccups; burn a retry instead of handing
                     // the agent an empty turn.
                     Err(SlagError::ProviderTransient(why)) => {
+                        last_category = ProviderErrorCategory::BadResponse;
                         last_err = format!("empty 200: {why}");
                         match self.plan_retry(None, None, None, attempts_made, budget_used, unattended_waited, req.retry) {
                             Some(plan) => {
@@ -563,12 +577,16 @@ impl OpenRouter {
                 }
             }
             if code == 400 && !req.tools.is_empty() && is_tool_validation_error(&text) {
-                return Err(SlagError::ToolValidation(tool_validation_message(&text)));
+                return Err(SlagError::ToolValidation(self.error_context(&req, ProviderErrorCategory::InvalidRequest,
+                    &tool_validation_message(&text))));
             }
-            if retry_hint.unwrap_or_else(|| transient_status(status)) {
+            let category = classify_response(code, &text);
+            let deterministic = matches!(category, ProviderErrorCategory::Auth | ProviderErrorCategory::Billing | ProviderErrorCategory::InvalidRequest);
+            if !deterministic && retry_hint.unwrap_or_else(|| transient_status(status)) {
                 // Any transient status may carry Retry-After — 429 rate
                 // limits and 502/503 gateway drains alike — so honor it
                 // whenever the server sent one, not only on 429.
+                last_category = category;
                 last_err = format!("{status}: {excerpt}");
                 match self.plan_retry(
                     Some(code),
@@ -586,33 +604,16 @@ impl OpenRouter {
                     None => break,
                 }
             }
-            // Auth and billing failures have a fix; a bare status line does
-            // not tell the user what it is.
-            let remedy = match (self.provider, code) {
-                (ProviderPreset::OpenRouter, 401 | 403) => Some(
-                    "OpenRouter rejected the key. Run `slag key` to set a new one \
-                     (a shell OPENROUTER_API_KEY overrides the saved key)",
-                ),
-                (ProviderPreset::OpenRouter, 402) => Some("OpenRouter is out of credit. Top up at https://openrouter.ai/credits"),
-                _ => None,
-            };
-            // Classified once, here; the category label leads the Display
-            // string, so the dashboard's Error event reads "credit balance
-            // low" instead of a raw body excerpt.
             return Err(SlagError::ProviderApi(ProviderApiError {
                 status: Some(code),
-                category: classify_status(code),
+                category,
                 retryable: false,
-                excerpt: match remedy {
-                    Some(remedy) => format!("{remedy} [{status}: {excerpt}]"),
-                    None => excerpt,
-                },
+                excerpt: self.error_context(&req, category, &excerpt),
             }));
         }
 
-        Err(SlagError::ProviderTransient(format!(
-            "gave up after {attempts_made} attempts: {last_err}"
-        )))
+        Err(SlagError::ProviderTransient(self.error_context(&req, last_category,
+            &format!("gave up after {attempts_made} attempts: {last_err}"))))
     }
 }
 
@@ -717,11 +718,78 @@ fn heartbeat_slices(total: Duration) -> Vec<(u64, Duration)> {
     }
 }
 
+fn provider_remedy(provider: ProviderPreset, category: ProviderErrorCategory, base_url: &str) -> String {
+    match provider {
+        ProviderPreset::Ollama if category == ProviderErrorCategory::Network => return "Start the server with `ollama serve`.".into(),
+        ProviderPreset::LmStudio if category == ProviderErrorCategory::Network => return "Start LM Studio's local server.".into(),
+        _ => {}
+    }
+    match category {
+        ProviderErrorCategory::Auth => match provider.key_env() {
+            Some(env) => format!("Set {env} or run `slag key --provider {}`. The environment key overrides the saved key.", provider.name()),
+            None => "Check the local server's authentication settings.".into(),
+        },
+        ProviderErrorCategory::Billing => {
+            let url = match provider {
+                ProviderPreset::OpenRouter => "https://openrouter.ai/credits",
+                ProviderPreset::OpenAI => "https://platform.openai.com/settings/organization/billing/overview",
+                ProviderPreset::Anthropic => "https://console.anthropic.com/settings/billing",
+                ProviderPreset::Gemini => "https://aistudio.google.com/usage",
+                ProviderPreset::Groq => "https://console.groq.com/settings/billing",
+                ProviderPreset::Cerebras => "https://cloud.cerebras.ai/platform/billing",
+                ProviderPreset::Xai => "https://console.x.ai/team/default/billing",
+                ProviderPreset::Mistral => "https://admin.mistral.ai/organization/billing",
+                ProviderPreset::DeepSeek => "https://platform.deepseek.com/top_up",
+                ProviderPreset::Together => "https://api.together.ai/settings/billing",
+                ProviderPreset::Fireworks => "https://app.fireworks.ai/account/billing",
+                _ => return "Check the server's credits and spend limit.".into(),
+            };
+            format!("Check credits and spend limits at {url}.")
+        }
+        ProviderErrorCategory::InvalidRequest => {
+            let auth = provider.key_env().map(|env| format!(" -H \"Authorization: Bearer ${env}\"" )).unwrap_or_default();
+            format!("Check the model id and request. List models with `curl{auth} {}/models`.", base_url.trim_end_matches('/'))
+        }
+        ProviderErrorCategory::RateLimit => "Wait for the rate limit to reset or reduce parallel calls.".into(),
+        ProviderErrorCategory::Network => "Check the API base URL and network connection.".into(),
+        ProviderErrorCategory::BadResponse => "Check the endpoint's chat-completions response format.".into(),
+        _ => "Retry after the provider restores service.".into(),
+    }
+}
+
+fn classify_response(status: u16, body: &str) -> ProviderErrorCategory {
+    let body = body.to_ascii_lowercase();
+    if status == 402 || (matches!(status, 403 | 429) && [
+        "insufficient_quota", "insufficient quota", "insufficient credit", "out of credit",
+        "credits exhausted", "credit balance", "spend limit", "spending limit", "billing",
+        "payment required", "exceeded your current quota", "monthly limit", "budget exceeded",
+        "no credits", "credit limit", "run out of credits", "purchase credits", "exhausted its credits",
+        "exhausted your credits", "billing_hard_limit_reached", "daily spend limit",
+    ].iter().any(|text| body.contains(text))) {
+        return ProviderErrorCategory::Billing;
+    }
+    if matches!(status, 400 | 403 | 404 | 422) && [
+        "invalid api key", "invalid_api_key", "incorrect api key", "wrong api key",
+        "missing api key", "authentication", "unauthorized",
+    ].iter().any(|text| body.contains(text)) {
+        return ProviderErrorCategory::Auth;
+    }
+    if matches!(status, 400 | 403 | 404 | 422) && [
+        "model_not_found", "model not found", "invalid model", "model does not exist",
+        "model_not_available", "unknown model",
+    ].iter().any(|text| body.contains(text)) {
+        return ProviderErrorCategory::InvalidRequest;
+    }
+    classify_status(status)
+}
+
 /// Provider error category from an HTTP status, decided exactly once.
 fn classify_status(status: u16) -> ProviderErrorCategory {
     match status {
         401 | 403 => ProviderErrorCategory::Auth,
         402 => ProviderErrorCategory::Billing,
+        408 => ProviderErrorCategory::Network,
+        409 => ProviderErrorCategory::Server,
         429 => ProviderErrorCategory::RateLimit,
         503 | 529 => ProviderErrorCategory::Overloaded,
         500..=599 => ProviderErrorCategory::Server,
@@ -851,7 +919,16 @@ impl Provider for OpenRouter {
         &self,
         req: ChatRequest,
     ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>> {
-        Box::pin(async move { self.chat_impl(req).await })
+        Box::pin(async move {
+            if let Some(error) = crate::error::provider_run_failure() {
+                return Err(error);
+            }
+            let result = self.chat_impl(req).await;
+            if let Err(error) = &result {
+                crate::error::record_provider_failure(error);
+            }
+            crate::error::provider_run_failure().map_or(result, Err)
+        })
     }
 
     /// Wire the heartbeat sink: `ApiRetry` events flow here during
@@ -1961,29 +2038,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn x_should_retry_true_retries_a_400() {
+    async fn x_should_retry_true_cannot_retry_an_invalid_request() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(400)
                     .insert_header("x-should-retry", "true")
-                    .set_body_string("flaky 400"),
+                    .set_body_string("invalid request"),
             )
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .expect(1)
             .mount(&server)
             .await;
 
         let provider = OpenRouter::with_provider(ProviderPreset::OpenRouter, "sk-test", server.uri());
-        let resp = provider.chat(request(vec![], None)).await.expect("header-driven retry");
-        assert_eq!(resp.content, "forged");
+        let error = provider.chat(request(vec![], None)).await.unwrap_err();
+        assert!(error.is_deterministic_provider());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2792,6 +2863,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_failure_classes_include_context_and_do_not_retry_deterministic_errors() {
+        for (status, body, category, remedy) in [
+            (401, "Wrong API Key", ProviderErrorCategory::Auth, "XAI_API_KEY"),
+            (403, "Your team has exhausted its credits. Purchase credits to continue.", ProviderErrorCategory::Billing, "console.x.ai"),
+            (429, "Spend limit exceeded", ProviderErrorCategory::Billing, "console.x.ai"),
+            (402, "Payment required", ProviderErrorCategory::Billing, "console.x.ai"),
+            (404, "Model nope-model-404 not found", ProviderErrorCategory::InvalidRequest, "/models"),
+            (400, "Invalid request parameter", ProviderErrorCategory::InvalidRequest, "Check the model id"),
+            (400, "Invalid API key", ProviderErrorCategory::Auth, "slag key --provider xai"),
+            (429, "Rate limit exceeded", ProviderErrorCategory::RateLimit, "rate limit"),
+            (503, "Service unavailable", ProviderErrorCategory::Overloaded, "restores service"),
+            (500, "Internal error", ProviderErrorCategory::Server, "restores service"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).insert_header("x-should-retry", "true").set_body_string(body))
+                .expect(1)
+                .mount(&server).await;
+            let deterministic = matches!(category, ProviderErrorCategory::Auth | ProviderErrorCategory::Billing | ProviderErrorCategory::InvalidRequest);
+            let provider = OpenRouter::with_provider(ProviderPreset::Xai, "secret-test-key", server.uri())
+                .with_max_attempts(if deterministic { 3 } else { 1 });
+            let error = provider.chat(request(vec![], None)).await.unwrap_err();
+            let message = error.to_string();
+            if deterministic {
+                let SlagError::ProviderApi(api) = &error else { panic!("{error}") };
+                assert_eq!(api.category, category);
+                assert!(error.is_deterministic_provider());
+                assert!(message.contains(remedy), "{message}");
+            } else {
+                assert!(error.retryable());
+                assert!(!error.is_deterministic_provider());
+            }
+            assert!(message.contains("xai, role smith, model qwen/qwen3-coder"), "{message}");
+            assert!(!message.contains("secret-test-key"));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_connection_errors_name_the_provider_and_server_remedy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        for (preset, remedy) in [
+            (ProviderPreset::Ollama, "ollama serve"),
+            (ProviderPreset::LmStudio, "Start LM Studio's local server"),
+        ] {
+            let provider = OpenRouter::with_provider(preset, "", &url).with_max_attempts(1);
+            let message = provider.chat(request(vec![], None)).await.unwrap_err().to_string();
+            assert!(message.contains(preset.name()), "{message}");
+            assert!(message.contains("role smith, model qwen/qwen3-coder"), "{message}");
+            assert!(message.contains(remedy), "{message}");
+        }
+    }
+
+    #[test]
+    fn provider_remedies_cover_each_preset_without_key_values() {
+        for preset in [ProviderPreset::OpenRouter, ProviderPreset::OpenAI, ProviderPreset::Anthropic,
+            ProviderPreset::Gemini, ProviderPreset::Groq, ProviderPreset::Cerebras, ProviderPreset::Xai,
+            ProviderPreset::Mistral, ProviderPreset::DeepSeek, ProviderPreset::Together, ProviderPreset::Fireworks,
+            ProviderPreset::Ollama, ProviderPreset::LmStudio, ProviderPreset::Custom] {
+            let auth = provider_remedy(preset, ProviderErrorCategory::Auth, preset.base_url());
+            if let Some(env) = preset.key_env() {
+                assert!(auth.contains(env), "{auth}");
+                assert!(auth.contains(&format!("slag key --provider {}", preset.name())), "{auth}");
+            }
+            let model = provider_remedy(preset, ProviderErrorCategory::InvalidRequest, "http://localhost:1234/v1");
+            assert!(model.contains("curl"));
+            assert!(model.contains("/models"));
+        }
+    }
+
+    #[tokio::test]
     async fn credits_skip_network_without_an_account_key() {
         let server = MockServer::start().await;
         assert_eq!(fetch_credits("", &server.uri()).await, None);
@@ -2990,7 +3135,9 @@ mod tests {
                 .expect(1).mount(&server).await;
             let provider = OpenRouter::with_provider(ProviderPreset::Groq, "test-key", server.uri());
             let error = provider.chat(request(vec![spec()], None)).await.unwrap_err();
-            assert!(matches!(error, SlagError::ToolValidation(ref feedback) if feedback == message));
+            let SlagError::ToolValidation(feedback) = error else { panic!("expected tool validation error") };
+            assert!(feedback.contains(message));
+            assert!(feedback.contains("groq, role smith, model qwen/qwen3-coder"));
         }
         assert!(!is_tool_validation_error("invalid tool schema: missing required property"));
     }

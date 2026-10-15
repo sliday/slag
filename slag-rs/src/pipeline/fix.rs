@@ -65,6 +65,7 @@ pub async fn run(
     trace: Option<PathBuf>,
     temper: bool,
 ) -> Result<(), SlagError> {
+    let _provider_run = crate::error::ProviderRunGuard::begin();
     if let Some(m) = &args.model {
         std::env::set_var("SLAG_MODEL_BASE", m);
     }
@@ -126,6 +127,9 @@ pub async fn run(
 
     if let Some(path) = session {
         let _ = std::fs::remove_file(path);
+    }
+    if let Some(error) = crate::error::provider_run_failure() {
+        return Err(error);
     }
     let outcome = result?;
     report(&outcome);
@@ -370,6 +374,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         let response = match response {
             Ok(r) => r,
             Err(e @ (SlagError::Cancelled | SlagError::RunBudgetExhausted { .. })) => return Err(e),
+            Err(e) if e.is_deterministic_provider() => return Err(e),
             Err(e) => {
                 failure = Some(Failure::new(
                     format!("the session failed: {e}"),
@@ -446,6 +451,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                     ));
                     continue;
                 }
+                Err(e) if e.is_deterministic_provider() => return Err(e),
                 // A warden that cannot run must not sink a verified fix.
                 Err(e) => note(hooks, &format!("warden could not judge the fix: {e}"), false),
             }
@@ -1043,6 +1049,54 @@ mod tests {
             .status
             .success();
         assert!(ok, "{cmd}");
+    }
+
+    #[tokio::test]
+    async fn auth_failure_stops_fix_before_a_plan_model_retry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_guard, _config_dir) = crate::config::isolated_config_dir();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "message": "Wrong API Key" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = crate::config::active_provider().unwrap();
+        let config = EngineConfig {
+            api_key: "test-key".into(),
+            model_base: format!("{}::work-model", provider.name()),
+            model_plan: format!("{}::plan-model", provider.name()),
+            model_alt: format!("{}::alt-model", provider.name()),
+            model_judge: format!("{}::judge-model", provider.name()),
+            effort: None,
+            base_url: server.uri(),
+            duel: crate::config::DuelMode::Off,
+            duel_rounds_override: None,
+            screenshot_cmd: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = job_in(dir.path());
+        job.args.issue = vec!["Fix the test".into()];
+        job.args.test = Some("true".into());
+        job.args.tries = 3;
+        let (tx, _rx) = crate::engine::events::channel();
+        let hooks = EngineHooks { events: Some(tx), ..EngineHooks::default() };
+
+        let error = match fix(&job, &config, &hooks).await {
+            Err(error) => error,
+            Ok(_) => panic!("authentication failure must stop the fix"),
+        };
+        assert!(error.is_deterministic_provider(), "{error}");
+        let requests = server.received_requests().await.unwrap();
+        let calls: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+        assert_eq!(calls.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&calls[0].body).unwrap();
+        assert_eq!(body["model"], "work-model");
     }
 
     #[test]

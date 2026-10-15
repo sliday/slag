@@ -150,6 +150,22 @@ pub enum SlagError {
 }
 
 impl SlagError {
+    pub fn is_deterministic_provider(&self) -> bool {
+        match self {
+            Self::ProviderApi(error) => matches!(error.category,
+                ProviderErrorCategory::Auth | ProviderErrorCategory::Billing | ProviderErrorCategory::InvalidRequest),
+            Self::SurveyFailed(message) | Self::FounderFailed(message)
+            | Self::SmithFailed(message) | Self::Provider(message) => {
+                ["provider error: invalid key (", "provider error: credit balance low (",
+                    "provider error: invalid request ("].iter().any(|prefix| message.contains(prefix))
+            }
+            Self::Other(error) => error.chain().any(|cause| {
+                cause.downcast_ref::<SlagError>().is_some_and(Self::is_deterministic_provider)
+            }),
+            _ => false,
+        }
+    }
+
     /// True when retrying the same call may succeed. Permanent failures
     /// (auth, billing, malformed requests) return false.
     pub fn retryable(&self) -> bool {
@@ -161,9 +177,61 @@ impl SlagError {
     }
 }
 
+static PROVIDER_RUN: std::sync::Mutex<Option<Option<ProviderApiError>>> = std::sync::Mutex::new(None);
+
+pub struct ProviderRunGuard {
+    quiet: bool,
+}
+
+impl ProviderRunGuard {
+    pub fn begin() -> Self {
+        *PROVIDER_RUN.lock().unwrap() = Some(None);
+        Self { quiet: crate::tui::is_quiet() }
+    }
+}
+
+impl Drop for ProviderRunGuard {
+    fn drop(&mut self) {
+        *PROVIDER_RUN.lock().unwrap() = None;
+        crate::tui::set_quiet(self.quiet);
+    }
+}
+
+pub fn provider_run_failure() -> Option<SlagError> {
+    PROVIDER_RUN.lock().unwrap().as_ref().and_then(|error| error.clone()).map(SlagError::ProviderApi)
+}
+
+pub fn record_provider_failure(error: &SlagError) {
+    if let SlagError::ProviderApi(api) = error {
+        if error.is_deterministic_provider() {
+            if let Some(first) = PROVIDER_RUN.lock().unwrap().as_mut() {
+                if first.is_none() {
+                    *first = Some(api.clone());
+                    // Suppress the success assay when a critic catches this failure.
+                    crate::tui::set_quiet(true);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deterministic_provider_errors_survive_pipeline_wrappers() {
+        for category in [ProviderErrorCategory::Auth, ProviderErrorCategory::Billing, ProviderErrorCategory::InvalidRequest] {
+            let error = SlagError::ProviderApi(api_err(Some(401), category, false, "groq, role smith, model example"));
+            assert!(error.is_deterministic_provider());
+            let message = error.to_string();
+            assert!(SlagError::SurveyFailed(message.clone()).is_deterministic_provider());
+            assert!(SlagError::FounderFailed(message.clone()).is_deterministic_provider());
+            assert!(SlagError::SmithFailed(message).is_deterministic_provider());
+        }
+        assert!(!SlagError::SmithFailed("invalid key in a source file".into()).is_deterministic_provider());
+        assert!(!SlagError::ToolValidation("invalid request".into()).is_deterministic_provider());
+    }
 
     #[test]
     fn transient_is_retryable_permanent_is_not() {

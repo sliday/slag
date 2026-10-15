@@ -139,6 +139,9 @@ impl NativeSmith {
     }
 
     async fn invoke_impl(&self, prompt_text: &str) -> Result<String, SlagError> {
+        if let Some(error) = crate::error::provider_run_failure() {
+            return Err(error);
+        }
         let model = self.model().to_string();
         let bands = prompt::build(&self.root, &model, self.mode);
         let effort = self.cfg.effort.or(Some(Effort::from_grade(self.grade)));
@@ -167,7 +170,11 @@ impl NativeSmith {
                     let _ = hook.send(event.clone());
                 }
                 if let Some(narr) = &narrator_tx {
-                    let _ = narr.send(event);
+                    if crate::error::provider_run_failure().is_none()
+                        || !matches!(&event, crate::engine::EngineEvent::Error { .. })
+                    {
+                        let _ = narr.send(event);
+                    }
                 }
             }
         });

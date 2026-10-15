@@ -52,7 +52,7 @@ pub async fn resmelt_ingot(
         if !quiet {
             println!("    {}✗{} smelter failed", super::fg(tui::WARM), super::reset());
         }
-        SlagError::SmithFailed(e.to_string())
+        if e.is_deterministic_provider() { e } else { SlagError::SmithFailed(e.to_string()) }
     })?;
     spinner.finish_and_clear();
 
