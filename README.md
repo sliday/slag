@@ -150,6 +150,25 @@ High-grade ingots can go to a twin-cast duel: two casts build the same ingot in 
 
 Final report. Counts forged versus cracked ingots, shows a temperature bar, and exits 0 on a full forge or 1 if anything cracked. It prints on failed runs too, since a run that cracked an ingot is when you most need the cracked list.
 
+## Fixing an issue: `slag fix`
+
+The pipeline above builds a project. `slag fix` solves one issue in a repository that already has code and tests, and skips the survey, the plan, and every file they write:
+
+```bash
+slag fix "export drops the last day of the range"
+slag fix 123                      # GitHub issue in this repo, fetched with gh
+slag fix https://github.com/owner/repo/issues/123
+slag fix --issue-file ISSUE.md --pr
+```
+
+1. slag finds the test command (package.json, Cargo.toml, go.mod, Python tests, Makefile, or `--test CMD`) and runs it before any edit.
+2. One agent session reads the code, adds a regression test, fixes the bug, and runs the tests.
+3. slag reruns the tests itself. The verdict comes from those exit codes, not from the model's summary. A session that deletes or skips an existing test fails.
+4. slag reverts the source change and reruns the tests to show the new test catches the bug, then puts the fix back.
+5. The fix lands as one commit on a new `slag/fix-<slug>` branch (`slag/fix-<n>-<slug>` for a GitHub issue). The report prints the diff stat and the verification command.
+
+A failed attempt retries on the plan model, starting from the failure slag saw. `--tries N` sets the attempts (default 3), `--no-commit` leaves the fix in the working tree, `--pr` pushes the branch and opens a draft PR, and `--temper` adds the warden as an independent judge. Outside git, slag tracks the changes in a private temporary repository and commits nothing.
+
 ## Architecture
 
 ```
@@ -182,6 +201,7 @@ No vendor CLI underneath: the engine is slag's own agent loop speaking the OpenR
 |---------|------|
 | `slag "commission"` | Write `PRD.md` and run the full pipeline |
 | `slag` | Forge the `PRD.md` already in this directory |
+| `slag fix ISSUE` | Fix one issue in this repository and commit it on a new branch |
 | `slag key [KEY]` | Show setup, or verify and store a key |
 | `slag status` | Show crucible state |
 | `slag resume` | Resume an existing forge |
