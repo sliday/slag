@@ -1,19 +1,57 @@
-Committed `91305cc` on `gauntlet/provider`. No push. The worktree is clean.
+Committed on `gauntlet/provider`:
 
-Fixed JSON tool recovery, recoverable tool-validation errors, and credential routing. The OpenRouter alias now applies only to OpenRouter. Foreign preset hosts and redirects cannot receive another preset’s credentials.
+- `7174847` provider retry fixes.
+- `eed67e6` provider-agnostic help text.
 
-| Provider | Chosen default | Result | Wall time |
-|---|---|---|---:|
-| Cerebras | `qwen-3.8-27b` | FORGED, 3 tests pass | 15.14 s |
-| Groq | `openai/gpt-oss-120b` | FORGED, 1 test passes | 270.07 s |
-| OpenAI | `gpt-4.1-mini` | FORGED, 1 test passes | 18.03 s |
+Rate-limit signals now override billing words on 429. Body delays preserve fractions and cap at 60 seconds. Wiremock tests preserve xAI billing and OpenAI `insufficient_quota` classification.
 
-Each generated `hello.py` prints `hello`. Groq’s 8,000-token-per-minute limit delayed verification; one concurrent check failed with 429.
+**929 tests passed; 1 ignored.** Clippy completed with warnings. The worktree is clean.
 
-**Verification:** 862 unit tests and nine CLI tests pass. Clippy passes with warnings. Estimated total spend: **$0.27**, using logged tokens and published [Cerebras](https://www.cerebras.ai/pricing), [Groq](https://console.groq.com/docs/models), and [OpenAI](https://developers.openai.com/api/docs/models/gpt-4.1-mini) rates.
+Live verification did **not** reach FORGED:
 
-Changed: `config.rs`, `engine/agent.rs`, `engine/provider.rs`, `error.rs`, `README.md`, and `CLAUDE.md`. No change to `proof.rs` was necessary.
+| Attempt | Wall time | Result |
+|---|---:|---|
+| First | 650.01 s | Test timeout after repeated undeclared tool names |
+| Final | 124.42 s | One ingot forged, then Groq’s daily quota blocked completion |
 
-ASK: Fix tool recovery and credential isolation, verify live, and commit.
-🟩Got 🟩Had 🟩Did
-🧠 —
+Groq reported **198,764 of 200,000 daily tokens used**. I stopped live calls.
+
+The final run printed:
+
+```text
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 20.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 1.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
+⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 17.0s.
+```
+
+Reported tokens imply about **$0.015**, using [Groq’s published prices](https://console.groq.com/docs/model/openai/gpt-oss-120b). This estimate excludes unreported failed generations.
+
+Files changed:
+
+- `slag-rs/src/engine/provider.rs`
+- `slag-rs/src/cli.rs`
+- `slag-rs/tests/cli.rs`
+
+Verification commands:
+
+```sh
+cd slag-rs
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --all-targets
+cd ..
+git diff --check
+```
+
+Live command used scratch directories and the default Groq model:
+
+```sh
+slag --provider groq --anvils 1 --temper 0 \
+  "write hello.py that prints hello and a unittest for it"
+```
+
+ASK: Fix Groq throttles and help text, verify FORGED live, and commit.
+🟩Got 🟩Had 🟨Did — Live FORGED verification remains blocked by Groq’s daily quota.
+🧠 High

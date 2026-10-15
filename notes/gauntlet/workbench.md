@@ -59,6 +59,64 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Held: mobile embed 341 px instead of full bleed; provider names flip every 0.27 s, too fast to read; font-swap CLS.
 - Open: on-screen `slag fix` output is guessed until the fix lane lands.
 
+### 21:25 bench (instrument), lead verification
+- 8 tasks: 3 py (unittest), 3 js (node:test), 1 rust, 1 sh; 3 easy, 3 medium, 2 hard.
+- Floor noop 0/8, ceiling reference 8/8, every hidden suite fails on the buggy repo.
+- Leak found by lead: adapters got `bench/issues/<task>/ISSUE.md` (beside `hidden/` and `reference.patch`) and `BENCH_TASK_DIR`. Fixed by kimi; probe adapter now checks env and paths. MERGED.
+- Codex baseline (gpt-6.1-sol, medium): **8/8, median 80 s, p90 155 s.** This is the bar for `slag fix`.
+
+### 21:25 loop lane (codex), lead verification
+- Root cause: duplicate ingot ids (`crucible.rs:141` updated only the first `i1`, leaving a twin queued); `forge.rs:206` fetched the cracked first match; `duel.rs:102` `.max(1)` forced a paid round after heat exhaustion.
+- Fix rejects duplicate ids, blocks terminal ingots, stops passes without progress. Mock regression test. 829 + 8 tests pass. MERGED.
+
+### 21:25 provider round 2 (codex), lead verification
+- JSON-content tool-call recovery; provider tool-validation 400 goes back to the model; `SLAG_OPENROUTER_BASE` now applies to openrouter only.
+- Builder's live table: cerebras `qwen-3.8-27b` FORGED 15 s, openai `gpt-4.1-mini` 18 s, groq `openai/gpt-oss-120b` 270 s (8k TPM account limit).
+- Integration branch after merging bench + loop + provider: 866 unit + 13 integration tests pass. Critic r2 (fresh) running on the integrated build.
+
+### 22:05 fix lane landed, video r2 landed
+- Fix builder smoke (its own fixtures, not the bar): slag 10-12 s per fix vs codex 74-78 s, about $0.001 per fix. Verdict comes from harness-run tests; deleted tests fail the attempt; reproduction proven by reverting the fix.
+- MERGED into integration (README table conflict resolved by hand). 891 unit + 17 integration tests pass.
+- Bench adapter `bench/agents/slag-fix.sh` wired to the real CLI. Lead instrument check: `py-passcheck` PASS in 6 s on cerebras `qwen-3.8-27b`. Transcript: `refs/real/slag-fix-cerebras-py-passcheck.txt`.
+- Critic fix-r1 (fresh) running the full bench, 2 runs, several providers, blind diff votes vs codex.
+- Video r2: poster now equals frame 0 (source RMSE 0); video opens on the finished fix. webm 980 KB, mp4 1.5 MB. On-screen `slag fix` lines still guessed; reconcile after the TUI lane merges, since TUI changes the stream output.
+
+### 22:20 provider, critic r2 (Fable, fresh): WINNER bar (gap moved)
+- b: 6/6 FORGED: mistral 7 s, cerebras 19 s, openai 20 s, openrouter 61 s, groq 233 s (8k TPM throttle), gemini 248 s. c: proxy saw only the active provider's host; `SLAG_OPENROUTER_BASE` trap no longer leaks. d: cerebras work + openai plan + mistral judge forged in 19 s. f: every run terminated.
+- BIGGEST_GAP: deterministic provider errors (bad key, unknown model, no credits) burn 5 heats plus a re-smelt; messages lack provider name and remedy; xAI billing 403 labelled "invalid key". Sent as provider r3.
+- Second tier, routed to loop lane r2: founder marked ingots `forged` with no proof run (mistral run); smith read slag's own `logs/` (gemini burned 1.48M tokens).
+- Competitor: slag ties aider on time-to-first-fast-run (3 steps each), beats opencode.
+
+### 22:40 loop r2 merged; data-loss race found in `slag fix`
+- Loop r2: founded ingots always enter as `ore` (`founder.rs:123`); broad file search prunes `logs/`, `.git`, `slag-anvil-*` (`tools.rs:1360`). MERGED.
+- Lead found a flaky test, then a real race behind it: `reproduce()` registers a global shutdown rescue, then writes the pre-fix originals. A shutdown in between (concurrent test, or Ctrl-C) restores the fix first and the originals after, so the user's file ends without the fix. Seen 1 in 6 full suite runs (`fix.rs:1123`, left "1", right "2"). Sent to the fix builder.
+- Fix critic r1 partial: cerebras 16/16, median 5.5 s, p90 14 s; openai gpt-4.1-mini 15/16, median 13 s (one confident wrong fix stamped FIXED). Codex bar: 8/8, median 80 s.
+
+### 23:00 provider r3 + race repair merged
+- Provider r3: auth, billing and invalid-request errors stop at the first call (exit 1, heat 0, smelt 0); messages name provider, role, model and remedy. Critic r3 (fresh) running.
+- Race repair: swap and rescue share one lock with phases Armed/Swapped/Done/Rescued; tests use a local rescue slot. Lead ran the full integration suite 10 times: 10/10 green (903 unit + 22 integration).
+
+### 23:20 provider, critic r3 (Fable, fresh): WINNER bar, narrowly
+- e passes: groq bad key 0.21 s, xAI billing 0.53 s with URL, lmstudio no server 1.86 s with start hint, unknown model stops at first smith call (heat 0, smelt 0, exit 1).
+- f passes: `slag fix --provider cerebras` on a fresh 2-file repo: 7.5 s, correct even-median fix + 3 tests, only api.cerebras.ai contacted.
+- BIGGEST_GAP: regression from r3: Groq TPM 429 body contains ".../settings/billing", classified as billing, run dies in 3 s. Sent as r4 together with the `--help` OpenRouter wording (third round in a row).
+- Critic: "slag would win if Groq ran." Install-to-fast-run: slag 3 commands, aider 4, opencode install + TUI steps.
+- Gemini run: smith ran `find /Users/stas ...` outside the workspace. New lane `sandbox` (Claude builder; codex cannot nest Seatbelt): OS-level write confinement for the shell tool.
+
+### 23:50 TUI lane merged
+- `slag replay <tape> --at <point> --size WxH` freezes deterministic frames; every run writes `logs/tape-*.jsonl`; stream view drawn from events with a pinned footer; failed heats say why; assay leads with the verdict.
+- Integration bug from TUI x provider r3: fatal error printed 2-3 times, warden failure labelled "surveyor failed". Fixed by the TUI builder (71283e3). Suite green with cargo's own exit code: 928 unit + 27 integration.
+- Lead note: an earlier merge commit went in while 2 tests failed (grep masked cargo's exit code). Fixed by the next merge; checks now read cargo's exit status.
+- Non-TTY `slag fix` log pads tool rows to ~220 columns; fix flow shows the commission banner. Left for the TUI critic.
+- Critic tui-r1 (Fable, fresh) running: blind P/Q/R vs Codex CLI and Claude Code at 80x24 and 160x48, then the real build.
+
+## Integration checklist (smoothing)
+- Compiler warnings: baseline 21; target 0.
+- `shutdown.rs` tests drain every hook in the process; isolate them.
+- `spend -` for providers without pricing; `--help` OpenRouter wording.
+- Video on-screen CLI lines must match the final real output.
+- Website Features and "Why One Key?" sections still OpenRouter-only.
+
 ## Instrument notes
 
 See `instruments.md`.

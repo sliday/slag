@@ -1,0 +1,42 @@
+
+  ░░░▒▒▓█  SLAG  █▓▒▒░░░
+  cold      hot       pure
+  survey · design · forge · temper
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚒ FIX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ░ issue: Weak passwords are being accepted
+  ✓ tests: `python3 -m unittest discover` (from unittest discovery) exit 0 before any edit
+  ⚒ attempt 1/3 · cerebras::qwen-3.8-27b
+  ⏺ Read(passcheck/core.py)
+    └ ok
+  ⏺ Read 3 files
+  ⏺ Update(passcheck/core.py)
+    └ ok
+  ⏺ Updated 3 files
+  ⏺ Run(python3 -m unittest discover && python3…)
+    └ ok
+  ⏺ Done
+    └ ok
+  ■ Root cause: passcheck/core.py:16 combined the length rule with the uppercase/digit rules using `or`, so a password meet…
+  ✓ verify: `python3 -m unittest discover` exit 0 in 0.0s
+  ✓ reproduced: without the fix `python3 -m unittest discover` gives exit 1
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚒ FIX · FIXED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  issue       Weak passwords are being accepted
+  verdict     FIXED in 1 attempt
+  reproduced  With the source change reverted, `python3 -m unittest discover` gives exit 1: the new test catches the bug.
+  verified    `python3 -m unittest discover` exit 0 · 0.0s
+  changed     passcheck/core.py  |  2 +-
+              tests/test_hash.py | 22 +++++++++++++++++++++-
+              2 files changed, 22 insertions(+), 2 deletions(-)
+  branch      slag/fix-weak-passwords-are-being-accepted @ b3e5af0
+  time        wall 5s · api 4s · tools 0s
+              gather 0.1s · session 4.7s · verify 0.0s · reproduce 0.1s · commit 0.1s
+  spend       -
+
+  review: git show --stat HEAD
+
