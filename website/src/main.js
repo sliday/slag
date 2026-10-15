@@ -25,10 +25,36 @@ function initCopyButtons() {
   });
 }
 
+// The hero video plays only while it is on screen. The inline script next
+// to it already kept the poster for reduced motion and Save-Data; this
+// follows the viewer if they change the motion setting later.
+function initHeroVideo() {
+  const video = document.getElementById('hero-video');
+  if (!video || !('IntersectionObserver' in window)) return;
+  const still = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const lean = Boolean(navigator.connection && navigator.connection.saveData);
+  let visible = true;
+  const sync = () => {
+    if (!video.autoplay) return;
+    if (visible) video.play().catch(() => {});
+    else video.pause();
+  };
+  new IntersectionObserver(([entry]) => {
+    visible = entry.isIntersecting;
+    sync();
+  }).observe(video);
+  still.addEventListener('change', () => {
+    video.autoplay = !still.matches && !lean;
+    if (video.autoplay) sync();
+    else video.pause();
+  });
+}
+
 function init() {
   renderIngots(exampleIngots);
   logSExpressions(exampleIngots);
   initCopyButtons();
+  initHeroVideo();
 }
 
 if (document.readyState === 'loading') {

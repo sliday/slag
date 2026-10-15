@@ -4,14 +4,15 @@
     <meta charset="UTF-8" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2692;</text></svg>" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>slag - forge orchestrator</title>
-    <meta name="description" content="slag: Smelt ideas, skim the bugs, forge the product. A task orchestrator using metallurgical metaphors and AI-powered development workflows. One binary, one OpenRouter key." />
+    <title>slag - fix issues fast, with any model</title>
+    <meta name="description" content="slag fixes issues in your repo and proves each fix with your own tests. It runs on any LLM provider with one flag, and forges whole projects from one sentence in proof-gated ingots. One binary." />
+    <link rel="preload" as="image" href="/media/slag-hero-poster.webp" type="image/webp" />
   </head>
   <body>
     <div id="app">
 
       <!-- S1: HERO -->
-      <header class="forge-header" box="double" style="padding: 3ch 4ch; margin-bottom: 3lh;">
+      <header class="forge-header" box="double">
         <!-- Forge Effects Layer -->
         <div class="forge-effects" aria-hidden="true">
           <svg class="forge-glow-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
@@ -61,8 +62,28 @@
 
         <!-- Logo - div instead of pre (no gray bg) -->
         <div class="hero-logo"><span style="color: var(--slag-cold);">░░░</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-pure);">█</span>  <span style="color: var(--slag-pure); font-weight: bold;">SLAG</span>  <span style="color: var(--slag-pure);">█</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-cold);">░░░</span></div>
-        <p style="color: var(--slag-pure); margin-top: 1lh; font-size: 1.1rem; font-weight: bold; text-align: center; position: relative; z-index: 1;">Smelt ideas, skim the bugs, forge the product.</p>
-        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Task orchestrator for AI-powered development. Breaks requirements into S-expression ingots and forges them with its own agentic engine speaking straight to the OpenRouter API: tool loop, retries, re-smelt recovery, proof-gated commits. One binary, one key, no vendor CLI to install first.</p>
+        <p style="color: var(--slag-pure); margin-top: 1lh; font-size: 1.1rem; font-weight: bold; text-align: center; position: relative; z-index: 1;">Fix issues fast, with any model.</p>
+        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Point slag at an issue. It reproduces the bug, fixes it, and proves the fix with your own tests. You review a branch, or a draft PR with <code>--pr</code>. One flag picks the provider. Hand it a sentence instead and it forges a whole project in proof-gated ingots.</p>
+        <figure class="hero-video">
+          <video id="hero-video" autoplay muted loop playsinline preload="metadata" poster="/media/slag-hero-poster.webp" width="1600" height="900" aria-label="Demo, 24 seconds, no sound. slag fix 482 --pr reproduces the bug as a failing test, patches src/export.py, passes the full suite, and opens a draft PR. The same command runs on cerebras, groq, anthropic, openai, gemini, ollama and other providers with --provider, and roles can mix providers. Then slag &quot;build a todo api&quot; --temper 1 forges four ingots, each checked by its proof, one after a retry, and a warden judges the result.">
+            <source src="/media/slag-hero.webm" type='video/webm; codecs="vp9"' />
+            <source src="/media/slag-hero.mp4" type="video/mp4" />
+          </video>
+          <script>
+            // Runs while the page parses, before autoplay can start. Reduced
+            // motion or Save-Data shows the poster and nothing else.
+            (function (v) {
+              var still = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+              var lean = navigator.connection && navigator.connection.saveData;
+              if (still || lean) {
+                v.removeAttribute('autoplay');
+                v.autoplay = false;
+                v.preload = 'none';
+                v.pause();
+              }
+            })(document.getElementById('hero-video'));
+          </script>
+        </figure>
         <div class="temp-bar" style="margin-top: 1.5lh; text-align: center; position: relative; z-index: 1;">
           <span style="color: var(--slag-cold);">🧱</span><span style="color: var(--foreground2);"> ore </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-hot);"> 🔥</span><span style="color: var(--foreground2);"> forge </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-pure);"> ✅</span><span style="color: var(--foreground2);"> done </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-warm);"> ❌</span><span style="color: var(--foreground2);"> fail? </span><span style="color: var(--foreground2);">→</span><span style="color: var(--slag-hot);"> ♻️</span><span style="color: var(--foreground2);"> re-smelt </span><span style="color: var(--foreground2);">↩</span>
         </div>
@@ -79,19 +100,24 @@
             <code data-copy>curl -sSf https://slag.dev/install.sh | sh</code>
           </div>
           <div class="cmd-line">
-            <span class="cmd-comment"># paste your OpenRouter key, once</span>
-            <code data-copy>slag key</code>
+            <span class="cmd-comment"># fix issue 123 in the repo you are in, then open a draft PR</span>
+            <code data-copy>slag fix 123 --pr</code>
           </div>
           <div class="cmd-line">
-            <span class="cmd-comment"># forge</span>
+            <span class="cmd-comment"># describe the bug instead, on any provider</span>
+            <code data-copy>slag fix "dates are off by one in the export" --provider groq</code>
+          </div>
+          <div class="cmd-line">
+            <span class="cmd-comment"># or forge a whole project from one sentence</span>
             <code data-copy>slag "Build a REST API with auth and rate limiting"</code>
           </div>
           <div class="cmd-line">
-            <span class="cmd-comment"># or watch and steer it live in the dashboard</span>
+            <span class="cmd-comment"># watch and steer it live in the dashboard</span>
             <code data-copy>slag --tui "Build a REST API with auth and rate limiting"</code>
           </div>
         </div>
-        <p class="disclaimer">One <a href="https://openrouter.ai/workspaces/default/keys" target="_blank" rel="noopener noreferrer">OpenRouter key</a> is the whole setup. No Claude CLI, no vendor login, no model to pick: every role runs on <code>openrouter/auto</code> until you override it. The key is verified before it is saved, and lives in <code>~/.config/slag/config.toml</code> at mode 0600. Already have <code>OPENROUTER_API_KEY</code> exported? Skip step two.</p>
+        <p class="disclaimer">One key from one provider is the whole setup. Pick it with <code>--provider</code>, <code>SLAG_PROVIDER</code>, or <code>provider</code> in <code>~/.config/slag/config.toml</code>: cerebras, groq, openai, anthropic, gemini, xai, mistral, deepseek, together, fireworks, ollama, lmstudio, or openrouter, the default. slag reads the provider's usual key variable (<code>GROQ_API_KEY</code>, <code>OPENAI_API_KEY</code>, and so on), or the key <code>slag key</code> stores. Local models through ollama need no key. Each role (plan, work, judge) can run on a different provider.</p>
+        <p class="disclaimer"><code>slag fix</code> takes an issue number, a GitHub issue URL, or plain text. It reproduces the bug first, then fixes it and runs your test suite. It commits on a <code>slag/fix-…</code> branch and prints the command that proves the fix.</p>
         <p class="disclaimer">slag runs shell commands and edits files in the directory you start it in. Point it at a fresh directory or a repo you can revert.</p>
         <p class="disclaimer">The published build is macOS on Apple Silicon. Elsewhere, clone the repo and run <code>cargo install --path slag-rs</code>.</p>
       </section>
@@ -398,9 +424,10 @@
             </tr>
           </thead>
           <tbody>
+            <tr><td><code>slag fix &lt;issue&gt;</code></td><td>Reproduce, fix, and prove an issue in this repo. Takes a number, a GitHub issue URL, or text. <code>--pr</code> opens a draft PR</td></tr>
             <tr><td><code>slag "commission"</code></td><td>Write PRD.md from the commission and run the full pipeline</td></tr>
             <tr><td><code>slag</code></td><td>Forge the PRD.md already in this directory</td></tr>
-            <tr><td><code>slag key [KEY]</code></td><td>Show setup, or verify and store an OpenRouter key</td></tr>
+            <tr><td><code>slag key [KEY]</code></td><td>Show the active provider and its key, or store a key</td></tr>
             <tr><td><code>slag status</code></td><td>Show crucible state</td></tr>
             <tr><td><code>slag resume</code></td><td>Resume an existing forge</td></tr>
             <tr><td><code>slag update</code></td><td>Self-update to the latest release</td></tr>
@@ -414,6 +441,7 @@
             </tr>
           </thead>
           <tbody>
+            <tr><td><code>--provider NAME</code></td><td>LLM provider: openrouter (default), cerebras, groq, openai, anthropic, gemini, ollama, and more</td></tr>
             <tr><td><code>--tui</code></td><td>Full-screen dashboard: crucible, live feed, steering input</td></tr>
             <tr><td><code>--anvils N</code></td><td>Max parallel anvil workers (default 3)</td></tr>
             <tr><td><code>--auto</code></td><td>Force <code>openrouter/auto</code> on all four roles, ignoring pinned models</td></tr>
