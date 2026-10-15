@@ -1,0 +1,1 @@
+{"id": "py-passcheck", "lang": "python", "difficulty": "easy", "summary": "Password strength check uses OR instead of AND, so passwords missing rules pass."}

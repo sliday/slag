@@ -1,0 +1,16 @@
+diff --git a/src/preview.js b/src/preview.js
+index b003071..ab3061f 100644
+--- a/src/preview.js
++++ b/src/preview.js
+@@ -5,8 +5,9 @@
+  * appending an ellipsis when the text was cut.
+  */
+ function makePreview(text, maxChars = 20) {
+-  if (text.length <= maxChars) return text;
+-  return text.slice(0, maxChars) + "…";
++  const chars = Array.from(text);
++  if (chars.length <= maxChars) return text;
++  return chars.slice(0, maxChars).join("") + "…";
+ }
+ 
+ module.exports = { makePreview };

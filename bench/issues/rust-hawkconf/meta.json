@@ -1,0 +1,1 @@
+{"id": "rust-hawkconf", "lang": "rust", "difficulty": "hard", "summary": "Lexer consumes the newline ending a comment without bumping the line counter; the error surfaces in parser output."}

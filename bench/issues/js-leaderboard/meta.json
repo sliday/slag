@@ -1,0 +1,1 @@
+{"id": "js-leaderboard", "lang": "javascript", "difficulty": "easy", "summary": "topPlayers sorts with default Array.sort (string sort), so the order ignores numeric points."}

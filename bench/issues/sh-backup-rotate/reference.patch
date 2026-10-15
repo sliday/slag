@@ -1,0 +1,13 @@
+diff --git a/bin/rotate.sh b/bin/rotate.sh
+index 3fb92be..16ae644 100755
+--- a/bin/rotate.sh
++++ b/bin/rotate.sh
+@@ -14,7 +14,7 @@ keep=$2
+ 
+ [ -d "$dir" ] || die "no such directory: $dir"
+ 
+-ls -1t "$dir"/backup-*.tar.gz 2>/dev/null | head -n "$keep" | while IFS= read -r f; do
++ls -1t "$dir"/backup-*.tar.gz 2>/dev/null | tail -n "+$((keep + 1))" | while IFS= read -r f; do
+   log "deleting $f"
+   rm -f "$f"
+ done

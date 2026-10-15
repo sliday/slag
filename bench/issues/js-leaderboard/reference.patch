@@ -1,0 +1,13 @@
+diff --git a/src/leaderboard.js b/src/leaderboard.js
+index b736c5a..7e5ea0c 100644
+--- a/src/leaderboard.js
++++ b/src/leaderboard.js
+@@ -5,7 +5,7 @@
+  * starting at 1.
+  */
+ function topPlayers(players, limit = 10) {
+-  const sorted = players.slice().sort().reverse();
++  const sorted = players.slice().sort((a, b) => b.points - a.points);
+   return sorted.slice(0, limit).map((player, index) => ({
+     rank: index + 1,
+     ...player,

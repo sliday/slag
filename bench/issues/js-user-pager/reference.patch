@@ -1,0 +1,26 @@
+diff --git a/src/api.js b/src/api.js
+index 0711b2a..4b79dac 100644
+--- a/src/api.js
++++ b/src/api.js
+@@ -11,7 +11,7 @@ function listUsers(store, query = {}) {
+   const page = query.page || 1;
+   const perPage = query.perPage || 10;
+   const result = paginate(store.all(), page, perPage);
+-  const totalPages = Math.floor(result.total / perPage);
++  const totalPages = Math.ceil(result.total / perPage);
+   return {
+     users: result.items,
+     page,
+diff --git a/src/paginate.js b/src/paginate.js
+index 07b209c..b43a337 100644
+--- a/src/paginate.js
++++ b/src/paginate.js
+@@ -5,7 +5,7 @@
+  * plus pagination metadata.
+  */
+ function paginate(items, page = 1, perPage = 10) {
+-  const start = page * perPage;
++  const start = (page - 1) * perPage;
+   return {
+     items: items.slice(start, start + perPage),
+     page,

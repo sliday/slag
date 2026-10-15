@@ -1,0 +1,1 @@
+{"id": "js-user-pager", "lang": "javascript", "difficulty": "medium", "summary": "Pagination offset treats page as 0-based and totalPages floors instead of ceils; bugs span paginate.js and api.js."}
