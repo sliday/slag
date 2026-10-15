@@ -1,0 +1,26 @@
+Committed `6a8e6d6` on `gauntlet/loop`. Clean worktree. No push.
+
+Duplicate IDs let updates affect only the first `i1`, leaving another queued ([crucible.rs:141](/Users/stas/Playground/slag/.claude/worktrees/lane-loop/slag-rs/src/crucible.rs:141)). The forge fetched the cracked first match for that queued ID ([forge.rs:206](/Users/stas/Playground/slag/.claude/worktrees/lane-loop/slag-rs/src/pipeline/forge.rs:206)). The duel’s `.max(1)` forced another paid round after heat exhaustion ([duel.rs:102](/Users/stas/Playground/slag/.claude/worktrees/lane-loop/slag-rs/src/pipeline/duel.rs:102)).
+
+The fix rejects duplicate IDs, enforces re-smelt state, blocks terminal ingots, and stops scheduling passes without progress.
+
+Files changed under `slag-rs/`:
+
+- `src/crucible.rs`
+- `src/pipeline/forge.rs`
+- `src/pipeline/resmelt.rs`
+- `src/pipeline/duel.rs`
+- `tests/forge_loop.rs`
+
+Verification: **837 tests passed**. Mock regressions confirm termination and zero calls on terminal resume. No live API calls. Clippy passed with existing warnings.
+
+```sh
+cd /Users/stas/Playground/slag/.claude/worktrees/lane-loop/slag-rs
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --all-targets
+git diff HEAD --check
+```
+
+ASK: Fix and test the cracked-ingot forge loop, then commit without pushing.
+🟩Got 🟩Had 🟩Did
+🧠 —

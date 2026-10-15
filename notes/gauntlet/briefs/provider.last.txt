@@ -1,37 +1,19 @@
-Committed `2d46979` on `gauntlet/provider`. No push. The worktree is clean.
+Committed `91305cc` on `gauntlet/provider`. No push. The worktree is clean.
 
-Implemented 14 presets, config precedence, `provider::model` roles, named keys, OpenRouter feature gates, bounded retries, and native tool metadata replay.
+Fixed JSON tool recovery, recoverable tool-validation errors, and credential routing. The OpenRouter alias now applies only to OpenRouter. Foreign preset hosts and redirects cannot receive another preset’s credentials.
 
-Changed files:
+| Provider | Chosen default | Result | Wall time |
+|---|---|---|---:|
+| Cerebras | `qwen-3.8-27b` | FORGED, 3 tests pass | 15.14 s |
+| Groq | `openai/gpt-oss-120b` | FORGED, 1 test passes | 270.07 s |
+| OpenAI | `gpt-4.1-mini` | FORGED, 1 test passes | 18.03 s |
 
-- [config.rs](slag-rs/src/config.rs), [cli.rs](slag-rs/src/cli.rs), [main.rs](slag-rs/src/main.rs)
-- [provider.rs](slag-rs/src/engine/provider.rs), [mod.rs](slag-rs/src/engine/mod.rs), [native.rs](slag-rs/src/smith/native.rs)
-- [providers_cli.rs](slag-rs/tests/providers_cli.rs), [README.md](README.md), [CLAUDE.md](CLAUDE.md)
+Each generated `hello.py` prints `hello`. Groq’s 8,000-token-per-minute limit delayed verification; one concurrent check failed with 429.
 
-Verification: **851 unit tests and nine CLI tests pass**. Clippy passes with warnings.
+**Verification:** 862 unit tests and nine CLI tests pass. Clippy passes with warnings. Estimated total spend: **$0.27**, using logged tokens and published [Cerebras](https://www.cerebras.ai/pricing), [Groq](https://console.groq.com/docs/models), and [OpenAI](https://developers.openai.com/api/docs/models/gpt-4.1-mini) rates.
 
-```bash
-cd slag-rs
-CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test
-CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --all-targets
-CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test live_provider_tool_smoke -- --ignored --nocapture
-git diff HEAD --check
-```
+Changed: `config.rs`, `engine/agent.rs`, `engine/provider.rs`, `error.rs`, `README.md`, and `CLAUDE.md`. No change to `proof.rs` was necessary.
 
-I changed one existing assertion because Retry-After HTTP dates now work. Existing provider fixtures pin OpenRouter to prevent environment races.
-
-| Live smoke | Result | Latency |
-|---|---|---:|
-| OpenRouter | Pass, tool call | 1,067 ms |
-| OpenAI | Skip, key absent | — |
-| Cerebras | Skip, key absent | — |
-| Groq | Skip, key absent | — |
-| Gemini | Skip, key absent | — |
-| xAI | Skip, key absent | — |
-| Mistral | Skip, key absent | — |
-
-Only the OpenRouter key exists in this shell. Six live integrations remain unverified. I found no unresolved endpoint uncertainty. Anthropic’s compatibility limits appear in both docs.
-
-ASK: Make slag’s engine provider agnostic while preserving compatibility.
-🟩Got 🟨Had 🟨Did, six live checks lack keys.
-🧠 Low
+ASK: Fix tool recovery and credential isolation, verify live, and commit.
+🟩Got 🟩Had 🟩Did
+🧠 —
