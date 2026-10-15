@@ -17,12 +17,18 @@ TIMEOUT=600
 RUNS=1
 OUT=""
 VERIFY=0
+LEAK_CHECK=0
+
+# Never let a caller's environment leak bench paths into adapters.
+unset BENCH_TASK_DIR 2>/dev/null || true
+unset BENCH_REFERENCE_PATCH 2>/dev/null || true
 
 usage() {
   cat <<'EOF'
 Usage:
   bench/run.sh --agent <adapter> [--tasks id1,id2] [--timeout 600] [--runs 1] [--out results.json]
   bench/run.sh --verify-fixtures [--tasks id1,id2]
+  bench/run.sh --leak-check
 
 Options:
   --agent        Path to adapter executable, or a name in bench/agents/.
@@ -31,7 +37,11 @@ Options:
   --runs         Repetitions per task. Default: 1.
   --out          JSON output path. Default: bench/results/<timestamp>/results.json.
   --verify-fixtures  Check that hidden tests fail on the untouched repo and
-                 pass after reference.patch is applied. No agent is run.
+                 pass after reference.patch is applied. Runs the leak
+                 check first. No agent is run.
+  --leak-check   Run the probe adapter through the normal plumbing and
+                 fail if the environment or handed-over paths leak
+                 'hidden', 'reference.patch', or 'bench/issues'.
 EOF
 }
 
@@ -43,6 +53,7 @@ while [ $# -gt 0 ]; do
     --runs) RUNS=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --verify-fixtures) VERIFY=1; shift ;;
+    --leak-check) LEAK_CHECK=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -134,9 +145,54 @@ git_commit_base() {
   git -C "$1" -c user.email=bench@localhost -c user.name=bench commit -qm "base"
 }
 
+# Copies ISSUE.md into a fresh temp dir that holds nothing else, so the
+# path handed to an adapter never sits beside hidden/ or
+# reference.patch. Prints the temp dir path; the caller removes it.
+prepare_issue_copy() {
+  local task_dir=$1 idir
+  idir=$(mktemp -d -t benchissue)
+  cp "$task_dir/ISSUE.md" "$idir/ISSUE.md"
+  echo "$idir"
+}
+
+# Runs bench/agents/probe.sh through the same plumbing a real adapter
+# gets. Fails when the environment or the handed-over paths leak the
+# held-out tests or the reference fix.
+leak_check() {
+  local probe="$BENCH_DIR/agents/probe.sh"
+  if [ ! -x "$probe" ]; then
+    echo "leak check: probe adapter missing: $probe" >&2
+    return 1
+  fi
+  set -- $TASK_LIST
+  local task=$1
+  local task_dir="$ISSUES_DIR/$task"
+  local tmp idir log rc
+  tmp=$(mktemp -d -t benchleak)
+  cp -R "$task_dir/repo" "$tmp/repo"
+  git_commit_base "$tmp/repo"
+  idir=$(prepare_issue_copy "$task_dir")
+  log="$tmp/probe.log"
+  WATCH_MARKER="$log.timedout"
+  unset BENCH_REFERENCE_PATCH 2>/dev/null || true
+  run_with_timeout "$probe" "$idir/ISSUE.md" "$tmp/repo" >"$log" 2>&1
+  rc=$RC
+  rm -rf "$idir"
+  if [ "$rc" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ]; then
+    echo "leak check: clean"
+    rm -rf "$tmp"
+    return 0
+  fi
+  echo "leak check: FAILED"
+  sed 's/^/  /' "$log"
+  rm -rf "$tmp"
+  return 1
+}
+
 verify_fixtures() {
   local overall=0
   local task
+  leak_check || overall=1
   for task in $TASK_LIST; do
     local td="$ISSUES_DIR/$task"
     echo "task: $task"
@@ -188,6 +244,11 @@ median_p90() {
 
 build_task_list
 
+if [ "$LEAK_CHECK" -eq 1 ]; then
+  leak_check
+  exit $?
+fi
+
 if [ "$VERIFY" -eq 1 ]; then
   verify_fixtures
   exit $?
@@ -231,11 +292,18 @@ for task in $TASK_LIST; do
     log="$RESULTS_DIR/${task}.r${run}.log"
     check_log="$RESULTS_DIR/${task}.r${run}.check.log"
     WATCH_MARKER="$log.timedout"
-    export BENCH_TASK_DIR="$task_dir"
+    # Only the reference adapter may see a path into bench/issues/.
+    if [ "$(basename "$AGENT")" = "reference.sh" ]; then
+      export BENCH_REFERENCE_PATCH="$task_dir/reference.patch"
+    else
+      unset BENCH_REFERENCE_PATCH 2>/dev/null || true
+    fi
+    issue_dir=$(prepare_issue_copy "$task_dir")
 
     start=$(date +%s)
-    run_with_timeout "$AGENT" "$task_dir/ISSUE.md" "$work" >"$log" 2>&1
+    run_with_timeout "$AGENT" "$issue_dir/ISSUE.md" "$work" >"$log" 2>&1
     end=$(date +%s)
+    rm -rf "$issue_dir"
     wall=$((end - start))
     rc=$RC
     timed_out=$TIMED_OUT

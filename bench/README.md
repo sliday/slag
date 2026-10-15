@@ -47,19 +47,27 @@ An adapter is an executable invoked as:
 
     <adapter> <issue_file> <repo_dir>
 
-It gets `BENCH_TASK_DIR` in the environment (the task directory, where
-`reference.patch` lives). Anything the adapter prints goes to the run
-log. Bundled adapters: `noop.sh` (does nothing), `reference.sh`
-(applies the reference patch), `codex.sh`, `fx.sh`, `slag-fix.sh`
-(placeholder for the future `slag fix` command).
+`<issue_file>` is a copy of ISSUE.md in a temp dir of its own, so the
+path never sits beside `hidden/` or `reference.patch`. Adapters receive
+no environment variable pointing into `bench/issues/`, with one
+exception: when the adapter's basename is `reference.sh`, the runner
+sets `BENCH_REFERENCE_PATCH` to the task's patch. Anything the adapter
+prints goes to the run log. Bundled adapters: `noop.sh` (does nothing),
+`probe.sh` (leak check), `reference.sh` (applies the reference patch),
+`codex.sh`, `fx.sh`, `slag-fix.sh` (placeholder for the future
+`slag fix` command).
 
 ## Instrument checks
 
     bench/run.sh --verify-fixtures
+    bench/run.sh --leak-check
 
 Every task's hidden suite must fail on the untouched repo and pass
-after `reference.patch` is applied. Additionally, the noop adapter must
-score 0/8 and the reference adapter 8/8:
+after `reference.patch` is applied. The leak check runs the probe
+adapter through the normal plumbing; it fails if the environment or the
+handed-over paths mention `hidden`, `reference.patch`, or
+`bench/issues` (`--verify-fixtures` runs it too). Additionally, the
+noop adapter must score 0/8 and the reference adapter 8/8:
 
     bench/run.sh --agent bench/agents/noop.sh
     bench/run.sh --agent bench/agents/reference.sh
