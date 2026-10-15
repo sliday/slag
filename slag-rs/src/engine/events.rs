@@ -274,6 +274,13 @@ fn classify(name: &str, args: &str) -> (String, Option<String>) {
     (verb, arg)
 }
 
+/// An error that stops the whole run: a provider refusing the key, the
+/// account, or the request. It has one owner, the last line `main` prints,
+/// so the live views leave it out rather than say it twice.
+pub(crate) fn is_fatal_provider(message: &str) -> bool {
+    crate::error::SlagError::Provider(message.to_string()).is_deterministic_provider()
+}
+
 /// A judge's report (`VERDICT: pass … EVIDENCE: …`) as one readable
 /// clause: whether it passed, and the evidence or the gap that says why.
 /// `None` for a summary that is not a verdict.
@@ -658,6 +665,9 @@ impl RenderState {
                     let head = format!("  {} ", paint(PURE, "■"));
                     prints.extend(wrap_hanging(&head, summary, width, 4, 2));
                 }
+            }
+            EngineEvent::Error { message } if is_fatal_provider(message) => {
+                self.flush_streak(&mut prints);
             }
             EngineEvent::Error { message } => {
                 self.flush_streak(&mut prints);
@@ -1534,6 +1544,15 @@ mod tests {
         assert_eq!(finish_gist(cast).as_deref(), Some("mold cast · 2 ingots"));
         assert!(finish_gist("# BLUEPRINT\nbody").unwrap().starts_with("document drafted · 2 lines"));
         assert_eq!(finish_gist("Wrote the CLI and its tests."), None);
+    }
+
+    #[test]
+    fn a_fatal_provider_error_is_left_to_the_final_line() {
+        let mut state = RenderState::new(false);
+        let fatal = "provider error: invalid key (401): openai, role surveyor, model m. Set OPENAI_API_KEY";
+        assert!(printed(&state.feed(&EngineEvent::Error { message: fatal.into() })).is_empty());
+        let other = printed(&state.feed(&EngineEvent::Error { message: "edit failed".into() }));
+        assert!(other.iter().any(|l| l.contains("edit failed")), "{other:?}");
     }
 
     #[test]

@@ -104,6 +104,12 @@ pub struct Echo {
     goal_gap: Option<String>,
     goal_met: bool,
     assay_done: bool,
+    /// A provider refusal that stopped the run. No assay follows it: there
+    /// is no verdict to report on a run that could not call its model.
+    fatal: Option<String>,
+    /// Whether this echo prints that refusal itself. Live, `main` owns the
+    /// line; a replay has no `main` to print it, so the echo does.
+    owns_fatal: bool,
 }
 
 impl Echo {
@@ -128,7 +134,15 @@ impl Echo {
             goal_gap: None,
             goal_met: false,
             assay_done: false,
+            fatal: None,
+            owns_fatal: false,
         }
+    }
+
+    /// Print a run-stopping provider error at the end (replays).
+    pub fn owning_fatal(mut self, on: bool) -> Self {
+        self.owns_fatal = on;
+        self
     }
 
     pub fn set_width(&mut self, width: usize) {
@@ -211,6 +225,13 @@ impl Echo {
     pub fn finish(&mut self, at: Instant) -> Vec<String> {
         let mut out = Vec::new();
         self.flush_pending(&mut out);
+        if let Some(message) = self.fatal.clone() {
+            if self.owns_fatal {
+                out.push(String::new());
+                out.extend(wrap_labelled("✗", &message, self.width, 4).into_iter().map(|l| paint(WARM, &l)));
+            }
+            return out;
+        }
         if !self.assay_done && !self.plan.is_empty() {
             self.assay(at, &mut out);
         }
@@ -238,6 +259,9 @@ impl Echo {
                 out.extend(tui::banner_lines());
             }
             Mark::Header { text } => {
+                if self.fatal.is_some() {
+                    return;
+                }
                 self.phase = Phase::of(text);
                 self.header = Some(text.clone());
                 if text == "ASSAY" {
@@ -290,6 +314,13 @@ impl Echo {
                 if let Some(c) = usage.cost {
                     *self.cost.get_or_insert(0.0) += c;
                 }
+            }
+            EngineEvent::Error { message } if crate::engine::events::is_fatal_provider(message) => {
+                if self.fatal.is_none() {
+                    self.fatal = Some(message.clone());
+                }
+                // Nothing is running any more: the footer goes.
+                self.phase = Phase::Assay;
             }
             EngineEvent::Warning { message } => {
                 if let Some(gap) = warden_word(message) {
@@ -1004,6 +1035,25 @@ mod tests {
                 assert!(n <= width, "{n} > {width}: {:?}", strip(l));
             }
         }
+    }
+
+    #[test]
+    fn a_run_stopped_by_its_provider_gets_no_assay() {
+        let fatal = "provider error: invalid key (401): openai, role warden, model m. Set OPENAI_API_KEY";
+        let done = PLAN.replace(":status molten", ":status forged").replace(":status ore", ":status forged");
+        let t0 = Instant::now();
+        let mut live = Echo::new(80);
+        live.cue(&Cue::Plan(done.clone()), t0);
+        live.cue(&ev(EngineEvent::Error { message: fatal.into() }), t0);
+        let text = plain(&live.finish(t0));
+        assert!(!text.contains("FORGED") && !text.contains("provider error"), "{text}");
+        // A replay has no `main` to print the line, so it prints it once.
+        let mut replay = Echo::new(80).owning_fatal(true);
+        replay.cue(&Cue::Plan(done), t0);
+        replay.cue(&ev(EngineEvent::Error { message: fatal.into() }), t0);
+        let text = plain(&replay.finish(t0));
+        assert_eq!(text.matches("invalid key").count(), 1, "{text}");
+        assert!(!text.contains("FORGED"), "{text}");
     }
 
     #[test]

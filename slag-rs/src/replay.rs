@@ -108,7 +108,9 @@ async fn play_stream(tape: &Tape, opts: &Opts, stop: Option<u64>) {
         crate::tui::set_width(w as usize);
     }
     let instant = stop.is_some();
-    let mut view = Stream::new(tty, opts.size.map(|(w, _)| w as usize)).defer_footer(instant);
+    let mut view = Stream::new(tty, opts.size.map(|(w, _)| w as usize))
+        .defer_footer(instant)
+        .owning_fatal(true);
     let epoch = Instant::now();
     let mut last_t = 0u64;
     for timed in &tape.cues {
