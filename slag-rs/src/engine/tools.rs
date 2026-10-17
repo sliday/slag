@@ -1545,16 +1545,17 @@ impl ToolBox {
                 let path = entry.path();
                 let name = entry.file_name();
                 let child = relative.join(&name);
+                let hidden_heap = name == ".git" || name.to_string_lossy().starts_with("slag-anvil-");
                 if path.is_dir() {
-                    let hidden_heap = (relative.as_os_str().is_empty() && name == "logs")
-                        || name == ".git"
-                        || name.to_string_lossy().starts_with("slag-anvil-");
-                    if !hidden_heap || explicit {
+                    let hidden_dir = (relative.as_os_str().is_empty() && name == "logs") || hidden_heap;
+                    if !hidden_dir || explicit {
                         stack.push((path, child));
                     }
                 } else if path.is_file()
+                    && !hidden_heap
                     && glob_matches(pattern, &child.to_string_lossy())
                     || path.is_file()
+                        && !hidden_heap
                         && !pattern.contains('/')
                         && child.file_name().is_some_and(|name| glob_matches(pattern, &name.to_string_lossy()))
                 {
