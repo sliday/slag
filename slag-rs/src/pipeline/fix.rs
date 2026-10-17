@@ -1109,7 +1109,10 @@ type Saved = (PathBuf, repo::Content, Option<std::fs::Permissions>);
 /// A file recreated from nothing gets its mode back too, or a new script
 /// would lose its executable bit on the way through. Every swap drops the
 /// file's Python bytecode: a same-size swap inside one second otherwise
-/// leaves a `.pyc` that runs the other version of the code.
+/// leaves a `.pyc` that runs the other version of the code. Every write
+/// also gets a `swap_mtime`, so no cache keyed on whole-second mtimes (one
+/// under `PYTHONPYCACHEPREFIX` included) can mistake one version for the
+/// other.
 fn restore(files: &[Saved]) {
     for (path, content, mode) in files {
         repo::purge_bytecode(path);
@@ -1119,6 +1122,9 @@ fn restore(files: &[Saved]) {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(path, bytes);
+                if let Ok(file) = std::fs::File::options().write(true).open(path) {
+                    let _ = file.set_modified(swap_mtime(path));
+                }
                 if let Some(mode) = mode {
                     let _ = std::fs::set_permissions(path, mode.clone());
                 }
@@ -1128,6 +1134,28 @@ fn restore(files: &[Saved]) {
             }
         }
     }
+}
+
+/// The mtime a swapped file gets: the clock, unless this file's previous
+/// swap already used this whole second, in which case the next whole
+/// second. Two versions of a file then never share an mtime second, the
+/// clock is never truncated (a build tool still sees the fix as newer than
+/// anything compiled from the old source), and a file runs at most a
+/// second ahead of the clock.
+fn swap_mtime(path: &std::path::Path) -> std::time::SystemTime {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static LAST: Mutex<BTreeMap<PathBuf, SystemTime>> = Mutex::new(BTreeMap::new());
+    let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = SystemTime::now();
+    let stamp = match last.get(path) {
+        Some(prev) if secs(now) <= secs(*prev) => {
+            UNIX_EPOCH + Duration::from_secs(secs(*prev) + 1)
+        }
+        _ => now,
+    };
+    last.insert(path.to_path_buf(), stamp);
+    stamp
 }
 
 /// Commit the verified fix on a new branch, and open a draft PR when asked.
@@ -1861,6 +1889,67 @@ mod tests {
             "the user's suite must pass right after FIXED: {}",
             String::from_utf8_lossy(&after.stderr)
         );
+    }
+
+    /// The critic's case as it happens, with nothing pinned: the
+    /// reproduction run compiles the old source (this check command writes
+    /// bytecode on purpose), the fix is swapped back at once, and the tree
+    /// slag hands over must pass `python3 -m unittest` like the commit.
+    #[tokio::test]
+    async fn the_handed_over_tree_passes_its_suite_right_after_the_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        std::fs::write(root.join("calc.py"), "def f(a, b):\n    return a + b\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "__pycache__/\n").unwrap();
+        sh(root, "git add -A && git commit -qm init");
+        let job = job_in(root);
+        let before = job.git.as_ref().unwrap().snapshot();
+        std::fs::write(root.join("calc.py"), "def f(a, b):\n    return a * b\n").unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("tests/test_calc.py"),
+            "import unittest\nfrom calc import f\n\nclass T(unittest.TestCase):\n    \
+             def test_multiplies(self):\n        self.assertEqual(f(2, 3), 6)\n",
+        )
+        .unwrap();
+        let changed = job.git.as_ref().unwrap().changed_since(&before);
+
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+        let started = std::time::SystemTime::now();
+        let writes_bytecode = "env -u PYTHONDONTWRITEBYTECODE python3 -m unittest discover -s tests";
+        let (repro, _) = reproduce(&job, &before, &changed, writes_bytecode, None, &rescuer).await;
+        assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
+
+        let secs = |t: std::time::SystemTime| {
+            t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        };
+        let restored = std::fs::metadata(root.join("calc.py")).unwrap().modified().unwrap();
+        assert!(secs(restored) > secs(started), "the fix's mtime second is past the old source's");
+        let suite = std::process::Command::new("bash")
+            .args(["-c", "env -u PYTHONDONTWRITEBYTECODE python3 -m unittest discover -s tests"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            suite.status.success(),
+            "the handed-over tree must pass like the commit: {}",
+            String::from_utf8_lossy(&suite.stderr)
+        );
+    }
+
+    #[test]
+    fn swap_mtimes_never_share_a_second() {
+        let secs = |t: std::time::SystemTime| {
+            t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        };
+        let path = std::path::Path::new("/nonexistent/slag/swap.py");
+        let (a, b, c) = (swap_mtime(path), swap_mtime(path), swap_mtime(path));
+        assert!(secs(a) < secs(b) && secs(b) < secs(c), "{a:?} {b:?} {c:?}");
+        let other = swap_mtime(std::path::Path::new("/nonexistent/slag/other.py"));
+        assert!(secs(other) <= secs(a) + 1, "another file does not inherit this one's drift");
     }
 
     #[test]
