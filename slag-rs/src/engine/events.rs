@@ -670,7 +670,7 @@ impl RenderState {
                 if let Some((pass, why)) = verdict_gist(summary) {
                     // The judge is a model: its reasons are its words, in
                     // quotes and dim, so they never read as slag's own check.
-                    let (word, color) = if pass { ("pass", PURE) } else { ("fail", WARM) };
+                    let (word, color) = if pass { ("pass", PURE) } else if crate::pipeline::warden::is_unverified_report(&why) { ("unverified", WARM) } else { ("fail", WARM) };
                     let head = format!("  {} {}  ", paint(color, "⚖"), paint(color, &format!("judge says {word}")));
                     prints.extend(
                         wrap_hanging(&head, &format!("“{why}”"), width, 4, 2)
@@ -975,7 +975,7 @@ fn warden_lines(message: &str, word: &str, width: usize) -> Vec<String> {
         paint(color, "warden"),
         dim(&format!("round {round}"))
     );
-    let body = if met { word.to_string() } else { format!("goal not met — {word}") };
+    let body = if met || crate::pipeline::warden::is_unverified_report(word) { word.to_string() } else { format!("goal not met — {word}") };
     wrap_hanging(&head, &body, width, 4, 3)
 }
 

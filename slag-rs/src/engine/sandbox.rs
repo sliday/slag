@@ -133,6 +133,7 @@ pub struct Sandbox {
     writable: Vec<PathBuf>,
     /// Git control paths inside the writable set that stay read-only.
     locked: Locked,
+    read_only: bool,
     /// Landlock ruleset, built once in the parent and applied in each
     /// child between fork and exec.
     #[cfg(target_os = "linux")]
@@ -174,6 +175,31 @@ pub fn protect_git_dir(git_dir: &Path) {
 impl Sandbox {
     pub fn off() -> Self {
         Self::with(Backend::None, Vec::new(), Locked::default())
+    }
+
+    /// Deny filesystem writes, independent of the configured forge sandbox.
+    pub fn read_only() -> std::io::Result<Self> {
+        let backend = backend();
+        if backend == Backend::None {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "read-only review requires a working OS sandbox; no unconfined fallback"));
+        }
+        let mut sandbox = Self::with(backend, Vec::new(), Locked::default());
+        sandbox.read_only = true;
+        #[cfg(target_os = "linux")]
+        if backend == Backend::Landlock {
+            sandbox.ruleset = landlock::read_only_ruleset(&sandbox.writable);
+            if sandbox.ruleset.is_none() {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                    "read-only review requires Landlock ABI 3 or a working bubblewrap"));
+            }
+            sandbox.backend = Backend::Landlock;
+        }
+        if sandbox.backend == Backend::None {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "the OS refused the read-only review sandbox"));
+        }
+        Ok(sandbox)
     }
 
     /// The sandbox config asks for: `--no-sandbox`, `SLAG_SANDBOX`, then
@@ -229,6 +255,7 @@ impl Sandbox {
             backend,
             writable,
             locked,
+            read_only: false,
             #[cfg(target_os = "linux")]
             ruleset,
         }
@@ -302,7 +329,8 @@ impl Sandbox {
     /// `/dev/shm`), then each existing writable path bound read-write over
     /// it. bwrap refuses to bind a missing source, so absent caches drop.
     fn bwrap_args(&self) -> Vec<OsString> {
-        let mut args: Vec<OsString> = ["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev"]
+        let device_bind = if self.read_only { "--ro-bind" } else { "--dev-bind" };
+        let mut args: Vec<OsString> = ["--ro-bind", "/", "/", device_bind, "/dev", "/dev"]
             .into_iter()
             .map(OsString::from)
             .collect();
@@ -789,6 +817,15 @@ mod landlock {
     /// A ruleset that handles every write right this kernel knows and
     /// grants them beneath each existing writable path and `/dev`.
     pub fn ruleset(writable: &[PathBuf]) -> Option<OwnedFd> {
+        ruleset_with_devices(writable, &[PathBuf::from("/dev")])
+    }
+
+    pub fn read_only_ruleset(writable: &[PathBuf]) -> Option<OwnedFd> {
+        if abi()? < 3 { return None; }
+        ruleset_with_devices(writable, &[PathBuf::from("/dev/null"), PathBuf::from("/dev/zero")])
+    }
+
+    fn ruleset_with_devices(writable: &[PathBuf], devices: &[PathBuf]) -> Option<OwnedFd> {
         let abi = abi()?;
         let mut handled = WRITE_FILE
             | REMOVE_DIR
@@ -823,8 +860,7 @@ mod landlock {
         }
         // SAFETY: the kernel just returned this fd and nothing else owns it.
         let ruleset = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-        let dev = PathBuf::from("/dev");
-        for path in writable.iter().chain(std::iter::once(&dev)) {
+        for path in writable.iter().chain(devices) {
             let Ok(file) = open_path(path) else { continue };
             let is_dir = file.metadata().is_ok_and(|m| m.is_dir());
             // Directory rights on a file rule are EINVAL.
@@ -1011,6 +1047,44 @@ mod tests {
             writable.iter().map(PathBuf::from).collect(),
             Locked::default(),
         )
+    }
+
+    #[test]
+    fn readonly_profiles_have_no_writable_filesystem_trees() {
+        let mut sb = sandbox(Backend::Seatbelt, &[]);
+        sb.read_only = true;
+        let args = sb.seatbelt_args();
+        assert!(!args.iter().any(|arg| arg.to_string_lossy().starts_with("W0=")));
+        assert!(!args[1].to_string_lossy().contains("subpath"));
+        let args = sb.bwrap_args();
+        assert!(!args.iter().any(|arg| arg == "--bind" || arg == "--dev-bind"));
+    }
+
+    #[tokio::test]
+    async fn readonly_sandbox_blocks_workspace_and_machine_writes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let sb = match Sandbox::read_only() {
+            Ok(sb) => sb,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+                assert!(error.to_string().contains("read-only review requires"));
+                return;
+            }
+        };
+        std::fs::write(workspace.path().join("artifact.py"), "VALUE = 42\n").unwrap();
+        let check = sb.wrap("python3").args(["-B", "-c", "import artifact; assert artifact.VALUE == 42"])
+            .current_dir(workspace.path()).output().await.unwrap();
+        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+        for path in [workspace.path().join("artifact.py"), machine.path().join("marker")] {
+            let output = sb.wrap("python3").args([
+                "-B", "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('changed')",
+            ]).arg(&path).current_dir(workspace.path()).output().await.unwrap();
+            assert!(!output.status.success(), "write succeeded at {}", path.display());
+        }
+        assert_eq!(std::fs::read_to_string(workspace.path().join("artifact.py")).unwrap(), "VALUE = 42\n");
+        assert!(!machine.path().join("marker").exists());
+        assert!(!workspace.path().join("__pycache__").exists());
     }
 
     #[test]

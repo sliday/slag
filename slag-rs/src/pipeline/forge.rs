@@ -327,6 +327,13 @@ async fn run_inner(
                         restore_unfinished_batch(&batch).await?;
                         return Err(e);
                     }
+                    Ok((id, Err(e))) if unverified_review(&e) => {
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
+                        restore_unfinished_batch(&batch).await?;
+                        emit(&hooks.events, EngineEvent::Warning { message: format!("warden ingot {id}: {e}") });
+                        return Err(e);
+                    }
                     Ok((id, Err(_))) => {
                         let ingot = {
                             let _guard = CRUCIBLE_LOCK.lock().await;
@@ -428,6 +435,10 @@ async fn run_inner(
             set_back_to_ore(&ingot.id).await?;
             return struck;
         }
+        if struck.as_ref().is_err_and(unverified_review) {
+            set_back_to_ore(&ingot.id).await?;
+            return struck;
+        }
         if struck.is_ok() {
             let _guard = CRUCIBLE_LOCK.lock().await;
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
@@ -471,6 +482,10 @@ async fn run_inner(
             println!();
         }
     }
+}
+
+fn unverified_review(error: &SlagError) -> bool {
+    matches!(error, SlagError::SmithFailed(reason) if super::warden::is_unverified_report(reason))
 }
 
 async fn resmelt_unlocked(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError> {
@@ -1195,7 +1210,7 @@ async fn strike_ingot(
         let (ok, output) = (check.success, &check.output);
         log_to_file(
             &format!("ASSAY_{}_{current}", ingot.id),
-            &format!("exit={}\n{output}", if ok { 0 } else { 1 }),
+            &format!("command: {cmd}\nexit={}\n{output}", if ok { 0 } else { 1 }),
         );
         if !ok && cmd == ingot.proof.trim() && check.broken {
             return reject_broken_proof(ingot, current, &check, hooks).await;
@@ -1205,6 +1220,8 @@ async fn strike_ingot(
             // Verify proof if different from cmd
             if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
                 let check = check_verification(&ingot.proof).await;
+                log_to_file(&format!("ASSAY_{}_{current}_proof", ingot.id),
+                    &format!("command: {}\nexit={}\n{}", ingot.proof, if check.success { 0 } else { 1 }, check.output));
                 if !check.success {
                     if check.broken {
                         return reject_broken_proof(ingot, current, &check, hooks).await;
@@ -1235,6 +1252,10 @@ async fn strike_ingot(
                     ckpt.rewind();
                     unburn_heat(&ingot.id).await?;
                     return Err(e);
+                }
+                if verdict.is_unverified() {
+                    unburn_heat(&ingot.id).await?;
+                    return Err(SlagError::SmithFailed(verdict.gap));
                 }
                 if !verdict.fulfilled {
                     slag = Some(format!("Bar not met [{}]: {}", ingot.id, verdict.gap));
@@ -1315,13 +1336,14 @@ fn rewind_failed_heat(
 
 fn append_ledger(ingot: &Ingot, heat: u8) {
     let entry = format!(
-        "\n## {} [{}] gr:{} skill:{}\n- {}\n- heats:{}\n",
+        "\n## {} [{}] gr:{} skill:{}\n- {}\n- heats:{}\n- proof: {}\n",
         chrono::Local::now().format("%m-%d %H:%M"),
         ingot.id,
         ingot.grade,
         ingot.skill,
         ingot.work,
         heat,
+        ingot.proof,
     );
     let _ = std::fs::OpenOptions::new()
         .create(true)
