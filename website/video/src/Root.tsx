@@ -17,7 +17,7 @@ export const RemotionRoot: React.FC = () => (
   <Composition
     id="Hero"
     component={Hero}
-    durationInFrames={heroScript.duration * layout.fps}
+    durationInFrames={Math.round(heroScript.duration * layout.fps)}
     fps={layout.fps}
     width={layout.width}
     height={layout.height}

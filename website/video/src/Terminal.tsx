@@ -78,7 +78,9 @@ const Roll: React.FC<{seg: RollSeg; t: number; color: string}> = ({seg, t, color
   const i = rollIndex(seg, t);
   const word = seg.roll[i];
   const since = t - (seg.from + i * seg.every);
-  const p = seg.slide && i > 0 && since < 0.14 ? ease(clamp01(since / 0.14)) : 1;
+  // The word lands within 2 frames, so it never disagrees with the rows
+  // that swap under it.
+  const p = seg.slide && i > 0 && since < 0.07 ? ease(clamp01(since / 0.07)) : 1;
   if (p >= 1) return <span style={{color}}>{word}</span>;
   const prev = seg.roll[i - 1];
   const h = layout.lineHeight;
