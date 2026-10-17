@@ -967,19 +967,36 @@ async fn verify_and_seal(ingot: &Ingot, response: &str) -> Result<(), String> {
 }
 
 async fn run_verification(cmd: &str) -> (bool, String) {
+    let check = check_verification(cmd).await;
+    (check.success, check.output)
+}
+
+/// Run a CMD line or proof with the coordinator files protected, and keep
+/// the shell's own verdict on whether the command could run at all.
+async fn check_verification(cmd: &str) -> proof::ShellCheck {
+    let refused = |output: String| proof::ShellCheck {
+        success: false,
+        output,
+        broken: false,
+        reason: String::new(),
+    };
     if let Some(error) = crate::engine::agent::coordinator_command_error(cmd) {
-        return (false, error.to_string());
+        return refused(error.to_string());
     }
     let _guard = CRUCIBLE_LOCK.lock().await;
     let snapshot = match super::CoordinatorGuard::capture(Path::new(".")) {
         Ok(snapshot) => snapshot,
-        Err(e) => return (false, format!("cannot protect coordinator files: {e}")),
+        Err(e) => return refused(format!("cannot protect coordinator files: {e}")),
     };
-    let (ok, output) = proof::run_shell(cmd).await;
+    let check = proof::check_shell(cmd).await;
     match snapshot.restore() {
-        Ok(changed) if changed.is_empty() => (ok, output),
-        Ok(changed) => (false, format!("verification changed coordinator files: {}\n{output}", changed.join(", "))),
-        Err(e) => (false, format!("cannot restore coordinator files: {e}\n{output}")),
+        Ok(changed) if changed.is_empty() => check,
+        Ok(changed) => refused(format!(
+            "verification changed coordinator files: {}\n{}",
+            changed.join(", "),
+            check.output
+        )),
+        Err(e) => refused(format!("cannot restore coordinator files: {e}\n{}", check.output)),
     }
 }
 
@@ -1174,18 +1191,27 @@ async fn strike_ingot(
         }
 
         // Run CMD
-        let (ok, output) = run_verification(&cmd).await;
+        let check = check_verification(&cmd).await;
+        let (ok, output) = (check.success, &check.output);
         log_to_file(
             &format!("ASSAY_{}_{current}", ingot.id),
             &format!("exit={}\n{output}", if ok { 0 } else { 1 }),
         );
+        if !ok && cmd == ingot.proof.trim() && check.broken {
+            return reject_broken_proof(ingot, current, &check, hooks).await;
+        }
 
         if ok {
             // Verify proof if different from cmd
             if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
-                let (proof_ok, proof_output) = run_verification(&ingot.proof).await;
-                if !proof_ok {
-                    slag = Some(format!("Proof failed [{}]: {proof_output}", ingot.proof));
+                let check = check_verification(&ingot.proof).await;
+                if !check.success {
+                    if check.broken {
+                        return reject_broken_proof(ingot, current, &check, hooks).await;
+                    }
+                    log_to_file(&format!("PROOF_{}_{current}", ingot.id),
+                        &format!("exit=1\n{}\n{}", check.reason, check.output));
+                    slag = Some(format!("Proof failed [{}]: {}", ingot.proof, check.output));
                     if !quiet {
                         println!("{}✗{} impure", super::fg(tui::WARM), super::reset());
                     }
@@ -1193,6 +1219,8 @@ async fn strike_ingot(
                     continue;
                 }
             }
+
+            log_to_file(&format!("PROOF_{}_{current}", ingot.id), "exit=0\n");
 
             // The sub-goal gate. `proof` has only shown that something
             // appeared; the bar asks whether this ingot's goal was met, and
@@ -1237,6 +1265,25 @@ async fn strike_ingot(
     }
 
     Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max))
+}
+
+async fn reject_broken_proof(
+    ingot: &Ingot,
+    heat: u8,
+    check: &proof::ShellCheck,
+    hooks: &EngineHooks,
+) -> Result<(), SlagError> {
+    let reason = format!("broken proof [{}]: {}",
+        crate::engine::events::preview(&ingot.proof, 80),
+        crate::engine::events::preview(&check.reason, 160));
+    log_to_file(&format!("PROOF_{}_{heat}", ingot.id),
+        &format!("exit=1\n{}\n{}", check.reason, check.output));
+    emit(&hooks.events, EngineEvent::Warning { message: format!("[{}] {reason}", ingot.id) });
+    if !tui::is_quiet() {
+        println!("{}✗{} {reason}", super::fg(tui::WARM), super::reset());
+    }
+    unburn_heat(&ingot.id).await?;
+    Err(SlagError::ProofFailed { id: ingot.id.clone(), reason })
 }
 
 /// Item 68: a failed heat with retries left rewinds the workspace to the

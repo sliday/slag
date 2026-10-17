@@ -860,7 +860,11 @@ pub fn read_proof(
             Some((exit, out)) if exit.trim() != "exit=0" => {
                 Some(failure_gist(out).unwrap_or_else(|| "the proof exited non-zero".to_string()))
             }
-            Some(_) => Some("the smith's check passed; the ingot's proof or bar did not".to_string()),
+            Some(_) => newest_log(logs, &format!("_PROOF_{id}_{heat}.log"), since)
+                .and_then(|proof| proof.strip_prefix("exit=1\n")
+                    .and_then(|out| out.lines().find(|l| !l.trim().is_empty()))
+                    .map(|line| crate::engine::events::preview(line, 120)))
+                .or_else(|| Some("the smith's check passed; the ingot's proof or bar did not".to_string())),
             None => Some("the proof never ran".to_string()),
         }
     };
@@ -1031,6 +1035,26 @@ mod tests {
         // A pass carries its command and no reason.
         let ok = read_proof(dir.path(), "i2", 1, true, since);
         assert_eq!((ok.cmd.as_deref(), ok.why), (Some("node --test"), None));
+    }
+
+    #[test]
+    fn a_failed_ingot_proof_names_the_shell_error_after_a_passing_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = std::time::SystemTime::now() - Duration::from_secs(5);
+        for (name, body) in [
+            ("STRIKE_i1_1", "CMD: true\n"),
+            ("ASSAY_i1_1", "exit=0\n"),
+            ("PROOF_i1_1", "exit=1\nbash: -c: line 1: syntax error near unexpected token `('\nsecond line\n"),
+        ] {
+            std::fs::write(dir.path().join(format!("20261017_100000_{name}.log")), body).unwrap();
+        }
+        let proof = read_proof(dir.path(), "i1", 1, false, since);
+        assert_eq!(proof.why.as_deref(), Some("bash: -c: line 1: syntax error near unexpected token `('"));
+        let other_heat = read_proof(dir.path(), "i1", 2, false, since);
+        assert!(!other_heat.why.unwrap().contains("syntax error"));
+        std::fs::write(dir.path().join("20261017_100001_PROOF_i1_1.log"), "exit=0\n").unwrap();
+        let rewritten = read_proof(dir.path(), "i1", 1, false, since);
+        assert!(!rewritten.why.unwrap().contains("syntax error"));
     }
 
     #[test]

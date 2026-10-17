@@ -112,15 +112,14 @@ fn parse_fields(s: &str) -> Vec<(String, String)> {
         // Read value (quoted or unquoted)
         let value = if chars[i] == '"' {
             i += 1; // skip opening quote
-            let val_start = i;
+            let mut val = String::new();
             while i < len && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < len {
-                    i += 2; // skip escaped char
-                } else {
+                if chars[i] == '\\' && i + 1 < len && matches!(chars[i + 1], '"' | '\\') {
                     i += 1;
                 }
+                val.push(chars[i]);
+                i += 1;
             }
-            let val: String = chars[val_start..i].iter().collect();
             if i < len {
                 i += 1; // skip closing quote
             }
@@ -139,23 +138,81 @@ fn parse_fields(s: &str) -> Vec<(String, String)> {
     fields
 }
 
-/// Parse all ingot lines from a crucible file's content.
-pub fn parse_crucible(content: &str) -> Vec<Ingot> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("(ingot ") {
-                parse_ingot(trimmed)
-            } else {
-                None
+/// Split headers and ingot records without splitting quoted newlines.
+pub(crate) fn crucible_records(content: &str) -> Vec<(usize, &str)> {
+    let mut records = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+    let mut start_line = 1;
+    let mut quoted = false;
+    let mut ingot = false;
+    for (line_index, line) in content.split_inclusive('\n').enumerate() {
+        if start == offset {
+            start_line = line_index + 1;
+            ingot = line.trim_start().starts_with("(ingot ");
+        }
+        if ingot {
+            let mut chars = line.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if quoted && ch == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
+                    chars.next();
+                } else if ch == '"' {
+                    quoted = !quoted;
+                }
             }
-        })
+        }
+        offset += line.len();
+        if !quoted {
+            let record = content[start..offset]
+                .strip_suffix('\n')
+                .unwrap_or(&content[start..offset]);
+            let record = record.strip_suffix('\r').unwrap_or(record);
+            records.push((start_line, record));
+            start = offset;
+        }
+    }
+    if start < content.len() {
+        records.push((start_line, &content[start..]));
+    }
+    records
+}
+
+/// Parse all ingot records from a crucible file's content.
+pub fn parse_crucible(content: &str) -> Vec<Ingot> {
+    crucible_records(content)
+        .into_iter()
+        .filter_map(|(_, record)| parse_ingot(record))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn quoted_values_decode_only_quotes_and_backslashes() {
+        let line = r#"(ingot :id "i1" :proof "python3 -c \"import hello; print('ok')\"; grep 'a\.b\|c' file; printf '%s\n' \"$HOME\"; echo \\")"#;
+        let ingot = parse_ingot(line).unwrap();
+        assert_eq!(
+            ingot.proof,
+            r#"python3 -c "import hello; print('ok')"; grep 'a\.b\|c' file; printf '%s\n' "$HOME"; echo \"#,
+        );
+    }
+
+    #[test]
+    fn multiline_records_keep_headers_and_line_numbers() {
+        let content = ";; header\n(ingot :id \"i1\" :proof \"printf 'one\ntwo'\")\n;; footer\n(ingot :id \"i2\" :proof \"true\")\n";
+        let records = crucible_records(content);
+        assert_eq!(
+            records.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
+            vec![1, 2, 4, 5]
+        );
+        assert_eq!(records[0].1, ";; header");
+        assert_eq!(records[2].1, ";; footer");
+        let ingots = parse_crucible(content);
+        assert_eq!(ingots.len(), 2);
+        assert_eq!(ingots[0].proof, "printf 'one\ntwo'");
+        assert_eq!(ingots[1].id, "i2");
+    }
 
     #[test]
     fn a_bar_is_parsed_and_kept_out_of_extra() {

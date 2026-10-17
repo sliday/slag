@@ -1,11 +1,15 @@
 use super::Ingot;
 
+fn escape_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Serialize an Ingot back to its s-expression string representation.
 pub fn write_ingot(ingot: &Ingot) -> String {
     let solo = if ingot.solo { "t" } else { "nil" };
     let mut s = format!(
         "(ingot :id \"{}\" :status {} :solo {} :grade {} :skill {} :heat {} :max {} :smelt {} :proof \"{}\" :work \"{}\"",
-        ingot.id,
+        escape_quoted(&ingot.id),
         ingot.status,
         solo,
         ingot.grade,
@@ -13,14 +17,14 @@ pub fn write_ingot(ingot: &Ingot) -> String {
         ingot.heat,
         ingot.max,
         ingot.smelt,
-        ingot.proof,
-        ingot.work,
+        escape_quoted(&ingot.proof),
+        escape_quoted(&ingot.work),
     );
 
     // The sub-goal bar, when the plan carries one. Optional so a crucible
     // written before the field round-trips byte-for-byte.
     if !ingot.bar.is_empty() {
-        s.push_str(&format!(" :bar \"{}\"", ingot.bar));
+        s.push_str(&format!(" :bar \"{}\"", escape_quoted(&ingot.bar)));
     }
 
     // Optional duel override: absent stays absent (Auto policy).
@@ -35,9 +39,13 @@ pub fn write_ingot(ingot: &Ingot) -> String {
 
     // Append unknown extra fields for forward compatibility
     for (key, value) in &ingot.extra {
-        // If value looks like it needs quoting (contains spaces), quote it
-        if value.contains(' ') || value.contains('"') {
-            s.push_str(&format!(" :{key} \"{value}\""));
+        // Quote values that cannot remain a single unquoted token.
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '"' | ')' | '\\'))
+        {
+            s.push_str(&format!(" :{key} \"{}\"", escape_quoted(value)));
         } else {
             s.push_str(&format!(" :{key} {value}"));
         }
@@ -65,6 +73,45 @@ mod tests {
 
     use super::*;
     use crate::sexp::{Skill, Status};
+
+    #[test]
+    fn quoted_strings_round_trip() {
+        use crate::sexp::parser::{parse_crucible, parse_ingot};
+        let mut values = vec![String::new()];
+        for _ in 0..3 {
+            let previous = values.clone();
+            for value in previous {
+                for ch in ['a', '"', '\\', '\n', '\r', '\t', '$', ')', 'λ'] {
+                    values.push(format!("{value}{ch}"));
+                }
+            }
+        }
+        values.extend([
+            r#"python3 -c "import hello; print(hello.main())""#.into(),
+            r#"grep 'a\.b\|c' file && printf '%s\n' "$HOME""#.into(),
+            "printf 'first\nsecond'\ntrue".into(),
+            r#"python3 -c "print('nested \\"quote\\"')""#.into(),
+        ]);
+        for value in values {
+            let mut ingot = parse_ingot(r#"(ingot :id "i1" :proof "true")"#).unwrap();
+            ingot.id = value.clone();
+            ingot.proof = value.clone();
+            ingot.work = value.clone();
+            ingot.bar = value.clone();
+            ingot.extra = vec![("custom".into(), value.clone())];
+            let written = write_ingot(&ingot);
+            for parsed in [
+                parse_ingot(&written).unwrap(),
+                parse_crucible(&written).remove(0),
+            ] {
+                assert_eq!(parsed.id, value, "{written:?}");
+                assert_eq!(parsed.proof, value, "{written:?}");
+                assert_eq!(parsed.work, value, "{written:?}");
+                assert_eq!(parsed.bar, value, "{written:?}");
+                assert_eq!(parsed.extra, ingot.extra, "{written:?}");
+            }
+        }
+    }
 
     #[test]
     fn write_basic_ingot() {
