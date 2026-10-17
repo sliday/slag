@@ -6,6 +6,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::collections::HashSet;
+#[cfg(not(test))]
+use std::collections::HashMap;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -40,6 +45,9 @@ const HEARTBEAT_SLICE: Duration = Duration::from_secs(30);
 /// retry waits at least this long, so `unattended_waited` strictly grows
 /// and the cumulative 6h ceiling always terminates the loop.
 const UNATTENDED_MIN_DELAY: Duration = Duration::from_secs(1);
+
+#[cfg(not(test))]
+static MODEL_INDEX_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, std::sync::Arc<ModelsIndex>>>> = OnceLock::new();
 
 /// Retry budget: `SLAG_MAX_RETRIES` overrides the default. Three attempts
 /// over ~1.5s proved far too brittle for overnight forge runs now that
@@ -239,14 +247,25 @@ impl OpenRouter {
     /// A failed fetch still caches (empty windows, disk-cached prices), so
     /// an offline run does not re-fetch on every turn.
     async fn models_index(&self) -> std::sync::Arc<ModelsIndex> {
-        if self.provider != ProviderPreset::OpenRouter {
+        if !self.provider.has_models_endpoint() {
             return std::sync::Arc::new(ModelsIndex::default());
         }
         let mut slot = self.models.lock().await;
         if let Some(index) = slot.as_ref() {
             return index.clone();
         }
-        let body = fetch_models_body(&self.base_url).await;
+        #[cfg(not(test))]
+        let (mut process_cache, cache_key) = {
+            let cache = MODEL_INDEX_CACHE.get_or_init(Default::default);
+            let cache_key = format!("{:?}:{}", self.provider, self.base_url);
+            let process_cache = cache.lock().await;
+            if let Some(index) = process_cache.get(&cache_key) {
+                *slot = Some(index.clone());
+                return index.clone();
+            }
+            (process_cache, cache_key)
+        };
+        let body = fetch_models_body_for(&self.api_key, &self.base_url).await;
         let mut index = ModelsIndex::parse(body.as_deref());
         if index.prices.is_empty() {
             // No live prices: an offline run can still estimate from the
@@ -258,6 +277,8 @@ impl OpenRouter {
             crate::engine::pricing::store(&index.prices);
         }
         let index = std::sync::Arc::new(index);
+        #[cfg(not(test))]
+        process_cache.insert(cache_key, index.clone());
         *slot = Some(index.clone());
         index
     }
@@ -469,6 +490,18 @@ impl OpenRouter {
 
     async fn chat_direct(&self, req: ChatRequest) -> Result<NormalizedResponse, SlagError> {
         crate::config::validate_provider_url(self.provider, &self.base_url)?;
+        #[cfg(not(test))]
+        if self.provider.has_models_endpoint() {
+            let models = self.models_index().await;
+            if !models.ids.is_empty() && !models.contains(&req.model) {
+                return Err(SlagError::ProviderApi(ProviderApiError {
+                    status: Some(404),
+                    category: ProviderErrorCategory::InvalidRequest,
+                    retryable: false,
+                    excerpt: self.error_context(&req, ProviderErrorCategory::InvalidRequest, &format!("model {} not found", req.model)),
+                }));
+            }
+        }
         let mut body = self.build_body(&req);
         let mut shape_retries = 0usize;
         let url = format!("{}/chat/completions", self.base_url);
@@ -1136,14 +1169,21 @@ pub async fn fetch_context_length(base_url: &str, model: &str) -> Option<u64> {
 /// `None` on any failure; both the window cache and the price table treat
 /// that as "unknown", never as an error.
 pub async fn fetch_models_body(base_url: &str) -> Option<String> {
+    fetch_models_body_for("", base_url).await
+}
+
+async fn fetch_models_body_for(api_key: &str, base_url: &str) -> Option<String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
-    let resp = client
-        .get(&url)
+    let mut request = client.get(&url);
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let resp = request
         .header("HTTP-Referer", "https://slag.dev")
         .header("X-Title", "slag")
         .send()
@@ -1156,6 +1196,7 @@ pub async fn fetch_models_body(base_url: &str) -> Option<String> {
 /// Everything one `/models` fetch yields: context windows and prices.
 #[derive(Debug, Default)]
 struct ModelsIndex {
+    ids: HashSet<String>,
     windows: std::collections::HashMap<String, u64>,
     prices: crate::engine::pricing::PricingTable,
 }
@@ -1165,6 +1206,11 @@ impl ModelsIndex {
         let Some(body) = body else {
             return Self::default();
         };
+        let models = serde_json::from_str::<ModelsResponse>(body).ok();
+        let ids = models
+            .as_ref()
+            .map(|m| m.data.iter().map(|e| e.id.clone()).collect())
+            .unwrap_or_default();
         let windows = serde_json::from_str::<ModelsResponse>(body)
             .map(|m| {
                 m.data
@@ -1174,6 +1220,7 @@ impl ModelsIndex {
             })
             .unwrap_or_default();
         Self {
+            ids,
             windows,
             prices: crate::engine::pricing::parse_table(body),
         }
@@ -1188,6 +1235,10 @@ impl ModelsIndex {
         }
         let bare = model.split(':').next().unwrap_or(model);
         self.windows.get(bare).copied()
+    }
+
+    fn contains(&self, model: &str) -> bool {
+        self.ids.contains(model) || self.ids.contains(model.split(':').next().unwrap_or(model))
     }
 }
 
@@ -1538,6 +1589,13 @@ mod tests {
             role: crate::engine::Role::Smith,
             retry: RetryPolicy::full(),
         }
+    }
+
+    #[test]
+    fn model_index_rejects_unknown_model_ids() {
+        let index = ModelsIndex::parse(Some(r#"{"data":[{"id":"known-model"}]}"#));
+        assert!(index.contains("known-model"));
+        assert!(!index.contains("unknown-model"));
     }
 
     #[test]

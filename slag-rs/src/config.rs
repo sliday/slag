@@ -202,6 +202,10 @@ impl ProviderPreset {
         }
     }
 
+    pub fn has_models_endpoint(self) -> bool {
+        !matches!(self, Self::Anthropic | Self::Custom)
+    }
+
     pub fn key_env(self) -> Option<&'static str> {
         match self {
             Self::OpenRouter => Some("OPENROUTER_API_KEY"),
