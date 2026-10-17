@@ -1,0 +1,29 @@
+Committed `dbf17f5` on `gauntlet/efficiency`. Worktree clean. No push. The lead’s `fix.rs` change remains intact.
+
+Warden sessions now use read-only tools and OS confinement. A mutation attempt stops review as unverified. Resume casts saved gaps before artifact review.
+
+| Live run | Tokens | Seconds | Verdict |
+|---|---:|---:|---|
+| wc, final build | 9,457 | 8.124 | FORGED |
+| CSV, final build | 11,781 | 10.550 | FORGED |
+| PEP 668 resume | 73,708 | 33.559 | Repair ingot forged; artifact rejected |
+
+Both final artifacts pass bare `python3 -m unittest`, three tests each.
+
+**The live PEP repair remains incomplete.** Final replays exposed generated-proof and package-path errors. The coordinator reported failure or unverified; it did not declare success.
+
+Total estimated live spend: **$0.349**, including 19 attempts.
+
+Verification:
+
+- `CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test`: exit **0**, 1,053 passed, one ignored.
+- Real OS confinement tests: four passed.
+- Key regressions: `temper_resume_forges_the_prior_gap_before_the_next_artifact_review`, `forbidden_warden_mutations_cannot_produce_an_accepted_pass`, and `unreadable_artifact_verdict_reports_an_unverified_goal`.
+
+Changed files: `engine/{agent,events,sandbox}.rs`, `flux.rs`, `pipeline/{forge,mod,warden}.rs`, `render/echo.rs`, `smith/native.rs`, `tests/commission_efficiency.rs`, and two evidence reports.
+
+[Full results, phase tables, test names, commands, and limitations](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/warden-round2-results.md)
+
+ASK: Confine wardens, repair resume scheduling, label unreadable verdicts, and verify live.
+🟩Got 🟩Had 🟨Did — Final live PEP repair remains incomplete.
+🧠 High

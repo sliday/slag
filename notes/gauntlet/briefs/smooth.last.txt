@@ -1,0 +1,20 @@
+Completed all eight items. Working tree is clean. No push or version bump.
+
+- 1. `bd5b9cb` removed unused code and fixed clippy warnings. Verified `cargo build`, release build, and clippy.
+- 2. `c29bf32` isolated shutdown tests with private registries. Verified shutdown tests.
+- 3. `b0d5ccb`, `483fad0`, `50690a7` added built-in glob walking and heap exclusions. Verified glob and forge tests.
+- 4. `1611e9b` replaced the forge sleep race with an event marker. Full tests passed under 16 `yes` processes.
+- 5. `73a7673` changed the fix banner to `reproduce → fix → prove → commit`.
+- 6. `0b31399` updated README and CLAUDE.md with adaptive duel behavior.
+- 7. `f8c433b`, `f1ec339` added cached provider model pre-flight checks. Verified with mock provider tests.
+- 8. `0c9dc56` fixed the `"a openai host"` grammar error.
+
+Final proof:
+
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test` passed 1,027 unit tests and all integration tests.
+
+`cargo build`, `cargo build --release`, and `cargo clippy --all-targets -- -D warnings` passed.
+
+ASK: Complete and verify all production smoothing cleanups in the slag worktree.
+🟩Got 🟩Had 🟩Did — all items committed and verified
+🧠 —

@@ -192,7 +192,60 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Same resume: "warden returned no readable verdict" on the blueprint; `--temper 2` did not forge the gap although the done screen's `next` row promised it.
 - Queued as efficiency r2 (owns warden.rs and smith tools): warden strictly read-only (no edit/write tools; shell under a read-only sandbox profile), resume honors the gap.
 
-## Integration checklist (smoothing)
+### TUI r3 and sandbox r3 merged
+- TUI r3 (d3a2424): `tui::clip` kept escapes whole (root cause of the orphan `[..m`); a test paints every done screen at 80 and 160 columns and rejects orphan sequences; header "run …" vs footer "turn …"; judge prose quoted; crucible titles 16-20 chars at 80 columns. Critic tui-r3 (fresh, blind, $0.10 cap) running.
+- Sandbox r3 (76f61a9): all 27 slag git calls through `sandbox::git()` with `core.hooksPath=/dev/null`, `core.fsmonitor=false`; `.git` config/hooks/commondir read-only for model commands (Seatbelt, bwrap); Landlock fingerprints command-bearing git config and refuses slag's own git if it changes; caches data-only + `$TMPDIR`. Critic sandbox-r2 (fresh) running.
+- Integration: 978 unit tests green.
+
+### sandbox, critic r2 (Fable, fresh): WINNER bar (one new escape)
+- Closed (verified): `.git/hooks` plant, `~/.cargo/bin`, `~/.cargo/config.toml`, `~/.rustup`, `~/Library/Caches`, all of `/private/var/folders`. Builds pass under sandbox-exec (cargo --offline, npm, python). 978 tests green.
+- ESCAPED: `slag fix` test detection runs `python -c "import pytest"` unsandboxed in the workspace (`fix/repo.rs:114-122`, from `detect_test` at `fix.rs:295`). A planted `pytest.py` or `.venv/bin/python` runs outside the sandbox on the next `slag fix`. Reproduced twice.
+- Sent as sandbox r4 with an audit of every process spawn in `slag-rs/src`.
+
+### fix r2 merged; Cerebras out of credit
+- Fix r2 (63908b4): prompt asks for the issue's own inputs and expected results, through public behavior, in the module's test file; a gate sends a weak test back once (no test, passes with the fix reverted, or a tool-free judge review with a 10 s cap). Reviewer caught 4/4 planted cases. Cerebras smoke: median 7.5 s before, 10.2 s after; hidden 40/40.
+- Cerebras returned 402 (credits exhausted) at the end of the builder's runs. Owner action needed to measure the fastest path again.
+- Lead change `e95c34c`: Cerebras `qwen-3*` models now get `reasoning_effort` (builder measured a short review at 1-2 s with effort low vs 15-27 s without). 984 tests green.
+- Critic fix-r2 (fresh) running on openai and mistral, blind diff votes vs codex.
+
+### provider, critic r4 (Fable, fresh): WINNER ours
+- b: 5/6 FORGED: cerebras 8 s, mistral 12 s, openai 23 s, openrouter 86 s, groq 406 s (429 throttle loop, forged anyway, $0.0078). Gemini failed on a provider-independent parser bug (below).
+- c: CONNECT proxy saw only the active provider's host; `SLAG_OPENROUTER_BASE` leak host never contacted; foreign `SLAG_BASE_URL` refused in 1.9 s before auth. d: mixed roles forged in 23 s, $0.036.
+- e: bad key 2.7 s, xAI no credits 2.5 s, lmstudio 3.6 s, bad model 12.2 s (after a $0.03 survey+found: no pre-flight). f: `slag fix` on cerebras 4 s and groq 8 s.
+- g: every spend estimate matches pricing.rs x published rates (cerebras, openai, gemini, mistral, groq); unpriced model prints token counts.
+- Competitor: slag 2 steps to a fast run and 2.7 s to a named bad-key error; aider 4 steps; opencode ~6.
+- BIGGEST_GAP (outside provider): `sexp/parser.rs:116-123` keeps backslashes in quoted values; a `:proof` with `\"` reaches bash verbatim, 5 heats + re-smelt, $0.59. Sent to loop lane r3 (codex), with broken-proof classification and a truthful operator line.
+- Second tier: stale `.pyc` in the handed-over tree after `slag fix` (fix r3); `--model` typo costs a survey+found pass before the 404.
+
+### video r4 merged
+- Captions hold ≥ 1.6 s (fix 1.65-2.85 s, providers 3.1-4.3 s, forge 1.7-2.8 s); provider roll 4 presets at 0.6 s; fix beat re-recorded on the new done screen; forge beat a real `--temper 1` run where the warden rejects the goal (PEP 668). webm 1,526,518 B, mp4 3,253,062 B, 29.2 s, seam RMSE 0.
+- Builder found: an unreadable warden verdict prints as "the warden rejected the result" (queue with the warden integrity work).
+
+### efficiency r1, sandbox r4, fix r3 merged
+- Efficiency r1 (9fbfa30), live on cerebras before its last retry fixes: wc commission 2,276,015 → **25,978 tokens**, 476 s → **6.5 s** (FORGED, warden pass, 6 tests); 4-file CSV utility 69,162 tokens, 20.3 s (FORGED, 11 tests); $0.10 for both. Cut: plan negotiations and duplicate reviews for small utilities; bounded replay and warden turns; coordinator state protected; commits after bookkeeping. Final build not re-run live (Cerebras 402).
+- Integration conflict: efficiency's warden evidence rule turned `slag fix`'s tool-free review pass into a gap; lead fix `a65289e` in `review_gap`. 1008 tests green.
+- Sandbox r4 (e30751e): `imports()` probe runs sandboxed (`Sandbox::wrap_std`); spawn audit table in the builder's report (workspace-controlled → sandboxed; slag git → hardened helper; `gh` → git guard env; fixed binaries fine; hooks/screenshot/MCP user-written, documented).
+- Fix r3 (53fe3c4): every reproduce swap purges that file's `.pyc`; slag's own runs set `PYTHONDONTWRITEBYTECODE=1`; regression test with the exact same-size, same-second trap.
+- Efficiency r2 (codex) running: read-only warden, resume forges the gap, unreadable verdict labelled honestly, live re-verify on mistral/openai.
+
+### loop r3 and efficiency r2 merged
+- Loop r3: quoted strings round-trip through PLAN saves (1,004 string cases); a proof bash cannot parse goes to re-smelt once without burning heats; operator line names the proof and the shell error. Lead resolved a `forge.rs` conflict: `check_verification()` keeps efficiency's coordinator guard and adds loop's broken-proof check.
+- Efficiency r2 (dbf17f5): wardens get read-only tools plus OS confinement; a mutation attempt stops review as unverified; resume casts saved gaps before artifact review; unreadable verdict labelled unverified. Live final build: wc 9,457 tokens / 8.1 s FORGED; CSV 11,781 / 10.6 s FORGED; PEP 668 resume 73,708 / 33.6 s: repair ingot forged, artifact still rejected (honest, not fixed). Spend $0.35.
+- Integration: 1026 unit + 9 integration suites green, including `forbidden_warden_mutations_cannot_produce_an_accepted_pass`, `temper_resume_forges_the_prior_gap_before_the_next_artifact_review`, `unreadable_artifact_verdict_reports_an_unverified_goal`.
+- Critics running: commission-r1 (slag vs codex exec on 3 commissions, blind quality vote, judge integrity) and sandbox-r3 (incl. warden read-only mode).
+
+### sandbox, critic r3 (Fable, fresh): WINNER bar
+- Warden read-only mode clean: no write to workspace, /tmp, $TMPDIR or $HOME; pip leaves nothing; detached child blocked; `read_only()` refuses where no backend exists.
+- Still closed: `.git/hooks`, `.git/config`, fsmonitor, `mv .git`, `~/.cargo/bin`, `~/.rustup`, `~/.npm/_npx`, LaunchAgents, rc files, other users' temp dirs, launchctl, osascript.
+- ESCAPED: `~/.cargo/registry/src` writable; a sandboxed write to a cached crate's `lib.rs` ran later under an unsandboxed `cargo build --offline` + `cargo run`. Same shape for .m2, gradle, go/pkg/mod, pnpm/bun/yarn stores, global CARGO_TARGET_DIR/GOCACHE. Sent as sandbox r5 (checksum-verified download caches only).
+- Lead incident: the smoothing codex lane also wrote its duel-docs edit into the MAIN checkout (README.md, CLAUDE.md). Diff saved, files restored to HEAD; change preserved in lane commit 0b31399.
+
+### sandbox r5 and smoothing merged
+- Sandbox r5 (8c27a27): no package cache writable (builder showed cargo does not re-check a cached `.crate`); npm/pnpm/yarn/bun/pip/uv/GOCACHE redirected to `$TMPDIR/slag-cache-$USER`; outside `CARGO_TARGET_DIR` → `<root>/target`; unextracted crate fails with a note (cargo fetch outside slag, vendor, or `sandbox_writable`). Linux not re-run (Docker down).
+- Smoothing: all 8 items (warnings, shutdown isolation, glob without rg, forge timing race, fix banner, duel docs, model pre-flight, article bug).
+- Integration gate: **1029 unit tests + all integration suites green; `cargo build` 0 warnings (v2.9.0: 21); `cargo clippy --all-targets -- -D warnings` exit 0.**
+
+## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
 - `spend -` for providers without pricing; `--help` OpenRouter wording.
@@ -201,6 +254,7 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Linux without `rg`: `glob_matches_patterns_with_directory_components` fails (sandbox on or off). Glob needs a fallback or the test must skip.
 - ~~Cost: `spend -` for every non-OpenRouter provider~~ done in provider r5.
 - README duel sentence contradicts the CLI's duel line and the site.
+- A forge test timed out once under load average > 30 (sandbox builder, r3). Find and de-time it so CI under load cannot flake.
 
 ## Instrument notes
 
