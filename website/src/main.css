@@ -367,6 +367,21 @@ a:hover {
   transform: scale(1.25);
 }
 
+/* Hero video. width/height on the element plus aspect-ratio reserve the
+   16:9 box before the poster arrives, so nothing shifts. */
+.hero-video {
+  margin-top: 1.5lh;
+}
+
+.hero-video video {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  border-radius: 6px;
+  background: var(--background0);
+}
+
 /* Responsive */
 @media (min-width: 640px) {
   body {
@@ -384,6 +399,8 @@ a:hover {
 .forge-header {
   position: relative;
   overflow: visible;
+  padding: 3ch 4ch;
+  margin-bottom: 3lh;
   animation: forge-breathe 4s ease-in-out infinite;
 }
 
@@ -397,6 +414,26 @@ a:hover {
 
 /* Logo - no pre tag, no gray bg */
 .hero-logo { font-size: 2.5rem; text-align: center; line-height: 1.2; position: relative; z-index: 1; }
+
+@media (max-width: 639px) {
+  /* The video runs edge to edge: its smallest text is sized for the full
+     phone width. The logo shrinks to stay on one line. */
+  .forge-header {
+    padding: 2ch 1.5ch;
+  }
+
+  .hero-video {
+    margin-inline: calc(50% - 50vw);
+  }
+
+  .hero-video video {
+    border-radius: 0;
+  }
+
+  .hero-logo {
+    font-size: min(2.5rem, 6.2vw);
+  }
+}
 
 /* SVG glow */
 .forge-glow-svg { position: absolute; inset: -4px; width: calc(100% + 8px); height: calc(100% + 8px); }
@@ -437,8 +474,9 @@ a:hover {
 @keyframes spark-burst-down { 0% { opacity: 0; transform: translate(0,0) scale(0.3); } 2% { opacity: 1; transform: translate(0,2px) scale(1); } 20% { opacity: 0; transform: translate(-4px,15px) scale(0); } 100% { opacity: 0; } }
 @keyframes spark-burst-left { 0% { opacity: 0; transform: translate(0,0) scale(0.3); } 2% { opacity: 1; transform: translate(-2px,0) scale(1); } 20% { opacity: 0; transform: translate(-20px,-4px) scale(0); } 100% { opacity: 0; } }
 
-/* Forge strike glow pulse - subtle flash synced with spark burst */
-.forge-header { animation: forge-breathe 4s ease-in-out infinite, forge-strike-glow 3s ease-out infinite; }
+/* Forge strike glow pulse - subtle flash synced with spark burst. It lights
+   the fire and the logo, not the whole header, so the video never flickers. */
+.forge-effects, .hero-logo { animation: forge-strike-glow 3s ease-out infinite; }
 @keyframes forge-strike-glow { 0% { filter: brightness(1.12); } 8% { filter: brightness(1); } 100% { filter: brightness(1); } }
 
 /* Floating Embers */
@@ -456,9 +494,10 @@ a:hover {
 @keyframes heat-wave { 0%, 100% { opacity: 0.3; } 50% { opacity: 0.5; } }
 
 /* Hover boost - faster strikes */
-.forge-header:hover { animation: forge-breathe-intense 2s ease-in-out infinite, forge-strike-glow 1.5s ease-out infinite; }
+.forge-header:hover { animation: forge-breathe-intense 2s ease-in-out infinite; }
+.forge-header:hover .forge-effects, .forge-header:hover .hero-logo { animation-duration: 1.5s; }
 .forge-header:hover .spark { animation-duration: 1.5s; }
 @keyframes forge-breathe-intense { 0%, 100% { box-shadow: 0 0 15px rgba(255,152,64,0.4), 0 0 30px rgba(255,152,64,0.2); } 50% { box-shadow: 0 0 35px rgba(255,152,64,0.6), 0 0 70px rgba(255,152,64,0.3), 0 0 100px rgba(224,108,117,0.15); } }
 
 /* Reduced motion */
-@media (prefers-reduced-motion: reduce) { .forge-header, .forge-header::before { animation: none; } .spark, .ember { display: none; } .edge-glow { animation: none; opacity: 0.6; } }
+@media (prefers-reduced-motion: reduce) { .forge-header, .forge-header::before, .forge-effects, .hero-logo { animation: none; } .spark, .ember { display: none; } .edge-glow { animation: none; opacity: 0.6; } }
