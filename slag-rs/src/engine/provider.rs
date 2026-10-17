@@ -664,6 +664,9 @@ fn reasoning_effort(provider: ProviderPreset, model: &str, effort: super::Effort
             _ => effort.as_str(),
         }),
         ProviderPreset::Groq | ProviderPreset::Cerebras if model.contains("gpt-oss") => Some(effort.as_str()),
+        // Measured 2026-10-17: qwen-3.8-27b answers a short review in 1-2 s
+        // with effort low and 15-27 s without it.
+        ProviderPreset::Cerebras if model.starts_with("qwen-3") => Some(effort.as_str()),
         ProviderPreset::Xai if model.starts_with("grok-3-mini") => Some(match effort {
             super::Effort::Low => "low",
             _ => "high",
@@ -3211,6 +3214,7 @@ mod tests {
             (ProviderPreset::Groq, "llama-3.3-70b-versatile", None),
             (ProviderPreset::Cerebras, "gpt-oss-120b", Some("medium")),
             (ProviderPreset::Cerebras, "llama3.1-8b", None),
+            (ProviderPreset::Cerebras, "qwen-3.8-27b", Some("medium")),
             (ProviderPreset::Xai, "grok-3-mini", Some("high")),
             (ProviderPreset::Anthropic, "claude-sonnet-4-5", None),
         ] {
