@@ -91,11 +91,16 @@ fn pace(gap: u64, speed: f64) -> Duration {
 }
 
 /// How long to hold the last frame: `--hold` when given, otherwise until a
-/// key when stopped at a point, otherwise not at all.
+/// key when stopped at a point, otherwise not at all. Only a person at a
+/// terminal can end an open hold: a pipe, a script or a `--size` text
+/// frame exits at once instead of waiting a day.
 fn hold_for(opts: &Opts, stopped: bool) -> Option<Duration> {
+    let interactive = opts.size.is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
     match opts.hold {
         Some(secs) => Some(Duration::from_secs_f64(secs.max(0.0))),
-        None if stopped => Some(Duration::from_secs(24 * 3600)),
+        None if stopped && interactive => Some(Duration::from_secs(24 * 3600)),
         None => None,
     }
 }
