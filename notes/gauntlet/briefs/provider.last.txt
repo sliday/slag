@@ -1,57 +1,54 @@
-Committed on `gauntlet/provider`:
+Committed `a8f8efb` on `gauntlet/provider`. Worktree clean.
 
-- `7174847` provider retry fixes.
-- `eed67e6` provider-agnostic help text.
+Added 33 dated price entries, configuration overrides, cached-input discounts, and shared spend formatting. Unknown prices show token counts. Pricing makes no catalog request outside OpenRouter.
 
-Rate-limit signals now override billing words on 429. Body delays preserve fractions and cap at 60 seconds. Wiremock tests preserve xAI billing and OpenAI `insufficient_quota` classification.
+**991 tests passed; 1 ignored. Cargo exited 0.** Clippy exited 0 with warnings.
 
-**929 tests passed; 1 ignored.** Clippy completed with warnings. The worktree is clean.
+Both live fixes passed in one attempt:
 
-Live verification did **not** reach FORGED:
+| Provider | Input / output tokens | Spend line | Wall time |
+|---|---:|---|---:|
+| Cerebras | 14,639 / 519 | `spend ≈ $0.0153 est.` | 2.81 s |
+| OpenAI | 13,916 / 267 | `spend ≈ $0.0028 est.` | 6.27 s |
 
-| Attempt | Wall time | Result |
-|---|---:|---|
-| First | 650.01 s | Test timeout after repeated undeclared tool names |
-| Final | 124.42 s | One ingot forged, then Groq’s daily quota blocked completion |
+Prices checked **2026-10-15**, USD per million tokens:
 
-Groq reported **198,764 of 200,000 daily tokens used**. I stopped live calls.
+- [Cerebras Qwen 3.8 27B](https://www.cerebras.ai/pricing): **$0.99 input / $1.49 output**. Calculation: **$0.01526592**.
+- [OpenAI GPT-4.1 mini](https://developers.openai.com/api/docs/models/gpt-4.1-mini): **$0.40 input / $1.60 output / $0.10 cached input**. The uncached calculation is $0.0059936; cache discounts reduce the estimate to **$0.002768**.
 
-The final run printed:
+Combined estimate: **$0.0180**. `slag cost` and JSON status preserved both estimates.
 
-```text
-⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 20.0s.
-⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 1.0s.
-⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
-⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
-⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 25.0s.
-⚠ groq, role smith, model openai/gpt-oss-120b: rate limit (429); retry in 17.0s.
-```
-
-Reported tokens imply about **$0.015**, using [Groq’s published prices](https://console.groq.com/docs/model/openai/gpt-oss-120b). This estimate excludes unreported failed generations.
+The full table includes sources and dates in [pricing.rs](/Users/stas/Playground/slag/.claude/worktrees/lane-provider/slag-rs/src/engine/pricing.rs).
 
 Files changed:
 
-- `slag-rs/src/engine/provider.rs`
-- `slag-rs/src/cli.rs`
-- `slag-rs/tests/cli.rs`
+```text
+CLAUDE.md
+README.md
+slag-rs/src/cli.rs
+slag-rs/src/config.rs
+slag-rs/src/dashboard.rs
+slag-rs/src/engine/events.rs
+slag-rs/src/engine/mod.rs
+slag-rs/src/engine/pricing.rs
+slag-rs/src/engine/provider.rs
+slag-rs/src/pipeline/assay.rs
+slag-rs/src/pipeline/fix.rs
+slag-rs/src/render/echo.rs
+slag-rs/src/render/stream.rs
+```
 
 Verification commands:
 
 ```sh
-cd slag-rs
-CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test
-CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --all-targets
-cd ..
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test --manifest-path slag-rs/Cargo.toml
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --manifest-path slag-rs/Cargo.toml --all-targets
 git diff --check
+python3 /private/tmp/slag-round5-live.py
 ```
 
-Live command used scratch directories and the default Groq model:
+Existing assertions changed for estimate labels, unknown-token fallback, and four-decimal formatting.
 
-```sh
-slag --provider groq --anvils 1 --temper 0 \
-  "write hello.py that prints hello and a unittest for it"
-```
-
-ASK: Fix Groq throttles and help text, verify FORGED live, and commit.
-🟩Got 🟩Had 🟨Did — Live FORGED verification remains blocked by Groq’s daily quota.
-🧠 High
+ASK: Add honest provider pricing across spend displays, verify live, and commit.
+🟩Got 🟩Had 🟩Did
+🧠 —
