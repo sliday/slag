@@ -340,7 +340,7 @@ pub fn banner_lines() -> Vec<String> {
             unbold(),
             dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
         ),
-        format!("  {}", dim("survey → plan → forge → assay")),
+        format!("  {}", dim("reproduce → fix → prove → commit")),
     ]
 }
 
