@@ -23,41 +23,41 @@ use tokio::process::Command;
 
 use crate::config::SandboxMode;
 
-/// Writable under `$HOME`: the data-only caches build tools fill on a
-/// normal run. Nothing here is on PATH or read as config, so a write
-/// cannot plant a program: `~/.cargo/bin`, `~/.rustup`, the npx cache and
-/// global package bins stay read-only.
-const HOME_CACHES: &[&str] = &[
-    ".cargo/registry",
-    ".cargo/git",
-    ".npm/_cacache",
-    ".npm/_logs",
-    ".cache/pip",
-    ".cache/uv",
-    ".cache/go-build",
-    ".cache/yarn",
-    "Library/Caches/pip",
-    "Library/Caches/go-build",
-    "Library/Caches/Yarn",
-    "Library/pnpm/store",
-    ".local/share/pnpm/store",
-    ".pnpm-store",
-    ".bun/install/cache",
-    ".yarn/berry/cache",
-    ".gradle/caches",
-    ".m2/repository",
-    "go/pkg/mod",
+/// Writable under `$HOME`. Package caches are not: each one holds code a
+/// later build outside the sandbox runs (cargo extracts a cached `.crate`
+/// without checking it, an npm or pip cache serves the metadata that
+/// carries its own checksums, a Go build cache holds compiled objects).
+/// Only npm's log dir is here, so `npm` itself does not fail.
+const HOME_CACHES: &[&str] = &[".npm/_logs"];
+
+/// Caches a sandboxed command gets in a throwaway place instead: each
+/// variable points at `<temp>/slag-cache-<user>/<name>` unless it already names a
+/// writable path. A tool then fetches into a cache no outside build reads.
+/// Cargo has no such switch for its registry, so a crate that is not
+/// already extracted fails; the denial note says how to fetch it.
+const THROWAWAY_CACHES: &[(&str, &str)] = &[
+    ("npm_config_cache", "npm"),
+    ("npm_config_store_dir", "pnpm"),
+    ("YARN_CACHE_FOLDER", "yarn"),
+    ("BUN_INSTALL_CACHE_DIR", "bun"),
+    ("PIP_CACHE_DIR", "pip"),
+    ("UV_CACHE_DIR", "uv"),
+    ("GOCACHE", "go-build"),
 ];
 
-/// Env vars that move a cache or build output, and the data-only parts of
-/// what they name (`""` for all of it).
-const CACHE_ENV: &[(&str, &[&str])] = &[
-    ("CARGO_HOME", &["registry", "git"]),
-    ("CARGO_TARGET_DIR", &[""]),
-    ("GOPATH", &["pkg/mod"]),
-    ("GOCACHE", &[""]),
-    ("GOMODCACHE", &[""]),
-    ("XDG_CACHE_HOME", &["pip", "uv", "go-build", "yarn"]),
+/// Package caches whose refused writes get the fetch-outside advice.
+const PACKAGE_CACHES: &[&str] = &[
+    ".cargo/registry",
+    ".cargo/git",
+    ".npm",
+    ".m2",
+    ".gradle",
+    "go/pkg/mod",
+    "Library/Caches",
+    ".cache",
+    ".local/share/pnpm",
+    ".bun",
+    ".yarn",
 ];
 
 /// Files in a git dir that make git run a program, plus the pointer a
@@ -88,6 +88,10 @@ pub const GIT_GUARD_ENV: [(&str, &str); 5] = [
 /// How a named denial opens and what follows its path. `blocked_path`
 /// reads a note back with them, so the two stay in step.
 const BLOCKED_NOTE: &str = "[sandbox] write outside the workspace was blocked by slag's sandbox: ";
+const CACHE_TAIL: &str = ". slag keeps package caches read-only: a cached package could carry \
+     code into builds that run later outside the sandbox. Fetch dependencies outside slag first \
+     (`cargo fetch`, `go mod download`), vendor them into the workspace, or list the cache in \
+     `sandbox_writable` in slag's config.";
 const BLOCKED_TAIL: &str = ". Only the workspace, temp dirs and tool caches are writable; \
      write inside the workspace instead of retrying.";
 const GIT_NOTE: &str = "[sandbox] write to git's hooks or config was blocked by slag's sandbox: ";
@@ -133,6 +137,9 @@ pub struct Sandbox {
     writable: Vec<PathBuf>,
     /// Git control paths inside the writable set that stay read-only.
     locked: Locked,
+    /// Environment for sandboxed commands: `THROWAWAY_CACHES`, and a
+    /// `CARGO_TARGET_DIR` inside the root when the user's points outside.
+    env: Vec<(String, PathBuf)>,
     read_only: bool,
     /// Landlock ruleset, built once in the parent and applied in each
     /// child between fork and exec.
@@ -181,8 +188,10 @@ impl Sandbox {
     pub fn read_only() -> std::io::Result<Self> {
         let backend = backend();
         if backend == Backend::None {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-                "read-only review requires a working OS sandbox; no unconfined fallback"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "read-only review requires a working OS sandbox; no unconfined fallback",
+            ));
         }
         let mut sandbox = Self::with(backend, Vec::new(), Locked::default());
         sandbox.read_only = true;
@@ -190,14 +199,18 @@ impl Sandbox {
         if backend == Backend::Landlock {
             sandbox.ruleset = landlock::read_only_ruleset(&sandbox.writable);
             if sandbox.ruleset.is_none() {
-                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-                    "read-only review requires Landlock ABI 3 or a working bubblewrap"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "read-only review requires Landlock ABI 3 or a working bubblewrap",
+                ));
             }
             sandbox.backend = Backend::Landlock;
         }
         if sandbox.backend == Backend::None {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-                "the OS refused the read-only review sandbox"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the OS refused the read-only review sandbox",
+            ));
         }
         Ok(sandbox)
     }
@@ -219,20 +232,33 @@ impl Sandbox {
         let tmpdir = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let mut env_caches = Vec::new();
-        for (var, parts) in CACHE_ENV {
-            let Some(base) = std::env::var_os(var).filter(|v| !v.is_empty()) else {
-                continue;
-            };
-            env_caches.extend(parts.iter().map(|p| PathBuf::from(&base).join(p)));
-        }
-        let writable = writable_paths(root, extras, home.as_deref(), Some(&tmpdir), &env_caches);
+        let writable = writable_paths(root, extras, home.as_deref(), Some(&tmpdir), &[]);
         let private = PRIVATE_GIT_DIRS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let locked = locked_git_paths(root, &private);
-        Self::with(backend(), writable, locked)
+        let mut sandbox = Self::with(backend(), writable, locked);
+        let current = |var: &str| {
+            std::env::var_os(var)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        };
+        // Per user: a bare /tmp is shared, and another account's planted
+        // cache should not reach even a sandboxed build.
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+        let throwaway = tmpdir.join(format!("slag-cache-{user}"));
+        for (var, name) in THROWAWAY_CACHES {
+            if !current(var).is_some_and(|p| sandbox.allows(&p)) {
+                sandbox.env.push((var.to_string(), throwaway.join(name)));
+            }
+        }
+        if current("CARGO_TARGET_DIR").is_some_and(|p| !sandbox.allows(&p)) {
+            sandbox
+                .env
+                .push(("CARGO_TARGET_DIR".to_string(), root.join("target")));
+        }
+        sandbox
     }
 
     fn with(backend: Backend, writable: Vec<PathBuf>, locked: Locked) -> Self {
@@ -255,6 +281,7 @@ impl Sandbox {
             backend,
             writable,
             locked,
+            env: Vec::new(),
             read_only: false,
             #[cfg(target_os = "linux")]
             ruleset,
@@ -299,6 +326,7 @@ impl Sandbox {
         if let Some(ruleset) = &self.ruleset {
             landlock::confine(&mut cmd, std::os::fd::AsRawFd::as_raw_fd(ruleset));
         }
+        cmd.envs(self.env.iter().map(|(k, v)| (k, v)));
         cmd
     }
 
@@ -329,7 +357,11 @@ impl Sandbox {
     /// `/dev/shm`), then each existing writable path bound read-write over
     /// it. bwrap refuses to bind a missing source, so absent caches drop.
     fn bwrap_args(&self) -> Vec<OsString> {
-        let device_bind = if self.read_only { "--ro-bind" } else { "--dev-bind" };
+        let device_bind = if self.read_only {
+            "--ro-bind"
+        } else {
+            "--dev-bind"
+        };
         let mut args: Vec<OsString> = ["--ro-bind", "/", "/", device_bind, "/dev", "/dev"]
             .into_iter()
             .map(OsString::from)
@@ -369,7 +401,8 @@ impl Sandbox {
     pub fn denial_note(&self, output: &str, failed: bool) -> Option<String> {
         let markers = self.backend.markers();
         let mut unnamed = None;
-        for line in output.lines() {
+        let lines: Vec<&str> = output.lines().collect();
+        for (n, &line) in lines.iter().enumerate() {
             let lower = line.to_ascii_lowercase();
             let Some((at, marker)) = markers
                 .iter()
@@ -380,9 +413,20 @@ impl Sandbox {
             if reader_line(line) {
                 continue;
             }
-            match path_near(line, at) {
+            // Cargo names the path a few lines above the errno, in its
+            // "Caused by:" chain; look back that far.
+            let named = path_near(line, at).or_else(|| {
+                lines[n.saturating_sub(4)..n]
+                    .iter()
+                    .rev()
+                    .find_map(|prev| path_near(prev, prev.len()))
+            });
+            match named {
                 Some(path) if self.locked.covers(&self.absolute(&path)) => {
                     return Some(format!("{GIT_NOTE}{}{GIT_TAIL}", path.display()));
+                }
+                Some(path) if !self.allows(&path) && package_cache(&path) => {
+                    return Some(format!("{BLOCKED_NOTE}{}{CACHE_TAIL}", path.display()));
                 }
                 Some(path) if !self.allows(&path) => {
                     return Some(format!("{BLOCKED_NOTE}{}{BLOCKED_TAIL}", path.display()));
@@ -420,6 +464,20 @@ impl Sandbox {
             _ => resolve(path),
         }
     }
+}
+
+/// Whether `path` lies in a package cache under `$HOME` or a cache dir an
+/// environment variable names.
+fn package_cache(path: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let named = ["CARGO_HOME", "GOMODCACHE", "GOPATH", "XDG_CACHE_HOME"]
+        .iter()
+        .filter_map(|v| std::env::var_os(v).filter(|v| !v.is_empty()))
+        .map(PathBuf::from);
+    home.iter()
+        .flat_map(|h| PACKAGE_CACHES.iter().map(move |c| h.join(c)))
+        .chain(named)
+        .any(|c| path.starts_with(&c) || resolve(path).starts_with(&c))
 }
 
 /// Whether `path` (resolved) is one of `root`'s git control paths, which
@@ -460,12 +518,13 @@ pub fn git_async() -> Command {
 /// as a test run's status.
 pub fn blocked_path(output: &str) -> Option<&str> {
     output.lines().find_map(|line| {
-        [(BLOCKED_NOTE, BLOCKED_TAIL), (GIT_NOTE, GIT_TAIL)]
+        let rest = line
+            .strip_prefix(BLOCKED_NOTE)
+            .or_else(|| line.strip_prefix(GIT_NOTE))?;
+        [BLOCKED_TAIL, GIT_TAIL, CACHE_TAIL]
             .into_iter()
-            .find_map(|(note, tail)| {
-                let rest = line.strip_prefix(note)?;
-                Some(rest.split_once(tail).map_or(rest, |(path, _)| path))
-            })
+            .find_map(|tail| rest.split_once(tail).map(|(path, _)| path))
+            .or(Some(rest))
     })
 }
 
@@ -821,8 +880,13 @@ mod landlock {
     }
 
     pub fn read_only_ruleset(writable: &[PathBuf]) -> Option<OwnedFd> {
-        if abi()? < 3 { return None; }
-        ruleset_with_devices(writable, &[PathBuf::from("/dev/null"), PathBuf::from("/dev/zero")])
+        if abi()? < 3 {
+            return None;
+        }
+        ruleset_with_devices(
+            writable,
+            &[PathBuf::from("/dev/null"), PathBuf::from("/dev/zero")],
+        )
     }
 
     fn ruleset_with_devices(writable: &[PathBuf], devices: &[PathBuf]) -> Option<OwnedFd> {
@@ -1054,10 +1118,14 @@ mod tests {
         let mut sb = sandbox(Backend::Seatbelt, &[]);
         sb.read_only = true;
         let args = sb.seatbelt_args();
-        assert!(!args.iter().any(|arg| arg.to_string_lossy().starts_with("W0=")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("W0=")));
         assert!(!args[1].to_string_lossy().contains("subpath"));
         let args = sb.bwrap_args();
-        assert!(!args.iter().any(|arg| arg == "--bind" || arg == "--dev-bind"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--bind" || arg == "--dev-bind"));
     }
 
     #[tokio::test]
@@ -1073,16 +1141,44 @@ mod tests {
             }
         };
         std::fs::write(workspace.path().join("artifact.py"), "VALUE = 42\n").unwrap();
-        let check = sb.wrap("python3").args(["-B", "-c", "import artifact; assert artifact.VALUE == 42"])
-            .current_dir(workspace.path()).output().await.unwrap();
-        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
-        for path in [workspace.path().join("artifact.py"), machine.path().join("marker")] {
-            let output = sb.wrap("python3").args([
-                "-B", "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('changed')",
-            ]).arg(&path).current_dir(workspace.path()).output().await.unwrap();
-            assert!(!output.status.success(), "write succeeded at {}", path.display());
+        let check = sb
+            .wrap("python3")
+            .args(["-B", "-c", "import artifact; assert artifact.VALUE == 42"])
+            .current_dir(workspace.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        for path in [
+            workspace.path().join("artifact.py"),
+            machine.path().join("marker"),
+        ] {
+            let output = sb
+                .wrap("python3")
+                .args([
+                    "-B",
+                    "-c",
+                    "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('changed')",
+                ])
+                .arg(&path)
+                .current_dir(workspace.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "write succeeded at {}",
+                path.display()
+            );
         }
-        assert_eq!(std::fs::read_to_string(workspace.path().join("artifact.py")).unwrap(), "VALUE = 42\n");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("artifact.py")).unwrap(),
+            "VALUE = 42\n"
+        );
         assert!(!machine.path().join("marker").exists());
         assert!(!workspace.path().join("__pycache__").exists());
     }
@@ -1164,37 +1260,36 @@ mod tests {
             ],
             Some(home),
             Some(Path::new("/var/tmpdir-x")),
-            &[PathBuf::from("/opt/cargo/registry")],
+            &[],
         );
         assert_eq!(paths[0], root.path());
-        for want in [
-            "/home/smith/.cargo/registry",
-            "/home/smith/.npm/_cacache",
-            "/home/smith/Library/Caches/pip",
-            "/home/smith/.local/share/pnpm/store",
-            "/var/tmpdir-x",
-            "/opt/cargo/registry",
-            "/srv/data",
-        ] {
+        for want in ["/home/smith/.npm/_logs", "/var/tmpdir-x", "/srv/data"] {
             assert!(
                 paths.contains(&PathBuf::from(want)),
                 "{want} missing: {paths:?}"
             );
         }
-        // Program paths: on PATH, or run later by a tool outside.
-        for program in [
+        // Code paths: on PATH, run by a tool outside, or a package cache a
+        // later build outside reads (registry/src is extracted source).
+        for code in [
             "/home/smith",
-            "/home/smith/.cargo",
             "/home/smith/.cargo/bin",
+            "/home/smith/.cargo/registry/src/x/crate-1.0.0/src/lib.rs",
+            "/home/smith/.cargo/registry/cache/x/crate-1.0.0.crate",
+            "/home/smith/.cargo/registry/index",
             "/home/smith/.rustup",
-            "/home/smith/.npm",
-            "/home/smith/.bun",
-            "/home/smith/.local/share/pnpm",
-            "/home/smith/Library/Caches",
+            "/home/smith/.npm/_cacache",
+            "/home/smith/.npm/_npx",
+            "/home/smith/.m2/repository",
+            "/home/smith/.gradle/caches",
+            "/home/smith/go/pkg/mod",
+            "/home/smith/.local/share/pnpm/store",
+            "/home/smith/Library/Caches/go-build",
+            "/home/smith/.cache/pip",
         ] {
             assert!(
-                !paths.iter().any(|p| Path::new(program).starts_with(p)),
-                "{program} is writable: {paths:?}"
+                !paths.iter().any(|p| Path::new(code).starts_with(p)),
+                "{code} is writable: {paths:?}"
             );
         }
         let temp = if cfg!(target_os = "macos") {
@@ -1208,6 +1303,60 @@ mod tests {
             "every user's temp tree stays read-only"
         );
         assert!(!paths.iter().any(|p| p.ends_with("relative/ignored")));
+    }
+
+    #[test]
+    fn a_refused_cache_write_says_how_to_fetch() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let src = home.join(".cargo/registry/src/index.crates.io-x/itoa-1.0.17");
+        let sb = sandbox(Backend::Seatbelt, &["/ws"]);
+        // Cargo's own shape: the path and the errno sit lines apart.
+        let out = format!(
+            "error: failed to unpack package `itoa v1.0.17`\n\nCaused by:\n  \
+             failed to create directory `{}`\n\nCaused by:\n  Operation not permitted (os error 1)\n",
+            src.display()
+        );
+        let note = sb.denial_note(&out, true).expect("note");
+        assert!(
+            note.contains("cargo fetch") && note.contains("sandbox_writable"),
+            "{note}"
+        );
+        assert_eq!(blocked_path(&note), Some(src.to_str().unwrap()));
+    }
+
+    #[test]
+    fn package_caches_move_to_a_throwaway_place() {
+        let (_guard, _cfg) = crate::config::isolated_config_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // A shared target dir outside the workspace; it need not exist.
+        let saved = std::env::var_os("CARGO_TARGET_DIR");
+        std::env::set_var("CARGO_TARGET_DIR", "/nonexistent-slag-shared-target");
+        let sb = Sandbox::new(&root, &[]);
+        match saved {
+            Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
+            None => std::env::remove_var("CARGO_TARGET_DIR"),
+        }
+        let env = |var: &str| {
+            sb.env
+                .iter()
+                .find(|(k, _)| k == var)
+                .map(|(_, v)| v.clone())
+        };
+        for var in [
+            "npm_config_cache",
+            "GOCACHE",
+            "PIP_CACHE_DIR",
+            "UV_CACHE_DIR",
+        ] {
+            let path = env(var).unwrap_or_else(|| panic!("{var} not redirected: {:?}", sb.env));
+            assert!(
+                sb.allows(&path),
+                "{var} = {} is not writable",
+                path.display()
+            );
+        }
+        assert_eq!(env("CARGO_TARGET_DIR"), Some(root.join("target")));
     }
 
     #[test]
@@ -1504,8 +1653,41 @@ mod tests {
         assert!(String::from_utf8_lossy(&log.stdout).contains("forge(i1)"));
         assert!(!marker.exists(), "a plant ran in slag's own git");
 
-        // Program paths: on PATH, or run later by a tool outside.
+        // A crate's extracted source in the registry: appending to it is
+        // how the critic planted code that `cargo build` outside compiled.
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cargo"));
+        let lib = std::fs::read_dir(cargo_home.join("registry/src"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|index| {
+                std::fs::read_dir(index.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .map(|krate| krate.path().join("src/lib.rs"))
+            .find(|lib| lib.is_file());
+        if let Some(lib) = lib {
+            let before = std::fs::read(&lib).unwrap();
+            let out = bash(&format!(
+                "echo 'pub fn planted() {{}}' >> '{}'",
+                lib.display()
+            ))
+            .await
+            .output;
+            let after = std::fs::read(&lib).unwrap();
+            if after != before {
+                std::fs::write(&lib, &before).unwrap();
+            }
+            assert_eq!(after, before, "the registry source took a plant: {out}");
+            assert!(out.contains("cargo fetch"), "{out}");
+        }
+
+        // Program paths: on PATH, or run later by a tool outside.
         let env_or = |var: &str, rel: &str| {
             std::env::var_os(var)
                 .map(PathBuf::from)
@@ -1513,6 +1695,8 @@ mod tests {
         };
         for dir in [
             env_or("CARGO_HOME", ".cargo").join("bin"),
+            env_or("CARGO_HOME", ".cargo").join("registry/cache"),
+            env_or("CARGO_HOME", ".cargo").join("registry/index"),
             env_or("RUSTUP_HOME", ".rustup"),
             home.join("Library/Caches"),
             home.join(".npm/_npx"),
