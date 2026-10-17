@@ -463,7 +463,15 @@ impl Echo {
     fn done_line(&self, id: &str, ok: bool, heat: u8, cmd: Option<&str>, took: Option<Duration>) -> String {
         let max = self.max_heat(id).unwrap_or(heat.max(1));
         let (glyph, color, word) = if ok { ("✓", PURE, "forged") } else { ("✗", WARM, "cracked") };
-        let mut meta = vec![if ok { format!("heat {heat}/{max}") } else { format!("after {heat} heats") }];
+        // What slag itself checked: the proof ran and exited 0. Anything a
+        // model said about it sits above, in quotes, as the model's word.
+        let mut meta = Vec::new();
+        if ok {
+            meta.push("proof exit 0".to_string());
+            meta.push(format!("heat {heat}/{max}"));
+        } else {
+            meta.push(format!("after {heat} heats"));
+        }
         if let Some(t) = took {
             meta.push(tui::clock(t));
         }
@@ -1215,5 +1223,41 @@ mod tests {
         assert!(text.contains("✓ i1  test -f a") && text.contains("exit 0"), "{text}");
         assert!(text.contains("· i2  forged; no proof outcome recorded"), "{text}");
         assert!(!text.contains("✓ i2"), "{text}");
+    }
+
+    /// Every done screen the assay draws, painted as a terminal paints it:
+    /// each escape must be whole. A lost ESC prints its body as text.
+    #[test]
+    fn every_assay_verdict_renders_with_every_escape_whole() {
+        let t0 = Instant::now();
+        let forged = PLAN.replace(":status molten", ":status forged").replace(":status ore", ":status forged");
+        let cracked = PLAN.replace(":status molten", ":status forged").replace(":status ore", ":status cracked");
+        let cases: [(&str, String, Vec<Cue>); 3] = [
+            ("FORGED", forged.clone(), vec![]),
+            (
+                "GOAL NOT MET",
+                forged,
+                vec![ev(EngineEvent::Warning { message: "warden round 1: the README never shows the CLI".into() })],
+            ),
+            ("CRACKED", cracked, vec![]),
+        ];
+        for (word, plan, extra) in cases {
+            for width in [79usize, 159] {
+                let text = tui::with_color(true, || {
+                    let mut echo = Echo::new(width);
+                    echo.cue(&Cue::Plan(plan.clone()), t0);
+                    echo.cue(&Cue::Proof(Proof { id: "i1".into(), heat: 1, cmd: Some("test -f a".into()), ok: true, why: None }), t0);
+                    echo.cue(&Cue::Proof(Proof { id: "i3".into(), heat: 5, cmd: Some("test -f c".into()), ok: false, why: Some("no such file".into()) }), t0);
+                    for c in &extra {
+                        echo.cue(c, t0);
+                    }
+                    echo.cue(&Cue::Stats(Stats { diff: Some("2 files changed, 9 insertions(+)".into()), commits: Some(2), head: Some("0f6ac66".into()), branch: Some("main".into()), ..Default::default() }), t0);
+                    echo.finish(t0 + Duration::from_secs(90)).join("\n")
+                });
+                assert!(text.contains(word), "{word}: {text}");
+                let problems = tui::ansi_problems(&text);
+                assert!(problems.is_empty(), "{word} at {width}: {problems:?}\n{text}");
+            }
+        }
     }
 }
