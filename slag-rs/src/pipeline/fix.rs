@@ -631,6 +631,13 @@ impl Ctx<'_> {
             }
         }
 
+        // The session's own test runs cached bytecode for whatever was on
+        // disk then; slag's verdict must come from the source as it is.
+        if let Some(git) = &job.git {
+            for p in &changed {
+                repo::purge_bytecode(&git.top.join(p));
+            }
+        }
         let clock = std::time::Instant::now();
         let checks = verify(job, hooks, self.usable_test, agent_cmd.as_deref()).await;
         phases.verify += clock.elapsed().as_secs_f64();
@@ -1096,9 +1103,12 @@ type Saved = (PathBuf, repo::Content, Option<std::fs::Permissions>);
 
 /// Write each path's content back, removing paths whose content is `None`.
 /// A file recreated from nothing gets its mode back too, or a new script
-/// would lose its executable bit on the way through.
+/// would lose its executable bit on the way through. Every swap drops the
+/// file's Python bytecode: a same-size swap inside one second otherwise
+/// leaves a `.pyc` that runs the other version of the code.
 fn restore(files: &[Saved]) {
     for (path, content, mode) in files {
+        repo::purge_bytecode(path);
         match content {
             Some(bytes) => {
                 if let Some(parent) = path.parent() {
@@ -1784,6 +1794,68 @@ mod tests {
         assert_eq!(during, "1\n", "the originals were on disk during the check");
         assert_eq!(repro.0, Repro::NotShown("interrupted".into()));
         assert_eq!(value(&job), "2\n", "the rescue put the fix back");
+    }
+
+    /// The TUI critic's case: `a + b` and `a * b` have the same size, and
+    /// Python trusts a `.pyc` whose recorded mtime second and size match
+    /// the source. After a swap inside one second the old bytecode ran,
+    /// and the suite failed right after slag printed FIXED.
+    #[tokio::test]
+    async fn a_same_size_same_second_swap_leaves_no_stale_bytecode() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = "def f(a, b):\n    return a + b\n";
+        let new = "def f(a, b):\n    return a * b\n";
+        assert_eq!(old.len(), new.len());
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        std::fs::write(root.join("calc.py"), old).unwrap();
+        std::fs::write(root.join(".gitignore"), "__pycache__/\n").unwrap();
+        sh(root, "git add -A && git commit -qm init");
+        let job = job_in(root);
+        let before = job.git.as_ref().unwrap().snapshot();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(
+            root.join("tests/test_calc.py"),
+            "import unittest\nfrom calc import f\n\nclass T(unittest.TestCase):\n    \
+             def test_multiplies(self):\n        self.assertEqual(f(2, 3), 6)\n",
+        )
+        .unwrap();
+
+        // Build the trap on purpose: bytecode of the old source, then the
+        // new source in place with the same size and the same mtime.
+        let python = "env -u PYTHONDONTWRITEBYTECODE python3";
+        let pin = "python3 -c 'import os; os.utime(\"calc.py\", (1700000000, 1700000000))'";
+        sh(root, pin);
+        sh(root, &format!("{python} -c 'import calc'"));
+        std::fs::write(root.join("calc.py"), new).unwrap();
+        sh(root, pin);
+        let stale = std::process::Command::new("bash")
+            .args(["-c", &format!("{python} -c 'import calc; print(calc.f(2, 3))'")])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&stale.stdout).trim(), "5", "the trap is real");
+
+        let changed = job.git.as_ref().unwrap().changed_since(&before);
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+        let cmd = "python3 -m unittest discover -s tests";
+        let (repro, _) = reproduce(&job, &before, &changed, cmd, None, &rescuer).await;
+        assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
+
+        // Same second, same size again: only a purged cache recompiles.
+        sh(root, pin);
+        let after = std::process::Command::new("bash")
+            .args(["-c", &format!("{python} -m unittest discover -s tests")])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            after.status.success(),
+            "the user's suite must pass right after FIXED: {}",
+            String::from_utf8_lossy(&after.stderr)
+        );
     }
 
     #[test]
