@@ -364,3 +364,167 @@ async fn mock_smith_skips_heap_discovery_with_rg_and_find() {
         assert!(results[4].contains("heap needle"), "{}", results[4]);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_proofs_resmelt_once_without_spending_retry_heats() {
+    for (proof, error) in [
+        ("if then", "syntax error"),
+        ("slag_missing_proof_command", "command not found"),
+        ("./check-proof", "Permission denied"),
+        ("exit 126", "126"),
+        ("exit 127", "127"),
+    ] {
+        let root = project(&format!(
+            "(ingot :id \"i1\" :solo nil :max 5 :proof \"{proof}\")\n"
+        ));
+        std::fs::write(root.path().join("check-proof"), "#!/bin/sh\ntrue\n").unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let rewrite = format!("(ingot :id \"i1\" :solo nil :max 5 :proof \"{proof}\")");
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let content = if body["model"] == "test/plan" {
+                    &rewrite
+                } else if proof == "exit 127" {
+                    "CMD: exit 127"
+                } else {
+                    "CMD: true"
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
+                }))
+            })
+            .mount(&server)
+            .await;
+        let out = forge(root.path(), config.path(), &server.uri(), "off")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path().ends_with("/chat/completions"))
+                .count(),
+            3,
+            "{proof}"
+        );
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(output.contains("broken proof"), "{output}");
+        assert!(output.contains(proof), "{output}");
+        assert!(output.contains(error), "{output}");
+        let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
+        assert!(plan.contains(":status cracked"), "{plan}");
+        assert!(plan.contains(":heat 0 :max 5 :smelt 1"), "{plan}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resmelt_rewrites_a_broken_proof_and_forges_the_ingot() {
+    let root = project("(ingot :id \"i1\" :solo t :max 5 :proof \"if then\")\n");
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let content = if body["model"] == "test/plan" {
+                "(ingot :id \"i1\" :solo t :max 5 :proof \"true\")"
+            } else {
+                "CMD: true"
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
+            }))
+        })
+        .mount(&server)
+        .await;
+    forge(root.path(), config.path(), &server.uri(), "off")
+        .assert()
+        .success();
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/chat/completions"))
+            .count(),
+        3
+    );
+    let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
+    assert!(plan.contains(":status forged"), "{plan}");
+    assert!(plan.contains(":heat 1 :max 5 :smelt 1"), "{plan}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quoted_proof_runs_after_plan_load_and_save() {
+    let root = project(
+        r#"(ingot :id "i1" :solo nil :max 5 :proof "printf '%s\n' \"a.b|c\" | grep 'a\.b\|c' > proof-ran")"#,
+    );
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "CMD: true"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    forge(root.path(), config.path(), &server.uri(), "off")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("proof-ran")).unwrap(),
+        "a.b|c\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_proof_failures_keep_retry_heats_and_show_the_error() {
+    for (proof, cmd, error) in [
+        (
+            "echo invariant_failed >&2; false",
+            "true",
+            "invariant_failed",
+        ),
+        ("echo invalid_regex >&2; exit 2", "true", "invalid_regex"),
+        ("true", "if then", "syntax error"),
+    ] {
+        let root = project(&format!(
+            "(ingot :id \"i1\" :solo nil :max 3 :smelt 1 :proof \"{proof}\")\n"
+        ));
+        let config = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": format!("CMD: {cmd}")}, "finish_reason": "stop"}]
+        })))
+        .expect(3)
+        .mount(&server)
+        .await;
+        let out = forge(root.path(), config.path(), &server.uri(), "off")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(output.contains(error), "{output}");
+        assert!(!output.contains("broken proof"), "{output}");
+        let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
+        assert!(plan.contains(":heat 3 :max 3 :smelt 1"), "{plan}");
+    }
+}

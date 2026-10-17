@@ -1127,18 +1127,27 @@ async fn strike_ingot(
         }
 
         // Run CMD
-        let (ok, output) = proof::run_shell(&cmd).await;
+        let check = proof::check_shell(&cmd).await;
+        let (ok, output) = (check.success, &check.output);
         log_to_file(
             &format!("ASSAY_{}_{heat}", ingot.id),
             &format!("exit={}\n{output}", if ok { 0 } else { 1 }),
         );
+        if !ok && cmd == ingot.proof.trim() && check.broken {
+            return reject_broken_proof(ingot, current, &check, hooks).await;
+        }
 
         if ok {
             // Verify proof if different from cmd
             if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
-                let (proof_ok, proof_output) = proof::run_shell(&ingot.proof).await;
-                if !proof_ok {
-                    slag = Some(format!("Proof failed [{}]: {proof_output}", ingot.proof));
+                let check = proof::check_shell(&ingot.proof).await;
+                if !check.success {
+                    if check.broken {
+                        return reject_broken_proof(ingot, current, &check, hooks).await;
+                    }
+                    log_to_file(&format!("PROOF_{}_{current}", ingot.id),
+                        &format!("exit=1\n{}\n{}", check.reason, check.output));
+                    slag = Some(format!("Proof failed [{}]: {}", ingot.proof, check.output));
                     if !quiet {
                         println!("{}✗{} impure", super::fg(tui::WARM), super::reset());
                     }
@@ -1146,6 +1155,8 @@ async fn strike_ingot(
                     continue;
                 }
             }
+
+            log_to_file(&format!("PROOF_{}_{current}", ingot.id), "exit=0\n");
 
             // The sub-goal gate. `proof` has only shown that something
             // appeared; the bar asks whether this ingot's goal was met, and
@@ -1192,6 +1203,25 @@ async fn strike_ingot(
     }
 
     Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max))
+}
+
+async fn reject_broken_proof(
+    ingot: &Ingot,
+    heat: u8,
+    check: &proof::ShellCheck,
+    hooks: &EngineHooks,
+) -> Result<(), SlagError> {
+    let reason = format!("broken proof [{}]: {}",
+        crate::engine::events::preview(&ingot.proof, 80),
+        crate::engine::events::preview(&check.reason, 160));
+    log_to_file(&format!("PROOF_{}_{heat}", ingot.id),
+        &format!("exit=1\n{}\n{}", check.reason, check.output));
+    emit(&hooks.events, EngineEvent::Warning { message: format!("[{}] {reason}", ingot.id) });
+    if !tui::is_quiet() {
+        println!("{}✗{} {reason}", super::fg(tui::WARM), super::reset());
+    }
+    unburn_heat(&ingot.id).await?;
+    Err(SlagError::ProofFailed { id: ingot.id.clone(), reason })
 }
 
 /// Item 68: a failed heat with retries left rewinds the workspace to the

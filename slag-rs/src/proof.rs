@@ -1,5 +1,24 @@
 use crate::error::SlagError;
 
+fn broken_shell_exit(code: Option<i32>, stderr: &str) -> bool {
+    matches!(code, Some(126 | 127)) || (code == Some(2) && stderr.lines().any(|line| {
+        (line.starts_with("bash:") || line.contains(": line ") || line.contains(": -c:"))
+            && (line.contains("syntax error") || line.contains("unexpected EOF")
+                || line.contains("unexpected end of file"))
+    }))
+}
+
+pub struct ShellCheck {
+    pub success: bool,
+    pub output: String,
+    pub broken: bool,
+    pub reason: String,
+}
+
+pub async fn check_shell(cmd: &str) -> ShellCheck {
+    check_shell_in(cmd, std::path::Path::new(".")).await
+}
+
 /// Extract `CMD: <command>` from smith response text.
 /// Takes the last CMD: line found (smith may output multiple).
 pub fn extract_cmd(response: &str) -> Option<String> {
@@ -20,6 +39,11 @@ pub async fn run_shell(cmd: &str) -> (bool, String) {
 /// under the smith's shell sandbox rooted at `dir`. A refused write leads
 /// the output, so the failed heat names it instead of showing a mystery.
 pub async fn run_shell_in(cmd: &str, dir: &std::path::Path) -> (bool, String) {
+    let result = check_shell_in(cmd, dir).await;
+    (result.success, result.output)
+}
+
+async fn check_shell_in(cmd: &str, dir: &std::path::Path) -> ShellCheck {
     let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let sandbox = crate::engine::sandbox::Sandbox::for_root(&root);
     match sandbox.wrap("bash").args(["-c", cmd]).current_dir(dir).output().await {
@@ -28,12 +52,24 @@ pub async fn run_shell_in(cmd: &str, dir: &std::path::Path) -> (bool, String) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{stdout}{stderr}");
             let ok = output.status.success();
-            match sandbox.denial_note(&combined, !ok) {
+            let broken = broken_shell_exit(output.status.code(), &stderr);
+            let reason = stderr.lines().find(|l| !l.trim().is_empty())
+                .or_else(|| if broken { None } else { stdout.lines().find(|l| !l.trim().is_empty()) })
+                .map(str::trim).map(str::to_string)
+                .unwrap_or_else(|| match output.status.code() {
+                    Some(code) => format!("shell exited with status {code}"),
+                    None => "shell terminated by a signal".into(),
+                });
+            let output = match sandbox.denial_note(&combined, !ok) {
                 Some(note) => (ok, format!("{note}\n{combined}")),
                 None => (ok, combined),
-            }
+            };
+            ShellCheck { success: ok, output: output.1, broken, reason }
         }
-        Err(e) => (false, format!("spawn error: {e}")),
+        Err(e) => {
+            let reason = format!("spawn error: {e}");
+            ShellCheck { success: false, output: reason.clone(), broken: false, reason }
+        }
     }
 }
 
@@ -85,6 +121,44 @@ pub async fn git_commit_in(dir: &std::path::Path, id: &str, work: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_proofs_distinguish_shell_errors_from_failed_assertions() {
+        for (code, stderr, broken) in [
+            (2, "bash: -c: line 1: syntax error near unexpected token `('", true),
+            (2, "bash: -c: line 1: unexpected EOF while looking for matching `\"'", true),
+            (126, "bash: line 1: ./check: Permission denied", true),
+            (127, "bash: line 1: missing_check: command not found", true),
+            (126, "", true),
+            (127, "", true),
+            (1, "AssertionError: expected 3", false),
+            (1, "SyntaxError: invalid syntax", false),
+            (2, "grep: invalid regular expression", false),
+            (2, "test failed: syntax error", false),
+            (0, "bash: syntax error", false),
+        ] {
+            assert_eq!(broken_shell_exit(Some(code), stderr), broken, "exit {code}: {stderr}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_checks_keep_stderr_separate_from_progress_output() {
+        let dir = tempfile::tempdir().unwrap();
+        for (command, broken) in [
+            ("printf 'progress\\n'; (", true),
+            ("printf 'progress\\n'; slag_missing_proof_command", true),
+            ("printf 'progress\\n'; printf 'assertion failed\\n' >&2; exit 1", false),
+        ] {
+            let result = check_shell_in(command, dir.path()).await;
+            assert!(!result.success);
+            assert_eq!(result.broken, broken, "{}", result.output);
+            assert_ne!(result.reason, "progress");
+            assert!(!result.reason.contains('\n'));
+        }
+        let no_stderr = check_shell_in("printf 'progress\\n'; exit 127", dir.path()).await;
+        assert!(no_stderr.broken);
+        assert_eq!(no_stderr.reason, "shell exited with status 127");
+    }
 
     #[test]
     fn extract_cmd_basic() {
