@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::error::SlagError;
 
 fn broken_shell_exit(code: Option<i32>, stderr: &str) -> bool {
@@ -25,16 +26,11 @@ pub fn extract_cmd(response: &str) -> Option<String> {
     response
         .lines()
         .map(str::trim_start)
-        .filter(|line| line.starts_with("CMD:"))
-        .last()
+        .rfind(|line| line.starts_with("CMD:"))
         .map(|line| line.strip_prefix("CMD:").unwrap().trim().to_string())
 }
 
 /// Run a shell command and return (success, output).
-pub async fn run_shell(cmd: &str) -> (bool, String) {
-    run_shell_in(cmd, std::path::Path::new(".")).await
-}
-
 /// `run_shell` in `dir`. A model writes proofs and CMD lines, so they run
 /// under the smith's shell sandbox rooted at `dir`. A refused write leads
 /// the output, so the failed heat names it instead of showing a mystery.
@@ -75,12 +71,18 @@ async fn check_shell_in(cmd: &str, dir: &std::path::Path) -> ShellCheck {
 
 /// Verify an ingot's proof command.
 /// Returns Ok(()) if proof passes, Err with reason if it fails.
+#[cfg(test)]
+pub async fn run_shell(cmd: &str) -> (bool, String) {
+    run_shell_in(cmd, std::path::Path::new(".")).await
+}
+
+#[cfg(test)]
 pub async fn verify_proof(proof: &str, id: &str) -> Result<(), SlagError> {
     if proof.is_empty() || proof == "true" {
         return Ok(());
     }
 
-    let (success, output) = run_shell(proof).await;
+    let (success, output) = run_shell_in(proof, std::path::Path::new(".")).await;
     if success {
         Ok(())
     } else {

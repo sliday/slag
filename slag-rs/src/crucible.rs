@@ -101,12 +101,6 @@ impl Crucible {
     }
 
     /// Async save (for use in tokio context)
-    pub async fn save_async(&self) -> Result<(), std::io::Error> {
-        let tmp = self.tmp_path();
-        tokio::fs::write(&tmp, self.render()).await?;
-        tokio::fs::rename(&tmp, &self.path).await
-    }
-
     /// Add newly cast ingots to an existing crucible, renumbering them
     /// past the highest id already in use.
     ///
@@ -116,7 +110,7 @@ impl Crucible {
     /// carry no references to each other, so renumbering is safe; ids are
     /// unique handles, not links.
     pub fn append(&mut self, ingots: Vec<Ingot>) -> usize {
-        let mut next = self
+        let next = self
             .ingots
             .iter()
             .filter_map(|i| i.id.trim_start_matches('i').parse::<usize>().ok())
@@ -124,9 +118,8 @@ impl Crucible {
             .unwrap_or(0)
             + 1;
         let added = ingots.len();
-        for mut ingot in ingots {
-            ingot.id = format!("i{next}");
-            next += 1;
+        for (offset, mut ingot) in ingots.into_iter().enumerate() {
+            ingot.id = format!("i{}", next + offset);
             self.ingots.push(ingot);
         }
         added
@@ -169,13 +162,14 @@ impl Crucible {
             .collect()
     }
 
-    /// Get sequential ore ingots (solo=nil)
+    #[cfg(test)]
     pub fn sequential_ore(&self) -> Option<&Ingot> {
         self.ingots
             .iter()
             .find(|i| i.status == Status::Ore && !i.solo)
     }
 
+    /// Get sequential ore ingots (solo=nil)
     /// Replace ingot(s) by id. If replacement is multiple ingots (split), all are inserted.
     pub fn replace(&mut self, id: &str, replacements: Vec<Ingot>) {
         if let Some(idx) = self.ingots.iter().position(|i| i.id == id) {
@@ -235,11 +229,7 @@ pub struct CrucibleCounts {
 
 impl CrucibleCounts {
     pub fn pct_forged(&self) -> u8 {
-        if self.total == 0 {
-            0
-        } else {
-            (self.forged * 100 / self.total) as u8
-        }
+        self.forged.saturating_mul(100).checked_div(self.total).unwrap_or(0) as u8
     }
 }
 

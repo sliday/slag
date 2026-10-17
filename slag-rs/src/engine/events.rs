@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crossterm::style::Color;
@@ -123,7 +123,7 @@ pub fn spawn_jsonl_sink(
     })
 }
 
-async fn open_append(path: &PathBuf, warned: &mut bool) -> Option<tokio::fs::File> {
+async fn open_append(path: &std::path::Path, warned: &mut bool) -> Option<tokio::fs::File> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -146,7 +146,7 @@ async fn open_append(path: &PathBuf, warned: &mut bool) -> Option<tokio::fs::Fil
     }
 }
 
-fn warn_once(warned: &mut bool, path: &PathBuf, err: &str) {
+fn warn_once(warned: &mut bool, path: &Path, err: &str) {
     if !*warned {
         eprintln!("slag: event sink {} failed: {err}", path.display());
         *warned = true;

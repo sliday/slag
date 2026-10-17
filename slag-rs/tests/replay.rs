@@ -13,7 +13,7 @@ fn fixture(rel: &str) -> String {
 /// A replay in an empty directory with no key anywhere: nothing it needs
 /// may come from the network or the user's setup.
 fn slag(scratch: &tempfile::TempDir) -> Command {
-    let mut cmd = Command::cargo_bin("slag").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("slag");
     cmd.current_dir(scratch.path())
         .env_remove("OPENROUTER_API_KEY")
         .env("SLAG_CONFIG_DIR", scratch.path())

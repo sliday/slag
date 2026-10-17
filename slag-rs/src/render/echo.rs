@@ -911,6 +911,7 @@ fn commission(prd: &str) -> Option<String> {
 /// what it burned, then the model without its vendor prefix.
 /// `anthropic/claude-haiku-5.5  smith  1619164 tok  $0.1784`
 /// → `smith      1.6M tok  $0.18  claude-haiku-5.5`.
+#[cfg(test)]
 fn ledger_row(row: &str) -> String {
     let parts: Vec<&str> = row.split_whitespace().collect();
     match parts.as_slice() {

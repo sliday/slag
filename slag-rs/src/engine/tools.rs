@@ -65,6 +65,24 @@ const BASELINE_CAP_CHARS: usize = 64 * 1024;
 /// lie (git's "racy clean" rule).
 const READ_CACHE_SETTLE: Duration = Duration::from_secs(2);
 
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    fn matches(pattern: &[u8], path: &[u8]) -> bool {
+        match pattern.first() {
+            None => path.is_empty(),
+            Some(b'*') if pattern.get(1) == Some(&b'*') => {
+                let rest = if pattern.get(2) == Some(&b'/') { &pattern[3..] } else { &pattern[2..] };
+                matches(rest, path) || path.first().is_some_and(|_| matches(pattern, &path[1..]))
+            }
+            Some(b'*') => matches(&pattern[1..], path)
+                || path.first().is_some_and(|b| *b != b'/' && matches(pattern, &path[1..])),
+            Some(b'?') => path.first().is_some_and(|b| *b != b'/' && matches(&pattern[1..], &path[1..])),
+            Some(b) => path.first() == Some(b) && matches(&pattern[1..], &path[1..]),
+        }
+    }
+
+    matches(pattern.as_bytes(), path.as_bytes())
+}
+
 /// Stamp of a file fully read this session: repeat full reads of a file
 /// whose mtime+size are unchanged return a short stub instead of the body.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -254,7 +272,7 @@ impl ToolBox {
             let state = self.read_state.lock().unwrap();
             let mut v: Vec<(PathBuf, FileState)> =
                 state.iter().map(|(p, s)| (p.clone(), *s)).collect();
-            v.sort_by(|a, b| b.1.seq.cmp(&a.1.seq));
+            v.sort_by_key(|a| std::cmp::Reverse(a.1.seq));
             v
         };
 
@@ -320,7 +338,7 @@ impl ToolBox {
         let state = self.read_state.lock().unwrap();
         let mut entries: Vec<(PathBuf, u64)> =
             state.iter().map(|(p, s)| (p.clone(), s.seq)).collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.1));
         entries.into_iter().take(n).map(|(p, _)| p).collect()
     }
 
@@ -1467,8 +1485,7 @@ impl ToolBox {
         Ok(result)
     }
 
-    /// Find files via `rg --files -g` with a `find -name` fallback (the
-    /// fallback matches basenames only). Sandbox-rooted; output is
+    /// Find files via a built-in walk with glob matching. Sandbox-rooted; output is
     /// workspace-relative and capped at GLOB_FILE_CAP entries.
     ///
     /// Runs from inside the search dir: rg matches `-g` globs against the
@@ -1479,28 +1496,17 @@ impl ToolBox {
         let pattern = req_str(args, "glob", "pattern")?;
         let raw_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let dir = self.resolve(raw_path)?;
-        let base = pattern.rsplit('/').next().unwrap_or(pattern);
-        let (rg_heap, find_heap) = self.heap_filters(&dir, Some(pattern));
-        let cmd = format!(
-            "cd {d} && if command -v rg >/dev/null 2>&1; then rg --files -g {p}{rg_heap}; else find . {find_heap}-type f -name {b} -print; fi",
-            p = sh_quote(pattern),
-            d = sh_quote(&dir.display().to_string()),
-            b = sh_quote(base),
-        );
-        let out = self.run_shell(&cmd, BASH_TIMEOUT_DEFAULT, false).await?;
-        // Results are dir-relative; re-anchor them workspace-relative.
+        let files = self.glob_files(&dir, pattern)?;
         let rel_dir = dir
             .strip_prefix(&self.root)
             .ok()
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.display().to_string());
-        let files: Vec<String> = out
-            .lines()
-            .filter(|l| !l.trim().is_empty() && !l.starts_with("(exit "))
-            .map(|l| l.strip_prefix("./").unwrap_or(l))
+        let files: Vec<String> = files
+            .into_iter()
             .map(|l| match &rel_dir {
                 Some(rd) => format!("{rd}/{l}"),
-                None => l.to_string(),
+                None => l,
             })
             .collect();
         if files.is_empty() {
@@ -1519,6 +1525,46 @@ impl ToolBox {
             ));
         }
         Ok(result)
+    }
+
+    fn glob_files(&self, dir: &Path, pattern: &str) -> Result<Vec<String>, SlagError> {
+        let relative = dir.strip_prefix(&self.root).unwrap_or(dir);
+        let explicit = relative
+            .components()
+            .chain(Path::new(pattern).components())
+            .any(|component| {
+                let name = component.as_os_str().to_string_lossy();
+                name == "logs" || name == ".git" || name.starts_with("slag-anvil-")
+            });
+        let mut files = Vec::new();
+        let mut stack = vec![(dir.to_path_buf(), PathBuf::new())];
+        while let Some((current, relative)) = stack.pop() {
+            let entries = std::fs::read_dir(&current)
+                .map_err(|e| SlagError::Tool(format!("glob: cannot read {}: {e}", current.display())))?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let child = relative.join(&name);
+                let hidden_heap = name == ".git" || name.to_string_lossy().starts_with("slag-anvil-");
+                if path.is_dir() {
+                    let hidden_dir = (relative.as_os_str().is_empty() && name == "logs") || hidden_heap;
+                    if !hidden_dir || explicit {
+                        stack.push((path, child));
+                    }
+                } else if path.is_file()
+                    && !hidden_heap
+                    && glob_matches(pattern, &child.to_string_lossy())
+                    || path.is_file()
+                        && !hidden_heap
+                        && !pattern.contains('/')
+                        && child.file_name().is_some_and(|name| glob_matches(pattern, &name.to_string_lossy()))
+                {
+                    files.push(child.display().to_string());
+                }
+            }
+        }
+        files.sort();
+        Ok(files)
     }
 
     /// Write full tool output to `logs/tool-results/<hash>.txt` inside the
@@ -2107,7 +2153,7 @@ fn read_only_bash(command: &str) -> bool {
         return false;
     }
     let mut any = false;
-    for seg in command.split(|c| matches!(c, ';' | '|' | '&' | '\n')) {
+    for seg in command.split([';', '|', '&', '\n']) {
         let seg = seg.trim();
         if seg.is_empty() {
             continue;
@@ -2281,7 +2327,7 @@ fn git_destructive(rest: &[&str]) -> Option<&'static str> {
             break t;
         }
     };
-    let has = |flag: &str| rest.iter().any(|t| *t == flag);
+    let has = |flag: &str| rest.contains(&flag);
     match sub {
         "reset" if has("--hard") => Some("may discard uncommitted changes"),
         // --force-with-lease is a distinct token and intentionally allowed.
@@ -2509,7 +2555,7 @@ fn reduce_bash_output(s: &str) -> String {
     joined
 }
 
-fn push_blanks<'a>(out: &mut Vec<&'a str>, blanks: usize) {
+fn push_blanks(out: &mut Vec<&str>, blanks: usize) {
     let emit = if blanks >= 3 { 1 } else { blanks };
     for _ in 0..emit {
         out.push("");

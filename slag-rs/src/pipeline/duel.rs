@@ -278,13 +278,7 @@ where
                     worktree::discard_in(repo, id).await;
                 }
             }
-            if let Err(e) = merged {
-                // Keep the proven winner's worktree and branch — its
-                // commit is the only copy of the work. The stale
-                // deterministic names are reclaimed by
-                // `worktree::create_in` on the next duel attempt.
-                return Err(e);
-            }
+            merged?;
             append_ledger(repo, ingot, winner, round);
             return Ok(DuelOutcome::Merged { winner, rounds: round });
         }
@@ -323,11 +317,7 @@ async fn crown(
     for lose_id in lose_ids {
         worktree::discard_in(repo, lose_id).await;
     }
-    if let Err(e) = merged {
-        // Keep the proven winner's worktree/branch (only copy of the work);
-        // `worktree::create_in` reclaims the stale names on the next duel.
-        return Err(e);
-    }
+    merged?;
     emit(
         &hooks.events,
         EngineEvent::DuelVerdict { id: ingot.id.clone(), winner, margin: 100 },

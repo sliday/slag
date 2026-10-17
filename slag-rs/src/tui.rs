@@ -265,6 +265,7 @@ pub fn clock(d: Duration) -> String {
 
 /// `$0.004`, `$0.06`, `$1.24`. A cheap run shows real digits rather than
 /// rounding to a `$0.00` that reads as free.
+#[cfg(test)]
 pub fn money(dollars: f64) -> String {
     if dollars < 0.01 {
         format!("${dollars:.3}")
@@ -340,7 +341,7 @@ pub fn banner_lines() -> Vec<String> {
             unbold(),
             dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
         ),
-        format!("  {}", dim("survey → plan → forge → assay")),
+        format!("  {}", dim("reproduce → fix → prove → commit")),
     ]
 }
 
@@ -570,6 +571,8 @@ pub fn spinner(msg: &str) -> ProgressBar {
 }
 
 /// Create a spark-style spinner
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn spark_spinner(msg: &str) -> ProgressBar {
     if is_quiet() {
         return ProgressBar::hidden();
@@ -596,6 +599,7 @@ pub fn spinner_frame(i: usize) -> &'static str {
 /// Metallurgical verbs for the live spinner status line. One per turn,
 /// picked by turn number, so a long forge reads like shop work instead of
 /// repeating "Forging…" forever.
+#[cfg(test)]
 pub const FORGE_VERBS: [&str; 12] = [
     "Forging",
     "Smelting",
@@ -612,6 +616,7 @@ pub const FORGE_VERBS: [&str; 12] = [
 ];
 
 /// Verb for turn `i`; wraps forever like `spinner_frame`.
+#[cfg(test)]
 pub fn forge_verb(i: usize) -> &'static str {
     FORGE_VERBS[i % FORGE_VERBS.len()]
 }
@@ -920,6 +925,7 @@ pub fn heat_color(heat: u8) -> Color {
 }
 
 /// Grade color for display
+#[cfg(test)]
 pub fn grade_color(grade: u8) -> Color {
     match grade {
         0..=1 => COLD,

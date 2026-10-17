@@ -370,6 +370,7 @@ pub fn status_json() -> Result<String, SlagError> {
 /// be unknown — a run that spent nothing yet, or an unreachable balance
 /// endpoint — and the line degrades to whichever half is real rather than
 /// printing a zero that reads as fact.
+#[cfg(test)]
 pub fn cost_line(session: Option<f64>, credits: Option<crate::engine::provider::Credits>) -> String {
     usage_cost_line(&crate::engine::Usage { cost: session, ..Default::default() }, credits)
 }
@@ -460,6 +461,7 @@ pub async fn show_cost() -> Result<(), SlagError> {
 /// its schema: a bare number, a total-ish key on an object, or a sum of
 /// per-entry `cost` fields all work. Returns None when nothing numeric
 /// can be found — the caller falls back to the event log.
+#[cfg(test)]
 pub fn session_costs_spend(path: &Path) -> Option<f64> {
     let contents = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
@@ -559,6 +561,7 @@ fn scan_str_at(hay: &str, start: usize) -> Option<String> {
 }
 
 /// Sum of every numeric value for `key` in the window.
+#[cfg(test)]
 pub fn scan_num_sum(hay: &str, key: &str) -> f64 {
     let needle = format!("\"{key}\":");
     hay.match_indices(&needle)
@@ -648,7 +651,7 @@ pub fn list_runs(dir: &Path) -> Vec<RunRow> {
             Some((modified, run_row(&e.path(), meta.len(), modified)))
         })
         .collect();
-    stamped.sort_by(|a, b| b.0.cmp(&a.0));
+    stamped.sort_by_key(|a| std::cmp::Reverse(a.0));
     stamped.into_iter().map(|(_, row)| row).collect()
 }
 

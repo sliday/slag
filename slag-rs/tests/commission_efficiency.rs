@@ -507,6 +507,9 @@ async fn unreadable_artifact_verdict_reports_an_unverified_goal() {
         requests
             .iter()
             .filter(|r| {
+                if !r.url.path().ends_with("/chat/completions") {
+                    return false;
+                }
                 let body: Value = serde_json::from_slice(&r.body).unwrap();
                 artifact_review(&body)
             })

@@ -192,7 +192,7 @@ The main loop. For each ingot:
 
 Independent ingots (`:solo t`) run on up to 3 parallel anvils. Dependent ingots (`:solo nil`) run sequentially after.
 
-High-grade ingots can go to a twin-cast duel: two casts build the same ingot in separate git worktrees, a judge model assays both, and the winner merges. Duels only fire when cast B runs a different model from the worker, since two rolls of the same dice cost triple the tokens and buy nothing. Set `SLAG_MODEL_ALT` to a different family to turn duels on for grade 3 and up, or force the behavior with `SLAG_DUEL=on` / `off`.
+Eligible independent ingots use two or three casts in separate git worktrees, with minimal, robust, or creative direction prompts. A judge model assays passing casts, then slag merges the winner. Auto mode uses work shape and grade: grades 3-4 usually use two casts, grade 5 or taste-heavy work uses three, and mechanical work stays single-cast. `:casts`, `:duel`, and `SLAG_DUEL` can override the choice. Cast B may use the same model as cast A.
 
 ### Phase 4: ASSAY
 

@@ -34,6 +34,38 @@ fn registry() -> &'static Mutex<Vec<Cleanup>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+#[cfg(test)]
+struct CleanupRegistry {
+    cleanups: Mutex<Vec<Cleanup>>,
+}
+
+#[cfg(test)]
+impl CleanupRegistry {
+    fn new() -> Self {
+        Self { cleanups: Mutex::new(Vec::new()) }
+    }
+
+    fn register<F: FnOnce() + Send + 'static>(&self, f: F) {
+        self.cleanups.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(f));
+    }
+
+    fn run_all(&self) -> usize {
+        let taken: Vec<Cleanup> = {
+            let mut reg = self.cleanups.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *reg)
+        };
+        let n = taken.len();
+        for cleanup in taken.into_iter().rev() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
+        }
+        n
+    }
+
+    fn pending(&self) -> usize {
+        self.cleanups.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
 /// Register a cleanup to run on shutdown. Runs at most once: `run_all`
 /// takes ownership of the whole list.
 pub fn register<F: FnOnce() + Send + 'static>(f: F) {
@@ -41,8 +73,7 @@ pub fn register<F: FnOnce() + Send + 'static>(f: F) {
     // the guard rather than propagating: dropping the remaining cleanups
     // because one of them was buggy is exactly the failure this module
     // exists to prevent.
-    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    reg.push(Box::new(f));
+    registry().lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(f));
 }
 
 /// Run every registered cleanup, most-recent first, and clear the
@@ -64,11 +95,6 @@ pub fn run_all() -> usize {
 }
 
 /// How many cleanups are currently registered.
-#[cfg(test)]
-pub fn pending() -> usize {
-    registry().lock().unwrap_or_else(|e| e.into_inner()).len()
-}
-
 /// Register the crucible rescue: on an abrupt exit, reload the crucible
 /// from disk, hand any Molten ingot back to Ore, and save. Molten means
 /// "an anvil owns this", and after a panic or a Ctrl-C no anvil owns
@@ -134,62 +160,51 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    // The registry is process-global, so these tests share it. They run
-    // under one lock to keep a concurrent `run_all` from draining another
-    // test's registrations.
-    fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     #[test]
     fn cleanups_run_in_reverse_registration_order() {
-        let _g = guard();
-        run_all();
+        let registry = CleanupRegistry::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
         for tag in ["sink", "crucible", "terminal"] {
             let seen = seen.clone();
-            register(move || seen.lock().unwrap().push(tag));
+            registry.register(move || seen.lock().unwrap().push(tag));
         }
-        assert_eq!(run_all(), 3);
+        assert_eq!(registry.run_all(), 3);
         // Terminal was claimed last, so it is released first.
         assert_eq!(*seen.lock().unwrap(), vec!["terminal", "crucible", "sink"]);
     }
 
     #[test]
     fn draining_is_idempotent() {
-        let _g = guard();
-        run_all();
+        let registry = CleanupRegistry::new();
         let hits = Arc::new(AtomicUsize::new(0));
         let h = hits.clone();
-        register(move || {
+        registry.register(move || {
             h.fetch_add(1, Ordering::SeqCst);
         });
-        assert_eq!(run_all(), 1);
+        assert_eq!(registry.run_all(), 1);
         // A Ctrl-C landing while a panic unwinds must not double-save.
-        assert_eq!(run_all(), 0);
+        assert_eq!(registry.run_all(), 0);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn a_panicking_cleanup_does_not_strand_the_others() {
-        let _g = guard();
-        run_all();
+        let registry = CleanupRegistry::new();
         let survived = Arc::new(AtomicUsize::new(0));
         let a = survived.clone();
         let b = survived.clone();
-        register(move || {
+        registry.register(move || {
             a.fetch_add(1, Ordering::SeqCst);
         });
-        register(|| panic!("a buggy cleanup"));
-        register(move || {
+        registry.register(|| panic!("a buggy cleanup"));
+        registry.register(move || {
             b.fetch_add(1, Ordering::SeqCst);
         });
 
         // Silence the panic backtrace this test deliberately provokes.
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let ran = run_all();
+        let ran = registry.run_all();
         std::panic::set_hook(hook);
 
         assert_eq!(ran, 3);
@@ -198,13 +213,12 @@ mod tests {
 
     #[test]
     fn pending_reports_registry_depth() {
-        let _g = guard();
-        run_all();
-        assert_eq!(pending(), 0);
-        register(|| {});
-        register(|| {});
-        assert_eq!(pending(), 2);
-        run_all();
-        assert_eq!(pending(), 0);
+        let registry = CleanupRegistry::new();
+        assert_eq!(registry.pending(), 0);
+        registry.register(|| {});
+        registry.register(|| {});
+        assert_eq!(registry.pending(), 2);
+        registry.run_all();
+        assert_eq!(registry.pending(), 0);
     }
 }

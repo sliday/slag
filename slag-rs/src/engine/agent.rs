@@ -944,7 +944,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     if !output_shrunk {
                         output_shrunk = true;
                         if let Some(cap) = shrunk_output_cap(&e) {
-                            if out_tokens.map_or(true, |t| cap < t) {
+                            if out_tokens.is_none_or(|t| cap < t) {
                                 *out_tokens = Some(cap);
                                 emit(
                                     &self.events,

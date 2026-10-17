@@ -1,15 +1,21 @@
+#[cfg(test)]
 use std::future::Future;
+#[cfg(test)]
 use std::pin::Pin;
 
+#[cfg(test)]
 use super::Smith;
+#[cfg(test)]
 use crate::error::SlagError;
 
 /// Mock smith for testing. Returns canned responses.
+#[cfg(test)]
 pub struct MockSmith {
     responses: Vec<String>,
     call_count: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(test)]
 impl MockSmith {
     pub fn new(responses: Vec<String>) -> Self {
         Self {
@@ -32,6 +38,7 @@ impl MockSmith {
     }
 }
 
+#[cfg(test)]
 impl Smith for MockSmith {
     fn invoke(&self, _prompt: &str) -> Pin<Box<dyn Future<Output = Result<String, SlagError>> + Send + '_>> {
         let idx = self
