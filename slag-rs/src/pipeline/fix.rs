@@ -821,7 +821,11 @@ fn review_gap(raw: &str) -> Option<String> {
         return None;
     }
     let v = super::warden::parse_verdict(raw);
-    let named = !v.gap.is_empty() && !v.gap.contains("without naming a gap");
+    // The review runs without tools, so a pass carries no inspection
+    // evidence; the warden's evidence rule must not turn it into a gap.
+    let named = !v.gap.is_empty()
+        && !v.gap.contains("without naming a gap")
+        && !v.gap.contains("without inspection evidence");
     (!v.fulfilled && named).then_some(v.gap)
 }
 
