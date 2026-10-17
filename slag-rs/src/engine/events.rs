@@ -654,9 +654,16 @@ impl RenderState {
                 // A judge's report reads as its verdict, not as the raw
                 // `VERDICT: … GAP: … EVIDENCE: …` block it arrives in.
                 if let Some((pass, why)) = verdict_gist(summary) {
+                    // The judge is a model: its reasons are its words, in
+                    // quotes and dim, so they never read as slag's own check.
                     let (word, color) = if pass { ("pass", PURE) } else { ("fail", WARM) };
-                    let head = format!("  {} {}  ", paint(color, "⚖"), paint(color, &format!("judged {word}")));
-                    prints.extend(wrap_hanging(&head, &why, width, 4, 2));
+                    let head = format!("  {} {}  ", paint(color, "⚖"), paint(color, &format!("judge says {word}")));
+                    prints.extend(
+                        wrap_hanging(&head, &format!("“{why}”"), width, 4, 2)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, l)| if i == 0 { l } else { dim(&l) }),
+                    );
                 } else if let Some(gist) = finish_gist(summary) {
                     prints.push(line(PURE, "■", &dim(&preview(&gist, width.saturating_sub(4)))));
                 } else {
@@ -1527,7 +1534,7 @@ mod tests {
             summary: "VERDICT: fail\nGAP: no test covers the CLI\nEVIDENCE: ran it".into(),
         }));
         let text = lines.join("\n");
-        assert!(text.contains("judged fail") && text.contains("no test covers the CLI"), "{text}");
+        assert!(text.contains("judge says fail") && text.contains("“no test covers the CLI”"), "{text}");
         assert!(!text.contains("VERDICT"), "{text}");
         assert_eq!(verdict_gist("all done"), None);
     }

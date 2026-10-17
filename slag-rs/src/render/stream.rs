@@ -162,7 +162,7 @@ impl Stream {
         }
         let mut right = Vec::new();
         if let Some(start) = self.echo.started() {
-            right.push(tui::clock(at.saturating_duration_since(start)));
+            right.push(format!("run {}", tui::clock(at.saturating_duration_since(start))));
         }
         let usage = self.echo.spend();
         if usage.total_tokens > 0 {

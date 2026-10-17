@@ -317,7 +317,9 @@ fn clip_cells(text: &str, max: usize) -> String {
         return text.to_string();
     }
     let cut: String = text.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", cut.trim_end())
+    // A subject the engine already cut ends in `…`; a second one reads as
+    // a stutter, not as more text.
+    format!("{}…", cut.trim_end().trim_end_matches('…'))
 }
 
 /// A failed tool row (`✗ verb  subject — error`) as opposed to a failed
@@ -542,8 +544,8 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
             (palette(tui::BRIGHT), format!("↪ steer  {}", preview(text, 200)))
         }
         EngineEvent::Finish { summary } => match crate::engine::events::verdict_gist(summary) {
-            Some((true, text)) => (palette(tui::PURE), format!("⚖ judged pass — {text}")),
-            Some((false, text)) => (palette(tui::WARM), format!("⚖ judged fail — {text}")),
+            Some((true, text)) => (palette(tui::COLD), format!("⚖ judge says pass: “{text}”")),
+            Some((false, text)) => (palette(tui::WARM), format!("⚖ judge says fail: “{text}”")),
             None => (
                 palette(tui::PURE),
                 format!("■ {}", crate::engine::events::finish_gist(summary).unwrap_or_else(|| preview(summary, 400))),
@@ -564,7 +566,8 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
             (palette(tui::BRIGHT), format!("↻ {id} heat {heat}"))
         }
         EngineEvent::HeatTick { .. } => (palette(tui::COLD), String::new()),
-        EngineEvent::IngotDone { id, ok: true } => (palette(tui::PURE), format!("✓ {id} forged")),
+        // A forged ingot is one whose proof slag ran and saw exit 0.
+        EngineEvent::IngotDone { id, ok: true } => (palette(tui::PURE), format!("✓ {id} forged · proof exit 0")),
         EngineEvent::IngotDone { id, ok: false } => (palette(tui::WARM), format!("✗ {id} cracked")),
         EngineEvent::DuelRound { id, round } => {
             (palette(tui::BRIGHT), format!("⚔ {id} duel round {round}"))
@@ -634,14 +637,17 @@ pub(crate) fn forge_status(state: &DashState, now: Instant) -> Option<String> {
     if !state.ingots.iter().any(|r| r.status == IngotStatus::Forging) {
         return None;
     }
+    // This line is the current turn and says so; the header carries the
+    // run. Two clocks and two token counts on one screen read as a
+    // contradiction unless each names what it counts.
     let elapsed = now.saturating_duration_since(started);
-    let mut s = format!("⚒ {}…", tui::forge_verb(state.turn));
+    let mut s = format!("⚒ turn {}", state.turn);
     match (forging_count(state), sole_forging(state)) {
-        (_, Some(ingot)) => s.push_str(&format!(" {ingot} ·")),
-        (n, None) if n > 1 => s.push_str(&format!(" {n} anvils ·")),
+        (_, Some(ingot)) => s.push_str(&format!(" of {ingot}")),
+        (n, None) if n > 1 => s.push_str(&format!(" · {n} anvils")),
         _ => {}
     }
-    s.push_str(&format!(" {}s · {} tok", elapsed.as_secs(), tui::tokens(state.turn_tokens)));
+    s.push_str(&format!(" · {} · {} tok this turn", tui::clock(elapsed), tui::tokens(state.turn_tokens)));
     if let Some(rate) = crate::progress::token_rate(state.turn_tokens, elapsed) {
         s.push_str(&format!(" · {rate} tok/s"));
     }
@@ -1000,7 +1006,7 @@ pub(crate) fn draw(f: &mut Frame, state: &DashState) {
     // columns it gives way entirely, since a feed squeezed beside it is
     // worth less than a feed alone.
     let w = main.width;
-    let crucible = if w < 60 { 0 } else { (w * 38 / 100).clamp(28, 56) };
+    let crucible = if w < 60 { 0 } else { (w * 40 / 100).clamp(32, 56) };
     let [left, right] =
         Layout::horizontal([Constraint::Length(crucible), Constraint::Min(10)]).areas(main);
     if crucible > 0 {
@@ -1025,7 +1031,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &DashState) {
     let now = state.now();
     let mut right: Vec<String> = vec![run_phase(state)];
     if let Some(start) = state.started {
-        right.push(tui::clock(now.saturating_duration_since(start)));
+        right.push(format!("run {}", tui::clock(now.saturating_duration_since(start))));
     }
     if state.totals.total_tokens > 0 {
         right.push(format!("{} tok", tui::tokens(state.totals.total_tokens)));
@@ -1155,8 +1161,15 @@ fn ingot_line(row: &IngotRow, now: Instant, width: usize) -> Line<'_> {
         _ => None,
     };
     // Fixed columns: glyph, space, id, two spaces, and the note with a
-    // space before it. Whatever is left belongs to the title.
+    // space before it. Whatever is left belongs to the title, and a narrow
+    // pane drops a heat note before it starves the title: the name is what
+    // tells rows apart. A stall or a duel stays, it is news.
     let id_w = row.id.chars().count();
+    let base_room = width.saturating_sub(2 + id_w + 2);
+    let note = match note {
+        Some(n) if n.starts_with("heat") && base_room.saturating_sub(n.chars().count() + 1) < 16 => None,
+        other => other,
+    };
     let note_w = note.as_ref().map_or(0, |n| n.chars().count() + 1);
     let room = width.saturating_sub(2 + id_w + 2 + note_w);
     let title = ingot_title(&row.work, room);
@@ -1530,7 +1543,7 @@ fn draw_bottom(f: &mut Frame, area: Rect, state: &DashState) {
             (format!(" {}", preview(&line, width.saturating_sub(10))), color)
         }
         None if state.turn_started.is_some() => (
-            format!(" {} {}…", tui::spinner_frame(0), tui::forge_verb(state.turn)),
+            format!(" {} turn {}", tui::spinner_frame(0), state.turn),
             palette(tui::HOT),
         ),
         // Ingots on the anvil with no turn open: the forge is running a
@@ -2500,15 +2513,17 @@ mod tests {
 
         let t0 = state.turn_started.unwrap();
         let line = forge_status(&state, t0 + Duration::from_secs(12)).unwrap();
-        // Esc detaches, it does not interrupt; the line no longer says so.
-        assert_eq!(line, "⚒ Forging… i1 · 12s · 4.1k tok · 342 tok/s");
+        // The turn's own clock and tokens, labelled as the turn's, so they
+        // never read against the run totals in the header. Esc detaches,
+        // it does not interrupt; the line no longer says so.
+        assert_eq!(line, "⚒ turn 0 of i1 · 0:12 · 4.1k tok this turn · 342 tok/s");
 
         // A new turn re-zeros the token fold and rotates the verb.
         apply_event(&mut state, EngineEvent::TurnStart { turn: 1 });
         assert_eq!(state.turn_tokens, 0);
         let t1 = state.turn_started.unwrap();
         let line = forge_status(&state, t1 + Duration::from_secs(2)).unwrap();
-        assert!(line.starts_with("⚒ Smelting… i1 · 2s · 0 tok"), "{line}");
+        assert!(line.starts_with("⚒ turn 1 of i1 · 0:02 · 0 tok this turn"), "{line}");
         assert!(!line.contains("tok/s"), "rate guarded below 5s/2000 tok: {line}");
     }
 
@@ -2544,7 +2559,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(content.contains("Forging…"), "spinner status must render");
+        assert!(content.contains("turn 0 of i1"), "the turn status must render");
         assert!(!content.contains("esc to interrupt"), "Esc detaches; the bar must not promise more");
     }
 

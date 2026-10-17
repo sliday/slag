@@ -58,6 +58,10 @@ pub fn truecolor() -> bool {
 /// no: escape bytes in a log file or a pasted bug report help nobody, and
 /// they break `grep` on a colored word.
 pub fn colored() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_COLOR.with(|f| f.get()) {
+        return forced;
+    }
     static YES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *YES.get_or_init(|| {
         colored_from(
@@ -66,6 +70,72 @@ pub fn colored() -> bool {
             std::io::stderr().is_terminal(),
         )
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test color switch: a test that checks escape sequences paints
+    /// as a terminal would, without touching any other test's thread.
+    static FORCE_COLOR: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with color forced on or off in this thread only.
+#[cfg(test)]
+pub fn with_color<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = FORCE_COLOR.with(|c| c.replace(Some(on)));
+    let out = f();
+    FORCE_COLOR.with(|c| c.set(before));
+    out
+}
+
+/// Every way `s` would show raw bytes on a terminal: an ESC that does not
+/// open a complete CSI sequence, or a `[…m` left behind by a lost ESC.
+/// Empty when every escape is whole.
+#[cfg(test)]
+pub fn ansi_problems(s: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut text = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1b' {
+            if chars.get(i + 1) != Some(&'[') {
+                problems.push(format!("ESC without [ at char {i}"));
+                i += 1;
+                continue;
+            }
+            let mut j = i + 2;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == ';' || chars[j] == '?') {
+                j += 1;
+            }
+            match chars.get(j) {
+                Some(c) if ('@'..='~').contains(c) => i = j + 1,
+                _ => {
+                    problems.push(format!("unterminated CSI at char {i}"));
+                    i = j;
+                }
+            }
+            continue;
+        }
+        text.push(chars[i]);
+        i += 1;
+    }
+    // A lost ESC leaves its body behind as visible text: `[38;2;…m`.
+    let t: Vec<char> = text.chars().collect();
+    for (k, c) in t.iter().enumerate() {
+        if *c != '[' {
+            continue;
+        }
+        let mut j = k + 1;
+        while j < t.len() && (t[j].is_ascii_digit() || t[j] == ';') {
+            j += 1;
+        }
+        if j > k + 1 && t.get(j) == Some(&'m') {
+            let orphan: String = t[k..=j].iter().collect();
+            problems.push(format!("orphan escape body {orphan:?}"));
+        }
+    }
+    problems
 }
 
 /// Pure color policy: painted text lands on BOTH streams (stdout status
@@ -144,8 +214,43 @@ fn piped_width(columns: Option<&str>) -> usize {
 /// Clip plain text to `max` columns, ending in `…` when it had to cut.
 /// Whitespace runs (newlines included) collapse to one space first, so a
 /// multi-line message can never break the one-line-per-entry ledger.
+///
+/// Painted text keeps its escapes whole. Clipping it as plain text dropped
+/// each ESC and printed the rest, `[38;2;224;108;117m✗`, on the screen.
 pub fn clip(s: &str, max: usize) -> String {
-    crate::engine::events::preview(s, max)
+    if !s.contains('\x1b') {
+        // A string an earlier clip already ended in `…` must not end in two.
+        let out = crate::engine::events::preview(s, max);
+        return match out.strip_suffix("……") {
+            Some(head) => format!("{head}…"),
+            None => out,
+        };
+    }
+    let mut out = String::new();
+    let mut seen = 0usize;
+    let mut chars = s.chars().peekable();
+    let budget = max.max(1);
+    let total = visible_len(s);
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            for c in chars.by_ref() {
+                out.push(c);
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if total > budget && seen + 1 >= budget {
+            out.push('…');
+            out.push_str(&reset());
+            return out;
+        }
+        out.push(if c.is_control() { ' ' } else { c });
+        seen += 1;
+    }
+    out
 }
 
 /// `0:42`, `12:05`, `1:02:05`: run clocks read the same at every size.
@@ -1095,6 +1200,22 @@ mod tests {
         assert!(!sync_output_capable(None, Some("xterm-256color"), Multiplexer::None));
         assert!(!sync_output_capable(Some("ghostty"), None, Multiplexer::Tmux), "tmux excluded");
         assert!(!sync_output_capable(Some("kitty"), None, Multiplexer::Screen), "screen excluded");
+    }
+
+    /// Clipping painted text keeps every escape whole: dropping the ESC and
+    /// printing `[38;2;…m` was what a real terminal showed.
+    #[test]
+    fn clipping_painted_text_never_leaves_raw_escape_bytes() {
+        with_color(true, || {
+            let painted = format!("{} without the fix: exit 1, so the new test catches the bug", paint(WARM, "✗"));
+            for max in [5, 20, 200] {
+                let out = clip(&painted, max);
+                assert!(ansi_problems(&out).is_empty(), "{max}: {:?} in {out:?}", ansi_problems(&out));
+                assert!(visible_len(&out) <= max, "{max}: {out:?}");
+            }
+            assert!(!ansi_problems(&format!("{}x[0m", paint(WARM, "y"))).is_empty(), "the checker catches an orphan");
+        });
+        assert_eq!(clip("already cut…", 6), "alrea…");
     }
 
     /// A pipe never takes the controlling terminal's width.

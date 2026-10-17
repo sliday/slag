@@ -1021,13 +1021,20 @@ fn report(out: &Outcome) {
     if tui::is_quiet() {
         return;
     }
-    let w = tui::width();
     let fixed = out.verdict == Verdict::Fixed;
     tui::header(if fixed { "FIX · FIXED" } else { "FIX · NOT FIXED" });
+    for line in report_lines(out, tui::width()) {
+        println!("{line}");
+    }
+}
+
+/// The report card's lines under its header. Every glyph is painted on
+/// its own and every value clipped as plain text, so no escape sequence
+/// is ever cut in half on its way to the screen.
+fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
+    let mut lines = Vec::new();
     let label = |name: &str| tui::dim(&format!("{name:<6}"));
-    let row = |name: &str, value: &str| {
-        println!("  {}  {}", label(name), tui::clip(value, w.saturating_sub(10)));
-    };
+    let row = |name: &str, value: &str| format!("  {}  {}", label(name), tui::clip(value, w.saturating_sub(10)));
     let title = match out.issue.number {
         Some(n) => format!("#{n} {}", out.issue.title),
         None => out.issue.title.clone(),
@@ -1039,12 +1046,12 @@ fn report(out: &Outcome) {
         Verdict::Fixed => {
             let head = format!("  {} {}  ", tui::paint(tui::PURE, "✓"), tui::paint(tui::PURE, &format!("{}FIXED{}", bold(), reset())));
             let rest = format!("{title} · {attempts}");
-            println!("{head}{}", tui::clip(&rest, w.saturating_sub(tui::visible_len(&head))));
+            lines.push(format!("{head}{}", tui::clip(&rest, w.saturating_sub(tui::visible_len(&head)))));
         }
         Verdict::Failed(reason) => {
             let head = format!("  {} {}  ", tui::paint(tui::WARM, "✗"), tui::paint(tui::WARM, &format!("{}NOT FIXED{}", bold(), reset())));
-            println!("{head}{}", tui::clip(reason, w.saturating_sub(tui::visible_len(&head))));
-            row("issue", &title);
+            lines.push(format!("{head}{}", tui::clip(reason, w.saturating_sub(tui::visible_len(&head)))));
+            lines.push(row("issue", &title));
         }
     }
 
@@ -1059,38 +1066,54 @@ fn report(out: &Outcome) {
         ),
     };
     let room = w.saturating_sub(12 + next.0.chars().count());
-    println!("  {}  {}  {}", label("next"), tui::paint(tui::HOT, &next.0), tui::dim(&tui::clip(&next.1, room.max(4))));
-    println!();
+    lines.push(format!("  {}  {}  {}", label("next"), tui::paint(tui::HOT, &next.0), tui::dim(&tui::clip(&next.1, room.max(4)))));
+    lines.push(String::new());
 
-    // What ran, and how it exited.
-    for (i, check) in out.checks.iter().enumerate() {
-        let (glyph, color) = if check.ok() { ("✓", tui::PURE) } else { ("✗", tui::WARM) };
-        let meta = format!("{} · {:.1}s", check.status(), check.secs);
+    // What ran, and how it exited: a glyph, the command, the exit code.
+    let proof_row = |first: bool, ok: bool, text: &str, meta: &str| {
+        let (glyph, color) = if ok { ("✓", tui::PURE) } else { ("✗", tui::WARM) };
         let left = format!(
             "  {}  {} {}",
-            label(if i == 0 { "proof" } else { "" }),
+            label(if first { "proof" } else { "" }),
             tui::paint(color, glyph),
-            tui::clip(&check.cmd, w.saturating_sub(16 + meta.chars().count()))
+            tui::clip(text, w.saturating_sub(16 + meta.chars().count()))
         );
-        println!("{}", tui::spread(&left, &tui::paint(if check.ok() { tui::COLD } else { tui::WARM }, &meta), w));
+        if meta.is_empty() {
+            left
+        } else {
+            tui::spread(&left, &tui::paint(if ok { tui::COLD } else { tui::WARM }, meta), w)
+        }
+    };
+    for (i, check) in out.checks.iter().enumerate() {
+        let meta = format!("{} · {:.1}s", check.status(), check.secs);
+        lines.push(proof_row(i == 0, check.ok(), &check.cmd, &meta));
     }
-    if fixed {
-        let repro = match &out.repro {
-            Repro::Regression { status } => format!("{} without the fix: {status}, so the new test catches the bug", tui::paint(tui::WARM, "✗")),
-            Repro::Baseline { status } => format!("{} before the fix: {status}", tui::paint(tui::WARM, "✗")),
-            Repro::NotShown(why) => format!("{} reproduction not shown: {why}", tui::dim("·")),
-        };
-        println!("  {}  {}", label(if out.checks.is_empty() { "proof" } else { "" }), tui::clip(&repro, w.saturating_sub(10)));
+    if out.verdict == Verdict::Fixed {
+        let first = out.checks.is_empty();
+        match &out.repro {
+            // A failing run without the fix is the evidence the fix works:
+            // it reads as a failure, in the failure's colour, like any other.
+            Repro::Regression { status } => {
+                lines.push(proof_row(first, false, &format!("without the fix: {status}, so the new test catches the bug"), ""))
+            }
+            Repro::Baseline { status } => lines.push(proof_row(first, false, &format!("before the fix: {status}"), "")),
+            Repro::NotShown(why) => lines.push(format!(
+                "  {}  {} {}",
+                label(if first { "proof" } else { "" }),
+                tui::dim("·"),
+                tui::clip(&format!("reproduction not shown: {why}"), w.saturating_sub(12))
+            )),
+        }
     }
     if let Some(bad) = out.checks.iter().find(|c| !c.ok()) {
         for line in repo::tail(&bad.output, 8, 1_500).lines() {
-            println!("            {}", tui::dim(&tui::clip(line, w.saturating_sub(12))));
+            lines.push(format!("            {}", tui::dim(&tui::clip(line, w.saturating_sub(12)))));
         }
     }
 
     // What changed, and where it is.
     for (i, line) in out.stat.iter().enumerate() {
-        row(if i == 0 { "diff" } else { "" }, line.trim());
+        lines.push(row(if i == 0 { "diff" } else { "" }, line.trim()));
     }
     let mut work = Vec::new();
     if let (Some(branch), Some(sha)) = (&out.branch, &out.commit) {
@@ -1100,10 +1123,10 @@ fn report(out: &Outcome) {
         work.push(pr.clone());
     }
     if !work.is_empty() {
-        row("work", &work.join(" · "));
+        lines.push(row("work", &work.join(" · ")));
     }
     for n in &out.notes {
-        row("note", n);
+        lines.push(row("note", n));
     }
 
     // What it took.
@@ -1115,11 +1138,15 @@ fn report(out: &Outcome) {
         took.push(spend.to_string());
     }
     if !took.is_empty() {
-        row("run", &took.join(" · "));
+        lines.push(row("run", &took.join(" · ")));
     }
-    row("", &out.phases.line());
-    println!();
+    lines.push(row("", &out.phases.line()));
+    lines.push(String::new());
+    lines
 }
+
+#[cfg(test)]
+mod report_tests;
 
 #[cfg(test)]
 mod tests {
