@@ -1528,7 +1528,14 @@ impl ToolBox {
     }
 
     fn glob_files(&self, dir: &Path, pattern: &str) -> Result<Vec<String>, SlagError> {
-        let explicit = self.heap_filters(dir, Some(pattern)).0.is_empty();
+        let relative = dir.strip_prefix(&self.root).unwrap_or(dir);
+        let explicit = relative
+            .components()
+            .chain(Path::new(pattern).components())
+            .any(|component| {
+                let name = component.as_os_str().to_string_lossy();
+                name == "logs" || name == ".git" || name.starts_with("slag-anvil-")
+            });
         let mut files = Vec::new();
         let mut stack = vec![(dir.to_path_buf(), PathBuf::new())];
         while let Some((current, relative)) = stack.pop() {
@@ -1539,7 +1546,9 @@ impl ToolBox {
                 let name = entry.file_name();
                 let child = relative.join(&name);
                 if path.is_dir() {
-                    let hidden_heap = name == "logs" || name == ".git" || name.to_string_lossy().starts_with("slag-anvil-");
+                    let hidden_heap = (relative.as_os_str().is_empty() && name == "logs")
+                        || name == ".git"
+                        || name.to_string_lossy().starts_with("slag-anvil-");
                     if !hidden_heap || explicit {
                         stack.push((path, child));
                     }
