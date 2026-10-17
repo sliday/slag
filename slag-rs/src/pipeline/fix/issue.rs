@@ -153,6 +153,7 @@ pub async fn resolve(words: &[String], file: Option<&Path>) -> Result<Issue, Sla
 /// Fetch a GitHub issue with `gh issue view`.
 async fn fetch(number: u64, repo: Option<&str>) -> Result<Issue, SlagError> {
     let mut cmd = tokio::process::Command::new("gh");
+    cmd.envs(crate::engine::sandbox::GIT_GUARD_ENV);
     cmd.args(["issue", "view", &number.to_string(), "--json", "number,title,body,url,comments"]);
     if let Some(repo) = repo {
         cmd.args(["--repo", repo]);

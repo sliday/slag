@@ -240,7 +240,7 @@ sandbox = "auto"                               # or "off"
 sandbox_writable = ["~/data", "/srv/scratch"]  # extra writable paths
 ```
 
-`--no-sandbox` or `SLAG_SANDBOX=off` turns it off. Precedence is flag, then environment, then file. A model writes every `:proof` and `CMD:` line, and `slag fix` can edit the test scripts it then runs, so slag runs proofs, CMD checks, and `slag fix` test runs in the same sandbox. A refused write shows up in the failure as `write blocked by slag's sandbox: <path>`. Hooks and `screenshot_cmd` stay outside it because you wrote them.
+`--no-sandbox` or `SLAG_SANDBOX=off` turns it off. Precedence is flag, then environment, then file. A model writes every `:proof` and `CMD:` line, and `slag fix` can edit the test scripts it then runs, so slag runs proofs, CMD checks, and `slag fix` test runs in the same sandbox. A refused write shows up in the failure as `write blocked by slag's sandbox: <path>`. Test detection's Python probe (`import pytest` with the workspace's `.venv/bin/python` or `python3`) runs in the sandbox too. Hooks, `screenshot_cmd` and `[mcp]` servers stay outside it because you wrote them. They start in the workspace, so a bare `npx` or `python` there can pick up a package the model installed; give them absolute paths if that matters to you.
 
 ## Architecture
 
