@@ -1812,7 +1812,7 @@ mod tests {
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
 
-        let check = "echo seen > seen.txt; sleep 1; bash tests/check.sh";
+        let check = "echo seen > seen.txt; while [ ! -f continue.txt ]; do sleep 0.01; done; bash tests/check.sh";
         let (repro, during) = tokio::join!(
             reproduce(&job, &before, &changed, check, None, &rescuer),
             async {
@@ -1821,6 +1821,7 @@ mod tests {
                 }
                 let during = value(&job);
                 fire(&slot);
+                std::fs::write(job.cwd.join("continue.txt"), "ok\n").unwrap();
                 during
             }
         );
