@@ -255,7 +255,10 @@ impl Run {
 
 /// Run `cmd` under bash in `dir`, stdout and stderr interleaved as a
 /// terminal would show them. `CI=true` keeps watch-mode runners from
-/// waiting on a keypress that never comes. The session can rewrite the
+/// waiting on a keypress that never comes. `PYTHONDONTWRITEBYTECODE`
+/// keeps slag's own runs from leaving `.pyc` files behind: the
+/// reproduction check compiles the old source, and a cache entry from it
+/// can outlive the swap back (see `purge_bytecode`). The session can rewrite the
 /// test scripts this runs, so it runs in the smith's shell sandbox; a
 /// refused write ends the output with the sandbox's note.
 pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
@@ -268,6 +271,7 @@ pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
         .arg(format!("exec 2>&1\n{cmd}"))
         .current_dir(dir)
         .env("CI", "true")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -354,6 +358,29 @@ fn kill_group(pid: u32) {
         .arg(format!("kill -9 -{pid}"))
         .stderr(Stdio::null())
         .status();
+}
+
+/// Drop the cached bytecode of a Python source file. Python trusts a
+/// `.pyc` whose recorded mtime (whole seconds) and size match the source,
+/// so swapping `a + b` for `a * b` within one second leaves a cache entry
+/// that runs the wrong code. Deleting the entry forces a recompile; it is
+/// only a cache.
+pub fn purge_bytecode(path: &Path) {
+    if path.extension().and_then(|e| e.to_str()) != Some("py") {
+        return;
+    }
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+        return;
+    };
+    let _ = std::fs::remove_file(dir.join(format!("{stem}.pyc")));
+    let Ok(entries) = std::fs::read_dir(dir.join("__pycache__")) else { return };
+    let prefix = format!("{stem}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".pyc") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The last `lines` lines of `text`, capped at `bytes`. Test runners put
@@ -931,6 +958,35 @@ mod tests {
             Some("tests/test_prune.sh (new file)"),
             "named like the tests, not like the runner"
         );
+    }
+
+    #[test]
+    fn purging_bytecode_drops_only_that_modules_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "calc.py", "");
+        write(dir.path(), "calc.pyc", "");
+        write(dir.path(), "__pycache__/calc.cpython-314.pyc", "");
+        write(dir.path(), "__pycache__/calc.cpython-314.opt-1.pyc", "");
+        write(dir.path(), "__pycache__/calculator.cpython-314.pyc", "");
+        purge_bytecode(&dir.path().join("calc.py"));
+        assert!(!dir.path().join("calc.pyc").exists());
+        let left: Vec<String> = std::fs::read_dir(dir.path().join("__pycache__"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["calculator.cpython-314.pyc"], "another module's cache stays");
+    }
+
+    #[tokio::test]
+    async fn slags_own_runs_write_no_bytecode() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run(
+            "python3 -c 'import sys; print(sys.dont_write_bytecode)'",
+            dir.path(),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(run.output.contains("True"), "{}", run.output);
     }
 
     #[test]
