@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::sexp::parser::{parse_crucible, parse_ingot};
+use crate::sexp::parser::{crucible_records, parse_crucible, parse_ingot};
 use crate::sexp::writer::write_ingot;
 use crate::sexp::{Ingot, Status};
 
@@ -26,14 +26,14 @@ impl Crucible {
         let mut header_lines = Vec::new();
         let mut ingots: Vec<Ingot> = Vec::new();
 
-        for (n, line) in content.lines().enumerate() {
+        for (n, line) in crucible_records(&content) {
             let trimmed = line.trim();
             if trimmed.starts_with("(ingot ") {
                 if let Some(ingot) = parse_ingot(trimmed) {
                     if ingots.iter().any(|i| i.id == ingot.id) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("{}:{}: duplicate ingot id {}", path.display(), n + 1, ingot.id),
+                            format!("{}:{}: duplicate ingot id {}", path.display(), n, ingot.id),
                         ));
                     }
                     ingots.push(ingot);
@@ -44,7 +44,7 @@ impl Crucible {
                     eprintln!(
                         "slag: {}:{}: dropped unparseable ingot line: {preview}",
                         path.display(),
-                        n + 1
+                        n
                     );
                 }
             } else {
@@ -494,6 +494,25 @@ mod tests {
         // Round-trip intact.
         let c2 = Crucible::load(f.path()).unwrap();
         assert_eq!(c2.ingots.len(), 4);
+    }
+
+    #[test]
+    fn quoted_and_multiline_fields_survive_plan_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("PLAN.md");
+        let mut ingots = parse_ingot_lines("(ingot :id \"i1\" :proof \"true\")");
+        let proof = "printf '%s\\n' \"$HOME\"\n# literal newline, regex \\. and \\|";
+        ingots[0].proof = proof.into();
+        ingots[0].work = "First line\n(ingot :id \"text, not another task\")".into();
+        let mut crucible = Crucible::new(&path, ingots);
+        for _ in 0..3 {
+            crucible.save().unwrap();
+            crucible = Crucible::load(&path).unwrap();
+            assert_eq!(crucible.ingots.len(), 1);
+            assert_eq!(crucible.ingots[0].proof, proof);
+            assert_eq!(crucible.ingots[0].work, "First line\n(ingot :id \"text, not another task\")");
+            assert_eq!(crucible.header_lines.len(), 2);
+        }
     }
 
     #[test]
