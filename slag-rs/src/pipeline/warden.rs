@@ -86,7 +86,12 @@ pub fn parse_verdict(raw: &str) -> Verdict {
         }
     }
     match fulfilled {
-        Some(true) => Verdict { fulfilled: true, gap: String::new(), evidence },
+        Some(true) if !evidence.trim().is_empty() => Verdict { fulfilled: true, gap: String::new(), evidence },
+        Some(true) => Verdict {
+            fulfilled: false,
+            gap: "the warden returned a pass without inspection evidence".to_string(),
+            evidence,
+        },
         Some(false) => Verdict {
             fulfilled: false,
             gap: if gap.is_empty() {
@@ -154,10 +159,8 @@ fn is_usable(bar: &str) -> bool {
 
 /// Judge the built artifact against the bar.
 ///
-/// The smith is a forge-mode agent because the warden has to *run* things —
-/// the build, the tests, the app. What it must not get is the builder's
-/// account of the work, so nothing about the forge is passed in beyond the
-/// goal and the bar.
+/// The warden reads source and runs checks with a bounded inspection budget.
+/// It receives the goal and bar without the builder's account of the work.
 pub async fn judge_artifact(
     cfg: &EngineConfig,
     hooks: &EngineHooks,
@@ -234,12 +237,11 @@ pub async fn judge_ingot(
     let smith = crate::smith::make_warden(cfg, hooks);
     match smith.invoke(&crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar)).await {
         Ok(raw) => parse_verdict(&raw),
-        // A warden that cannot run must not fail an ingot whose proof
-        // passed. Judging is an extra gate, never a new way to lose work.
-        Err(e) => {
-            let _ = e;
-            Verdict { fulfilled: true, gap: String::new(), evidence: "warden unavailable".into() }
-        }
+        Err(e) => Verdict {
+            fulfilled: false,
+            gap: format!("the warden could not inspect the ingot: {e}"),
+            evidence: String::new(),
+        },
     }
 }
 
@@ -313,6 +315,13 @@ mod tests {
         assert!(v.fulfilled);
         assert!(v.gap.is_empty());
         assert!(v.evidence.contains("24/24"));
+    }
+
+    #[test]
+    fn a_pass_without_inspection_evidence_fails() {
+        let v = parse_verdict("VERDICT: pass\nGAP:\nEVIDENCE:");
+        assert!(!v.fulfilled);
+        assert!(v.gap.contains("without inspection evidence"));
     }
 
     #[test]

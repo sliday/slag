@@ -37,6 +37,7 @@ pub struct NativeSmith {
     /// are `Smith`; the plan smith carries whichever phase built it, so
     /// surveyor and founder spend separate even on one model.
     role: Role,
+    scope_only: bool,
 }
 
 impl NativeSmith {
@@ -52,6 +53,7 @@ impl NativeSmith {
             hooks: hooks.clone(),
             ingot_spend: SpendAccum::default(),
             role: Role::Smith,
+            scope_only: false,
         }
     }
 
@@ -73,6 +75,24 @@ impl NativeSmith {
             hooks: hooks.clone(),
             ingot_spend: SpendAccum::default(),
             role: Role::Plan,
+            scope_only: false,
+        }
+    }
+
+    pub fn scope(cfg: EngineConfig, root: PathBuf, hooks: &EngineHooks) -> Self {
+        Self {
+            grade: 1,
+            role: Role::Surveyor,
+            scope_only: true,
+            ..Self::plan(cfg, root, hooks)
+        }
+    }
+
+    pub fn review(cfg: EngineConfig, root: PathBuf, hooks: &EngineHooks) -> Self {
+        Self {
+            mode: PromptMode::Review,
+            role: Role::Warden,
+            ..Self::plan(cfg, root, hooks)
         }
     }
 
@@ -102,6 +122,7 @@ impl NativeSmith {
             },
             ingot_spend: SpendAccum::default(),
             role: Role::Duel,
+            scope_only: false,
         }
     }
 
@@ -117,7 +138,7 @@ impl NativeSmith {
             return model;
         }
         match self.mode {
-            PromptMode::Plan => &self.cfg.model_plan,
+            PromptMode::Plan | PromptMode::Review => &self.cfg.model_plan,
             PromptMode::Forge => self.cfg.model_for_grade(self.grade),
         }
     }
@@ -143,8 +164,20 @@ impl NativeSmith {
             return Err(error);
         }
         let model = self.model().to_string();
-        let bands = prompt::build(&self.root, &model, self.mode);
-        let effort = self.cfg.effort.or(Some(Effort::from_grade(self.grade)));
+        let system = if self.scope_only {
+            "Classify the commission's scope. Return only the requested JSON. Do not build or inspect files.".into()
+        } else {
+            prompt::build(&self.root, &model, self.mode).join()
+        };
+        let effort = if self.scope_only {
+            Some(Effort::Low)
+        } else {
+            self.cfg.effort.or(Some(if self.mode == PromptMode::Review {
+                Effort::Low
+            } else {
+                Effort::from_grade(self.grade)
+            }))
+        };
 
         // One agent channel fans out to the JSONL sink, the display, and
         // (when the TUI is up) the dashboard hook. The dashboard replaces
@@ -152,7 +185,7 @@ impl NativeSmith {
         // corrupt the alternate screen.
         let (tx, mut rx) = events::channel();
         let (tx_jsonl, rx_jsonl) = events::channel();
-        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
         let jsonl_path = PathBuf::from(crate::config::LOG_DIR).join(format!("engine-{ts}.jsonl"));
         let jsonl = events::spawn_jsonl_sink(rx_jsonl, jsonl_path);
 
@@ -184,11 +217,12 @@ impl NativeSmith {
         // per model on the provider; `None` on fetch failure keeps the
         // default): a 32k model compacts before it 400s, a 1M model does
         // not throw context away at the fixed default.
-        let window = provider.context_length(&model).await;
+        let window = if self.scope_only { None } else { provider.context_length(&model).await };
         let toolbox = ToolBox::new(&self.root)
             .with_policy(crate::engine::policy::Policy::from_config())
             .with_steer(self.hooks.steer.clone());
         let mut agent = ForgeAgent::new(provider, toolbox, &model)
+            .with_coordinator_root(self.root.clone())
             .with_context_window(window)
             .with_effort(effort)
             .with_ingot_spend(self.ingot_spend.clone())
@@ -200,6 +234,15 @@ impl NativeSmith {
         // document -- so the tool is withheld rather than argued with.
         if self.mode == PromptMode::Plan {
             agent = agent.without_finish();
+            if self.role == Role::Warden {
+                agent = agent.with_read_only_tools().with_max_turns(2);
+            }
+        }
+        if self.mode == PromptMode::Review {
+            agent = agent.with_read_only_tools().with_required_inspection().with_max_turns(6);
+        }
+        if self.scope_only {
+            agent = agent.with_no_tools().with_max_turns(1);
         }
         if let Some(steer) = &self.hooks.steer {
             agent = agent.with_steer(steer.clone());
@@ -208,7 +251,7 @@ impl NativeSmith {
             agent = agent.with_cancel(cancel.clone());
         }
 
-        let result = agent.run(bands.join(), prompt_text.to_string()).await;
+        let result = agent.run(system, prompt_text.to_string()).await;
 
         // Drop the agent (and its EventTx) so the sinks drain and exit.
         drop(agent);
@@ -266,6 +309,101 @@ mod tests {
         let smith = NativeSmith::plan(cfg(), PathBuf::from("."), &EngineHooks::default());
         assert_eq!(smith.model(), "plan/model");
         assert_eq!(smith.mode, PromptMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn scope_uses_one_small_request_without_tools_or_a_window_lookup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"direct\":true,\"proof\":\"python3 -m unittest\"}"}, "finish_reason": "stop"}],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = cfg();
+        config.base_url = server.uri();
+        config.effort = Some(Effort::High);
+        let smith = NativeSmith::scope(config, PathBuf::from("."), &EngineHooks::default());
+        let proof = crate::pipeline::surveyor::direct_proof(&smith, "Create a local utility with a unittest.")
+            .await.unwrap();
+        assert_eq!(proof.as_deref(), Some("python3 -m unittest"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "plan/model");
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert!(body.get("tools").is_none_or(|tools| tools.as_array().unwrap().is_empty()));
+        assert!(body["messages"][0]["content"].as_str().unwrap().len() < 200);
+    }
+
+    #[tokio::test]
+    async fn warden_inspects_files_and_runs_checks_without_builder_tools() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("output.txt"), "accepted\n").unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let inspected = body["messages"].as_array().unwrap().iter()
+                    .any(|message| message["role"] == "tool");
+                let message = if inspected {
+                    serde_json::json!({
+                        "content": "VERDICT: pass\nGAP:\nEVIDENCE: output.txt contains accepted; cat output.txt prints accepted",
+                    })
+                } else {
+                    serde_json::json!({
+                        "content": "",
+                        "tool_calls": [
+                            {"id": "source", "type": "function", "function": {
+                                "name": "read_file", "arguments": "{\"path\":\"output.txt\"}",
+                            }},
+                            {"id": "check", "type": "function", "function": {
+                                "name": "bash", "arguments": "{\"command\":\"cat output.txt\"}",
+                            }},
+                        ],
+                    })
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": message, "finish_reason": if inspected { "stop" } else { "tool_calls" }}],
+                }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = cfg();
+        config.base_url = server.uri();
+        let smith = NativeSmith::review(config, dir.path().into(), &EngineHooks::default());
+        let raw = smith.invoke("Review output.txt.").await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&raw).fulfilled);
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = requests.iter()
+            .filter(|request| request.url.path() == "/chat/completions")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        for body in &bodies {
+            let tools: Vec<_> = body["tools"].as_array().unwrap().iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect();
+            assert!(tools.contains(&"bash"));
+            assert!(tools.contains(&"read_file"));
+            assert!(!tools.iter().any(|name| ["write_file", "edit_file", "finish"].contains(name)));
+        }
+        let results: Vec<_> = bodies[1]["messages"].as_array().unwrap().iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|message| message["content"].as_str().unwrap().contains("accepted")));
+        assert_eq!(std::fs::read_to_string(dir.path().join("output.txt")).unwrap(), "accepted\n");
     }
 
     #[tokio::test]

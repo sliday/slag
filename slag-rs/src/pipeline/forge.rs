@@ -24,6 +24,11 @@ pub(crate) const MAX_TRANSIENT_PER_HEAT: u8 = 5;
 
 struct FatalCast(Box<dyn Smith>);
 
+enum Forged {
+    Strike,
+    Duel,
+}
+
 impl Smith for FatalCast {
     fn invoke(&self, prompt: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, SlagError>> + Send + '_>> {
         let prompt = prompt.to_string();
@@ -282,12 +287,17 @@ async fn run_inner(
                     return Err(error);
                 }
                 match result {
-                    Ok((id, Ok(()))) => {
+                    Ok((id, Ok(kind))) => {
                         let _guard = CRUCIBLE_LOCK.lock().await;
                         let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
                         crucible.set_status(&id, Status::Forged);
                         crucible.save()?;
                         let heat = crucible.get(&id).map(|i| i.heat).unwrap_or(0);
+                        let ingot = crucible.get(&id).unwrap();
+                        if matches!(kind, Forged::Strike) {
+                            append_ledger(ingot, heat);
+                        }
+                        proof::git_commit(&id, &ingot.work).await;
                         run_log.append(&RunEntry::IngotDone { id: id.clone(), ok: true, heat });
                         fire_ingot_hook(&id, true, &hooks.events).await;
                         emit(&hooks.events, EngineEvent::IngotDone { id, ok: true });
@@ -318,26 +328,24 @@ async fn run_inner(
                         return Err(e);
                     }
                     Ok((id, Err(_))) => {
-                        // Try resmelt. Holding the lock across the smith call
-                        // stalls other anvils' heat ticks, but keeps the
-                        // load-resmelt-save section atomic.
-                        let _guard = CRUCIBLE_LOCK.lock().await;
-                        let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
-                        if let Some(ingot) = crucible.get(&id).cloned() {
+                        let ingot = {
+                            let _guard = CRUCIBLE_LOCK.lock().await;
+                            Crucible::load(Path::new(CRUCIBLE))?.get(&id).cloned()
+                        };
+                        if let Some(ingot) = ingot {
                             let smith = crate::smith::make_base_smith(config, hooks);
-                            let result = resmelt::resmelt_ingot(&mut crucible, &ingot, smith.as_ref()).await;
+                            let result = resmelt_unlocked(&ingot, smith.as_ref()).await;
                             if let Err(e) = result.as_ref() {
                                 if e.is_deterministic_provider() {
-                                    drop(_guard);
                                     set.abort_all();
                                     while set.join_next().await.is_some() {}
                                     restore_unfinished_batch(&batch).await?;
                                     return result;
                                 }
                             }
-                            if result.is_ok() {
-                                crucible.save()?;
-                            } else {
+                            if result.is_err() {
+                                let _guard = CRUCIBLE_LOCK.lock().await;
+                                let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
                                 crucible.set_status(&id, Status::Cracked);
                                 crucible.save()?;
                                 let heat = crucible.get(&id).map(|i| i.heat).unwrap_or(0);
@@ -426,14 +434,16 @@ async fn run_inner(
             crucible.set_status(&ingot.id, Status::Forged);
             crucible.save()?;
             let heat = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(0);
+            append_ledger(&ingot, heat);
             run_log.append(&RunEntry::IngotDone { id: ingot.id.clone(), ok: true, heat });
             fire_ingot_hook(&ingot.id, true, &hooks.events).await;
             emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
+            proof::git_commit(&ingot.id, &ingot.work).await;
         } else {
+            let base_smith = crate::smith::make_base_smith(config, hooks);
+            let result = resmelt_unlocked(&ingot, base_smith.as_ref()).await;
             let _guard = CRUCIBLE_LOCK.lock().await;
             let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
-            let base_smith = crate::smith::make_base_smith(config, hooks);
-            let result = resmelt::resmelt_ingot(&mut crucible, &ingot, base_smith.as_ref()).await;
             if let Err(e) = result.as_ref() {
                 if e.is_deterministic_provider() {
                     crucible.set_status(&ingot.id, Status::Ore);
@@ -461,6 +471,23 @@ async fn run_inner(
             println!();
         }
     }
+}
+
+async fn resmelt_unlocked(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError> {
+    let mut draft = {
+        let _guard = CRUCIBLE_LOCK.lock().await;
+        Crucible::load(Path::new(CRUCIBLE))?
+    };
+    let other_ids: std::collections::HashSet<_> = draft.ingots.iter()
+        .filter(|i| i.id != ingot.id).map(|i| i.id.clone()).collect();
+    resmelt::resmelt_ingot(&mut draft, ingot, smith).await?;
+    let replacements = draft.ingots.into_iter()
+        .filter(|i| !other_ids.contains(&i.id)).collect();
+    let _guard = CRUCIBLE_LOCK.lock().await;
+    let mut current = Crucible::load(Path::new(CRUCIBLE))?;
+    current.replace(&ingot.id, replacements);
+    current.save()?;
+    Ok(())
 }
 
 async fn restore_unfinished_batch(batch: &[Ingot]) -> Result<(), SlagError> {
@@ -505,7 +532,7 @@ async fn forge_ingot(
     duel_cfg: Option<(&EngineConfig, u8)>,
     hooks: &EngineHooks,
     config: &EngineConfig,
-) -> Result<(), SlagError> {
+) -> Result<Forged, SlagError> {
     if matches!(ingot.status, Status::Cracked | Status::Forged) {
         return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
     }
@@ -575,7 +602,7 @@ async fn forge_ingot(
                         super::reset()
                     );
                 }
-                return Ok(());
+                return Ok(Forged::Duel);
             }
             Ok(duel::DuelOutcome::FellThrough) => {
                 if let Some(e) = crate::error::provider_run_failure() {
@@ -618,11 +645,11 @@ async fn forge_ingot(
             let _guard = CRUCIBLE_LOCK.lock().await;
             if let Ok(crucible) = Crucible::load(Path::new(CRUCIBLE)) {
                 if let Some(current) = crucible.get(&ingot.id) {
-                    fallback.max = remaining_budget(ingot.max, current.heat);
+                    fallback.heat = current.heat;
                 }
             }
         }
-        if fallback.max == 0 {
+        if remaining_budget(fallback.max, fallback.heat) == 0 {
             return Err(SlagError::IngotCracked(ingot.id.clone(), ingot.max));
         }
         // The fallback smith shares the duel's spend accumulator: the
@@ -635,9 +662,9 @@ async fn forge_ingot(
             hooks,
             cast_spend.clone(),
         );
-        return strike_ingot(&fallback, fallback_smith.as_ref(), hooks, cfg).await;
+        return strike_ingot(&fallback, fallback_smith.as_ref(), hooks, cfg).await.map(|_| Forged::Strike);
     }
-    strike_ingot(ingot, smith, hooks, config).await
+    strike_ingot(ingot, smith, hooks, config).await.map(|_| Forged::Strike)
 }
 
 /// Heats left after `spent` of a `max` budget.
@@ -793,6 +820,7 @@ async fn resume_crashed_ingot(
                 crucible.set_status(&ingot.id, Status::Forged);
                 crucible.save()?;
                 append_ledger(ingot, ingot.heat);
+                proof::git_commit(&ingot.id, &ingot.work).await;
                 fire_ingot_hook(&ingot.id, true, &hooks.events).await;
             emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
                 run_log.append(&RunEntry::IngotDone {
@@ -890,6 +918,7 @@ async fn resume_session(
         .with_steer(hooks.steer.clone());
     let mut agent = ForgeAgent::new(provider, toolbox, &model)
         .with_context_window(window)
+        .with_coordinator_root(std::path::PathBuf::from("."))
         .with_resume(true)
         .with_effort(config.effort.or(Some(Effort::from_grade(ingot.grade))));
     if let Some(tx) = &hooks.events {
@@ -921,12 +950,12 @@ async fn resume_session(
 /// retry heat would have been fed.
 async fn verify_and_seal(ingot: &Ingot, response: &str) -> Result<(), String> {
     let cmd = proof::extract_cmd(response).ok_or("NO CMD: line in response".to_string())?;
-    let (ok, output) = proof::run_shell(&cmd).await;
+    let (ok, output) = run_verification(&cmd).await;
     if !ok {
         return Err(format!("CMD failed (exit 1): {output}"));
     }
     if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
-        let (proof_ok, proof_output) = proof::run_shell(&ingot.proof).await;
+        let (proof_ok, proof_output) = run_verification(&ingot.proof).await;
         if !proof_ok {
             return Err(format!("Proof failed [{}]: {proof_output}", ingot.proof));
         }
@@ -934,8 +963,24 @@ async fn verify_and_seal(ingot: &Ingot, response: &str) -> Result<(), String> {
     if let Some(e) = crate::error::provider_run_failure() {
         return Err(e.to_string());
     }
-    proof::git_commit(&ingot.id, &ingot.work).await;
     Ok(())
+}
+
+async fn run_verification(cmd: &str) -> (bool, String) {
+    if let Some(error) = crate::engine::agent::coordinator_command_error(cmd) {
+        return (false, error.to_string());
+    }
+    let _guard = CRUCIBLE_LOCK.lock().await;
+    let snapshot = match super::CoordinatorGuard::capture(Path::new(".")) {
+        Ok(snapshot) => snapshot,
+        Err(e) => return (false, format!("cannot protect coordinator files: {e}")),
+    };
+    let (ok, output) = proof::run_shell(cmd).await;
+    match snapshot.restore() {
+        Ok(changed) if changed.is_empty() => (ok, output),
+        Ok(changed) => (false, format!("verification changed coordinator files: {}\n{output}", changed.join(", "))),
+        Err(e) => (false, format!("cannot restore coordinator files: {e}\n{output}")),
+    }
 }
 
 /// Invoke the smith, absorbing transient provider errors: up to
@@ -1010,7 +1055,7 @@ async fn strike_ingot(
         );
     }
 
-    for heat in 1..=ingot.max {
+    for heat in 1..=remaining_budget(ingot.max, ingot.heat) {
         // Update heat in crucible file
         let current = {
             let _guard = CRUCIBLE_LOCK.lock().await;
@@ -1028,15 +1073,15 @@ async fn strike_ingot(
         ckpt.begin();
 
         if !quiet {
-            let hc = match heat {
+            let hc = match current {
                 1..=2 => tui::WARM,
                 3 => tui::HOT,
                 4 => tui::BRIGHT,
                 _ => tui::PURE,
             };
-            let hb = if heat > 4 { super::bold() } else { String::new() };
+            let hb = if current > 4 { super::bold() } else { String::new() };
             print!(
-                "    {}{}⚒ {heat}/{}{} ",
+                "    {}{}⚒ {current}/{}{} ",
                 hb,
                 super::fg(hc),
                 ingot.max,
@@ -1044,8 +1089,10 @@ async fn strike_ingot(
             );
         }
 
-        let flux_text = flux::prepare_flux(ingot, slag.as_deref());
-        log_to_file(&format!("FLUX_{}_{heat}", ingot.id), &flux_text);
+        let mut active = ingot.clone();
+        active.heat = current;
+        let flux_text = flux::prepare_flux(&active, slag.as_deref());
+        log_to_file(&format!("FLUX_{}_{current}", ingot.id), &flux_text);
 
         let spinner_msg = if ingot.is_complex() {
             "planning..."
@@ -1096,7 +1143,7 @@ async fn strike_ingot(
                 if !quiet {
                     println!("{}✗{}", super::fg(tui::WARM), super::reset());
                 }
-                rewind_failed_heat(&ckpt, ingot, heat, hooks);
+                rewind_failed_heat(&ckpt, ingot, current, hooks);
                 continue;
             }
         };
@@ -1106,7 +1153,7 @@ async fn strike_ingot(
             unburn_heat(&ingot.id).await?;
             return Err(e);
         }
-        log_to_file(&format!("STRIKE_{}_{heat}", ingot.id), &response);
+        log_to_file(&format!("STRIKE_{}_{current}", ingot.id), &response);
 
         // Extract CMD
         let cmd = match proof::extract_cmd(&response) {
@@ -1116,7 +1163,7 @@ async fn strike_ingot(
                 if !quiet {
                     println!("{}✗{} no CMD", super::fg(tui::WARM), super::reset());
                 }
-                rewind_failed_heat(&ckpt, ingot, heat, hooks);
+                rewind_failed_heat(&ckpt, ingot, current, hooks);
                 continue;
             }
         };
@@ -1127,22 +1174,22 @@ async fn strike_ingot(
         }
 
         // Run CMD
-        let (ok, output) = proof::run_shell(&cmd).await;
+        let (ok, output) = run_verification(&cmd).await;
         log_to_file(
-            &format!("ASSAY_{}_{heat}", ingot.id),
+            &format!("ASSAY_{}_{current}", ingot.id),
             &format!("exit={}\n{output}", if ok { 0 } else { 1 }),
         );
 
         if ok {
             // Verify proof if different from cmd
             if !ingot.proof.is_empty() && ingot.proof != cmd && ingot.proof != "true" {
-                let (proof_ok, proof_output) = proof::run_shell(&ingot.proof).await;
+                let (proof_ok, proof_output) = run_verification(&ingot.proof).await;
                 if !proof_ok {
                     slag = Some(format!("Proof failed [{}]: {proof_output}", ingot.proof));
                     if !quiet {
                         println!("{}✗{} impure", super::fg(tui::WARM), super::reset());
                     }
-                    rewind_failed_heat(&ckpt, ingot, heat, hooks);
+                    rewind_failed_heat(&ckpt, ingot, current, hooks);
                     continue;
                 }
             }
@@ -1166,7 +1213,7 @@ async fn strike_ingot(
                     if !quiet {
                         println!("{}✗{} short of the bar", super::fg(tui::WARM), super::reset());
                     }
-                    rewind_failed_heat(&ckpt, ingot, heat, hooks);
+                    rewind_failed_heat(&ckpt, ingot, current, hooks);
                     continue;
                 }
             }
@@ -1179,15 +1226,13 @@ async fn strike_ingot(
             if !quiet {
                 println!("{}{}█{}", super::bold(), super::fg(tui::PURE), super::reset());
             }
-            proof::git_commit(&ingot.id, &ingot.work).await;
-            append_ledger(ingot, heat);
             return Ok(());
         } else {
             slag = Some(format!("CMD failed (exit 1): {output}"));
             if !quiet {
                 println!("{}✗{}", super::fg(tui::WARM), super::reset());
             }
-            rewind_failed_heat(&ckpt, ingot, heat, hooks);
+            rewind_failed_heat(&ckpt, ingot, current, hooks);
         }
     }
 

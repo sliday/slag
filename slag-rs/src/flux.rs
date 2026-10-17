@@ -91,14 +91,12 @@ fn oversized_instructions_in(paths: &[&str]) -> Vec<String> {
 }
 
 /// Build the prompt (flux) for striking an ingot.
-/// Includes blueprint, alloy recipes, crucible state, ledger, git diff.
+/// Includes the task, blueprint, project rules, and a compact plan state.
 pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
     let blueprint = load_instruction(BLUEPRINT, "None", &read_instruction(BLUEPRINT));
     let alloy = load_instruction(ALLOY_FILE, "None yet", &read_instruction(ALLOY_FILE));
-    let crucible = load_instruction(CRUCIBLE, "Empty", &read_instruction(CRUCIBLE));
-    let ledger = read_tail(LEDGER, 25);
+    let crucible = compact_plan(&std::fs::read_to_string(CRUCIBLE).unwrap_or_default());
     let override_header = INSTRUCTION_OVERRIDE_HEADER;
-    let git_diff = git_diff_stat();
 
     let complex_note = if ingot.grade >= HIGH_GRADE {
         " ◉ COMPLEX"
@@ -118,6 +116,7 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         Skill: {skill}{skill_note}\n\
         Heat: {heat}/{max}\n\
         Proof: {proof}\n\
+        Acceptance: {bar}\n\
         \n\
         === PROJECT INSTRUCTIONS ===\n\
         {override_header}\n\
@@ -128,14 +127,12 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         === ALLOY RECIPES ===\n\
         {alloy}\n\
         \n\
-        === CRUCIBLE STATE ===\n\
+        === PLAN STATE (read only) ===\n\
         {crucible}\n\
         \n\
-        === RECENT LEDGER ===\n\
-        {ledger}\n\
-        \n\
-        === GIT DIFF ===\n\
-        {git_diff}\n\n",
+        slag owns PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/.\n\
+        Do not write, restore, remove, or commit these paths. Do not run git commands.\n\
+        Ignore coordinator files and generated caches when you inspect cleanliness.\n\n",
         id = ingot.id,
         work = ingot.work,
         grade = ingot.grade,
@@ -143,6 +140,7 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         heat = ingot.heat,
         max = ingot.max,
         proof = ingot.proof,
+        bar = ingot.bar,
     );
 
     if let Some(slag_msg) = slag {
@@ -154,9 +152,8 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         flux.push_str("=== INSTRUCTIONS ===\n");
         flux.push_str("1. Forge this ingot completely\n");
         flux.push_str("2. Create/modify all necessary files\n");
-        flux.push_str("3. Add useful patterns to AGENTS.md\n");
         flux.push_str(
-            "4. Finish with the verification command in the finish tool's `cmd` field\n\n",
+            "3. Finish with the verification command in the finish tool's `cmd` field\n\n",
         );
 
         if ingot.is_complex() {
@@ -175,6 +172,14 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
     }
 
     flux
+}
+
+fn compact_plan(plan: &str) -> String {
+    let items: Vec<String> = crate::sexp::parser::parse_crucible(plan)
+        .into_iter()
+        .map(|i| format!("{}: {} ({})", i.id, i.work, i.status))
+        .collect();
+    if items.is_empty() { "Empty".into() } else { items.join("\n") }
 }
 
 /// Human line for whole-job spend, restored from
@@ -375,15 +380,13 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
         "ROLE: set the acceptance bar for this commission.\n\n\
          COMMISSION:\n{ore}\n\n\
          BLUEPRINT:\n{blueprint}\n\n\
-         Write the bar a harsh reviewer will hold the finished work to. Every \
-         line must be something an agent can OPEN AND INSPECT, never an \
-         adjective. \"Production ready\" gives a reviewer nothing to lose \
-         against, so it calls the work done at \"pretty good for AI\".\n\n\
-         Prefer lines with a mechanical part -- a number, a command and its \
-         expected output, a named file that must exist and what must be in it. \
-         A measurement survives an argument; an impression does not.\n\n\
-         The bar does not have to be reachable. Its job is to stop a reviewer \
-         calling the work done too early.\n\n\
+         Derive a short, reachable checklist from the commission's stated requirements.\n\
+         Use the blueprint for context. Do not promote its design choices into requirements.\n\
+         Name observable behavior and a direct way to inspect it.\n\
+         Add no test counts, formatting rules, dependency bans, or features unless the commission requires them.\n\
+         Permit normal imports between project modules.\n\
+         Check test execution through the test runner, never by regex over test names or output.\n\
+         Ignore slag's coordinator files and generated caches when you check cleanliness.\n\n\
          Produce EXACTLY this document:\n\n\
          ## THE BAR\nOne sentence naming what the finished work is measured \
          against.\n\n\
@@ -393,7 +396,7 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          ## HOW TO INSPECT\n\
          The commands a reviewer runs to check the list, in order.\n\n\
          RULES:\n\
-         - You are the EXPERT. Decide the bar yourself.\n\
+         - Trace each checklist item to a stated requirement.\n\
          - NO QUESTIONS, NO PREAMBLE.\n\n\
          {}",
         DOCUMENT_OUTPUT_RULE
@@ -415,9 +418,8 @@ pub fn plan_warden_prompt(kind: &str, ore: &str, bar: &str, doc: &str) -> String
          THE {kind} under review:\n{doc}\n\n\
          Question: if this {kind} were carried out exactly as written, would \
          the result clear the bar?\n\n\
-         Judge coverage, not style. Look for what the bar demands and this \
-         {kind} never mentions -- a missing capability is the failure that \
-         matters here, and it is far cheaper to find now than after a forge.\n\n\
+         Judge coverage of stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
+         Do not require extra features, test counts, naming rules, or bans on normal project imports.\n\n\
          Do not ask for more detail for its own sake. A terse {kind} that \
          covers the bar passes.\n\n\
          Name ONE gap: the biggest thing the bar needs and this {kind} \
@@ -441,9 +443,11 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          author nothing.\n\n\
          THE SUB-GOAL:\n{work}\n\n\
          ITS BAR:\n{bar}\n\n\
-         Inspect what is actually on disk. Run it. A passing test and a \
-         present file are not the sub-goal; the sub-goal is what the work \
-         above describes.\n\n\
+         Inspect the source on disk. Run the relevant tests or a direct behavior check.\n\
+         Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
+         Do not edit files or run git commands.\n\
+         Judge the stated sub-goal. Add no features, test counts, naming rules, or bans on normal project imports.\n\
+         Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\n\
          Judge only this sub-goal. Work outside it is not your concern, and \
          a gap you name that belongs to another ingot wastes a heat here.\n\n\
          Name ONE gap: the biggest that still matters for THIS sub-goal.\n\n\
@@ -465,18 +469,19 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          author nothing.\n\n\
          THE GOAL:\n{ore}\n\n\
          THE BAR:\n{bar}\n\n\
-         Inspect the REAL artifact in this directory. Run the build. Run the \
-         tests. Open the files that matter. Where the work is visual or \
-         interactive, look at it rather than reasoning about the source. A \
-         review written from a summary is a review of the summary.\n\n\
-         Then judge the goal, not the tasks. Passing tests and present files \
-         are not the goal; the goal is what the commission asked for.\n\n\
-         Name ONE gap: the biggest that still matters. A list of twenty small \
-         notes produces twenty small edits and no real improvement.\n\n\
+         Inspect the source on disk. Run the relevant tests and probe the required behavior.\n\
+         For visual or interactive work, inspect the interface.\n\
+         Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
+         Do not edit files or run git commands.\n\
+         Judge the commission's stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
+         Add no features, test counts, naming rules, or bans on normal project imports.\n\
+         Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\
+         Name one unmet requirement if the artifact fails. Cite the command output or source that proves your verdict.\n\
+         Fail if you cannot inspect the artifact or verify a required behavior.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
          VERDICT: pass or fail\n\
          GAP: one sentence, empty when it passes\n\
-         EVIDENCE: what you actually inspected — a path, a number, an observation"
+         EVIDENCE: the paths you inspected and commands you ran, with their results"
     )
 }
 
@@ -610,17 +615,6 @@ pub fn profile() -> String {
     }
 }
 
-fn read_tail(path: &str, lines: usize) -> String {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let all_lines: Vec<&str> = content.lines().collect();
-            let start = all_lines.len().saturating_sub(lines);
-            all_lines[start..].join("\n")
-        }
-        Err(_) => "Fresh".into(),
-    }
-}
-
 fn git_diff_stat() -> String {
     std::process::Command::new("git")
         .args(["diff", "--stat", "HEAD~3"])
@@ -685,6 +679,15 @@ mod tests {
     fn first_heat_flux_states_cmd_contract() {
         let flux = prepare_flux(&sample_ingot(), None);
         assert!(flux.contains("`cmd` field"), "the ingot flux names the field, not a prose line");
+    }
+
+    #[test]
+    fn compact_plan_omits_proof_and_retry_state() {
+        let mut ingot = sample_ingot();
+        ingot.bar = "behavior required by the commission".into();
+        ingot.proof = "a long test command".into();
+        let plan = compact_plan(&crate::sexp::writer::write_ingot(&ingot));
+        assert_eq!(plan, "i1: Do the thing (ore)");
     }
 
     /// Item 59: every instruction file that enters the prompt says where it

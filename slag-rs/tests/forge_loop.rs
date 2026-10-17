@@ -218,7 +218,7 @@ async fn missing_cmd_after_resmelt_cracks_once_and_resume_spends_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(debug_assertions)]
-async fn unchanged_pass_stops_panicked_anvils_without_provider_calls() {
+async fn exhausted_heat_cracks_without_provider_calls() {
     let root = project("(ingot :id \"i1\" :status molten :solo t :heat 255 :max 5 :smelt 1)\n");
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
@@ -231,9 +231,10 @@ async fn unchanged_pass_stops_panicked_anvils_without_provider_calls() {
     forge(root.path(), config.path(), &server.uri(), "off")
         .assert()
         .failure()
-        .stderr(contains("forge made no progress"));
+        .stderr(contains("forge failed: 1 ingots cracked"));
     let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
     assert!(plan.contains(":heat 255"), "{plan}");
+    assert!(plan.contains(":status cracked"), "{plan}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

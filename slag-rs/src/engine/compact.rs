@@ -19,6 +19,8 @@ use crate::error::SlagError;
 
 const PRUNABLE_MIN_CHARS: usize = 500;
 const KEEP_TAIL: usize = 6;
+const EVIDENCE_PREFIX: &str = "Earlier tool evidence (older output is in the transcript):\n";
+const EVIDENCE_CHARS: usize = 4_000;
 /// Bytes per token for JSON-family payloads (item 58): dense punctuation
 /// tokenizes at roughly half the rate of prose and code.
 const DENSE_BYTES_PER_TOKEN: usize = 2;
@@ -121,6 +123,55 @@ pub fn convo_chars(messages: &[ChatMessage]) -> usize {
             message_chars(m, path)
         })
         .sum()
+}
+
+/// Keep complete recent tool rounds and a bounded local evidence ledger.
+pub fn retain_recent_rounds(messages: &mut Vec<ChatMessage>, keep: usize) -> bool {
+    let keep = keep.max(1);
+    let rounds: Vec<_> = group_rounds(messages)
+        .into_iter()
+        .filter(|r| r.start >= 2 && opens_tool_round(&messages[r.start]))
+        .collect();
+    if rounds.len() <= keep {
+        return false;
+    }
+    let cut = rounds[rounds.len() - keep].start;
+    let mut evidence = String::new();
+    for m in &messages[2..cut] {
+        if let Some(old) = m.content.strip_prefix(EVIDENCE_PREFIX) {
+            evidence.push_str(old);
+            continue;
+        }
+        if let Some(calls) = &m.tool_calls {
+            for call in calls {
+                let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+                let detail = args.get("path").or_else(|| args.get("command"))
+                    .and_then(Value::as_str).unwrap_or("");
+                evidence.push_str(&format!("{} {}\n", call.name, bounded_text(detail, 300)));
+            }
+        }
+        if !m.content.is_empty() {
+            evidence.push_str(&format!("{}: {}\n", m.role, bounded_text(&m.content, 600)));
+        }
+    }
+    let evidence = if evidence.chars().count() > EVIDENCE_CHARS {
+        evidence.chars().rev().take(EVIDENCE_CHARS).collect::<String>()
+            .chars().rev().collect()
+    } else {
+        evidence
+    };
+    messages.splice(2..cut, [ChatMessage::user(format!("{EVIDENCE_PREFIX}{evidence}"))]);
+    true
+}
+
+fn bounded_text(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(cap / 2).collect();
+    let tail: String = text.chars().rev().take(cap / 2).collect::<String>()
+        .chars().rev().collect();
+    format!("{head} ... {tail}")
 }
 
 /// Shrink the conversation until total content chars fit the budget or
@@ -517,6 +568,48 @@ mod tests {
             });
             assert!(paired, "orphan tool result at index {i} (id {id})");
         }
+    }
+
+    #[test]
+    fn recent_rounds_keep_the_task_and_bounded_evidence_without_orphans() {
+        let mut messages = base_convo();
+        let task = messages[1].content.clone();
+        for i in 0..20 {
+            messages.extend(round(
+                &format!("c{i}"), "bash",
+                serde_json::json!({"command": format!("python3 check_{i}.py")}), 2_000,
+            ));
+            retain_recent_rounds(&mut messages, 2);
+        }
+        assert_eq!(messages[1].content, task);
+        assert_eq!(messages.len(), 7);
+        assert!(messages[2].content.starts_with(EVIDENCE_PREFIX));
+        assert!(messages[2].content.chars().count() <= EVIDENCE_CHARS + EVIDENCE_PREFIX.len());
+        assert!(messages[2].content.contains("python3 check_17.py"));
+        assert_eq!(messages[3].tool_calls.as_ref().unwrap()[0].id, "c18");
+        assert_eq!(messages[5].tool_calls.as_ref().unwrap()[0].id, "c19");
+        assert_no_orphans(&messages);
+        assert!(!retain_recent_rounds(&mut messages, 2));
+    }
+
+    #[test]
+    fn recent_rounds_preserve_steers_and_complete_parallel_results() {
+        let mut messages = base_convo();
+        messages.extend(round("c0", "bash", serde_json::json!({"command": "false"}), 600));
+        messages[3].content = "ERROR: validation failed\n<system-reminder>keep unicode support</system-reminder>".into();
+        messages.push(ChatMessage::assistant("", Some(vec![
+            call("c1", "read_file", serde_json::json!({"path": "one.rs"})),
+            call("c2", "read_file", serde_json::json!({"path": "two.rs"})),
+        ])));
+        messages.push(long_tool("c1", 600));
+        messages.push(long_tool("c2", 600));
+        messages.extend(round("c3", "bash", serde_json::json!({"command": "true"}), 600));
+        assert!(retain_recent_rounds(&mut messages, 2));
+        assert!(messages[2].content.contains("validation failed"));
+        assert!(messages[2].content.contains("keep unicode support"));
+        assert_no_orphans(&messages);
+        assert!(messages.iter().any(|m| m.tool_call_id.as_deref() == Some("c1")));
+        assert!(messages.iter().any(|m| m.tool_call_id.as_deref() == Some("c2")));
     }
 
     #[test]

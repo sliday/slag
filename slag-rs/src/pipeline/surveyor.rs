@@ -4,6 +4,28 @@ use crate::flux;
 use crate::smith::{self, Smith};
 use crate::tui;
 
+pub async fn direct_proof(smith: &dyn Smith, commission: &str) -> Result<Option<String>, SlagError> {
+    let raw = smith.invoke(&format!(
+        "Choose the work scope for a fresh, empty project.\n\
+         COMMISSION:\n{commission}\n\n\
+         Use direct=true only for a local utility with at most four product files, \
+         a deterministic test command, and no external service, UI, deployment, \
+         or architectural research. Otherwise use direct=false.\n\
+         Return only JSON: {{\"direct\":true,\"proof\":\"test command\"}} \
+         or {{\"direct\":false}}. Do not use tools. \
+         The proof must test the requested behavior. Do not invent acceptance rules."
+    )).await?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return Ok(None);
+    };
+    let proof = value["proof"].as_str().unwrap_or_default().trim();
+    if value["direct"] == true && !proof.is_empty() && proof != "true" {
+        Ok(Some(proof.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Phase 1: Analyze the commission (PRD.md) and produce a BLUEPRINT.md
 pub async fn run(smith: &dyn Smith) -> Result<(), SlagError> {
     run_with_guidance(smith, None).await
@@ -94,4 +116,24 @@ fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
     let _ = std::fs::write(&path, content);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_scope_requires_a_test_command_and_explicit_routing() {
+        for (reply, expected) in [
+            (r#"{"direct":true,"proof":"python3 -m unittest"}"#, Some("python3 -m unittest")),
+            (r#"{"direct":false}"#, None),
+            (r#"{"direct":true,"proof":"true"}"#, None),
+            (r#"{"direct":true,"proof":""}"#, None),
+            ("A small project.", None),
+        ] {
+            let smith = crate::smith::mock::MockSmith::fixed(reply);
+            assert_eq!(direct_proof(&smith, "local utility with tests").await.unwrap().as_deref(), expected);
+            assert_eq!(smith.call_count(), 1);
+        }
+    }
 }

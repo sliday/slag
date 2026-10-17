@@ -1,0 +1,245 @@
+{
+  "date": "2026-10-17",
+  "branch": "gauntlet/efficiency",
+  "runs": [
+    {
+      "name": "wc",
+      "root": "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/wc",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "cerebras"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 6.503906584111974,
+      "total_tokens": 25978,
+      "totals": {
+        "prompt": 23273,
+        "completion": 2705,
+        "cost": 0.027070720000000003
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 181,
+          "completion": 669,
+          "seconds": 0.879,
+          "start": 0.073,
+          "cost": 0.001176
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 11136,
+          "completion": 1408,
+          "seconds": 2.556,
+          "start": 1.02,
+          "cost": 0.01312256
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 11956,
+          "completion": 628,
+          "seconds": 2.591,
+          "start": 3.726,
+          "cost": 0.01277216
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_105116_300155000",
+          "role": "surveyor",
+          "prompt": 181,
+          "completion": 669,
+          "calls": 1,
+          "models": [
+            "cerebras::qwen-3.8-27b"
+          ]
+        },
+        {
+          "id": "20261017_105117_245914000",
+          "role": "smith",
+          "prompt": 11136,
+          "completion": 1408,
+          "calls": 3,
+          "models": [
+            "cerebras::qwen-3.8-27b"
+          ]
+        },
+        {
+          "id": "20261017_105119_952820000",
+          "role": "warden",
+          "prompt": 11956,
+          "completion": 628,
+          "calls": 4,
+          "models": [
+            "cerebras::qwen-3.8-27b"
+          ]
+        }
+      ],
+      "timed_out": false,
+      "artifact_root": "/var/folders/kq/0_xklq7j45q3bbw9ky25yt5h0000gn/T/slag-efficiency-20261017-zu1sxnpa/wc"
+    },
+    {
+      "name": "csvstats",
+      "root": "/private/var/folders/kq/0_xklq7j45q3bbw9ky25yt5h0000gn/T/slag-efficiency-20261017-zu1sxnpa/csvstats",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "Write a small Python CSV summary utility in four files: csvstats.py with summarize(path) returning the row count and sum of the amount column; cli.py that prints the row count and total for a CSV path; test_csvstats.py with unittest coverage; README.md with usage. Use only the standard library. Ignore blank amount cells. Reject invalid numeric amounts with a clear error and nonzero CLI exit. Test normal input, blank cells, and invalid amounts.",
+        "--temper",
+        "1",
+        "--provider",
+        "cerebras"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 20.310141999972984,
+      "total_tokens": 69162,
+      "totals": {
+        "prompt": 56751,
+        "completion": 12411,
+        "cost": 0.07467587999999999
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 259,
+          "completion": 985,
+          "seconds": 3.0629999999999997,
+          "start": 0.132,
+          "cost": 0.0017240600000000001
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 34729,
+          "completion": 9203,
+          "seconds": 12.354000000000001,
+          "start": 3.26,
+          "cost": 0.04809417999999999
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 21763,
+          "completion": 2223,
+          "seconds": 4.284999999999998,
+          "start": 15.819,
+          "cost": 0.02485764
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_105154_126315000",
+          "role": "surveyor",
+          "prompt": 259,
+          "completion": 985,
+          "calls": 1,
+          "models": [
+            "cerebras::qwen-3.8-27b"
+          ]
+        },
+        {
+          "id": "20261017_105157_251354000",
+          "role": "smith",
+          "prompt": 34729,
+          "completion": 9203,
+          "calls": 7,
+          "models": [
+            "cerebras::qwen-3.8-27b"
+          ]
+        },
+        {
+          "id": "20261017_105209_813525000",
+          "role": "warden",
+          "prompt": 21763,
+          "completion": 2223,
+          "calls": 5,
+          "models": [
+            "cerebras::qwen-3.8-27b"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-final",
+      "root": "/private/var/folders/kq/0_xklq7j45q3bbw9ky25yt5h0000gn/T/slag-efficiency-20261017-zu1sxnpa/wc-final",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "cerebras"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 0.7772580001037568,
+      "total_tokens": 0,
+      "totals": {
+        "prompt": 0,
+        "completion": 0,
+        "cost": 0.0
+      },
+      "sessions": [],
+      "engine_sessions": [
+        {
+          "id": "20261017_110042_267281000",
+          "role": null,
+          "prompt": 0,
+          "completion": 0,
+          "calls": 0,
+          "models": []
+        }
+      ],
+      "timed_out": false
+    }
+  ],
+  "context": {
+    "wc": {
+      "requests": 3,
+      "full_history_characters": 20366,
+      "sent_message_characters": 20366,
+      "compactions": 0,
+      "forge_prompt_characters": 1351
+    },
+    "csvstats": {
+      "requests": 7,
+      "full_history_characters": 96701,
+      "sent_message_characters": 78000,
+      "compactions": 4,
+      "forge_prompt_characters": 2560
+    }
+  },
+  "artifact_verification": {
+    "wc": {
+      "unittest_exit": 0,
+      "unittest_output": "4\n....wc.py: /nonexistent/path/file.txt: No such file or directory\n.usage: wc.py FILE\n.\n----------------------------------------------------------------------\nRan 6 tests in 0.001s\n\nOK\n",
+      "cli_checks": "Unicode whitespace: 4; empty file: 0",
+      "git_status": "clean"
+    },
+    "csvstats": {
+      "unittest_exit": 0,
+      "unittest_output": "...........\n----------------------------------------------------------------------\nRan 11 tests in 0.005s\n\nOK\n",
+      "valid_cli_output": "rows: 3\ntotal: 4.0\n",
+      "invalid_cli_exit": 1,
+      "invalid_cli_stderr": "error: /var/folders/kq/0_xklq7j45q3bbw9ky25yt5h0000gn/T/tmp3rocag17/input.txt: invalid numeric amount 'oops' on line 2\n",
+      "git_status": "clean"
+    }
+  },
+  "cost_estimate_total": 0.10174659999999999,
+  "final_build_live_status": "Blocked: Cerebras HTTP 402 credit balance low. One rejected request, no retry, no usage returned. Successful runs preceded final retry and recovery-log hardening.",
+  "cargo_test": {
+    "command": "cd slag-rs && CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test",
+    "exit_code": 0,
+    "passed": 1019,
+    "ignored": 1
+  },
+  "evidence_root": "/var/folders/kq/0_xklq7j45q3bbw9ky25yt5h0000gn/T/slag-efficiency-20261017-zu1sxnpa",
+  "final_binary_sha256": "94967ed763122885b9cb65dfacd0d8d43f4dd97842981797d50ced0120343cbe"
+}
