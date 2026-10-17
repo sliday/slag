@@ -219,7 +219,9 @@ A failed attempt retries on the plan model, starting from the failure slag saw. 
 
 ## Sandbox
 
-The smith's shell commands can read anything and reach the network. They can write only inside the workspace, the temp dirs, and the tool caches under `$HOME`: `.cargo`, `.rustup`, `.npm`, `.cache`, `Library/Caches`, `.gradle`, `.m2`, `go`, `.bun`, `.pnpm-store`, `.local/share/pnpm`, `.yarn`, plus wherever `CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME`, `GOPATH`, `GOCACHE`, `GOMODCACHE` or `XDG_CACHE_HOME` point. A workspace in a linked git worktree or a repo subdirectory can also write its git dir. The file tools already refuse paths outside the workspace. The sandbox needs no setup:
+The smith's shell commands can read anything and reach the network. They can write only inside the workspace, `/tmp` and your own `$TMPDIR`, and the data-only tool caches: `~/.cargo/registry`, `~/.cargo/git`, `~/.npm/_cacache` and `_logs`, `pip`, `uv`, `go-build` and Yarn caches under `~/.cache` or `~/Library/Caches`, the pnpm, bun and Yarn Berry stores, `~/.gradle/caches`, `~/.m2/repository`, and `~/go/pkg/mod`. `CARGO_HOME`, `GOPATH` and `XDG_CACHE_HOME` move those caches; `CARGO_TARGET_DIR`, `GOCACHE` and `GOMODCACHE` are writable whole. Nothing on your `PATH` or loaded as a program is writable: not `~/.cargo/bin`, `~/.rustup`, the npx cache, global package bins, the rest of `~/Library/Caches`, or other users' temp dirs. If a tool needs more, add it with `sandbox_writable`.
+
+Nothing a sandboxed command writes may become code that runs outside the sandbox. slag's own git (commits, snapshots, diffs, worktrees) runs outside it, so the workspace's `.git/hooks`, `.git/config`, `config.worktree`, `commondir` and the `.git` entry itself stay read-only for model commands and for the file tools, and every git command slag runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`. Ordinary git use that writes objects, refs and the index keeps working; `git init` over the workspace and `git config` do not. Landlock cannot carve a read-only file out of a writable tree, so on Landlock slag instead records what the git config would run and refuses its own git once a command changes that. A workspace in a linked git worktree or a repo subdirectory can also write its git dir's objects and refs. The file tools already refuse paths outside the workspace. The sandbox needs no setup:
 
 | Platform | Backend |
 |----------|---------|
@@ -231,7 +233,7 @@ The smith's shell commands can read anything and reach the network. They can wri
 
 On macOS, `sandbox-exec` fails when slag already runs inside another sandbox. slag then runs unconfined and warns once. On Linux, a `bwrap` that fails to start (no user namespaces) falls through to Landlock.
 
-When the sandbox refuses a write, the tool result tells the model `write outside the workspace was blocked by slag's sandbox: <path>`, so it changes approach instead of retrying.
+When the sandbox refuses a write, the tool result tells the model `write outside the workspace was blocked by slag's sandbox: <path>` (or `write to git's hooks or config was blocked by slag's sandbox: <path>`), so it changes approach instead of retrying.
 
 ```toml
 sandbox = "auto"                               # or "off"

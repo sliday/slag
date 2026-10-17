@@ -632,6 +632,21 @@ impl ToolBox {
         Ok(real)
     }
 
+    /// `resolve` for writes. Git's hooks and config are off limits even
+    /// inside the workspace: slag's own git reads them outside the sandbox,
+    /// so a file written there would run there. The shell sandbox locks
+    /// the same paths.
+    fn resolve_write(&self, raw: &str) -> Result<PathBuf, SlagError> {
+        let path = self.resolve(raw)?;
+        if super::sandbox::is_git_control(&self.root, &path) {
+            return Err(SlagError::Tool(format!(
+                "refused: {raw} is git's hooks or config, which slag keeps read-only \
+                 so nothing written here runs outside the sandbox"
+            )));
+        }
+        Ok(path)
+    }
+
     /// "Did you mean" hint for failed path lookups: names the workspace
     /// root and probes it for files sharing the missing path's basename
     /// (bounded walk; heavy build/VCS dirs and symlinked dirs skipped).
@@ -881,7 +896,7 @@ impl ToolBox {
     async fn write_file(&self, args: &Value) -> Result<String, SlagError> {
         let raw = req_str(args, "write_file", "path")?;
         let content = req_str(args, "write_file", "content")?;
-        let path = self.resolve(raw)?;
+        let path = self.resolve_write(raw)?;
         self.ensure_fresh_for_write(&path, raw, "write_file").await?;
         self.checkpoint_record(&path);
         self.invalidate_read_cache(&path);
@@ -918,7 +933,7 @@ impl ToolBox {
         if old.is_empty() {
             return Err(SlagError::Tool("old_string must not be empty".into()));
         }
-        let path = self.resolve(raw)?;
+        let path = self.resolve_write(raw)?;
         self.ensure_fresh_for_write(&path, raw, "edit_file").await?;
         self.checkpoint_record(&path);
         self.invalidate_read_cache(&path);
@@ -2665,6 +2680,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn file_tools_refuse_git_hooks_and_config() {
+        let (dir, tb) = setup();
+        std::fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "[core]\n").unwrap();
+        for (tool, args) in [
+            ("write_file", json!({"path": ".git/hooks/pre-commit", "content": "#!/bin/sh\n"})),
+            ("write_file", json!({"path": ".git/config", "content": "[core]\nfsmonitor = x\n"})),
+            ("edit_file", json!({"path": ".git/config", "old_string": "[core]", "new_string": "[x]"})),
+        ] {
+            let out = tb.dispatch(&call(tool, args)).await;
+            assert!(out.is_error && out.output.contains("read-only"), "{tool}: {}", out.output);
+        }
+        assert!(!dir.path().join(".git/hooks/pre-commit").exists());
+        let ok = tb.dispatch(&call("write_file", json!({"path": "src/a.rs", "content": "x"}))).await;
+        assert!(!ok.is_error, "{}", ok.output);
+    }
 
     fn call(name: &str, args: Value) -> ToolCall {
         ToolCall {

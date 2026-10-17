@@ -27,7 +27,7 @@ pub async fn create_in(repo: &Path, ingot_id: &str) -> Result<PathBuf, SlagError
     // deterministic, so a stale worktree dir or forge/* branch would
     // otherwise block every future duel of this ingot. All best-effort —
     // `git worktree add` below has the final word.
-    let _ = tokio::process::Command::new("git")
+    let _ = crate::engine::sandbox::git_async()
         .args(["worktree", "prune"])
         .current_dir(repo)
         .output()
@@ -38,7 +38,7 @@ pub async fn create_in(repo: &Path, ingot_id: &str) -> Result<PathBuf, SlagError
         let _ = tokio::fs::remove_dir_all(&leftover).await;
     }
 
-    let output = tokio::process::Command::new("git")
+    let output = crate::engine::sandbox::git_async()
         .args(["worktree", "add", &dir, "-b", &branch])
         .current_dir(repo)
         .output()
@@ -67,7 +67,7 @@ pub async fn merge_and_cleanup_in(repo: &Path, ingot_id: &str) -> Result<(), Sla
     let dir = dir_name(ingot_id);
 
     // Merge
-    let output = tokio::process::Command::new("git")
+    let output = crate::engine::sandbox::git_async()
         .args(["merge", &branch])
         .current_dir(repo)
         .output()
@@ -78,7 +78,7 @@ pub async fn merge_and_cleanup_in(repo: &Path, ingot_id: &str) -> Result<(), Sla
         let stderr = String::from_utf8_lossy(&output.stderr);
         // A conflicted merge leaves MERGE_HEAD + conflict markers in the
         // main checkout; abort so fallback paths never commit them.
-        let _ = tokio::process::Command::new("git")
+        let _ = crate::engine::sandbox::git_async()
             .args(["merge", "--abort"])
             .current_dir(repo)
             .output()
@@ -89,14 +89,14 @@ pub async fn merge_and_cleanup_in(repo: &Path, ingot_id: &str) -> Result<(), Sla
     }
 
     // Remove worktree
-    let _ = tokio::process::Command::new("git")
+    let _ = crate::engine::sandbox::git_async()
         .args(["worktree", "remove", &dir])
         .current_dir(repo)
         .output()
         .await;
 
     // Delete branch
-    let _ = tokio::process::Command::new("git")
+    let _ = crate::engine::sandbox::git_async()
         .args(["branch", "-d", &branch])
         .current_dir(repo)
         .output()
@@ -113,7 +113,7 @@ pub async fn cleanup_without_merge(ingot_id: &str) {
 /// Repo-aware variant of `cleanup_without_merge`.
 pub async fn cleanup_without_merge_in(repo: &Path, ingot_id: &str) {
     let dir = dir_name(ingot_id);
-    let _ = tokio::process::Command::new("git")
+    let _ = crate::engine::sandbox::git_async()
         .args(["worktree", "remove", "--force", &dir])
         .current_dir(repo)
         .output()
@@ -125,7 +125,7 @@ pub async fn cleanup_without_merge_in(repo: &Path, ingot_id: &str) {
 /// litter the repo with dead `forge/*` branches.
 pub async fn discard_in(repo: &Path, ingot_id: &str) {
     cleanup_without_merge_in(repo, ingot_id).await;
-    let _ = tokio::process::Command::new("git")
+    let _ = crate::engine::sandbox::git_async()
         .args(["branch", "-D", &branch_name(ingot_id)])
         .current_dir(repo)
         .output()
@@ -148,7 +148,7 @@ mod tests {
             vec!["config", "user.name", "slag"],
             vec!["commit", "--allow-empty", "-m", "base"],
         ] {
-            let out = std::process::Command::new("git")
+            let out = crate::engine::sandbox::git()
                 .args(&args)
                 .current_dir(&repo)
                 .output()

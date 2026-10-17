@@ -394,6 +394,8 @@ impl Git {
         let home = std::env::temp_dir().join(format!("slag-fix-{}-{nanos}", std::process::id()));
         git_in(Path::new("."), &["init", "-q", &home.to_string_lossy()])?;
         let git_dir = home.join(".git");
+        // The shadow sits in the temp dir, which model commands can write.
+        crate::engine::sandbox::protect_git_dir(&git_dir);
         let _ = std::fs::write(git_dir.join("info").join("exclude"), SHADOW_EXCLUDES);
         let git = Self { top, prefix: String::new(), shadow: Some(git_dir) };
         git.git_checked(&["add", "-A"]).ok()?;
@@ -423,7 +425,7 @@ impl Git {
 
     /// `git -C <dir>`, pointed at the shadow repository when there is one.
     fn command(&self, dir: &Path) -> std::process::Command {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = crate::engine::sandbox::git();
         cmd.arg("-C").arg(dir);
         if let Some(git_dir) = &self.shadow {
             cmd.arg("--git-dir").arg(git_dir).arg("--work-tree").arg(&self.top);
@@ -634,7 +636,7 @@ impl Drop for Git {
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::engine::sandbox::git()
         .arg("-C")
         .arg(dir)
         .args(args)

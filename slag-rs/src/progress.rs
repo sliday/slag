@@ -168,7 +168,7 @@ pub fn append_entry(entry: &ProgressEntry) -> Result<(), std::io::Error> {
 
 /// Get list of files changed since last commit
 pub fn files_changed_since_last_commit() -> Vec<String> {
-    std::process::Command::new("git")
+    crate::engine::sandbox::git()
         .args(["diff", "--name-only", "HEAD"])
         .output()
         .ok()

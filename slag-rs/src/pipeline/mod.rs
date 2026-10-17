@@ -384,7 +384,7 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     tui::header("FIRING FURNACE");
 
     // git init
-    let _ = std::process::Command::new("git")
+    let _ = crate::engine::sandbox::git()
         .args(["init", "-b", "main"])
         .output();
 
@@ -430,7 +430,7 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     // Initial commit, scoped to the files slag just wrote. `git add -A`
     // here swept whatever the user had lying around — including .env —
     // into a commit they never asked for.
-    let _ = std::process::Command::new("git")
+    let _ = crate::engine::sandbox::git()
         .args([
             "add",
             "--",
@@ -440,7 +440,7 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
             crate::config::LEDGER,
         ])
         .output();
-    let _ = std::process::Command::new("git")
+    let _ = crate::engine::sandbox::git()
         .args(["commit", "-m", "fire: furnace lit", "--quiet"])
         .output();
 
