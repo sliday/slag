@@ -1190,6 +1190,7 @@ fn open_pr(git: &Git, branch: &str, out: &Outcome) -> Result<String, String> {
     let body_path = std::env::temp_dir().join(format!("slag-fix-pr-{}.md", std::process::id()));
     std::fs::write(&body_path, pr_body(out)).map_err(|e| e.to_string())?;
     let created = std::process::Command::new("gh")
+        .envs(crate::engine::sandbox::GIT_GUARD_ENV)
         .current_dir(&git.top)
         .args(["pr", "create", "--draft", "--head", branch, "--title"])
         .arg(format!("fix: {}", out.issue.title))

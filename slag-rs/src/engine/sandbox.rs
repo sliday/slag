@@ -75,6 +75,16 @@ const GIT_GUARD: [&str; 4] = [
     "core.fsmonitor=false",
 ];
 
+/// `GIT_GUARD` as environment, for a fixed binary that runs git itself
+/// (`gh`): every git it spawns inherits it (git 2.31 and later).
+pub const GIT_GUARD_ENV: [(&str, &str); 5] = [
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+    ("GIT_CONFIG_VALUE_0", "/dev/null"),
+    ("GIT_CONFIG_KEY_1", "core.fsmonitor"),
+    ("GIT_CONFIG_VALUE_1", "false"),
+];
+
 /// How a named denial opens and what follows its path. `blocked_path`
 /// reads a note back with them, so the two stay in step.
 const BLOCKED_NOTE: &str = "[sandbox] write outside the workspace was blocked by slag's sandbox: ";
@@ -237,24 +247,30 @@ impl Sandbox {
 
     /// `program` under this sandbox; the caller adds its arguments.
     pub fn wrap(&self, program: &str) -> Command {
+        Command::from(self.wrap_std(program))
+    }
+
+    /// `wrap` for synchronous callers. The sandbox must outlive the spawn:
+    /// under Landlock the child applies its ruleset fd between fork and exec.
+    pub fn wrap_std(&self, program: &str) -> std::process::Command {
         let mut cmd = match self.backend {
             Backend::Seatbelt => {
-                let mut cmd = Command::new(SANDBOX_EXEC);
+                let mut cmd = std::process::Command::new(SANDBOX_EXEC);
                 cmd.args(self.seatbelt_args());
                 cmd.arg(program);
                 cmd
             }
             Backend::Bwrap => {
-                let mut cmd = Command::new("bwrap");
+                let mut cmd = std::process::Command::new("bwrap");
                 cmd.args(self.bwrap_args());
                 cmd.arg("--").arg(program);
                 cmd
             }
-            Backend::Landlock | Backend::None => Command::new(program),
+            Backend::Landlock | Backend::None => std::process::Command::new(program),
         };
         #[cfg(target_os = "linux")]
         if let Some(ruleset) = &self.ruleset {
-            landlock::confine(cmd.as_std_mut(), std::os::fd::AsRawFd::as_raw_fd(ruleset));
+            landlock::confine(&mut cmd, std::os::fd::AsRawFd::as_raw_fd(ruleset));
         }
         cmd
     }

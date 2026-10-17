@@ -174,8 +174,14 @@ fn file_mentions(path: &Path, needle: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|s| s.contains(needle))
 }
 
+/// The workspace picks what this runs: `python` may be its own
+/// `.venv/bin/python`, and `import` reads a `pytest.py` beside it first.
+/// So the probe runs in the sandbox, like the tests it chooses.
 fn imports(python: &str, root: &Path, module: &str) -> bool {
-    std::process::Command::new(python)
+    let real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let sandbox = crate::engine::sandbox::Sandbox::for_root(&real);
+    sandbox
+        .wrap_std(python)
         .args(["-c", &format!("import {module}")])
         .current_dir(root)
         .stdout(Stdio::null())
@@ -1054,6 +1060,41 @@ mod tests {
         let _ = bystander.wait();
         assert!(slow.timed_out);
         assert!(alive, "the timeout's kill reached a process outside its group");
+    }
+
+    /// Test detection probes the workspace's own Python before any model
+    /// call. A session can leave a `pytest.py` or a `.venv/bin/python`
+    /// behind; the next `slag fix` must not run either outside the sandbox.
+    #[test]
+    fn test_detection_runs_planted_python_only_in_the_sandbox() {
+        use crate::engine::sandbox::{backend, Backend};
+        let (_guard, _cfg) = crate::config::isolated_config_dir();
+        std::env::remove_var("SLAG_SANDBOX");
+        if backend() == Backend::None {
+            eprintln!("skipped: no sandbox backend works here");
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        for (planted, path, body) in [
+            ("pyshadow", "pytest.py", "open(__import__('os').path.expanduser('~/slag-escape-probe-pyshadow'), 'w')\n"),
+            ("venv", ".venv/bin/python", "#!/bin/sh\ntouch \"$HOME/slag-escape-probe-venv\"\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "tests/test_a.py", "import unittest\n");
+            write(dir.path(), path, body);
+            if planted == "venv" {
+                use std::os::unix::fs::PermissionsExt;
+                let script = dir.path().join(path);
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let probe = home.join(format!("slag-escape-probe-{planted}"));
+            let _ = std::fs::remove_file(&probe);
+            let detected = detect_test(dir.path());
+            let leaked = probe.exists();
+            let _ = std::fs::remove_file(&probe);
+            assert!(!leaked, "{planted}: test detection ran planted code outside the sandbox");
+            assert!(detected.is_some(), "{planted}: the tests are still found");
+        }
     }
 
     /// The session can rewrite a test script; slag still runs it in the
