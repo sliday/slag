@@ -387,6 +387,7 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          Permit normal imports between project modules.\n\
          Check test execution through the test runner, never by regex over test names or output.\n\
          Ignore slag's coordinator files and generated caches when you check cleanliness.\n\n\
+         Do not edit files. Do not install packages. Use the existing dependencies.\n\n\
          Produce EXACTLY this document:\n\n\
          ## THE BAR\nOne sentence naming what the finished work is measured \
          against.\n\n\
@@ -416,6 +417,7 @@ pub fn plan_warden_prompt(kind: &str, ore: &str, bar: &str, doc: &str) -> String
          THE GOAL:\n{ore}\n\n\
          THE BAR the finished work must clear:\n{bar}\n\n\
          THE {kind} under review:\n{doc}\n\n\
+         Read the supplied document. Do not edit files. Do not install packages.\n\n\
          Question: if this {kind} were carried out exactly as written, would \
          the result clear the bar?\n\n\
          Judge coverage of stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
@@ -425,7 +427,7 @@ pub fn plan_warden_prompt(kind: &str, ore: &str, bar: &str, doc: &str) -> String
          Name ONE gap: the biggest thing the bar needs and this {kind} \
          does not deliver.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
-         VERDICT: pass or fail\n\
+         VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
          EVIDENCE: the bar item that goes uncovered"
     )
@@ -443,16 +445,21 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          author nothing.\n\n\
          THE SUB-GOAL:\n{work}\n\n\
          ITS BAR:\n{bar}\n\n\
-         Inspect the source on disk. Run the relevant tests or a direct behavior check.\n\
+         Inspect the source and tests on disk.\n\
+         Read PROGRESS.md for the proof command and logs/*_ASSAY_*.log for its recorded output.\n\
+         Run independent checks that do not write files.\n\
+         The review filesystem is read-only, including temporary directories.\n\
+         Do not run tests that create fixtures or build files.\n\
+         Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
-         Do not edit files or run git commands.\n\
+         Do not edit files. Do not install packages. Do not run git commands.\n\
          Judge the stated sub-goal. Add no features, test counts, naming rules, or bans on normal project imports.\n\
          Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\n\
          Judge only this sub-goal. Work outside it is not your concern, and \
          a gap you name that belongs to another ingot wastes a heat here.\n\n\
          Name ONE gap: the biggest that still matters for THIS sub-goal.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
-         VERDICT: pass or fail\n\
+         VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
          EVIDENCE: what you actually inspected"
     )
@@ -469,17 +476,22 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          author nothing.\n\n\
          THE GOAL:\n{ore}\n\n\
          THE BAR:\n{bar}\n\n\
-         Inspect the source on disk. Run the relevant tests and probe the required behavior.\n\
+         Inspect the source and tests on disk.\n\
+         Read PROGRESS.md for the proof command and logs/*_ASSAY_*.log for its recorded output.\n\
+         Run independent checks that do not write files.\n\
+         The review filesystem is read-only, including temporary directories.\n\
+         Do not run tests that create fixtures or build files.\n\
+         Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          For visual or interactive work, inspect the interface.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
-         Do not edit files or run git commands.\n\
+         Do not edit files. Do not install packages. Do not run git commands.\n\
          Judge the commission's stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
          Add no features, test counts, naming rules, or bans on normal project imports.\n\
          Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\
          Name one unmet requirement if the artifact fails. Cite the command output or source that proves your verdict.\n\
-         Fail if you cannot inspect the artifact or verify a required behavior.\n\n\
+         Return unverified if you cannot inspect the artifact or verify a required behavior.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
-         VERDICT: pass or fail\n\
+         VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
          EVIDENCE: the paths you inspected and commands you ran, with their results"
     )

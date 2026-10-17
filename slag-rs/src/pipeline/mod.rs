@@ -364,6 +364,19 @@ pub async fn run(
 
     warden::set_rounds(temper_rounds);
 
+    let resumed_gap = if commission.is_none() && temper_rounds > 0 {
+        pending_goal_gap(std::path::Path::new(crate::config::LEDGER))
+    } else {
+        None
+    };
+    if let Some((round, gap)) = &resumed_gap {
+        if *round >= temper_rounds {
+            return Err(SlagError::GoalNotMet(format!(
+                "{gap}; use --temper {} resume to forge the gap", round + 1
+            )));
+        }
+    }
+
     let direct_candidate = commission.is_some_and(|c| c.chars().count() <= 800)
         && empty_project(std::path::Path::new("."))
         && temper_rounds > 0;
@@ -424,7 +437,7 @@ pub async fn run(
     // wrote this" made it unreachable in the common case. One corrective
     // pass, not a loop -- a surveyor that cannot cover the gap when told
     // exactly what it is will not cover it on an identical third try.
-    if !direct {
+    if !direct && resumed_gap.is_none() {
         if let Some(gap) = checkpoint(config, &hooks, "BLUEPRINT", crate::config::BLUEPRINT).await {
             let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
             surveyor::run_with_guidance(smith.as_ref(), Some(&gap)).await?;
@@ -465,6 +478,19 @@ pub async fn run(
         }
     }
 
+    if let Some((_, gap)) = &resumed_gap {
+        let crucible = Crucible::load(crucible_path)?;
+        if !crucible.has_pending() && crucible.counts().cracked == 0 {
+            fire_furnace(Some(gap))?;
+            let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Founder);
+            if founder::extend(smith.as_ref()).await? == 0 {
+                return Err(SlagError::GoalNotMet(format!(
+                    "{gap}; the founder cast no repair ingots"
+                )));
+            }
+        }
+    }
+
     // Phase 3: Forge, and Phase 4: Temper.
     //
     // The forge proves tasks; `:proof` answers "did this artifact appear".
@@ -475,7 +501,7 @@ pub async fn run(
     // casts ingots, and the forge runs again -- both halves of that loop
     // already existed.
     let mut forged;
-    let mut round = 0usize;
+    let mut round = resumed_gap.as_ref().map_or(0, |(round, _)| *round);
     // The warden's last word, carried past the assay. A run that prints
     // FORGED over an unmet goal launders the doubt it was asked to remove.
     let mut goal_gap: Option<String> = None;
@@ -483,6 +509,7 @@ pub async fn run(
     // third outcome, distinct from met and unmet, and the one most likely
     // to be misread as success.
     let mut goal_judged = false;
+    let mut goal_unverified = None;
     loop {
         tui::header("FORGE");
         let crucible = Crucible::load(crucible_path)?;
@@ -513,17 +540,28 @@ pub async fn run(
             // built either way, and an unjudged run is worth more than a
             // lost one. Say so and stop tempering.
             Err(e) => {
+                goal_unverified = Some(format!("the warden could not judge the goal: {e}; goal unverified"));
                 crate::engine::emit(
                     &hooks.events,
                     crate::engine::EngineEvent::Warning {
-                        message: format!("warden could not judge the goal: {e}"),
+                        message: format!("warden round {round}: {}", goal_unverified.as_ref().unwrap()),
                     },
                 );
                 break;
             }
         };
-        goal_judged = true;
         crate::proof::git_commit("warden", &format!("record verdict for round {round}")).await;
+        if verdict.is_unverified() {
+            goal_unverified = Some(verdict.gap.clone());
+            crate::engine::emit(
+                &hooks.events,
+                crate::engine::EngineEvent::Warning {
+                    message: format!("warden round {round}: {}", verdict.gap),
+                },
+            );
+            break;
+        }
+        goal_judged = true;
         if verdict.fulfilled {
             goal_gap = None;
             crate::engine::emit(
@@ -580,6 +618,9 @@ pub async fn run(
     if !matches!(forged, Err(SlagError::Cancelled)) {
         let _ = assay::show();
     }
+    if let Some(reason) = goal_unverified {
+        return Err(SlagError::SmithFailed(reason));
+    }
     // The tasks can all pass while the commission goes unmet -- that gap is
     // the whole reason the warden exists, so it decides the run's verdict
     // and its exit code. A forge error still wins: a cracked ingot is the
@@ -620,6 +661,18 @@ pub async fn run(
     forged
 }
 
+fn pending_goal_gap(path: &std::path::Path) -> Option<(usize, String)> {
+    let ledger = std::fs::read_to_string(path).ok()?;
+    let section = ledger.rsplit("## Warden round ").next()?;
+    let (header, body) = section.split_once('\n')?;
+    if !header.trim_end().ends_with("goal not met") { return None; }
+    let round = header.split_whitespace().next()?.trim_end_matches(':').parse().ok()?;
+    let gap = body.lines().find_map(|line| line.strip_prefix("- gap: "))?.trim();
+    if gap.is_empty() || gap == "—" || gap.contains("goal unverified")
+        || gap.contains("no readable verdict") { return None; }
+    Some((round, gap.to_string()))
+}
+
 fn empty_project(root: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else { return false };
     entries.filter_map(Result::ok).all(|entry| {
@@ -634,7 +687,8 @@ fn found_direct(commission: &str, proof: &str) -> Result<(), SlagError> {
     std::fs::write(warden::BAR_FILE, format!(
         "## THE BAR\nMeet the original commission.\n\n## CHECKLIST\n\
          - [ ] {commission}\n\n## HOW TO INSPECT\n\
-         Read the product files. Run the tests and check the requested behavior.\n\
+         Read the product files and test source. Read logs/*_ASSAY_*.log for coordinator-run test results.\n\
+         Use read-only behavior probes. Do not run tests that create temporary files or fixtures.\n\
          Judge the commission without extra naming, style, or test-count rules.\n"
     ))?;
     let mut ingot = crate::sexp::parser::parse_ingot("(ingot :id \"i1\")").unwrap();
@@ -684,6 +738,15 @@ async fn checkpoint(
         }
     };
     if verdict.fulfilled {
+        return None;
+    }
+    if verdict.is_unverified() {
+        crate::engine::emit(
+            &hooks.events,
+            crate::engine::EngineEvent::Warning {
+                message: format!("warden {kind}: {}", verdict.gap),
+            },
+        );
         return None;
     }
     crate::engine::emit(
@@ -808,6 +871,20 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
 #[cfg(test)]
 mod coordinator_tests {
     use super::*;
+
+    #[test]
+    fn saved_goal_gaps_accept_both_ledger_headers_and_ignore_unverified_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("PROGRESS.md");
+        for header in ["## Warden round 1 — goal not met", "## Warden round 1: goal not met"] {
+            std::fs::write(&path, format!("{header}\n\n- gap: PEP 668 install fails\n- evidence: pip exit 1\n")).unwrap();
+            assert_eq!(pending_goal_gap(&path), Some((1, "PEP 668 install fails".into())));
+        }
+        for outcome in ["goal met", "goal unverified"] {
+            std::fs::write(&path, format!("## Warden round 2: {outcome}\n\n- gap: no readable verdict\n")).unwrap();
+            assert!(pending_goal_gap(&path).is_none());
+        }
+    }
 
     #[test]
     fn restore_preserves_state_and_removes_model_created_documents() {

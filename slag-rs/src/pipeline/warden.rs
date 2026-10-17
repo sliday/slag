@@ -49,13 +49,36 @@ pub struct Verdict {
     pub evidence: String,
 }
 
+impl Verdict {
+    pub fn unverified(reason: impl AsRef<str>) -> Self {
+        let reason = reason.as_ref().trim();
+        Self {
+            fulfilled: false,
+            gap: if is_unverified_report(reason) {
+                reason.to_string()
+            } else {
+                format!("{reason}; goal unverified")
+            },
+            evidence: String::new(),
+        }
+    }
+
+    pub fn is_unverified(&self) -> bool {
+        !self.fulfilled && is_unverified_report(&self.gap)
+    }
+}
+
+pub(crate) fn is_unverified_report(report: &str) -> bool {
+    report.trim_end().ends_with("; goal unverified")
+}
+
 /// Parse the warden's report. Tolerant of surrounding prose, because a
 /// model asked for three lines often delivers three lines and a paragraph.
 ///
-/// A report with no readable VERDICT is treated as a loss: the run must not
-/// be able to pass the goal check by producing unparseable output.
+/// An unreadable report leaves the goal unverified without rejecting the artifact.
 pub fn parse_verdict(raw: &str) -> Verdict {
     let mut fulfilled = None;
+    let mut unverified = false;
     let mut gap = String::new();
     let mut evidence = String::new();
     for line in raw.lines() {
@@ -77,6 +100,7 @@ pub fn parse_verdict(raw: &str) -> Verdict {
                 match word.as_str() {
                     "pass" => fulfilled = Some(true),
                     "fail" => fulfilled = Some(false),
+                    "unverified" => unverified = true,
                     _ => {}
                 }
             }
@@ -85,27 +109,17 @@ pub fn parse_verdict(raw: &str) -> Verdict {
             _ => {}
         }
     }
+    if unverified {
+        let mut verdict = Verdict::unverified(if gap.is_empty() { "the warden could not complete its inspection" } else { &gap });
+        verdict.evidence = evidence;
+        return verdict;
+    }
     match fulfilled {
         Some(true) if !evidence.trim().is_empty() => Verdict { fulfilled: true, gap: String::new(), evidence },
-        Some(true) => Verdict {
-            fulfilled: false,
-            gap: "the warden returned a pass without inspection evidence".to_string(),
-            evidence,
-        },
-        Some(false) => Verdict {
-            fulfilled: false,
-            gap: if gap.is_empty() {
-                "the warden reported a failure without naming a gap".to_string()
-            } else {
-                gap
-            },
-            evidence,
-        },
-        None => Verdict {
-            fulfilled: false,
-            gap: "the warden returned no readable verdict".to_string(),
-            evidence,
-        },
+        Some(true) => Verdict::unverified("the warden returned a pass without inspection evidence"),
+        Some(false) if gap.is_empty() => Verdict::unverified("the warden reported a failure without naming a gap"),
+        Some(false) => Verdict { fulfilled: false, gap, evidence },
+        None => Verdict::unverified("the warden returned no readable verdict"),
     }
 }
 
@@ -167,21 +181,49 @@ pub async fn judge_artifact(
     round: usize,
 ) -> Result<Verdict, SlagError> {
     let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
-    let bar = bar(cfg, hooks).await?;
+    let bar = match bar(cfg, hooks).await {
+        Ok(bar) => bar,
+        Err(e) => {
+            record(round, &Verdict::unverified(format!("the warden could not establish the acceptance bar: {e}")));
+            return Err(e);
+        }
+    };
 
     tui::header(&format!("WARDEN · round {round}"));
     let smith = crate::smith::make_warden(cfg, hooks);
-    let raw = smith
-        .invoke(&crate::flux::warden_prompt(&ore, &bar))
+    let prompt = format!("{}\n\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
+        crate::flux::warden_prompt(&ore, &bar), proof_output());
+    let raw = match smith
+        .invoke(&prompt)
         .await
-        .map_err(|e| {
-            // The warden is not the surveyor: a provider refusal keeps its
-            // own message (provider, role, model, remedy) unwrapped.
-            if e.is_deterministic_provider() { e } else { SlagError::SurveyFailed(e.to_string()) }
-        })?;
+    {
+        Ok(raw) => raw,
+        Err(e) => {
+            let verdict = Verdict::unverified(format!("the warden could not inspect the artifact: {e}"));
+            record(round, &verdict);
+            if e.is_deterministic_provider() {
+                return Err(e);
+            }
+            return Ok(verdict);
+        }
+    };
     let verdict = parse_verdict(&raw);
     record(round, &verdict);
     Ok(verdict)
+}
+
+fn proof_output() -> String {
+    let mut paths: Vec<_> = std::fs::read_dir(crate::config::LOG_DIR).into_iter().flatten()
+        .filter_map(Result::ok).map(|entry| entry.path())
+        .filter(|path| path.file_name().and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("_ASSAY_") && name.ends_with(".log")))
+        .collect();
+    paths.sort();
+    paths.into_iter().rev().take(8).rev().filter_map(|path| {
+        let text = std::fs::read_to_string(&path).ok()?;
+        let tail: String = text.chars().rev().take(4_000).collect::<String>().chars().rev().collect();
+        Some(format!("{}:\n{tail}", path.display()))
+    }).collect::<Vec<_>>().join("\n\n")
 }
 
 /// Judge a plan document -- the blueprint, or the crucible -- against the
@@ -198,11 +240,7 @@ pub async fn judge_plan_doc(
     let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
     let doc = std::fs::read_to_string(doc_path).unwrap_or_default();
     if doc.trim().is_empty() {
-        return Ok(Verdict {
-            fulfilled: true,
-            gap: String::new(),
-            evidence: format!("{doc_path} is empty; nothing to judge"),
-        });
+        return Ok(Verdict::unverified(format!("{doc_path} is empty; nothing to judge")));
     }
     let bar = bar(cfg, hooks).await?;
 
@@ -210,14 +248,8 @@ pub async fn judge_plan_doc(
     let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Warden);
     match smith.invoke(&crate::flux::plan_warden_prompt(kind, &ore, &bar, &doc)).await {
         Ok(raw) => Ok(parse_verdict(&raw)),
-        // A pre-forge check that cannot run must not stop the forge. It
-        // exists to save a wasted run, never to become a new way to lose
-        // one.
-        Err(_) => Ok(Verdict {
-            fulfilled: true,
-            gap: String::new(),
-            evidence: "warden unavailable".into(),
-        }),
+        Err(e) if e.is_deterministic_provider() => Err(e),
+        Err(e) => Ok(Verdict::unverified(format!("the warden could not inspect {doc_path}: {e}"))),
     }
 }
 
@@ -235,13 +267,11 @@ pub async fn judge_ingot(
     ingot: &crate::sexp::Ingot,
 ) -> Verdict {
     let smith = crate::smith::make_warden(cfg, hooks);
-    match smith.invoke(&crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar)).await {
+    let prompt = format!("{}\n\nPROOF COMMAND: {}\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
+        crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar), ingot.proof, proof_output());
+    match smith.invoke(&prompt).await {
         Ok(raw) => parse_verdict(&raw),
-        Err(e) => Verdict {
-            fulfilled: false,
-            gap: format!("the warden could not inspect the ingot: {e}"),
-            evidence: String::new(),
-        },
+        Err(e) => Verdict::unverified(format!("the warden could not inspect the ingot: {e}")),
     }
 }
 
@@ -253,10 +283,10 @@ fn record(round: usize, v: &Verdict) {
     let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(LEDGER) else {
         return;
     };
-    let outcome = if v.fulfilled { "goal met" } else { "goal not met" };
+    let outcome = if v.fulfilled { "goal met" } else if v.is_unverified() { "goal unverified" } else { "goal not met" };
     let _ = writeln!(
         f,
-        "\n## Warden round {round} — {outcome}\n\n- gap: {}\n- evidence: {}",
+        "\n## Warden round {round}: {outcome}\n\n- gap: {}\n- evidence: {}",
         if v.gap.is_empty() { "—" } else { &v.gap },
         if v.evidence.is_empty() { "—" } else { &v.evidence },
     );
@@ -265,6 +295,14 @@ fn record(round: usize, v: &Verdict) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_unverified_report_keeps_the_inspection_limit() {
+        let verdict = parse_verdict("VERDICT: unverified\nGAP: fixtures require writes\nEVIDENCE: read tests/test_app.py");
+        assert!(verdict.is_unverified());
+        assert_eq!(verdict.gap, "fixtures require writes; goal unverified");
+        assert_eq!(verdict.evidence, "read tests/test_app.py");
+    }
 
     #[test]
     fn a_one_line_bar_is_refused() {
@@ -318,9 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_without_inspection_evidence_fails() {
+    fn a_pass_without_inspection_evidence_leaves_the_goal_unverified() {
         let v = parse_verdict("VERDICT: pass\nGAP:\nEVIDENCE:");
         assert!(!v.fulfilled);
+        assert!(v.is_unverified());
         assert!(v.gap.contains("without inspection evidence"));
     }
 
@@ -330,6 +369,7 @@ mod tests {
             "VERDICT: fail\nGAP: enemies never path around cover\nEVIDENCE: src/ai/bot.ts:88 has no navmesh query",
         );
         assert!(!v.fulfilled);
+        assert!(!v.is_unverified());
         assert_eq!(v.gap, "enemies never path around cover");
         assert!(v.evidence.contains("bot.ts:88"));
     }
@@ -344,19 +384,36 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_report_is_a_loss_not_a_pass() {
-        // The run must not be able to clear the goal check by returning
-        // something the parser cannot read.
+    fn an_unreadable_report_leaves_the_goal_unverified() {
         let v = parse_verdict("Looks great to me!");
         assert!(!v.fulfilled);
-        assert!(v.gap.contains("no readable verdict"), "{}", v.gap);
+        assert!(v.is_unverified());
+        assert_eq!(v.gap, "the warden returned no readable verdict; goal unverified");
     }
 
     #[test]
-    fn a_failure_without_a_named_gap_still_reads_as_a_failure() {
+    fn a_failure_without_a_named_gap_leaves_the_goal_unverified() {
         let v = parse_verdict("VERDICT: fail");
         assert!(!v.fulfilled);
-        assert!(!v.gap.is_empty(), "a gapless failure still has to say something");
+        assert!(v.is_unverified());
+        assert!(v.gap.contains("without naming a gap"));
+    }
+
+    #[test]
+    fn a_failure_with_a_named_gap_remains_actionable_without_evidence() {
+        let v = parse_verdict("VERDICT: fail\nGAP: wrong word count");
+        assert!(!v.fulfilled);
+        assert!(!v.is_unverified());
+        assert_eq!(v.gap, "wrong word count");
+    }
+
+    #[test]
+    fn the_unverified_marker_does_not_repeat() {
+        let first = Verdict::unverified("inspection failed");
+        let second = Verdict::unverified(&first.gap);
+        assert_eq!(first, second);
+        assert!(is_unverified_report(&first.gap));
+        assert!(!is_unverified_report("a required output is missing"));
     }
 
     #[test]

@@ -1,0 +1,1725 @@
+{
+  "runs": [
+    {
+      "name": "csv-discovery",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/csv-discovery",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "Write a small Python CSV summary utility in four files: csvstats.py with summarize(path) returning the row count and sum of the amount column; cli.py that prints the row count and total for a CSV path; test_csvstats.py with unittest coverage; README.md with usage. Use only the standard library. Ignore blank amount cells. Reject invalid numeric amounts with a clear error and nonzero CLI exit. Test normal input, blank cells, and invalid amounts.",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 11.39322366612032,
+      "total_tokens": 15414,
+      "totals": {
+        "prompt": 14267,
+        "completion": 1147,
+        "cost": 0.005007599999999999
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 236,
+          "completion": 17,
+          "seconds": 0.9129999999999999,
+          "start": 0.054,
+          "cost": 0.00012160000000000001
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 9954,
+          "completion": 942,
+          "seconds": 7.907,
+          "start": 1.013,
+          "cost": 0.0034152
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 4077,
+          "completion": 188,
+          "seconds": 2.1260000000000012,
+          "start": 9.091,
+          "cost": 0.0014708
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112522_837885000",
+          "role": "surveyor",
+          "prompt": 236,
+          "completion": 17,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112523_796747000",
+          "role": "smith",
+          "prompt": 9954,
+          "completion": 942,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112531_875115000",
+          "role": "warden",
+          "prompt": 4077,
+          "completion": 188,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "csv-final-build",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/csv-final-build",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "Write a small Python CSV summary utility in four files: csvstats.py with summarize(path) returning the row count and sum of the amount column; cli.py that prints the row count and total for a CSV path; test_csvstats.py with unittest coverage; README.md with usage. Use only the standard library. Ignore blank amount cells. Reject invalid numeric amounts with a clear error and nonzero CLI exit. Test normal input, blank cells, and invalid amounts.",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 10.28728812513873,
+      "total_tokens": 14732,
+      "totals": {
+        "prompt": 13606,
+        "completion": 1126,
+        "cost": 0.004978400000000001
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 214,
+          "completion": 16,
+          "seconds": 0.619,
+          "start": 0.055,
+          "cost": 0.00011120000000000002
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 6337,
+          "completion": 953,
+          "seconds": 6.704000000000001,
+          "start": 0.725,
+          "cost": 0.0030228
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 7055,
+          "completion": 157,
+          "seconds": 2.5790000000000006,
+          "start": 7.564,
+          "cost": 0.0018444
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112333_038319000",
+          "role": "surveyor",
+          "prompt": 214,
+          "completion": 16,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112333_708505000",
+          "role": "smith",
+          "prompt": 6337,
+          "completion": 953,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112340_547101000",
+          "role": "warden",
+          "prompt": 7055,
+          "completion": 157,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "csv-release-check",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/csv-release-check",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "Write a small Python CSV summary utility in four files: csvstats.py with summarize(path) returning the row count and sum of the amount column; cli.py that prints the row count and total for a CSV path; test_csvstats.py with unittest coverage; README.md with usage. Use only the standard library. Ignore blank amount cells. Reject invalid numeric amounts with a clear error and nonzero CLI exit. Test normal input, blank cells, and invalid amounts.",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 10.549913458991796,
+      "total_tokens": 11781,
+      "totals": {
+        "prompt": 10661,
+        "completion": 1120,
+        "cost": 0.004558800000000001
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 236,
+          "completion": 17,
+          "seconds": 0.719,
+          "start": 0.053,
+          "cost": 0.00012160000000000001
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 6308,
+          "completion": 916,
+          "seconds": 7.578,
+          "start": 0.835,
+          "cost": 0.0029520000000000006
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 4117,
+          "completion": 187,
+          "seconds": 1.904,
+          "start": 8.541,
+          "cost": 0.0014851999999999999
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112741_529242000",
+          "role": "surveyor",
+          "prompt": 236,
+          "completion": 17,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112742_310239000",
+          "role": "smith",
+          "prompt": 6308,
+          "completion": 916,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112750_007829000",
+          "role": "warden",
+          "prompt": 4117,
+          "completion": 187,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "csv-verified",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/csv-verified",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "Write a small Python CSV summary utility in four files: csvstats.py with summarize(path) returning the row count and sum of the amount column; cli.py that prints the row count and total for a CSV path; test_csvstats.py with unittest coverage; README.md with usage. Use only the standard library. Ignore blank amount cells. Reject invalid numeric amounts with a clear error and nonzero CLI exit. Test normal input, blank cells, and invalid amounts.",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 11.747257000068203,
+      "total_tokens": 14489,
+      "totals": {
+        "prompt": 13338,
+        "completion": 1151,
+        "cost": 0.005372
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 214,
+          "completion": 16,
+          "seconds": 0.7649999999999999,
+          "start": 0.052,
+          "cost": 0.00011120000000000002
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 6373,
+          "completion": 1011,
+          "seconds": 7.385000000000001,
+          "start": 0.861,
+          "cost": 0.00313
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112233_534654000",
+          "role": "surveyor",
+          "prompt": 214,
+          "completion": 16,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112234_344245000",
+          "role": "smith",
+          "prompt": 6373,
+          "completion": 1011,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112241_853781000",
+          "role": "warden",
+          "prompt": 6751,
+          "completion": 124,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "pep668-final",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/pep668-final",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "2",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 16.573246625019237,
+      "total_tokens": 39670,
+      "totals": {
+        "prompt": 38030,
+        "completion": 1640,
+        "cost": 0.010271200000000001
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "founder",
+          "prompt": 21220,
+          "completion": 1261,
+          "seconds": 9.889999999999999,
+          "start": 0.031,
+          "cost": 0.0059744
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 11825,
+          "completion": 250,
+          "seconds": 3.612,
+          "start": 9.968,
+          "cost": 0.0029796000000000002
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112552_909053000",
+          "role": "founder",
+          "prompt": 21220,
+          "completion": 1261,
+          "calls": 6,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112602_846245000",
+          "role": "smith",
+          "prompt": 11825,
+          "completion": 250,
+          "calls": 4,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112606_514168000",
+          "role": "warden",
+          "prompt": 4985,
+          "completion": 129,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "pep668-install",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/pep668-install",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "1",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 13.741163833066821,
+      "total_tokens": 13935,
+      "totals": {
+        "prompt": 12028,
+        "completion": 1907,
+        "cost": 0.006672000000000001
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 2104,
+          "completion": 58,
+          "seconds": 1.084,
+          "start": 0.025,
+          "cost": 0.0009344
+        },
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 5991,
+          "completion": 1561,
+          "seconds": 9.625,
+          "start": 1.143,
+          "cost": 0.0041644
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 3933,
+          "completion": 288,
+          "seconds": 2.7920000000000016,
+          "start": 10.825,
+          "cost": 0.0015732
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112941_675742000",
+          "role": "warden",
+          "prompt": 2104,
+          "completion": 58,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112942_793625000",
+          "role": "surveyor",
+          "prompt": 5991,
+          "completion": 1561,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112952_475805000",
+          "role": "warden",
+          "prompt": 3933,
+          "completion": 288,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "pep668-install",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/pep668-install",
+      "argv": [
+        "slag",
+        "--temper",
+        "2",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 127.212,
+      "wall_measure": "tape elapsed, driver aggregation failed on parallel sessions",
+      "total_tokens": 886863,
+      "totals": {
+        "prompt": 877180,
+        "completion": 9683,
+        "cost": 0.18196800000000002
+      },
+      "sessions": [],
+      "engine_sessions": [
+        {
+          "id": "20261017_113030_519348000",
+          "role": "founder",
+          "prompt": 7642,
+          "completion": 419,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113034_481769000",
+          "role": "smith",
+          "prompt": 184032,
+          "completion": 1368,
+          "calls": 41,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113034_509193000",
+          "role": "smith",
+          "prompt": 181801,
+          "completion": 1399,
+          "calls": 41,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113120_705807000",
+          "role": "smith",
+          "prompt": 102827,
+          "completion": 1152,
+          "calls": 25,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113121_077800000",
+          "role": "smith",
+          "prompt": 170926,
+          "completion": 3153,
+          "calls": 39,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113154_304075000",
+          "role": "smith",
+          "prompt": 113653,
+          "completion": 1207,
+          "calls": 27,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113215_835628000",
+          "role": "smith",
+          "prompt": 82809,
+          "completion": 738,
+          "calls": 21,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113228_608148000",
+          "role": "smith",
+          "prompt": 31081,
+          "completion": 181,
+          "calls": 8,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113236_744949000",
+          "role": "warden",
+          "prompt": 2409,
+          "completion": 66,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "pep668-local",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/pep668-local",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "1",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 3.730035041924566,
+      "total_tokens": 6458,
+      "totals": {
+        "prompt": 6205,
+        "completion": 253,
+        "cost": 0.0024259999999999998
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 2219,
+          "completion": 31,
+          "seconds": 0.739,
+          "start": 0.024,
+          "cost": 0.0009372
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_113233_161043000",
+          "role": "warden",
+          "prompt": 2219,
+          "completion": 31,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_113233_947386000",
+          "role": "warden",
+          "prompt": 3986,
+          "completion": 222,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "pep668-release-check",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/pep668-release-check",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "2",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 107.96598441689275,
+      "total_tokens": 260392,
+      "totals": {
+        "prompt": 250198,
+        "completion": 10194,
+        "cost": 0.06716080000000003
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "founder",
+          "prompt": 28247,
+          "completion": 954,
+          "seconds": 10.39,
+          "start": 0.029,
+          "cost": 0.007526
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 33790,
+          "completion": 1381,
+          "seconds": 13.822000000000001,
+          "start": 10.461,
+          "cost": 0.0089672
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 11584,
+          "completion": 251,
+          "seconds": 3.838000000000001,
+          "start": 24.346,
+          "cost": 0.0023472000000000002
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 62753,
+          "completion": 1625,
+          "seconds": 20.889,
+          "start": 28.267,
+          "cost": 0.0167956
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 17615,
+          "completion": 607,
+          "seconds": 7.254000000000005,
+          "start": 49.242,
+          "cost": 0.005137200000000001
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 8333,
+          "completion": 113,
+          "seconds": 2.225999999999999,
+          "start": 56.585,
+          "cost": 0.001402
+        },
+        {
+          "phase": "",
+          "role": "plan",
+          "prompt": 11009,
+          "completion": 114,
+          "seconds": 1.8689999999999998,
+          "start": 58.93,
+          "cost": 0.0025124
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 19755,
+          "completion": 1497,
+          "seconds": 12.521999999999998,
+          "start": 60.841,
+          "cost": 0.0062652
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 21328,
+          "completion": 2292,
+          "seconds": 18.179000000000002,
+          "start": 73.473,
+          "cost": 0.0080128
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 11928,
+          "completion": 450,
+          "seconds": 5.538000000000011,
+          "start": 91.758,
+          "cost": 0.0027264000000000004
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 11928,
+          "completion": 467,
+          "seconds": 5.288000000000011,
+          "start": 97.392,
+          "cost": 0.0027536
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 11928,
+          "completion": 443,
+          "seconds": 4.962999999999994,
+          "start": 102.792,
+          "cost": 0.0027152
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112745_700624000",
+          "role": "founder",
+          "prompt": 28247,
+          "completion": 954,
+          "calls": 8,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112756_121057000",
+          "role": "smith",
+          "prompt": 33790,
+          "completion": 1381,
+          "calls": 10,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112809_998759000",
+          "role": "smith",
+          "prompt": 11584,
+          "completion": 251,
+          "calls": 4,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112813_918001000",
+          "role": "smith",
+          "prompt": 62753,
+          "completion": 1625,
+          "calls": 17,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112834_890039000",
+          "role": "smith",
+          "prompt": 17615,
+          "completion": 607,
+          "calls": 6,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112842_233088000",
+          "role": "smith",
+          "prompt": 8333,
+          "completion": 113,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112844_578988000",
+          "role": "plan",
+          "prompt": 11009,
+          "completion": 114,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112846_489082000",
+          "role": "smith",
+          "prompt": 19755,
+          "completion": 1497,
+          "calls": 6,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112859_120809000",
+          "role": "smith",
+          "prompt": 21328,
+          "completion": 2292,
+          "calls": 6,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112917_406131000",
+          "role": "smith",
+          "prompt": 11928,
+          "completion": 450,
+          "calls": 4,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112923_039715000",
+          "role": "smith",
+          "prompt": 11928,
+          "completion": 467,
+          "calls": 4,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112928_439522000",
+          "role": "smith",
+          "prompt": 11928,
+          "completion": 443,
+          "calls": 4,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "pep668",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/pep668",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "1",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 18.49618012504652,
+      "total_tokens": 26782,
+      "totals": {
+        "prompt": 24566,
+        "completion": 2216,
+        "cost": 0.010223200000000002
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 4736,
+          "completion": 146,
+          "seconds": 1.929,
+          "start": 0.03,
+          "cost": 0.001552
+        },
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 5822,
+          "completion": 1461,
+          "seconds": 8.981,
+          "start": 1.987,
+          "cost": 0.0037064000000000003
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 14008,
+          "completion": 609,
+          "seconds": 7.3309999999999995,
+          "start": 11.008,
+          "cost": 0.0049648
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112242_378577000",
+          "role": "warden",
+          "prompt": 4736,
+          "completion": 146,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112244_336640000",
+          "role": "surveyor",
+          "prompt": 5822,
+          "completion": 1461,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112253_357379000",
+          "role": "warden",
+          "prompt": 14008,
+          "completion": 609,
+          "calls": 7,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "pep668",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/pep668",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "2",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 33.559097750112414,
+      "total_tokens": 73708,
+      "totals": {
+        "prompt": 70452,
+        "completion": 3256,
+        "cost": 0.0239056
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "founder",
+          "prompt": 23886,
+          "completion": 944,
+          "seconds": 9.014000000000001,
+          "start": 0.04,
+          "cost": 0.0083
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 16441,
+          "completion": 1286,
+          "seconds": 9.939999999999998,
+          "start": 9.108,
+          "cost": 0.0056004
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 16814,
+          "completion": 607,
+          "seconds": 7.349,
+          "start": 19.11,
+          "cost": 0.0055464
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 13311,
+          "completion": 419,
+          "seconds": 5.536000000000001,
+          "start": 26.576,
+          "cost": 0.004458800000000001
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112322_335970000",
+          "role": "founder",
+          "prompt": 23886,
+          "completion": 944,
+          "calls": 6,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112331_403290000",
+          "role": "smith",
+          "prompt": 16441,
+          "completion": 1286,
+          "calls": 4,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112341_405898000",
+          "role": "warden",
+          "prompt": 16814,
+          "completion": 607,
+          "calls": 7,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112348_872444000",
+          "role": "warden",
+          "prompt": 13311,
+          "completion": 419,
+          "calls": 6,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-discovery",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc-discovery",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 8.947822167072445,
+      "total_tokens": 9566,
+      "totals": {
+        "prompt": 8876,
+        "completion": 690,
+        "cost": 0.0038096000000000002
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 158,
+          "completion": 13,
+          "seconds": 0.859,
+          "start": 0.066,
+          "cost": 8.4e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 5387,
+          "completion": 494,
+          "seconds": 4.359,
+          "start": 0.972,
+          "cost": 0.0021004000000000005
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 3331,
+          "completion": 183,
+          "seconds": 2.2270000000000003,
+          "start": 5.505,
+          "cost": 0.0016251999999999998
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112521_040679000",
+          "role": "surveyor",
+          "prompt": 158,
+          "completion": 13,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112521_947147000",
+          "role": "smith",
+          "prompt": 5387,
+          "completion": 494,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112526_480124000",
+          "role": "warden",
+          "prompt": 3331,
+          "completion": 183,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-final-build",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc-final-build",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 11.962481332942843,
+      "total_tokens": 19488,
+      "totals": {
+        "prompt": 18486,
+        "completion": 1002,
+        "cost": 0.006501600000000001
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 136,
+          "completion": 16,
+          "seconds": 0.73,
+          "start": 0.054,
+          "cost": 8e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 8286,
+          "completion": 462,
+          "seconds": 4.455,
+          "start": 0.835,
+          "cost": 0.0024024000000000007
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 10064,
+          "completion": 524,
+          "seconds": 6.398,
+          "start": 5.426,
+          "cost": 0.0040192000000000005
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112329_589171000",
+          "role": "surveyor",
+          "prompt": 136,
+          "completion": 16,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112330_369896000",
+          "role": "smith",
+          "prompt": 8286,
+          "completion": 462,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112334_961773000",
+          "role": "warden",
+          "prompt": 10064,
+          "completion": 524,
+          "calls": 6,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-final",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc-final",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "mistral"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 8.603599333902821,
+      "total_tokens": 17553,
+      "totals": {
+        "prompt": 16880,
+        "completion": 673,
+        "cost": 0.0015706799999999996
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 142,
+          "completion": 17,
+          "seconds": 0.374,
+          "start": 0.046,
+          "cost": 1.638e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 10141,
+          "completion": 495,
+          "seconds": 5.399,
+          "start": 0.462,
+          "cost": 0.00081159
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_111951_322879000",
+          "role": "surveyor",
+          "prompt": 142,
+          "completion": 17,
+          "calls": 1,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        },
+        {
+          "id": "20261017_111951_737990000",
+          "role": "smith",
+          "prompt": 10141,
+          "completion": 495,
+          "calls": 3,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        },
+        {
+          "id": "20261017_111957_249414000",
+          "role": "warden",
+          "prompt": 6597,
+          "completion": 161,
+          "calls": 3,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-mistral-final",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc-mistral-final",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "mistral"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 7.707885291893035,
+      "total_tokens": 21659,
+      "totals": {
+        "prompt": 21242,
+        "completion": 417,
+        "cost": 0.0015076199999999999
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 142,
+          "completion": 15,
+          "seconds": 0.47200000000000003,
+          "start": 0.068,
+          "cost": 3.03e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 12775,
+          "completion": 262,
+          "seconds": 4.552,
+          "start": 0.591,
+          "cost": 0.00082065
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112441_376892000",
+          "role": "surveyor",
+          "prompt": 142,
+          "completion": 15,
+          "calls": 1,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        },
+        {
+          "id": "20261017_112441_905270000",
+          "role": "smith",
+          "prompt": 12775,
+          "completion": 262,
+          "calls": 4,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        },
+        {
+          "id": "20261017_112446_574208000",
+          "role": "warden",
+          "prompt": 8325,
+          "completion": 140,
+          "calls": 4,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-openai",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc-openai",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 9.52560424990952,
+      "total_tokens": 13429,
+      "totals": {
+        "prompt": 12862,
+        "completion": 567,
+        "cost": 0.0036328000000000003
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 136,
+          "completion": 15,
+          "seconds": 1.038,
+          "start": 0.054,
+          "cost": 7.840000000000001e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 8259,
+          "completion": 452,
+          "seconds": 5.688,
+          "start": 1.139,
+          "cost": 0.0023756000000000003
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112143_970338000",
+          "role": "surveyor",
+          "prompt": 136,
+          "completion": 15,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112145_055131000",
+          "role": "smith",
+          "prompt": 8259,
+          "completion": 452,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112150_869983000",
+          "role": "warden",
+          "prompt": 4467,
+          "completion": 100,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-release-check",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc-release-check",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 8.123954917071387,
+      "total_tokens": 9457,
+      "totals": {
+        "prompt": 8867,
+        "completion": 590,
+        "cost": 0.003262
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 158,
+          "completion": 13,
+          "seconds": 0.871,
+          "start": 0.056,
+          "cost": 8.4e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 5325,
+          "completion": 430,
+          "seconds": 4.151,
+          "start": 0.969,
+          "cost": 0.0020116
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 3384,
+          "completion": 147,
+          "seconds": 1.968,
+          "start": 5.248,
+          "cost": 0.0011664000000000002
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112739_433766000",
+          "role": "surveyor",
+          "prompt": 158,
+          "completion": 13,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112740_347706000",
+          "role": "smith",
+          "prompt": 5325,
+          "completion": 430,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112744_624582000",
+          "role": "warden",
+          "prompt": 3384,
+          "completion": 147,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc-verified",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc-verified",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 11.577904375037178,
+      "total_tokens": 14350,
+      "totals": {
+        "prompt": 13429,
+        "completion": 921,
+        "cost": 0.004310800000000001
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 136,
+          "completion": 17,
+          "seconds": 0.852,
+          "start": 0.051,
+          "cost": 8.16e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 8407,
+          "completion": 491,
+          "seconds": 4.679,
+          "start": 0.943,
+          "cost": 0.0024588
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 4886,
+          "completion": 413,
+          "seconds": 4.585,
+          "start": 5.755,
+          "cost": 0.0017704
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_112222_778795000",
+          "role": "surveyor",
+          "prompt": 136,
+          "completion": 17,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112223_670888000",
+          "role": "smith",
+          "prompt": 8407,
+          "completion": 491,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261017_112228_483110000",
+          "role": "warden",
+          "prompt": 4886,
+          "completion": 413,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "timed_out": false
+    },
+    {
+      "name": "wc",
+      "root": "/private/tmp/slag-warden-r2-3yx6gkfi/wc",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "write wc.py that counts words in a file, with a unittest",
+        "--temper",
+        "1",
+        "--provider",
+        "mistral"
+      ],
+      "exit_code": 1,
+      "wall_seconds": 7.485535792075098,
+      "total_tokens": 16731,
+      "totals": {
+        "prompt": 16043,
+        "completion": 688,
+        "cost": 0.0017565299999999996
+      },
+      "sessions": [
+        {
+          "phase": "",
+          "role": "surveyor",
+          "prompt": 142,
+          "completion": 17,
+          "seconds": 0.617,
+          "start": 0.071,
+          "cost": 3.15e-05
+        },
+        {
+          "phase": "",
+          "role": "smith",
+          "prompt": 10224,
+          "completion": 533,
+          "seconds": 3.872,
+          "start": 0.728,
+          "cost": 0.0009678
+        },
+        {
+          "phase": "",
+          "role": "warden",
+          "prompt": 5677,
+          "completion": 138,
+          "seconds": 2.152,
+          "start": 4.719,
+          "cost": 0.00075723
+        }
+      ],
+      "engine_sessions": [
+        {
+          "id": "20261017_111800_751445000",
+          "role": "surveyor",
+          "prompt": 142,
+          "completion": 17,
+          "calls": 1,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        },
+        {
+          "id": "20261017_111801_408520000",
+          "role": "smith",
+          "prompt": 10224,
+          "completion": 533,
+          "calls": 3,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        },
+        {
+          "id": "20261017_111805_399795000",
+          "role": "warden",
+          "prompt": 5677,
+          "completion": 138,
+          "calls": 2,
+          "models": [
+            "mistral::mistral-small-latest"
+          ]
+        }
+      ],
+      "timed_out": false
+    }
+  ],
+  "estimated_total_usd": 0.34889523000000006,
+  "artifact_verification": [
+    {
+      "name": "wc-release-check",
+      "exit": 0,
+      "output": "...\n----------------------------------------------------------------------\nRan 3 tests in 0.001s\n\nOK\n"
+    },
+    {
+      "name": "csv-release-check",
+      "exit": 0,
+      "output": "...\n----------------------------------------------------------------------\nRan 3 tests in 0.001s\n\nOK\n"
+    }
+  ]
+}

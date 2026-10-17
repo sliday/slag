@@ -91,9 +91,10 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
+    let review_root = root.path().to_path_buf();
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(|request: &wiremock::Request| {
+        .respond_with(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let messages = body["messages"].to_string();
             let results = tool_results(&body);
@@ -132,17 +133,18 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
             assert!(!names.contains(&"edit_file"), "{names:?}");
             assert!(!names.contains(&"finish"), "{names:?}");
             if results.is_empty() {
+                assert!(git(&review_root, &["status", "--porcelain"]).is_empty());
+                assert!(git(&review_root, &["show", "HEAD:PLAN.md"]).contains(":status forged"));
+                assert!(git(&review_root, &["show", "HEAD:PROGRESS.md"]).contains("heats:1"));
                 return response(json!({"content": null, "tool_calls": [
-                    tool("review-write", "write_file", json!({"path": "wc.py", "content": "raise RuntimeError('review edited product')"})),
                     tool("inspect", "read_file", json!({"path": "wc.py"})),
-                    tool("verify", "bash", json!({"command": "python3 -m unittest && test -z \"$(git status --porcelain)\" && git show HEAD:PLAN.md | grep -q ':status forged' && git show HEAD:PROGRESS.md | grep -q 'heats:1' && printf 'sealed and checked'"})),
+                    tool("inspect-tests", "read_file", json!({"path": "test_wc.py"})),
                 ]}));
             }
-            assert_eq!(results.len(), 3, "{results:?}");
-            assert!(results[0].contains("unavailable during review"), "{results:?}");
-            assert!(results[1].contains("def count_words(path)"), "{results:?}");
-            assert!(results[2].contains("sealed and checked"), "{results:?}");
-            response(json!({"content": "VERDICT: pass\nEVIDENCE: read wc.py, ran unittest, checked committed forged status and clean tree"}))
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert!(results[0].contains("def count_words(path)"), "{results:?}");
+            assert!(results[1].contains("assertEqual(wc.count_words"), "{results:?}");
+            response(json!({"content": "VERDICT: pass\nEVIDENCE: read wc.py and test_wc.py; the test checks three words across two lines"}))
         })
         .expect(5)
         .mount(&server).await;
@@ -315,4 +317,269 @@ async fn resumed_single_smith_preserves_debris_after_its_final_failed_heat() {
     let ledger = std::fs::read_to_string(root.path().join("PROGRESS.md")).unwrap();
     assert!(!ledger.contains("heats:"), "{ledger}");
     server.verify().await;
+}
+
+const INSTALL_GAP: &str =
+    "PEP668 blocks the documented pip install command; use a virtual environment.";
+const INSTALL_BEFORE: &str = "# Install\n\npip install example\n";
+const INSTALL_AFTER: &str =
+    "# Install\n\npython3 -m venv .venv\n. .venv/bin/activate\npip install example\n";
+
+fn forged_project(gap: Option<&str>) -> tempfile::TempDir {
+    let root = resumed_project("test -f README.md");
+    for (name, content) in [
+        ("PRD.md", "# Commission\n\nProvide install instructions that work under PEP668.\n".to_string()),
+        ("BLUEPRINT.md", "# Blueprint\n\nDocument installation in README.md.\n".to_string()),
+        ("BAR.md", "## THE BAR\nHonor the commission.\n- Installation works under PEP668.\n".to_string()),
+        ("README.md", INSTALL_BEFORE.to_string()),
+        ("PLAN.md", "(ingot :id \"i1\" :status forged :solo nil :grade 1 :heat 1 :max 3 :proof \"test -f README.md\" :work \"Write install instructions\")\n".to_string()),
+        ("PROGRESS.md", gap.map_or_else(
+            || "# Smithy Ledger\n".to_string(),
+            |gap| format!("# Smithy Ledger\n\n## Warden round 1 — goal not met\n\n- gap: {gap}\n- evidence: pip install rejected the externally managed environment\n")
+        )),
+    ] {
+        std::fs::write(root.path().join(name), content).unwrap();
+    }
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-m", "artifact awaits tempering"]);
+    root
+}
+
+fn artifact_review(body: &Value) -> bool {
+    body["messages"].as_array().unwrap().iter().any(|m| {
+        m["role"] == "system"
+            && m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("# slag warden"))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn temper_resume_forges_the_prior_gap_before_the_next_artifact_review() {
+    use std::sync::{Arc, Mutex};
+
+    let root = forged_project(Some(INSTALL_GAP));
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let messages = body["messages"].to_string();
+            let results = tool_results(&body);
+            if artifact_review(&body) {
+                if results.is_empty() {
+                    seen.lock().unwrap().push("warden-inspect");
+                    response(json!({"content": null, "tool_calls": [
+                        tool("inspect", "read_file", json!({"path": "README.md"})),
+                    ]}))
+                } else if results[0].contains("python3 -m venv") {
+                    seen.lock().unwrap().push("warden-pass");
+                    response(json!({"content": "VERDICT: pass\nEVIDENCE: README.md creates and activates a virtual environment before pip install"}))
+                } else {
+                    seen.lock().unwrap().push("warden-fail-before-repair");
+                    response(json!({"content": format!("VERDICT: fail\nGAP: {INSTALL_GAP}\nEVIDENCE: README.md runs pip install without a virtual environment")}))
+                }
+            } else if messages.contains("ROLE: Master Founder") {
+                seen.lock().unwrap().push("founder");
+                assert!(messages.contains(INSTALL_GAP), "{messages}");
+                response(json!({"content": "(ingot :id \"i1\" :status ore :solo nil :grade 1 :max 1 :proof \"grep -q venv README.md\" :work \"Fix README.md installation under PEP668 with a virtual environment\")"}))
+            } else if body["model"] == "test/work" {
+                if results.is_empty() {
+                    seen.lock().unwrap().push("smith-read");
+                    response(json!({"content": null, "tool_calls": [
+                        tool("read-install", "read_file", json!({"path": "README.md"})),
+                    ]}))
+                } else if results.len() == 1 {
+                    seen.lock().unwrap().push("smith-write");
+                    response(json!({"content": null, "tool_calls": [
+                        tool("fix-install", "write_file", json!({"path": "README.md", "content": INSTALL_AFTER})),
+                    ]}))
+                } else {
+                    seen.lock().unwrap().push("smith-finish");
+                    response(json!({"content": "CMD: grep -q venv README.md"}))
+                }
+            } else {
+                seen.lock().unwrap().push("checkpoint");
+                response(json!({"content": "VERDICT: pass\nEVIDENCE: the blueprint covers the requested install instructions"}))
+            }
+        })
+        .mount(&server).await;
+
+    let output = base_command(root.path(), config.path(), &server)
+        .args(["--temper", "2", "resume"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let observed = phases.lock().unwrap();
+    assert!(observed.contains(&"founder"), "{observed:?}\n{output:?}");
+    assert!(
+        !observed.contains(&"warden-fail-before-repair"),
+        "{observed:?}"
+    );
+    let positions: Vec<_> = [
+        "founder",
+        "smith-read",
+        "smith-write",
+        "smith-finish",
+        "warden-inspect",
+        "warden-pass",
+    ]
+    .iter()
+    .map(|phase| observed.iter().position(|entry| entry == phase).unwrap())
+    .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{observed:?}"
+    );
+    assert_eq!(
+        observed.iter().filter(|&&p| p == "founder").count(),
+        1,
+        "{observed:?}"
+    );
+    assert_eq!(
+        observed.iter().filter(|&&p| p == "warden-inspect").count(),
+        1,
+        "{observed:?}"
+    );
+    let plan = git(root.path(), &["show", "HEAD:PLAN.md"]);
+    assert_eq!(plan.matches(":status forged").count(), 2, "{plan}");
+    assert!(plan.contains(":id \"i2\""), "{plan}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("README.md")).unwrap(),
+        INSTALL_AFTER
+    );
+    assert!(git(root.path(), &["status", "--porcelain"]).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_artifact_verdict_reports_an_unverified_goal() {
+    let root = forged_project(None);
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if !artifact_review(&body) {
+                return response(json!({"content": "VERDICT: pass\nEVIDENCE: the blueprint covers the install instructions"}));
+            }
+            if tool_results(&body).is_empty() {
+                response(json!({"content": null, "tool_calls": [
+                    tool("inspect", "read_file", json!({"path": "README.md"})),
+                ]}))
+            } else {
+                response(json!({"content": "Inspection complete. I read README.md."}))
+            }
+        })
+        .mount(&server).await;
+
+    let output = base_command(root.path(), config.path(), &server)
+        .args(["--temper", "2", "resume"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let display = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        display.to_lowercase().contains("goal unverified"),
+        "{display}"
+    );
+    assert!(
+        !display.to_lowercase().contains("goal not met"),
+        "{display}"
+    );
+    assert!(!display.contains("FORGED"), "{display}");
+    assert!(!display.to_lowercase().contains("rejected"), "{display}");
+    assert!(!display.to_lowercase().contains("accepted"), "{display}");
+    let ledger = std::fs::read_to_string(root.path().join("PROGRESS.md")).unwrap();
+    assert!(ledger.contains("goal unverified"), "{ledger}");
+    assert!(!ledger.contains("goal not met"), "{ledger}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| {
+                let body: Value = serde_json::from_slice(&r.body).unwrap();
+                artifact_review(&body)
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        git(root.path(), &["show", "HEAD:PLAN.md"])
+            .matches("(ingot ")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forbidden_warden_mutations_cannot_produce_an_accepted_pass() {
+    for attack in [
+        tool(
+            "edit",
+            "edit_file",
+            json!({"path": "README.md", "old_string": "pip install example", "new_string": "skip installation"}),
+        ),
+        tool(
+            "touch",
+            "bash",
+            json!({"command": "touch review-marker.txt"}),
+        ),
+    ] {
+        let root = forged_project(None);
+        let config = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                if !artifact_review(&body) {
+                    return response(json!({"content": "VERDICT: pass\nEVIDENCE: the blueprint covers the install instructions"}));
+                }
+                if tool_results(&body).is_empty() {
+                    response(json!({"content": null, "tool_calls": [
+                        tool("inspect", "read_file", json!({"path": "README.md"})),
+                        attack.clone(),
+                    ]}))
+                } else {
+                    response(json!({"content": "VERDICT: pass\nEVIDENCE: README.md looked correct after inspection"}))
+                }
+            })
+            .mount(&server).await;
+
+        let output = base_command(root.path(), config.path(), &server)
+            .args(["--temper", "1", "resume"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let display = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            display.to_lowercase().contains("goal unverified"),
+            "{display}"
+        );
+        assert!(!display.contains("FORGED"), "{display}");
+        assert!(!display.contains("goal met"), "{display}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("README.md")).unwrap(),
+            INSTALL_BEFORE
+        );
+        assert!(!root.path().join("review-marker.txt").exists());
+        let ledger = std::fs::read_to_string(root.path().join("PROGRESS.md")).unwrap();
+        assert!(ledger.contains("goal unverified"), "{ledger}");
+        assert!(!ledger.contains("goal met"), "{ledger}");
+    }
 }

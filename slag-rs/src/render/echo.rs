@@ -679,7 +679,7 @@ impl Echo {
             let n = counts.cracked;
             ("✗", WARM, "CRACKED", format!("{n} of {} ingots failed every heat; {} forged", counts.total, counts.forged))
         } else if self.goal_gap.is_some() {
-            ("✗", WARM, "GOAL NOT MET", "every task passed its proof; the warden rejected the result".to_string())
+            if self.goal_gap.as_ref().is_some_and(|gap| gap.contains("goal unverified")) { ("!", WARM, "GOAL UNVERIFIED", self.goal_gap.clone().unwrap()) } else { ("✗", WARM, "GOAL NOT MET", "every task passed its proof; the warden rejected the result".to_string()) }
         } else if left > 0 {
             ("!", BRIGHT, "PAUSED", format!("{} of {} forged; {left} still queued", counts.forged, counts.total))
         } else if self.goal_met {

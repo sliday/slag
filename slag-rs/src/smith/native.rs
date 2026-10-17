@@ -164,11 +164,19 @@ impl NativeSmith {
             return Err(error);
         }
         let model = self.model().to_string();
-        let system = if self.scope_only {
-            "Classify the commission's scope. Return only the requested JSON. Do not build or inspect files.".into()
+        let mut system = if self.scope_only {
+            "Classify the commission's scope. Return only the requested JSON. Do not build or inspect files. For a fresh Python unittest project, choose python3 -m unittest so the proof discovers the complete test suite.".into()
         } else {
             prompt::build(&self.root, &model, self.mode).join()
         };
+        if self.role == Role::Warden {
+            system.push_str("\n\nREAD-ONLY REVIEW: You cannot write anywhere, including temporary directories. \
+                Read the source and tests first. Read logs/*_ASSAY_*.log for the coordinator's actual test output. \
+                Do not rerun unittest or pytest suites that create fixtures. Do not run py_compile or build commands. \
+                For Python syntax, use compile(open(path).read(), path, 'exec') in memory. \
+                For behavior, use existing files or in-memory inputs. Recorded proof plus source inspection can support a pass. \
+                A denied write ends this review as unverified. Return your verdict as text after inspection.");
+        }
         let effort = if self.scope_only {
             Some(Effort::Low)
         } else {
@@ -234,9 +242,9 @@ impl NativeSmith {
         // document -- so the tool is withheld rather than argued with.
         if self.mode == PromptMode::Plan {
             agent = agent.without_finish();
-            if self.role == Role::Warden {
-                agent = agent.with_read_only_tools().with_max_turns(2);
-            }
+        }
+        if self.role == Role::Warden {
+            agent = agent.with_read_only_tools().with_max_turns(2);
         }
         if self.mode == PromptMode::Review {
             agent = agent.with_read_only_tools().with_required_inspection().with_max_turns(6);
@@ -338,7 +346,7 @@ mod tests {
         assert_eq!(body["model"], "plan/model");
         assert_eq!(body["reasoning"]["effort"], "low");
         assert!(body.get("tools").is_none_or(|tools| tools.as_array().unwrap().is_empty()));
-        assert!(body["messages"][0]["content"].as_str().unwrap().len() < 200);
+        assert!(body["messages"][0]["content"].as_str().unwrap().len() < 300);
     }
 
     #[tokio::test]
@@ -348,6 +356,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("output.txt"), "accepted\n").unwrap();
+        let read_only_available = crate::engine::sandbox::Sandbox::read_only().is_ok();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -376,15 +385,19 @@ mod tests {
                     "choices": [{"message": message, "finish_reason": if inspected { "stop" } else { "tool_calls" }}],
                 }))
             })
-            .expect(2)
+            .expect(if read_only_available { 2 } else { 1 })
             .mount(&server)
             .await;
 
         let mut config = cfg();
         config.base_url = server.uri();
         let smith = NativeSmith::review(config, dir.path().into(), &EngineHooks::default());
-        let raw = smith.invoke("Review output.txt.").await.unwrap();
-        assert!(crate::pipeline::warden::parse_verdict(&raw).fulfilled);
+        let result = smith.invoke("Review output.txt.").await;
+        if read_only_available {
+            assert!(crate::pipeline::warden::parse_verdict(&result.unwrap()).fulfilled);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("review policy violation:"));
+        }
         let requests = server.received_requests().await.unwrap();
         let bodies: Vec<serde_json::Value> = requests.iter()
             .filter(|request| request.url.path() == "/chat/completions")
@@ -398,12 +411,80 @@ mod tests {
             assert!(tools.contains(&"read_file"));
             assert!(!tools.iter().any(|name| ["write_file", "edit_file", "finish"].contains(name)));
         }
-        let results: Vec<_> = bodies[1]["messages"].as_array().unwrap().iter()
-            .filter(|message| message["role"] == "tool")
-            .collect();
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|message| message["content"].as_str().unwrap().contains("accepted")));
+        assert_eq!(bodies.len(), if read_only_available { 2 } else { 1 });
+        if read_only_available {
+            let results: Vec<_> = bodies[1]["messages"].as_array().unwrap().iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|message| message["content"].as_str().unwrap().contains("accepted")));
+        }
         assert_eq!(std::fs::read_to_string(dir.path().join("output.txt")).unwrap(), "accepted\n");
+    }
+
+    #[tokio::test]
+    async fn warden_sessions_cannot_pass_after_a_forbidden_mutation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for document in [true, false] {
+            for shell in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("artifact.txt"), "original\n").unwrap();
+                let server = MockServer::start().await;
+                let mutation = if shell {
+                    serde_json::json!({"name": "bash", "arguments": serde_json::json!({
+                        "command": "python3 -c 'from pathlib import Path; Path(\"artifact.txt\").write_text(\"tampered\")'",
+                    }).to_string()})
+                } else {
+                    serde_json::json!({"name": "write_file", "arguments": serde_json::json!({
+                        "path": "artifact.txt", "content": "tampered",
+                    }).to_string()})
+                };
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(move |request: &wiremock::Request| {
+                        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        let inspected = body["messages"].as_array().unwrap().iter()
+                            .any(|message| message["role"] == "tool");
+                        let message = if inspected {
+                            serde_json::json!({"content": "VERDICT: pass\nGAP:\nEVIDENCE: read artifact.txt"})
+                        } else {
+                            serde_json::json!({"content": null, "tool_calls": [
+                                {"id": "inspect", "type": "function", "function": {
+                                    "name": "read_file", "arguments": "{\"path\":\"artifact.txt\"}",
+                                }},
+                                {"id": "mutate", "type": "function", "function": mutation},
+                            ]})
+                        };
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "choices": [{"message": message, "finish_reason": if inspected { "stop" } else { "tool_calls" }}],
+                        }))
+                    })
+                    .mount(&server).await;
+
+                let mut config = cfg();
+                config.base_url = server.uri();
+                let hooks = EngineHooks::default();
+                let smith = if document {
+                    NativeSmith::plan(config, dir.path().into(), &hooks).with_role(Role::Warden)
+                } else {
+                    NativeSmith::review(config, dir.path().into(), &hooks)
+                };
+                let result = smith.invoke("Inspect artifact.txt and return a verdict.").await;
+                assert!(result.is_err(), "document={document}, shell={shell}: {result:?}");
+                assert_eq!(std::fs::read_to_string(dir.path().join("artifact.txt")).unwrap(), "original\n");
+                let requests = server.received_requests().await.unwrap();
+                let request = requests.iter().find(|request| request.url.path() == "/chat/completions").unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let tools: Vec<_> = body["tools"].as_array().unwrap().iter()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap())
+                    .collect();
+                assert!(tools.contains(&"read_file"));
+                assert!(tools.contains(&"bash"));
+                assert!(!tools.iter().any(|name| ["write_file", "edit_file", "finish"].contains(name)));
+            }
+        }
     }
 
     #[tokio::test]

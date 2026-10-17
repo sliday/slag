@@ -29,6 +29,7 @@ use crate::error::SlagError;
 const DEFAULT_MAX_TURNS: usize = 40;
 const CHAR_BUDGET: usize = 48_000;
 const RECENT_TOOL_ROUNDS: usize = 2;
+const REVIEW_VIOLATION: &str = "review policy violation:";
 /// chars/4 is the estimation rule for text appended since the last usage
 /// anchor; token budgets convert to char targets through the same ratio.
 pub(crate) const CHARS_PER_TOKEN: usize = 4;
@@ -805,6 +806,12 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                 }
             }
 
+            if self.read_only_tools {
+                if let Some(outcome) = outcomes.iter().find(|o| o.output.starts_with(REVIEW_VIOLATION)) {
+                    return Err(SlagError::SmithFailed(outcome.output.clone()));
+                }
+            }
+
             if let Some(summary) = finish_summary {
                 // Keep the same-turn assistant text: Plan mode delivers the
                 // plan as final text before calling finish, and forge-mode
@@ -1190,6 +1197,12 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             if no_tools {
                 return ToolOutcome { output: "tools are unavailable in this session".into(), is_error: true };
             }
+            if read_only && !review_tool(&call.name) {
+                return ToolOutcome {
+                    output: format!("{REVIEW_VIOLATION} {} is unavailable during review", call.name),
+                    is_error: true,
+                };
+            }
             dispatch_hooked(toolbox, call, steer, events, root.as_deref(), read_only).await
         })
     }
@@ -1210,6 +1223,9 @@ async fn dispatch_hooked(
     coordinator_root: Option<&std::path::Path>,
     read_only_tools: bool,
 ) -> ToolOutcome {
+    if read_only_tools {
+        return guarded_dispatch(&toolbox, &call, coordinator_root, true).await;
+    }
     let pre = hooks::fire(
         hooks::HookEvent::PreTool,
         hooks::HookPayload::new(hooks::HookEvent::PreTool).with_tool(&call.name, &call.arguments),
@@ -1266,7 +1282,7 @@ async fn dispatch_hooked(
 }
 
 fn review_tool(name: &str) -> bool {
-    matches!(name, "read_file" | "bash" | "glob" | "grep" | "recipe_view")
+    matches!(name, "read_file" | "bash")
 }
 
 fn coordinator_path(path: &std::path::Path) -> bool {
@@ -1306,7 +1322,10 @@ async fn guarded_dispatch(
 ) -> ToolOutcome {
     let refused = |message: String| ToolOutcome { output: message, is_error: true };
     if read_only && !review_tool(&call.name) {
-        return refused(format!("{} is unavailable during review; inspect files and report a verdict", call.name));
+        return refused(format!("{REVIEW_VIOLATION} {} is unavailable during review", call.name));
+    }
+    if read_only && call.name == "bash" {
+        return review_shell(call, root).await;
     }
     let Some(root) = root else {
         return toolbox.dispatch(call).await;
@@ -1352,6 +1371,91 @@ async fn guarded_dispatch(
         _ => {}
     }
     result
+}
+
+async fn review_shell(call: &ToolCall, root: Option<&std::path::Path>) -> ToolOutcome {
+    use std::process::Stdio;
+    let violation = |message: String| ToolOutcome {
+        output: format!("{REVIEW_VIOLATION} {message}"), is_error: true,
+    };
+    let Some(root) = root else { return violation("review has no workspace root".into()); };
+    let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
+        Ok(args) => args,
+        Err(e) => return violation(format!("invalid shell arguments: {e}")),
+    };
+    let Some(command) = args.get("command").and_then(serde_json::Value::as_str) else {
+        return violation("review shell needs a command".into());
+    };
+    if args.get("run_in_background").and_then(serde_json::Value::as_bool) == Some(true) {
+        return violation("background commands are forbidden during review".into());
+    }
+    if let Some(reason) = review_command_error(command) { return violation(reason.into()); }
+    let sandbox = match super::sandbox::Sandbox::read_only() {
+        Ok(sandbox) => sandbox,
+        Err(e) => return violation(e.to_string()),
+    };
+    let timeout = args.get("timeout").and_then(serde_json::Value::as_u64).unwrap_or(20).clamp(1, 30);
+    let mut cmd = sandbox.wrap("/bin/sh");
+    cmd.args(["-c", command]).current_dir(root)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PIP_NO_INDEX", "1")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return violation(format!("cannot start read-only shell: {e}")),
+    };
+    #[cfg(unix)]
+    let pgid = child.id();
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return violation(format!("read-only shell failed: {e}")),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                let _ = tokio::process::Command::new("/bin/kill").args(["-KILL", &format!("-{pgid}")]).status().await;
+            }
+            return violation(format!("read-only shell exceeded {timeout}s"));
+        }
+    };
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    text.push_str(&stderr);
+    let lower = if output.status.success() { stderr.to_ascii_lowercase() } else { text.to_ascii_lowercase() };
+    if ["operation not permitted", "permission denied", "read-only file system", "sandbox_apply:", "no usable temporary directory"]
+        .iter().any(|marker| lower.contains(marker))
+    {
+        return violation(format!("the read-only shell refused access\n{}", preview(&text, 2_000)));
+    }
+    if text.chars().count() > 30_000 { text = text.chars().take(30_000).collect(); }
+    if !output.status.success() {
+        text.push_str(&format!("\n(exit {})", output.status.code().unwrap_or(-1)));
+    }
+    ToolOutcome { output: text, is_error: !output.status.success() }
+}
+
+fn review_command_error(command: &str) -> Option<&'static str> {
+    if let Some(reason) = coordinator_command_error(command) { return Some(reason); }
+    let words: Vec<_> = command.split(|c: char| c.is_whitespace() || ";|&()".contains(c))
+        .map(|word| word.trim_matches(['\'', '"']))
+        .collect();
+    let installer = words.iter().any(|word| {
+        let name = std::path::Path::new(word).file_name().and_then(|s| s.to_str()).unwrap_or(word);
+        matches!(name, "pip" | "pip3" | "npm" | "pnpm" | "yarn" | "bun" | "uv" | "brew" | "apt" | "apt-get" | "cargo" | "gem")
+    });
+    if words.iter().any(|word| {
+        matches!(*word, "touch" | "rm" | "mkdir" | "rmdir" | "mv" | "cp" | "chmod" | "chown" | "truncate" | "tee" | "dd" | "patch")
+    }) {
+        return Some("filesystem mutation commands are forbidden during review");
+    }
+    if words.contains(&"npx") || installer && words.iter().any(|word| {
+        matches!(*word, "install" | "add" | "sync" | "ci" | "update" | "upgrade" | "exec" | "run")
+    }) {
+        return Some("package installs and package resolution are forbidden during review");
+    }
+    None
 }
 
 /// Journal one appended message (no-op outside a forge attempt).
@@ -1610,6 +1714,47 @@ mod tests {
         )]).await;
         assert!(outcomes[0].is_error);
         assert!(!dir.path().join("artifact.py").exists());
+    }
+
+    #[tokio::test]
+    async fn readonly_review_mutation_taints_the_session_before_a_later_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.py"), "VALUE = 42\n").unwrap();
+        for mutation in [
+            tc("w", "write_file", serde_json::json!({"path": "artifact.py", "content": "wrong"})),
+            tc("b", "bash", serde_json::json!({"command": "touch marker"})),
+            tc("p", "bash", serde_json::json!({"command": "python3 -m pip install --target /tmp/forbidden-package pytest"})),
+            tc("t", "bash", serde_json::json!({"command": "python3 -c 'import tempfile; tempfile.NamedTemporaryFile()'"})),
+        ] {
+            let provider = MockProvider::new(vec![
+                resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "artifact.py"})), mutation]),
+                resp_text("VERDICT: pass", FinishReason::Stop),
+            ]);
+            let error = agent(provider.clone(), dir.path()).with_coordinator_root(dir.path()).with_read_only_tools()
+                .run("review".into(), "check artifact".into()).await.unwrap_err();
+            assert!(error.to_string().contains(REVIEW_VIOLATION), "{error}");
+            assert_eq!(provider.requests().len(), 1, "tainted review must not ask for another verdict");
+            assert_eq!(std::fs::read_to_string(dir.path().join("artifact.py")).unwrap(), "VALUE = 42\n");
+            assert!(!dir.path().join("marker").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_review_shell_runs_probes_or_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.py"), "VALUE = 42\n").unwrap();
+        let call = tc("b", "bash", serde_json::json!({
+            "command": "python3 -c 'import artifact; assert artifact.VALUE == 42; print(artifact.VALUE)'",
+        }));
+        let result = review_shell(&call, Some(dir.path())).await;
+        if super::super::sandbox::backend() == super::super::sandbox::Backend::None {
+            assert!(result.is_error);
+            assert!(result.output.starts_with(REVIEW_VIOLATION));
+        } else {
+            assert!(!result.is_error, "{}", result.output);
+            assert!(result.output.contains("42"));
+        }
+        assert!(!dir.path().join("__pycache__").exists());
     }
 
     #[tokio::test]
