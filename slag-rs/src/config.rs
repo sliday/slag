@@ -308,7 +308,7 @@ pub fn validate_provider_url(provider: ProviderPreset, base_url: &str) -> Result
         if provider != ProviderPreset::Custom && provider != owner
             && (host == domain || host.ends_with(&format!(".{domain}"))) {
             return Err(SlagError::Config(format!(
-                "refusing to send {} credentials to a {} host; select --provider {}",
+                "refusing to send {} credentials to the {} host; select --provider {}",
                 provider.name(), owner.name(), owner.name()
             )));
         }
