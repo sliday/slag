@@ -394,6 +394,7 @@ impl OpenRouter {
     /// `policy` is the per-request override (item 50): a side call caps its
     /// own attempts and opts out of the free unattended wait, so a judge or
     /// summary request cannot multiply load across every anvil.
+    #[allow(clippy::too_many_arguments)]
     fn plan_retry(
         &self,
         status: Option<u16>,
@@ -473,7 +474,7 @@ impl OpenRouter {
         let url = format!("{}/chat/completions", self.base_url);
         // Definite-assignment checked: every `break` below writes it first.
         let mut last_err;
-        let mut last_category = ProviderErrorCategory::Network;
+        let mut last_category;
         let mut attempts_made = 0usize;
         let mut budget_used = 0usize;
         let mut unattended_waited = Duration::ZERO;

@@ -180,7 +180,7 @@ fn parse_rule_list(value: &str) -> Vec<Rule> {
 /// non-command fragment that simply matches nothing.
 fn split_compound(command: &str) -> Vec<&str> {
     command
-        .split(|c| matches!(c, ';' | '|' | '&' | '\n' | '(' | ')'))
+        .split([';', '|', '&', '\n', '(', ')'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()

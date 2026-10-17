@@ -100,9 +100,6 @@ pub enum SlagError {
     #[error("goal not met: {0}")]
     GoalNotMet(String),
 
-    #[error("crucible parse error: {0}")]
-    CrucibleParse(String),
-
     #[error("ingot {0} cracked after {1} heats")]
     IngotCracked(String, u8),
 
@@ -168,6 +165,7 @@ impl SlagError {
 
     /// True when retrying the same call may succeed. Permanent failures
     /// (auth, billing, malformed requests) return false.
+    #[cfg(test)]
     pub fn retryable(&self) -> bool {
         match self {
             SlagError::ProviderTransient(_) => true,

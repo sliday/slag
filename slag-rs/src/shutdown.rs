@@ -95,11 +95,6 @@ pub fn run_all() -> usize {
 }
 
 /// How many cleanups are currently registered.
-#[cfg(test)]
-pub fn pending() -> usize {
-    registry().lock().unwrap_or_else(|e| e.into_inner()).len()
-}
-
 /// Register the crucible rescue: on an abrupt exit, reload the crucible
 /// from disk, hand any Molten ingot back to Ore, and save. Molten means
 /// "an anvil owns this", and after a panic or a Ctrl-C no anvil owns

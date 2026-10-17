@@ -272,7 +272,7 @@ impl ToolBox {
             let state = self.read_state.lock().unwrap();
             let mut v: Vec<(PathBuf, FileState)> =
                 state.iter().map(|(p, s)| (p.clone(), *s)).collect();
-            v.sort_by(|a, b| b.1.seq.cmp(&a.1.seq));
+            v.sort_by_key(|a| std::cmp::Reverse(a.1.seq));
             v
         };
 
@@ -338,7 +338,7 @@ impl ToolBox {
         let state = self.read_state.lock().unwrap();
         let mut entries: Vec<(PathBuf, u64)> =
             state.iter().map(|(p, s)| (p.clone(), s.seq)).collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.1));
         entries.into_iter().take(n).map(|(p, _)| p).collect()
     }
 
@@ -2143,7 +2143,7 @@ fn read_only_bash(command: &str) -> bool {
         return false;
     }
     let mut any = false;
-    for seg in command.split(|c| matches!(c, ';' | '|' | '&' | '\n')) {
+    for seg in command.split([';', '|', '&', '\n']) {
         let seg = seg.trim();
         if seg.is_empty() {
             continue;
@@ -2317,7 +2317,7 @@ fn git_destructive(rest: &[&str]) -> Option<&'static str> {
             break t;
         }
     };
-    let has = |flag: &str| rest.iter().any(|t| *t == flag);
+    let has = |flag: &str| rest.contains(&flag);
     match sub {
         "reset" if has("--hard") => Some("may discard uncommitted changes"),
         // --force-with-lease is a distinct token and intentionally allowed.
@@ -2545,7 +2545,7 @@ fn reduce_bash_output(s: &str) -> String {
     joined
 }
 
-fn push_blanks<'a>(out: &mut Vec<&'a str>, blanks: usize) {
+fn push_blanks(out: &mut Vec<&str>, blanks: usize) {
     let emit = if blanks >= 3 { 1 } else { blanks };
     for _ in 0..emit {
         out.push("");

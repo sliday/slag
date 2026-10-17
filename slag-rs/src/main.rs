@@ -1,3 +1,14 @@
+#![cfg_attr(test, allow(
+    clippy::await_holding_lock,
+    clippy::field_reassign_with_default,
+    clippy::expect_fun_call,
+    clippy::useless_vec,
+    clippy::needless_borrows_for_generic_args,
+    clippy::manual_range_contains,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::items_after_test_module,
+))]
+
 mod anvil;
 mod cli;
 mod config;

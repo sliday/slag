@@ -152,13 +152,12 @@ pub async fn run_with_guidance(
     if !tui::is_quiet() {
         println!();
         println!(
-            "  {}{:<5} {:<3} {:<4} {:<7} {}{}",
+            "  {}{:<5} {:<3} {:<4} {:<7} WORK{}",
             super::fg(tui::COLD),
             "ID",
             "GR",
             "SOLO",
             "SKILL",
-            "WORK",
             super::reset()
         );
         for (i, ingot) in ingots.iter().enumerate() {

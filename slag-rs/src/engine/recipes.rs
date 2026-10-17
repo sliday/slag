@@ -180,11 +180,7 @@ fn parse_frontmatter(content: &str) -> Frontmatter {
             "name" if !value.is_empty() => fm.name = Some(value.to_string()),
             "description" => fm.description = value.to_string(),
             "model" if !value.is_empty() => fm.model = Some(value.to_string()),
-            "context" => {
-                if value.eq_ignore_ascii_case("fork") {
-                    fm.context = RecipeContext::Fork;
-                }
-            }
+            "context" if value.eq_ignore_ascii_case("fork") => fm.context = RecipeContext::Fork,
             _ => {}
         }
     }

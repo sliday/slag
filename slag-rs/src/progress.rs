@@ -1,8 +1,13 @@
+#[cfg(test)]
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
+#[cfg(test)]
 use crate::config::LEDGER;
 use crate::crucible::CrucibleCounts;
+#[cfg(test)]
 use crate::sexp::Ingot;
 use crate::tui;
 
@@ -28,6 +33,7 @@ pub fn token_rate(tokens: u64, elapsed: Duration) -> Option<u64> {
 
 /// `118234` → `118k`; small counts stay exact so a 3-token probe does not
 /// render as `0k`. (Mirrors the stream renderer's formatter.)
+#[cfg(test)]
 fn fmt_tokens(n: u64) -> String {
     if n < 1000 {
         n.to_string()
@@ -40,6 +46,7 @@ fn fmt_tokens(n: u64) -> String {
 
 /// `⚒ Forging… (12s · 4.1k tok · 38 tok/s · esc to interrupt)` — the
 /// rate segment appears only past the guards.
+#[cfg(test)]
 pub fn spinner_status(verb: &str, elapsed: Duration, tokens: u64) -> String {
     let mut s = format!("⚒ {verb}… ({}s · {} tok", elapsed.as_secs(), fmt_tokens(tokens));
     if let Some(rate) = token_rate(tokens, elapsed) {
@@ -51,6 +58,8 @@ pub fn spinner_status(verb: &str, elapsed: Duration, tokens: u64) -> String {
 
 /// Live status accumulator: a turn-start `Instant` plus folded
 /// `EngineEvent::Tokens` deltas. The verb rotates with the turn number.
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LiveStatus {
     verb: &'static str,
@@ -58,6 +67,8 @@ pub struct LiveStatus {
     tokens: u64,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl LiveStatus {
     /// Start a turn: pick the verb, zero the counters, stamp the clock.
     pub fn start(turn: usize) -> Self {
@@ -129,6 +140,8 @@ pub fn clear_forge_state() {
 }
 
 /// Structured progress entry for PROGRESS.md
+#[cfg(test)]
+#[allow(dead_code)]
 pub struct ProgressEntry<'a> {
     pub ingot: &'a Ingot,
     pub heat: u8,
@@ -137,6 +150,8 @@ pub struct ProgressEntry<'a> {
 }
 
 /// Append a structured progress entry to PROGRESS.md
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn append_entry(entry: &ProgressEntry) -> Result<(), std::io::Error> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -167,6 +182,8 @@ pub fn append_entry(entry: &ProgressEntry) -> Result<(), std::io::Error> {
 }
 
 /// Get list of files changed since last commit
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn files_changed_since_last_commit() -> Vec<String> {
     crate::engine::sandbox::git()
         .args(["diff", "--name-only", "HEAD"])
@@ -188,6 +205,8 @@ pub fn files_changed_since_last_commit() -> Vec<String> {
 }
 
 /// Initialize the codebase patterns section in PROGRESS.md (Ralph-inspired)
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn init_patterns_section() -> Result<(), std::io::Error> {
     let ledger_path = std::path::Path::new(LEDGER);
     if ledger_path.exists() {
@@ -209,6 +228,8 @@ pub fn init_patterns_section() -> Result<(), std::io::Error> {
 }
 
 /// Append a pattern observation to the patterns section
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn append_pattern(pattern: &str) -> Result<(), std::io::Error> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)

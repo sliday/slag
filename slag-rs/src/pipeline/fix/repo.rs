@@ -634,27 +634,6 @@ impl Git {
         out.status.success().then_some(out.stdout)
     }
 
-    /// The session's changes as a diff, for a retry to start from.
-    /// Untracked files are listed by name: `git diff` cannot show them
-    /// without staging.
-    pub fn diff_of(&self, paths: &[String]) -> String {
-        let mut args = vec!["diff", "HEAD", "--"];
-        args.extend(paths.iter().map(String::as_str));
-        let mut diff = self.git(&args).unwrap_or_default();
-        let tracked: Vec<String> = self
-            .git(&["ls-files", "--", "."])
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        let new: Vec<&String> = paths.iter().filter(|p| !tracked.contains(p)).collect();
-        if !new.is_empty() {
-            diff.push_str("\nnew files: ");
-            diff.push_str(&new.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", "));
-        }
-        diff
-    }
-
     /// `path +added -removed` per changed path, new files counted by line.
     pub fn stat(&self, paths: &[String]) -> Vec<String> {
         let mut args = vec!["diff", "HEAD", "--numstat", "--"];

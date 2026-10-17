@@ -11,12 +11,6 @@ fn dir_name(ingot_id: &str) -> String {
 }
 
 /// Create a git worktree for an ingot's isolated execution
-pub async fn create(ingot_id: &str) -> Result<String, SlagError> {
-    create_in(Path::new("."), ingot_id)
-        .await
-        .map(|p| p.to_string_lossy().into_owned())
-}
-
 /// Repo-aware variant: run `git worktree add` from `repo`, returning the
 /// worktree path joined onto it. Same branch/dir naming as `create`.
 pub async fn create_in(repo: &Path, ingot_id: &str) -> Result<PathBuf, SlagError> {
@@ -56,10 +50,6 @@ pub async fn create_in(repo: &Path, ingot_id: &str) -> Result<PathBuf, SlagError
 }
 
 /// Merge a worktree branch back to main and clean up
-pub async fn merge_and_cleanup(ingot_id: &str) -> Result<(), SlagError> {
-    merge_and_cleanup_in(Path::new("."), ingot_id).await
-}
-
 /// Repo-aware variant of `merge_and_cleanup`: merge into the branch checked
 /// out at `repo`, then remove the worktree and delete the branch.
 pub async fn merge_and_cleanup_in(repo: &Path, ingot_id: &str) -> Result<(), SlagError> {
@@ -106,10 +96,6 @@ pub async fn merge_and_cleanup_in(repo: &Path, ingot_id: &str) -> Result<(), Sla
 }
 
 /// Remove a worktree without merging (failure case, preserves branch for debugging)
-pub async fn cleanup_without_merge(ingot_id: &str) {
-    cleanup_without_merge_in(Path::new("."), ingot_id).await
-}
-
 /// Repo-aware variant of `cleanup_without_merge`.
 pub async fn cleanup_without_merge_in(repo: &Path, ingot_id: &str) {
     let dir = dir_name(ingot_id);

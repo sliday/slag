@@ -279,6 +279,7 @@ impl Sandbox {
 
     /// `wrap` for synchronous callers. The sandbox must outlive the spawn:
     /// under Landlock the child applies its ruleset fd between fork and exec.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     pub fn wrap_std(&self, program: &str) -> std::process::Command {
         let mut cmd = match self.backend {
             Backend::Seatbelt => {

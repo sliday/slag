@@ -119,11 +119,6 @@ pub fn run_spend_dollars() -> f64 {
     millicents_to_dollars(RUN_SPEND_MILLICENTS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Resolve a project-relative path
-pub fn project_path(filename: &str) -> PathBuf {
-    PathBuf::from(filename)
-}
-
 /// Default model for every role: OpenRouter's automatic router picks a
 /// live model per request, so a fresh key works with zero model config.
 /// Each role still takes an env/file/flag override.
@@ -665,6 +660,7 @@ fn write_entries(path: &std::path::Path, entries: &[(String, String)]) -> Result
 }
 
 /// Forget the stored key. Leaves every other config entry in place.
+#[cfg(test)]
 pub fn clear_key() -> Result<Option<PathBuf>, SlagError> {
     let Some(path) = config_file_path() else {
         return Ok(None);
@@ -688,6 +684,7 @@ pub enum KeySource {
 }
 
 impl KeySource {
+    #[cfg(test)]
     pub fn label(self) -> &'static str {
         match self {
             KeySource::Env => "OPENROUTER_API_KEY",
@@ -697,6 +694,7 @@ impl KeySource {
 }
 
 /// Current key and where it came from, without onboarding.
+#[cfg(test)]
 pub fn key_status() -> Option<(KeySource, String)> {
     if let Some(key) = env_nonempty("OPENROUTER_API_KEY") {
         return Some((KeySource::Env, key));
@@ -709,6 +707,7 @@ pub fn key_status() -> Option<(KeySource, String)> {
 }
 
 /// Show a key without leaking it: first 7 and last 4 characters.
+#[cfg(test)]
 pub fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     if chars.len() <= 14 {
@@ -1146,8 +1145,6 @@ fn file_value(entries: &[(String, String)], key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
     /// Env vars are process-global; serialize every test that touches them.
     use crate::config::ENV_LOCK;
 

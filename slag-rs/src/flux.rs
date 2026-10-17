@@ -322,8 +322,7 @@ pub fn founder_addendum_prompt(addendum: &str, blueprint: &str, done: &str) -> S
 /// casts heuristics, proof shapes, rules. One copy, because a second one
 /// drifts and only the drifted branch gets debugged.
 fn founder_format_rules() -> String {
-    format!(
-        "OUTPUT: S-expressions only. One per line. No prose.\n\n\
+    "OUTPUT: S-expressions only. One per line. No prose.\n\n\
         TEMPLATE:\n\
         (ingot :id \"i1\" :status ore :solo t :grade 1 :skill default :heat 0 :max 5 :proof \"SHELL\" :work \"Task\")\n\n\
         FIELDS:\n\
@@ -362,10 +361,10 @@ fn founder_format_rules() -> String {
         - Match :skill to task type\n\
         - Every :proof must be executable shell\n\
         - Every :bar states an inspectable outcome, never an adjective\n\n\
-        OUTPUT ONLY S-EXPRESSIONS. The lines themselves are your answer; if \n\
-        you end the turn with the finish tool, the ingot lines must BE the \n\
-        finish summary, and the \u{2264}120-word limit does not apply."
-    )
+        OUTPUT ONLY S-EXPRESSIONS. The lines themselves are your answer; if \
+        you end the turn with the finish tool, the ingot lines must BE the \
+        finish summary, and the ≤120-word limit does not apply."
+        .to_string()
 }
 
 /// Ask for the acceptance bar: the concrete, inspectable statement a warden

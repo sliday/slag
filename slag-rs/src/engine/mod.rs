@@ -978,10 +978,10 @@ pub mod stats {
             assert!(after.tools >= before.tools + Duration::from_millis(25));
             let edit = after.tool_errors.get("edit_file").unwrap();
             let edit_before = before.tool_errors.get("edit_file").cloned().unwrap_or_default();
-            assert!(edit.total >= edit_before.total + 1);
+            assert!(edit.total > edit_before.total);
             assert!(
                 edit.classes.get("no-match").copied().unwrap_or(0)
-                    >= edit_before.classes.get("no-match").copied().unwrap_or(0) + 1
+                    > edit_before.classes.get("no-match").copied().unwrap_or(0)
             );
         }
     }
