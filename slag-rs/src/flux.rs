@@ -529,12 +529,11 @@ pub fn founder_prompt(ore: &str, blueprint: &str) -> String {
 /// `context` is what slag already knows about the repository (file list,
 /// test command, how the tests ended before any edit), gathered so the
 /// smith spends no turns rediscovering it. `retry` carries the failure
-/// slag observed after the previous attempt. The finish summary stays a
+/// slag observed after the previous attempt, or the one gap a reviewer
+/// left, under its own heading. The finish summary stays a
 /// summary here: slag writes the report from commands it ran itself.
 pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
-    let retry = retry
-        .map(|r| format!("=== PREVIOUS ATTEMPT FAILED ===\n{r}\n\n"))
-        .unwrap_or_default();
+    let retry = retry.map(|r| format!("{r}\n\n")).unwrap_or_default();
     format!(
         "=== ISSUE ===\n{issue}\n\n\
         {context}\n\
@@ -542,13 +541,24 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         === HOW TO WORK ===\n\
         You are fixing this issue in an existing repository with its own code and \
         tests. Few turns: batch reads, batch edits.\n\
-        1. Locate the code the issue is about. Read it and its tests in ONE turn.\n\
-        2. Reproduce. Add a regression test beside the existing tests, in their \
-        framework and style, that fails because of this bug. If a test is \
-        impractical, reproduce with one shell command instead. slag reruns your test \
-        with the fix reverted to prove it catches the bug, so when the cause is \
-        clear, make the test edit and the fix edit in ONE turn: two edit calls in the \
-        same message. When it is not, run the test first and watch it fail.\n\
+        1. Locate the code the issue is about. Read it and its tests in ONE turn. \
+        Trace the wrong result back to where it is produced: that is the root cause, \
+        and it is often not the file where the symptom shows.\n\
+        2. Write the regression test a reader of the issue would recognize:\n\
+        - the issue's own scenario: the inputs, values, and calls it names, asserting \
+        the result it says is expected. One test per case the issue lists, each named \
+        after the behavior it checks.\n\
+        - through the public function, method, or command the issue describes, never \
+        the internals of your fix.\n\
+        - in the test file for the module you fix (see TESTS above). When that module \
+        has none, create one beside the existing tests, named after the module, in \
+        their framework and style. Never put it in a test file for another module.\n\
+        - valid on this platform as written, and deterministic: no timing, no file \
+        creation order, no network.\n\
+        slag reruns your test with the fix reverted: it must then fail on an \
+        assertion about the reported behavior. When the cause is clear, make the test \
+        edit and the fix edit in ONE turn: two edit calls in the same message. When \
+        it is not, run the test first and watch it fail.\n\
         3. Fix the root cause with the smallest change that resolves the WHOLE issue, \
         every case it names. Keep public names and signatures.\n\
         4. Run the full test command. Your test and the existing ones must pass.\n\
@@ -560,6 +570,49 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         scripts under /tmp, not in the repository.\n\
         - Run no git commands. slag tracks the changes and commits after it verifies.\n\
         - No questions. Decide and proceed.\n"
+    )
+}
+
+/// The reviewer's brief for a passing fix: one model call, no tools, a
+/// fresh context. It reads the issue, the diff, and what the new tests did
+/// with the fix reverted, and names at most one gap the fixer then gets a
+/// single chance to close. The four checks are the ways a green fix still
+/// loses to a careful human: a symptom patch, a test that does not encode
+/// the reported case, a test in the wrong file, a test that cannot run.
+pub fn fix_review_prompt(
+    issue: &str,
+    diff: &str,
+    test_files: &str,
+    without_fix: &str,
+    platform: &str,
+) -> String {
+    format!(
+        "ROLE: reviewer of a bug fix. You did not write it and you owe its author \
+         nothing. You cannot run anything: judge from what is below.\n\n\
+         THE ISSUE:\n{issue}\n\n\
+         THE CHANGE (unified diff against the code before the fix):\n{diff}\n\n\
+         TEST FILES THAT EXISTED BEFORE THE FIX:\n{test_files}\n\n\
+         WITH THE SOURCE CHANGE REVERTED, THE TESTS DID THIS:\n{without_fix}\n\n\
+         PLATFORM: {platform}\n\n\
+         Check these four in order. Fail only on a clear miss, never on style:\n\
+         1. ROOT CAUSE: the source change fixes the cause the issue describes where it \
+         is produced, not a special case for the reported input, and not a patch where \
+         the symptom shows.\n\
+         2. THE ISSUE'S CASES: the new tests use the issue's own scenario, with the \
+         inputs it names and the result it says is expected, for every case it lists. \
+         A test that only restates the new code, or checks something the issue never \
+         mentions, misses.\n\
+         3. PLACE: each new test sits in the test file for the module it tests, or in \
+         a new file named after that module beside the existing tests. A test added to \
+         a file for a different module misses.\n\
+         4. VALID: with the fix reverted, the new tests fail on an assertion about the \
+         reported behavior. A failure from the test itself (a flag this platform does \
+         not accept, a syntax or import error, a missing file) misses, and so does a \
+         test that depends on timing or on file creation order.\n\n\
+         Reply with exactly these two lines and nothing after them:\n\
+         VERDICT: pass or fail\n\
+         GAP: empty on pass. On fail, one instruction the author can act on: what to \
+         change, in which file."
     )
 }
 

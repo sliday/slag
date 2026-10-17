@@ -362,13 +362,21 @@ fn extract_str_field(json_ish: &str, key: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Collapsed-streak summary: `ran 4 commands`, `read 3 files`.
-fn streak_summary(verb: &str, n: usize) -> String {
+/// Collapsed-streak summary: `ran 4 commands`, `read 3 files`. File verbs
+/// count distinct files, not calls: four edits of one file is `edited 1
+/// file (4 calls)`, never `edited 4 files`.
+fn streak_summary(verb: &str, n: usize, files: usize) -> String {
+    let files = match (files, n > files) {
+        (1, true) => format!("1 file ({n} calls)"),
+        (1, false) => "1 file".to_string(),
+        (f, true) => format!("{f} files ({n} calls)"),
+        (f, false) => format!("{f} files"),
+    };
     match verb {
         "run" => format!("ran {n} commands"),
-        "read" => format!("read {n} files"),
-        "write" => format!("wrote {n} files"),
-        "edit" => format!("edited {n} files"),
+        "read" => format!("read {files}"),
+        "write" => format!("wrote {files}"),
+        "edit" => format!("edited {files}"),
         "search" => format!("ran {n} searches"),
         "recipe" => format!("viewed {n} recipes"),
         _ => format!("{verb} × {n}"),
@@ -458,6 +466,9 @@ struct Card {
     verb: String,
     ok: bool,
     line: String,
+    /// The unclipped subject (a path, a command), so a streak can count
+    /// distinct files rather than calls.
+    key: String,
 }
 
 /// Stateful card renderer: pairs tool calls with results, drives the
@@ -481,6 +492,8 @@ pub struct RenderState {
     accum: IngotAccum,
     streak_verb: Option<String>,
     streak_count: usize,
+    /// Distinct subjects in the current streak.
+    streak_keys: std::collections::BTreeSet<String>,
     /// Second card of a possible streak, held until we know whether the
     /// third arrives (3+ collapse) or the streak breaks (print it).
     held: Option<Card>,
@@ -517,6 +530,7 @@ impl RenderState {
             accum: IngotAccum::new(now),
             streak_verb: None,
             streak_count: 0,
+            streak_keys: Default::default(),
             held: None,
             now,
             lifecycle: true,
@@ -848,6 +862,7 @@ impl RenderState {
         } else {
             width.saturating_sub(lead).saturating_mul(3) / 5
         };
+        let key = arg.clone().unwrap_or_default();
         let subject = arg.map(|a| preview(&a, subject_room.max(8))).unwrap_or_default();
         let (glyph, gcolor) = if ok { ("✓", COLD) } else { ("✗", WARM) };
         let mut text = format!(
@@ -866,7 +881,7 @@ impl RenderState {
                 text.push_str(&format!(" {} {}", dim("—"), paint(WARM, &preview(&gist, room))));
             }
         }
-        Card { verb, ok, line: text }
+        Card { verb, ok, line: text, key }
     }
 
     /// Streak-aware card emission. First card of a verb prints at once;
@@ -882,6 +897,7 @@ impl RenderState {
         }
         if self.streak_verb.as_deref() == Some(card.verb.as_str()) {
             self.streak_count += 1;
+            self.streak_keys.insert(card.key.clone());
             if self.streak_count == 2 {
                 self.held = Some(card);
             } else {
@@ -891,6 +907,7 @@ impl RenderState {
             self.flush_streak(prints);
             self.streak_verb = Some(card.verb.clone());
             self.streak_count = 1;
+            self.streak_keys.insert(card.key.clone());
             prints.push(card.line);
         }
     }
@@ -901,7 +918,7 @@ impl RenderState {
             prints.push(format!(
                 "  {} {}",
                 paint(COLD, "✓"),
-                dim(&streak_summary(verb, self.streak_count))
+                dim(&streak_summary(verb, self.streak_count, self.streak_keys.len()))
             ));
         } else if let Some(held) = self.held.take() {
             prints.push(held.line);
@@ -909,6 +926,7 @@ impl RenderState {
         self.held = None;
         self.streak_verb = None;
         self.streak_count = 0;
+        self.streak_keys.clear();
     }
 }
 
@@ -1394,6 +1412,23 @@ mod tests {
         let summary_at = lines.iter().position(|l| l.contains("ran 4 commands")).unwrap();
         let read_at = lines.iter().position(|l| l.contains("a.rs")).unwrap();
         assert!(summary_at < read_at);
+    }
+
+    #[test]
+    fn file_streaks_count_files_not_calls() {
+        let mut state = RenderState::new(false);
+        let mut events = Vec::new();
+        for path in ["a.rs", "a.rs", "b.rs", "a.rs"] {
+            events.push(start("read_file", &format!(r#"{{"path": "{path}"}}"#)));
+            events.push(result("read_file", true, "1|x"));
+        }
+        events.push(start("bash", r#"{"command": "ls"}"#));
+        events.push(result("bash", true, "ok"));
+        let joined = printed(&feed_all(&mut state, &events)).join("\n");
+        assert!(joined.contains("read 2 files (4 calls)"), "{joined}");
+        assert!(!joined.contains("read 4 files"), "{joined}");
+        assert_eq!(streak_summary("edit", 3, 3), "edited 3 files");
+        assert_eq!(streak_summary("edit", 4, 1), "edited 1 file (4 calls)");
     }
 
     #[test]
