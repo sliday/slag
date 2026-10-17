@@ -24,6 +24,16 @@ impl Respond for Script {
         let call = self.turns.get(n).cloned().unwrap_or_else(|| {
             tool("finish", json!({"summary": "out of script"}))
         });
+        // A plain-text turn: the reviewer's reply, which carries no tools.
+        if let Some(text) = call.get("text").and_then(Value::as_str) {
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }));
+        }
         ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
                 "message": {
@@ -188,4 +198,56 @@ async fn a_directory_outside_git_is_fixed_in_place() {
     assert!(stdout.contains("not a git repository"), "{stdout}");
     assert_eq!(std::fs::read_to_string(dir.path().join("value.txt")).unwrap(), "2\n");
     assert!(!dir.path().join(".git").exists(), "slag fix never turns a directory into a repo");
+}
+
+/// The suite: every `tests/*.sh` must pass.
+const SUITE: &str = "for t in tests/*.sh; do bash $t || exit 1; done";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reviewer_gap_gets_one_revision_that_lands_with_the_fix() {
+    let repo = buggy_repo();
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/value_test.sh", "content": "grep -qx 2 value.txt\n"})),
+        tool("finish", json!({"summary": "value.txt:1 now holds 2.", "cmd": SUITE})),
+        json!({"text": "VERDICT: fail\nGAP: name the test after the reported case: tests/test_value_is_two.sh"}),
+        tool("write_file", json!({"path": "tests/test_value_is_two.sh", "content": "grep -qx 2 value.txt\n"})),
+        tool("finish", json!({"summary": "Added the named test.", "cmd": SUITE})),
+    ])
+    .await;
+
+    let out = slag_fix(repo.path(), &server, &["value is wrong", "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("revised once after review"), "{stdout}");
+    let files = sh(repo.path(), "git show --name-only --format= HEAD");
+    assert!(files.contains("tests/test_value_is_two.sh") && files.contains("value.txt"), "{files}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revision_that_breaks_the_fix_is_rolled_back() {
+    let repo = buggy_repo();
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/value_test.sh", "content": "grep -qx 2 value.txt\n"})),
+        tool("finish", json!({"summary": "value.txt:1 now holds 2.", "cmd": SUITE})),
+        json!({"text": "VERDICT: fail\nGAP: also cover the value 3"}),
+        // The revision breaks the fix the tests had passed.
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "2", "new_string": "3"})),
+        tool("write_file", json!({"path": "tests/extra.sh", "content": "true\n"})),
+        tool("finish", json!({"summary": "Changed it.", "cmd": SUITE})),
+    ])
+    .await;
+
+    let out = slag_fix(repo.path(), &server, &["value is wrong", "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("kept the first fix"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(repo.path().join("value.txt")).unwrap(), "2\n");
+    assert!(!repo.path().join("tests/extra.sh").exists(), "the revision's new file is gone");
+    let files = sh(repo.path(), "git show --name-only --format= HEAD");
+    assert_eq!(files.trim(), "tests/value_test.sh\nvalue.txt", "{files}");
 }

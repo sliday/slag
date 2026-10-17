@@ -42,7 +42,70 @@ pub fn detect_test(root: &Path) -> Option<TestCmd> {
     if has_make_target(root, "test") {
         return Some(TestCmd::new("make test", "Makefile"));
     }
-    None
+    // A repository of shell scripts often carries its own runner.
+    ["tests/run.sh", "test.sh", "run_tests.sh", "tests/run_tests.sh"]
+        .iter()
+        .find(|p| root.join(p).is_file())
+        .map(|p| TestCmd::new(format!("bash {p}"), *p))
+}
+
+/// The machine the tests run on, said the way a test author needs it: the
+/// userland decides which flags `touch`, `date`, `sed` and `stat` accept.
+pub fn platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS with the BSD userland: touch, date, sed and stat take BSD flags, and GNU-only flags (touch -d, date -d, sed -i without a suffix argument) fail",
+        "linux" => "Linux with the GNU userland",
+        other => other,
+    }
+}
+
+/// Module names too generic to pair with a test file by name.
+const GENERIC_STEMS: &[&str] =
+    &["lib", "main", "mod", "index", "__init__", "app", "utils", "util", "helpers", "common"];
+
+/// The module a test file is named after: `tests/test_ledger.py` is
+/// `ledger`, `test/store.test.js` is `store`, `pkg/thing_test.go` is
+/// `thing`, `spec/model_spec.rb` is `model`, `tests/basic.rs` is `basic`.
+fn test_subject(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?;
+    let base = name.split('.').next()?.to_ascii_lowercase();
+    let base = base.strip_prefix("test_").unwrap_or(&base);
+    let base = base.strip_suffix("_test").or_else(|| base.strip_suffix("_spec")).unwrap_or(base);
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+/// Where a test for `src` belongs: the existing test file named after its
+/// module, or, when there is none, the path a new one should take, named
+/// the way the repository's own test files are. `None` for a generic
+/// module name or a repository with no tests in that language.
+pub fn test_home(src: &str, tests: &[String]) -> Option<String> {
+    let name = src.rsplit('/').next()?;
+    let (stem, ext) = name.split_once('.')?;
+    let stem = stem.to_ascii_lowercase();
+    if GENERIC_STEMS.contains(&stem.as_str()) {
+        return None;
+    }
+    if let Some(home) = tests.iter().find(|t| test_subject(t).as_deref() == Some(stem.as_str())) {
+        return Some(home.clone());
+    }
+    let ext = ext.rsplit('.').next()?;
+    // Copy the name of a real test file, not a runner script that only
+    // lives among them (`tests/run.sh` would name a new test `prune.sh`).
+    let same_lang: Vec<&String> = tests.iter().filter(|t| t.ends_with(&format!(".{ext}"))).collect();
+    let sibling = same_lang
+        .iter()
+        .find(|t| test_subject(t).is_some_and(|s| !t.ends_with(&format!("/{s}.{ext}"))))
+        .or(same_lang.first())?;
+    let subject = test_subject(sibling)?;
+    let (dir, file) = sibling.rsplit_once('/').unwrap_or(("", sibling.as_str()));
+    let lower = file.to_ascii_lowercase();
+    let at = lower.find(&subject)?;
+    let new = format!("{}{stem}{}", &file[..at], &file[at + subject.len()..]);
+    Some(if dir.is_empty() {
+        format!("{new} (new file)")
+    } else {
+        format!("{dir}/{new} (new file)")
+    })
 }
 
 fn node_test(root: &Path) -> Option<TestCmd> {
@@ -847,6 +910,35 @@ mod tests {
         let terms = vec!["export_csv".to_string(), "entries".to_string()];
         assert_eq!(rank_files(dir.path(), &files, &terms, 5), ["src/ledger.py", "tests/test_ledger.py"]);
         assert!(rank_files(dir.path(), &files, &[], 5).is_empty());
+    }
+
+    #[test]
+    fn a_tests_home_is_its_modules_test_file_or_a_new_one_named_alike() {
+        let tests: Vec<String> = ["tests/test_hashing.py", "test/store.test.js", "tests/basic.rs", "pkg/thing_test.go"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(test_home("src/hashing.py", &tests).as_deref(), Some("tests/test_hashing.py"));
+        assert_eq!(test_home("src/ledger.py", &tests).as_deref(), Some("tests/test_ledger.py (new file)"));
+        assert_eq!(test_home("lib/duration.js", &tests).as_deref(), Some("test/duration.test.js (new file)"));
+        assert_eq!(test_home("src/config.rs", &tests).as_deref(), Some("tests/config.rs (new file)"));
+        assert_eq!(test_home("pkg/other.go", &tests).as_deref(), Some("pkg/other_test.go (new file)"));
+        assert_eq!(test_home("src/lib.rs", &tests), None, "lib is too generic to pair by name");
+        assert_eq!(test_home("main.c", &tests), None, "no C tests to copy a name from");
+        let shell: Vec<String> =
+            ["tests/run.sh", "tests/test_keeps_other_files.sh"].map(String::from).to_vec();
+        assert_eq!(
+            test_home("prune.sh", &shell).as_deref(),
+            Some("tests/test_prune.sh (new file)"),
+            "named like the tests, not like the runner"
+        );
+    }
+
+    #[test]
+    fn a_shell_repository_runs_its_own_test_script() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "prune.sh", "");
+        write(dir.path(), "tests/run.sh", "");
+        assert_eq!(detect_test(dir.path()).unwrap().cmd, "bash tests/run.sh");
     }
 
     #[test]
