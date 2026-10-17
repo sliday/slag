@@ -15,6 +15,8 @@ pub enum PromptMode {
     Forge,
     /// Read-only survey pass: produce a plan, not edits.
     Plan,
+    /// Independent review with inspection tools and a bounded verdict.
+    Review,
 }
 
 /// The three prompt tiers, joined in stable → context → volatile order.
@@ -89,6 +91,19 @@ pub fn build(root: &Path, model: &str, mode: PromptMode) -> PromptBands {
 }
 
 fn stable_band(model: &str, mode: PromptMode) -> String {
+    if mode == PromptMode::Review {
+        return "# slag warden\n\n\
+            Review the commission's explicit requirements with independent evidence. \
+            Read the relevant artifact files and run focused checks. Batch related reads. \
+            Do not edit files, restore git state, or add requirements. \
+            slag owns PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
+            Ignore these coordinator files in cleanliness checks. \
+            Judge behavior and tests; allow normal local imports and project conventions. \
+            Stop after sufficient evidence. Return the requested verdict as text. \
+            Include concrete evidence for a PASS and an unmet requirement for each GAP. \
+            Never claim a check passed without its result."
+            .to_string();
+    }
     let mut s = String::new();
 
     s.push_str("# slag smith\n\n");
@@ -115,6 +130,7 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
             s.push_str("## Mode: forge\n\n");
             s.push_str("Full tool access. Work the ingot until the proof command passes.\n\n");
         }
+        PromptMode::Review => unreachable!(),
     }
 
     s.push_str("## Operating brief\n\n");
@@ -157,6 +173,9 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
          - Minimal diffs. Change only what the ingot requires; no drive-by fixes, no \
            reformatting, no stray comments.\n\
          - Never touch .env files. Never commit unless the ingot explicitly asks.\n\
+         - slag owns PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
+           Read them for context. Do not write, restore, remove, or commit them. \
+           Ignore them in cleanliness checks.\n\
          - ≤25 words of commentary between tool calls; finish summary ≤120 words.\n\
          - Report outcomes faithfully. Never claim checks pass when output shows failures. \
            Never weaken a test or the proof command to manufacture a pass. Never modify \
@@ -210,10 +229,6 @@ pub fn workspace_snapshot(root: &Path, model: &str) -> String {
     match git(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
         Some(branch) => {
             s.push_str(&format!("- branch: {}\n", branch.trim()));
-            let dirty = git(root, &["status", "--porcelain"])
-                .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count())
-                .unwrap_or(0);
-            s.push_str(&format!("- dirty files: {dirty}\n"));
             if let Some(log) = git(root, &["log", "--oneline", "-3"]) {
                 let log = log.trim();
                 if !log.is_empty() {

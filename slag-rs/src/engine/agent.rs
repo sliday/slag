@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use tokio::task::JoinHandle;
 
-use super::compact::{compact, convo_chars, summarize};
+use super::compact::{compact, convo_chars, retain_recent_rounds, summarize};
 use super::events::{arg_summary, preview};
 use super::tools::ToolBox;
 use super::hooks;
@@ -27,7 +27,8 @@ use super::{
 use crate::error::SlagError;
 
 const DEFAULT_MAX_TURNS: usize = 40;
-const CHAR_BUDGET: usize = 600_000;
+const CHAR_BUDGET: usize = 48_000;
+const RECENT_TOOL_ROUNDS: usize = 2;
 /// chars/4 is the estimation rule for text appended since the last usage
 /// anchor; token budgets convert to char targets through the same ratio.
 pub(crate) const CHARS_PER_TOKEN: usize = 4;
@@ -367,6 +368,11 @@ pub struct ForgeAgent {
     resume: bool,
     /// Withhold the `finish` tool, forcing the turn to end with text.
     no_finish: bool,
+    no_tools: bool,
+    read_only_tools: bool,
+    require_inspection: bool,
+    coordinator_root: Option<std::path::PathBuf>,
+    recent_tool_rounds: usize,
     /// Ledger attribution for every call this session makes. `Smith` by
     /// default; the plan-model factory flips it so plan spend separates
     /// from base spend even when both route to the same model id.
@@ -391,6 +397,11 @@ impl ForgeAgent {
             transcript_root: std::path::PathBuf::from("."),
             resume: false,
             no_finish: false,
+            no_tools: false,
+            read_only_tools: false,
+            require_inspection: false,
+            coordinator_root: None,
+            recent_tool_rounds: RECENT_TOOL_ROUNDS,
             role: Role::Smith,
         }
     }
@@ -406,6 +417,28 @@ impl ForgeAgent {
     /// discouraged by a prompt line the model is free to ignore.
     pub fn without_finish(mut self) -> Self {
         self.no_finish = true;
+        self
+    }
+
+    pub fn with_read_only_tools(mut self) -> Self {
+        self.read_only_tools = true;
+        self.no_finish = true;
+        self
+    }
+
+    pub fn with_no_tools(mut self) -> Self {
+        self.no_tools = true;
+        self
+    }
+
+    pub fn with_required_inspection(mut self) -> Self {
+        self.require_inspection = true;
+        self
+    }
+
+    pub fn with_coordinator_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        let root = root.into();
+        self.coordinator_root = Some(root.canonicalize().unwrap_or(root));
         self
     }
 
@@ -431,17 +464,16 @@ impl ForgeAgent {
     #[cfg(test)]
     fn with_char_budget(mut self, chars: usize) -> Self {
         self.token_budget = (chars / CHARS_PER_TOKEN).max(1);
+        self.recent_tool_rounds = usize::MAX;
         self
     }
 
-    /// Derive the token budget from the model's context window (fetched
-    /// per model from OpenRouter `/models`): window minus output reserve
-    /// minus compaction headroom. `None` (window unknown) keeps the
-    /// default; a `SLAG_CHAR_BUDGET` override always wins.
+    /// Cap the default budget to a smaller model window after reserves.
+    /// `None` keeps the default; `SLAG_CHAR_BUDGET` overrides both.
     pub fn with_context_window(mut self, window_tokens: Option<u64>) -> Self {
         if env_token_budget().is_none() {
             if let Some(window) = window_tokens {
-                self.token_budget = budget_for_window(window);
+                self.token_budget = budget_for_window(window).min(DEFAULT_TOKEN_BUDGET);
             }
         }
         self
@@ -571,6 +603,7 @@ impl ForgeAgent {
         let mut escalated = false;
         let mut nudges = 0usize;
         let mut tool_validation_errors = 0usize;
+        let mut inspected = false;
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
@@ -587,6 +620,10 @@ impl ForgeAgent {
             if applied_steers.len() > steered {
                 // Steers rewrite an existing tool result in place: the
                 // append-only journal can only stay true via a redump.
+                record_rewrite(tw, &messages);
+            }
+            if retain_recent_rounds(&mut messages, self.recent_tool_rounds) {
+                anchor = None;
                 record_rewrite(tw, &messages);
             }
             if compact_to_tokens(&mut messages, token_budget, &mut anchor) {
@@ -695,6 +732,13 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     emit(&self.events, EngineEvent::Error { message: e.to_string() });
                     return Err(e);
                 }
+                if self.require_inspection && !inspected {
+                    messages.push(ChatMessage::user(
+                        "Read the artifact files or run their checks before returning a verdict. Use an inspection tool now.",
+                    ));
+                    record_msg(tw, messages.last().unwrap());
+                    continue;
+                }
                 emit(&self.events, EngineEvent::Finish { summary: resp.content.clone() });
                 return Ok(resp.content);
             }
@@ -748,6 +792,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             // API never sees a dangling id (hermes pattern #7).
             let mut finish_summary: Option<String> = None;
             for (call, outcome) in calls.iter().zip(&outcomes) {
+                inspected |= !outcome.is_error && matches!(call.name.as_str(), "read_file" | "bash");
                 let content = if outcome.is_error {
                     format!("ERROR: {}", outcome.output)
                 } else {
@@ -786,10 +831,17 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         // A cancel raised during the last batch stops here — the batch's
         // tool results are already backfilled, so the transcript is whole.
         self.check_cancel()?;
+        if self.require_inspection && !inspected {
+            return Err(SlagError::SmithFailed("review ended without a successful artifact inspection".into()));
+        }
         messages.push(ChatMessage::user(
             "no more tool budget — summarize what was done",
         ));
         record_msg(tw, messages.last().unwrap());
+        if retain_recent_rounds(&mut messages, self.recent_tool_rounds) {
+            anchor = None;
+            record_rewrite(tw, &messages);
+        }
         if compact_to_tokens(&mut messages, token_budget, &mut anchor) {
             record_rewrite(tw, &messages);
         }
@@ -1023,10 +1075,13 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         ChatRequest {
             model: self.model.clone(),
             messages,
-            tools: if with_tools {
+            tools: if with_tools && !self.no_tools {
                 let mut specs = ToolBox::all_specs();
                 if self.no_finish {
                     specs.retain(|t| t.name != "finish");
+                }
+                if self.read_only_tools {
+                    specs.retain(|t| review_tool(&t.name));
                 }
                 specs
             } else {
@@ -1128,7 +1183,15 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         let call = call.clone();
         let steer = self.steer.clone();
         let events = self.events.clone();
-        tokio::spawn(async move { dispatch_hooked(toolbox, call, steer, events).await })
+        let root = self.coordinator_root.clone();
+        let read_only = self.read_only_tools;
+        let no_tools = self.no_tools;
+        tokio::spawn(async move {
+            if no_tools {
+                return ToolOutcome { output: "tools are unavailable in this session".into(), is_error: true };
+            }
+            dispatch_hooked(toolbox, call, steer, events, root.as_deref(), read_only).await
+        })
     }
 }
 
@@ -1144,6 +1207,8 @@ async fn dispatch_hooked(
     mut call: ToolCall,
     steer: Option<SteerQueue>,
     events: Option<EventTx>,
+    coordinator_root: Option<&std::path::Path>,
+    read_only_tools: bool,
 ) -> ToolOutcome {
     let pre = hooks::fire(
         hooks::HookEvent::PreTool,
@@ -1167,7 +1232,7 @@ async fn dispatch_hooked(
         call.arguments = rewritten;
     }
 
-    let mut outcome = toolbox.dispatch(&call).await;
+    let mut outcome = guarded_dispatch(&toolbox, &call, coordinator_root, read_only_tools).await;
 
     let event = if outcome.is_error {
         hooks::HookEvent::ToolError
@@ -1198,6 +1263,95 @@ async fn dispatch_hooked(
         outcome.output = format!("{}\n\n{}", outcome.output, appended.join("\n"));
     }
     outcome
+}
+
+fn review_tool(name: &str) -> bool {
+    matches!(name, "read_file" | "bash" | "glob" | "grep" | "recipe_view")
+}
+
+fn coordinator_path(path: &std::path::Path) -> bool {
+    matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == "logs")
+        || matches!(path.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md"))
+}
+
+pub(crate) fn coordinator_command_error(command: &str) -> Option<&'static str> {
+    let words: Vec<_> = command.split(|c: char| c.is_whitespace() || ";|&()".contains(c))
+        .map(|s| s.trim_matches(['\'', '"']))
+        .collect();
+    if words.iter().any(|w| matches!(*w, "restore" | "reset" | "checkout" | "clean"))
+        && words.contains(&"git")
+    {
+        return Some("slag owns coordinator files; do not restore, reset, checkout, or clean the worktree");
+    }
+    let call = ToolCall {
+        id: String::new(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": command}).to_string(),
+    };
+    let reads_only = ToolBox::path_access(&call).is_some_and(|(_, writer)| !writer);
+    if !reads_only && words.iter().any(|w| {
+        let path = std::path::Path::new(w.trim_matches(['>', '<']));
+        path.components().any(|c| matches!(c, std::path::Component::Normal(name) if matches!(name.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md" | "logs"))))
+    }) {
+        return Some("slag owns coordinator files and logs; inspect them with read_file and change only artifact files");
+    }
+    None
+}
+
+async fn guarded_dispatch(
+    toolbox: &ToolBox,
+    call: &ToolCall,
+    root: Option<&std::path::Path>,
+    read_only: bool,
+) -> ToolOutcome {
+    let refused = |message: String| ToolOutcome { output: message, is_error: true };
+    if read_only && !review_tool(&call.name) {
+        return refused(format!("{} is unavailable during review; inspect files and report a verdict", call.name));
+    }
+    let Some(root) = root else {
+        return toolbox.dispatch(call).await;
+    };
+    if let Some((path, true)) = ToolBox::path_access(call) {
+        let path = root.join(path);
+        let resolved = path.canonicalize().unwrap_or(path);
+        let relative = resolved.strip_prefix(root).unwrap_or(&resolved);
+        if coordinator_path(relative) {
+            return refused("slag owns this coordinator file; change only artifact files".into());
+        }
+    }
+    if call.name == "bash" {
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            if args.get("run_in_background").and_then(serde_json::Value::as_bool) == Some(true) {
+                return refused("run commands in the foreground so slag can protect coordinator files".into());
+            }
+            if let Some(reason) = args.get("command").and_then(serde_json::Value::as_str)
+                .and_then(coordinator_command_error)
+            {
+                return refused(reason.into());
+            }
+        }
+    }
+    if ToolBox::path_access(call).is_some_and(|(_, writer)| !writer) || call.name == "finish" {
+        return toolbox.dispatch(call).await;
+    }
+    let _lock = crate::crucible::CRUCIBLE_LOCK.lock().await;
+    let guard = match crate::pipeline::CoordinatorGuard::capture(root) {
+        Ok(guard) => guard,
+        Err(e) => return refused(format!("cannot protect coordinator files: {e}")),
+    };
+    let mut result = toolbox.dispatch(call).await;
+    match guard.restore() {
+        Ok(changed) if !changed.is_empty() => {
+            result.is_error = true;
+            result.output.push_str(&format!(
+                "\nslag restored its coordinator files: {}. Change only artifact files.",
+                changed.join(", ")
+            ));
+        }
+        Err(e) => return refused(format!("cannot restore coordinator files: {e}")),
+        _ => {}
+    }
+    result
 }
 
 /// Journal one appended message (no-op outside a forge attempt).
@@ -1442,6 +1596,124 @@ mod tests {
         ForgeAgent::new(provider, ToolBox::new(root), "test/model")
             .with_cost_cap(None)
             .with_run_cap(None)
+    }
+
+    #[tokio::test]
+    async fn review_withholds_write_tools_and_refuses_an_unoffered_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let reviewer = agent(MockProvider::new(vec![]), dir.path()).with_read_only_tools();
+        let specs = reviewer.request(Vec::new(), true, None).tools;
+        assert!(specs.iter().any(|tool| tool.name == "read_file"));
+        assert!(specs.iter().all(|tool| review_tool(&tool.name)));
+        let outcomes = reviewer.dispatch_batch(&[tc(
+            "w", "write_file", serde_json::json!({"path": "artifact.py", "content": "bad"}),
+        )]).await;
+        assert!(outcomes[0].is_error);
+        assert!(!dir.path().join("artifact.py").exists());
+    }
+
+    #[tokio::test]
+    async fn required_review_inspection_rejects_an_unsupported_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![resp_text("VERDICT: PASS", FinishReason::Stop)]);
+        let error = agent(provider.clone(), dir.path())
+            .with_read_only_tools().with_required_inspection().with_max_turns(1)
+            .run("review".into(), "inspect artifact".into()).await.unwrap_err();
+        assert!(error.to_string().contains("without a successful artifact inspection"));
+        assert_eq!(provider.requests().len(), 1);
+
+        std::fs::write(dir.path().join("artifact.py"), "print('hello')").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "artifact.py"}))]),
+            resp_text("VERDICT: PASS", FinishReason::Stop),
+        ]);
+        let result = agent(provider, dir.path()).with_read_only_tools().with_required_inspection()
+            .run("review".into(), "inspect artifact".into()).await.unwrap();
+        assert_eq!(result, "VERDICT: PASS");
+    }
+
+    #[tokio::test]
+    async fn a_no_tools_session_withholds_and_refuses_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let classifier = agent(MockProvider::new(vec![]), dir.path()).with_no_tools();
+        assert!(classifier.request(Vec::new(), true, None).tools.is_empty());
+        let result = classifier.dispatch_batch(&[tc("b", "bash", serde_json::json!({
+            "command": "printf bad > artifact.txt",
+        }))]).await;
+        assert!(result[0].is_error);
+        assert!(!dir.path().join("artifact.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn coordinator_guard_blocks_direct_writes_and_restores_indirect_shell_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PLAN.md"), "live status").unwrap();
+        let smith = agent(MockProvider::new(vec![]), dir.path())
+            .with_coordinator_root(dir.path());
+        let outcomes = smith.dispatch_batch(&[
+            tc("w", "write_file", serde_json::json!({"path": "PLAN.md", "content": "stale status"})),
+            tc("b", "bash", serde_json::json!({"command": "name=PLAN; printf stale > \"${name}.md\"; printf artifact > artifact.txt"})),
+        ]).await;
+        assert!(outcomes.iter().all(|outcome| outcome.is_error));
+        assert!(outcomes[0].output.contains("slag owns"));
+        assert!(outcomes[1].output.contains("slag restored"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("PLAN.md")).unwrap(), "live status");
+        assert_eq!(std::fs::read_to_string(dir.path().join("artifact.txt")).unwrap(), "artifact");
+    }
+
+    #[tokio::test]
+    async fn coordinator_guard_repairs_indirect_shell_changes_to_recovery_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs/transcripts")).unwrap();
+        let engine = dir.path().join("logs/engine-20261017_120000.jsonl");
+        let transcript = dir.path().join("logs/transcripts/i1-h1.jsonl");
+        std::fs::write(&engine, "{\"event\":\"turn_start\",\"turn\":1}\n").unwrap();
+        std::fs::write(&transcript, "{\"entry\":\"resume_attempt\"}\n").unwrap();
+        let smith = agent(MockProvider::new(vec![]), dir.path()).with_coordinator_root(dir.path());
+        let command = "name=lo; name=\"${name}gs\"; printf bad > \"$name/engine-20261017_120000.jsonl\"; rm \"$name/transcripts/i1-h1.jsonl\"; printf marker > \"$name/new-marker\"";
+        let outcome = smith.dispatch_batch(&[tc("b", "bash", serde_json::json!({"command": command}))]).await;
+        assert!(outcome[0].is_error);
+        assert!(outcome[0].output.contains("slag restored"));
+        assert_eq!(std::fs::read_to_string(engine).unwrap(), "{\"event\":\"turn_start\",\"turn\":1}\n");
+        assert_eq!(std::fs::read_to_string(transcript).unwrap(), "{\"entry\":\"resume_attempt\"}\n");
+        assert!(!dir.path().join("logs/new-marker").exists());
+    }
+
+    #[test]
+    fn coordinator_commands_allow_inspection_and_reject_restores_or_log_writes() {
+        assert!(coordinator_command_error("git status --porcelain").is_none());
+        assert!(coordinator_command_error("cat PLAN.md").is_none());
+        assert!(coordinator_command_error("git restore .").is_some());
+        assert!(coordinator_command_error("git -C . checkout HEAD -- PLAN.md").is_some());
+        assert!(coordinator_command_error("rm -rf logs/").is_some());
+        assert!(coordinator_command_error("printf bad > PLAN.md").is_some());
+        assert!(coordinator_command_error("python3 -m unittest").is_none());
+    }
+
+    #[tokio::test]
+    async fn requests_keep_only_two_complete_tool_rounds_and_a_small_evidence_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut script = Vec::new();
+        for i in 0..6 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), format!("evidence {i}\n").repeat(500)).unwrap();
+            script.push(resp_tools(vec![tc(
+                &format!("c{i}"), "read_file", serde_json::json!({"path": format!("f{i}.txt")}),
+            )]));
+        }
+        script.push(resp_text("done", FinishReason::Stop));
+        let provider = MockProvider::new(script);
+        agent(provider.clone(), dir.path()).run("system".into(), "original task".into()).await.unwrap();
+        let requests = provider.requests();
+        let last = &requests.last().unwrap().messages;
+        assert_eq!(last[1].content, "original task");
+        assert_eq!(last.len(), 7);
+        assert!(last[2].content.contains("Earlier tool evidence"));
+        assert_eq!(last[3].tool_calls.as_ref().unwrap()[0].id, "c4");
+        assert_eq!(last[5].tool_calls.as_ref().unwrap()[0].id, "c5");
+        let full_file_chars: usize = (0..6).map(|i| {
+            std::fs::read_to_string(dir.path().join(format!("f{i}.txt"))).unwrap().len()
+        }).sum();
+        assert!(convo_chars(last) < full_file_chars);
     }
 
     #[test]
@@ -1981,7 +2253,7 @@ mod tests {
     #[test]
     fn reinject_cap_scales_with_the_token_budget() {
         // Large windows keep the fixed per-file ceiling.
-        assert_eq!(reinject_file_cap(DEFAULT_TOKEN_BUDGET), REINJECT_FILE_CAP);
+        assert_eq!(reinject_file_cap(150_000), REINJECT_FILE_CAP);
         // At the floor the whole re-injection fits in a quarter of the
         // budget and never disappears entirely.
         let cap = reinject_file_cap(TOKEN_BUDGET_FLOOR);
@@ -2735,7 +3007,7 @@ mod tests {
         let default_budget = base.token_budget;
 
         let sized = agent(provider.clone(), dir.path()).with_context_window(Some(131_072));
-        assert_eq!(sized.token_budget, budget_for_window(131_072));
+        assert_eq!(sized.token_budget, DEFAULT_TOKEN_BUDGET);
         // Unknown window keeps whatever budget was already in place.
         let unknown = agent(provider, dir.path()).with_context_window(None);
         assert_eq!(unknown.token_budget, default_budget);
