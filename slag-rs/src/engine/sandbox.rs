@@ -2,8 +2,11 @@
 //!
 //! The file tools already refuse paths outside the anvil; this covers
 //! `bash`, whose commands the model writes. Reads and network stay open.
-//! Writes land only in the workspace, the temp dirs, the usual tool
-//! caches under `$HOME`, and any `sandbox_writable` paths from config.
+//! Writes land only in the workspace, this user's temp dirs, the
+//! data-only tool caches under `$HOME`, and any `sandbox_writable` paths
+//! from config. Nothing writable is code that later runs outside: no
+//! `~/.cargo/bin`, no `~/.rustup`, no npx cache, and the workspace's git
+//! hooks and config stay read-only, since slag's own git reads them.
 //!
 //! Backends, picked once per process:
 //! - macOS: `sandbox-exec` with a generated Seatbelt profile.
@@ -14,37 +17,62 @@
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use tokio::process::Command;
 
 use crate::config::SandboxMode;
 
-/// Writable under `$HOME`: the caches build tools fill on a normal run.
+/// Writable under `$HOME`: the data-only caches build tools fill on a
+/// normal run. Nothing here is on PATH or read as config, so a write
+/// cannot plant a program: `~/.cargo/bin`, `~/.rustup`, the npx cache and
+/// global package bins stay read-only.
 const HOME_CACHES: &[&str] = &[
-    ".cargo",
-    ".rustup",
-    ".npm",
-    ".cache",
-    "Library/Caches",
-    ".gradle",
-    ".m2",
-    "go",
-    ".bun",
+    ".cargo/registry",
+    ".cargo/git",
+    ".npm/_cacache",
+    ".npm/_logs",
+    ".cache/pip",
+    ".cache/uv",
+    ".cache/go-build",
+    ".cache/yarn",
+    "Library/Caches/pip",
+    "Library/Caches/go-build",
+    "Library/Caches/Yarn",
+    "Library/pnpm/store",
+    ".local/share/pnpm/store",
     ".pnpm-store",
-    ".local/share/pnpm",
-    ".yarn",
+    ".bun/install/cache",
+    ".yarn/berry/cache",
+    ".gradle/caches",
+    ".m2/repository",
+    "go/pkg/mod",
 ];
 
-/// Env vars that move those caches, or build output, somewhere else.
-const CACHE_ENV: &[&str] = &[
-    "CARGO_HOME",
-    "CARGO_TARGET_DIR",
-    "RUSTUP_HOME",
-    "GOPATH",
-    "GOCACHE",
-    "GOMODCACHE",
-    "XDG_CACHE_HOME",
+/// Env vars that move a cache or build output, and the data-only parts of
+/// what they name (`""` for all of it).
+const CACHE_ENV: &[(&str, &[&str])] = &[
+    ("CARGO_HOME", &["registry", "git"]),
+    ("CARGO_TARGET_DIR", &[""]),
+    ("GOPATH", &["pkg/mod"]),
+    ("GOCACHE", &[""]),
+    ("GOMODCACHE", &[""]),
+    ("XDG_CACHE_HOME", &["pip", "uv", "go-build", "yarn"]),
+];
+
+/// Files in a git dir that make git run a program, plus the pointer a
+/// linked worktree follows. Model commands may read them, never write.
+const GIT_CONTROL: &[&str] = &["config", "config.worktree", "hooks", "commondir"];
+
+/// Config that makes an ordinary git command run a program even when
+/// `.git/config` is clean: hooks fire on commit, merge and checkout;
+/// fsmonitor runs on any index refresh. Every git command slag runs
+/// itself carries these.
+const GIT_GUARD: [&str; 4] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
 ];
 
 /// How a named denial opens and what follows its path. `blocked_path`
@@ -52,6 +80,9 @@ const CACHE_ENV: &[&str] = &[
 const BLOCKED_NOTE: &str = "[sandbox] write outside the workspace was blocked by slag's sandbox: ";
 const BLOCKED_TAIL: &str = ". Only the workspace, temp dirs and tool caches are writable; \
      write inside the workspace instead of retrying.";
+const GIT_NOTE: &str = "[sandbox] write to git's hooks or config was blocked by slag's sandbox: ";
+const GIT_TAIL: &str = ". slag keeps them read-only so nothing a command writes runs outside \
+     the sandbox; use git commands that only touch objects, refs and the index.";
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -90,15 +121,49 @@ impl Backend {
 pub struct Sandbox {
     backend: Backend,
     writable: Vec<PathBuf>,
+    /// Git control paths inside the writable set that stay read-only.
+    locked: Locked,
     /// Landlock ruleset, built once in the parent and applied in each
     /// child between fork and exec.
     #[cfg(target_os = "linux")]
     ruleset: Option<std::os::fd::OwnedFd>,
 }
 
+/// Paths the sandbox keeps read-only inside otherwise writable trees.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Locked {
+    /// Exact entries: a `.git` dir or file, which a rename could swap
+    /// for one the model wrote. What lies beneath stays writable.
+    entries: Vec<PathBuf>,
+    /// Whole trees: each git dir's `GIT_CONTROL` paths.
+    trees: Vec<PathBuf>,
+}
+
+impl Locked {
+    fn covers(&self, path: &Path) -> bool {
+        self.entries.iter().any(|e| e == path) || self.trees.iter().any(|t| path.starts_with(t))
+    }
+}
+
+/// slag's own private repositories (the `slag fix` shadow lives in the
+/// temp dir, which model commands can write). Their control files get
+/// the same lock as the workspace's.
+static PRIVATE_GIT_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Lock `git_dir`'s hooks and config in every sandbox built from now on.
+pub fn protect_git_dir(git_dir: &Path) {
+    let dir = git_dir
+        .canonicalize()
+        .unwrap_or_else(|_| git_dir.to_path_buf());
+    let mut dirs = PRIVATE_GIT_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
 impl Sandbox {
     pub fn off() -> Self {
-        Self::with(Backend::None, Vec::new())
+        Self::with(Backend::None, Vec::new(), Locked::default())
     }
 
     /// The sandbox config asks for: `--no-sandbox`, `SLAG_SANDBOX`, then
@@ -115,24 +180,32 @@ impl Sandbox {
     /// backend this machine supports.
     pub fn new(root: &Path, extras: &[PathBuf]) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let tmpdir = std::env::var_os("TMPDIR").map(PathBuf::from);
-        let env_caches: Vec<PathBuf> = CACHE_ENV
-            .iter()
-            .filter_map(|v| std::env::var_os(v))
-            .filter(|v| !v.is_empty())
+        let tmpdir = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
-            .collect();
-        let writable = writable_paths(
-            root,
-            extras,
-            home.as_deref(),
-            tmpdir.as_deref(),
-            &env_caches,
-        );
-        Self::with(backend(), writable)
+            .unwrap_or_else(std::env::temp_dir);
+        let mut env_caches = Vec::new();
+        for (var, parts) in CACHE_ENV {
+            let Some(base) = std::env::var_os(var).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            env_caches.extend(parts.iter().map(|p| PathBuf::from(&base).join(p)));
+        }
+        let writable = writable_paths(root, extras, home.as_deref(), Some(&tmpdir), &env_caches);
+        let private = PRIVATE_GIT_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let locked = locked_git_paths(root, &private);
+        Self::with(backend(), writable, locked)
     }
 
-    fn with(backend: Backend, writable: Vec<PathBuf>) -> Self {
+    fn with(backend: Backend, writable: Vec<PathBuf>, locked: Locked) -> Self {
+        // Landlock grants whole trees and cannot carve a read-only file out
+        // of one, so there the git guard watches the locked files instead.
+        #[cfg(target_os = "linux")]
+        if let (Backend::Landlock, Some(root)) = (backend, writable.first()) {
+            git_guard::record(root, &locked);
+        }
         #[cfg(target_os = "linux")]
         let (backend, ruleset) = match backend {
             // A ruleset the kernel refused leaves nothing to enforce.
@@ -145,6 +218,7 @@ impl Sandbox {
         Self {
             backend,
             writable,
+            locked,
             #[cfg(target_os = "linux")]
             ruleset,
         }
@@ -180,19 +254,30 @@ impl Sandbox {
         };
         #[cfg(target_os = "linux")]
         if let Some(ruleset) = &self.ruleset {
-            landlock::confine(&mut cmd, std::os::fd::AsRawFd::as_raw_fd(ruleset));
+            landlock::confine(cmd.as_std_mut(), std::os::fd::AsRawFd::as_raw_fd(ruleset));
         }
         cmd
     }
 
     fn seatbelt_args(&self) -> Vec<OsString> {
-        let mut args: Vec<OsString> =
-            vec!["-p".into(), seatbelt_profile(self.writable.len()).into()];
-        for (i, path) in self.writable.iter().enumerate() {
-            let mut define = OsString::from(format!("W{i}="));
-            define.push(path.as_os_str());
-            args.push("-D".into());
-            args.push(define);
+        let profile = seatbelt_profile(
+            self.writable.len(),
+            self.locked.entries.len(),
+            self.locked.trees.len(),
+        );
+        let mut args: Vec<OsString> = vec!["-p".into(), profile.into()];
+        let params = [
+            ("W", &self.writable),
+            ("L", &self.locked.entries),
+            ("T", &self.locked.trees),
+        ];
+        for (prefix, paths) in params {
+            for (i, path) in paths.iter().enumerate() {
+                let mut define = OsString::from(format!("{prefix}{i}="));
+                define.push(path.as_os_str());
+                args.push("-D".into());
+                args.push(define);
+            }
         }
         args
     }
@@ -209,6 +294,25 @@ impl Sandbox {
             args.push("--bind".into());
             args.push(path.into());
             args.push(path.into());
+        }
+        // A git dir bound onto itself is a mount point, which no rename or
+        // rmdir can swap out; then its control files go back read-only. A
+        // `.git` file (a linked worktree's pointer) is bound read-only.
+        for entry in self
+            .locked
+            .entries
+            .iter()
+            .filter(|e| e.exists() && self.in_writable(e))
+        {
+            let flag = if entry.is_dir() {
+                "--bind"
+            } else {
+                "--ro-bind"
+            };
+            args.extend([flag.into(), entry.into(), entry.into()]);
+        }
+        for tree in self.locked.trees.iter().filter(|t| t.exists()) {
+            args.extend(["--ro-bind".into(), tree.into(), tree.into()]);
         }
         args.push("--die-with-parent".into());
         args
@@ -233,6 +337,9 @@ impl Sandbox {
                 continue;
             }
             match path_near(line, at) {
+                Some(path) if self.locked.covers(&self.absolute(&path)) => {
+                    return Some(format!("{GIT_NOTE}{}{GIT_TAIL}", path.display()));
+                }
                 Some(path) if !self.allows(&path) => {
                     return Some(format!("{BLOCKED_NOTE}{}{BLOCKED_TAIL}", path.display()));
                 }
@@ -254,20 +361,67 @@ impl Sandbox {
     /// canonical `/private/tmp` entry. Relative paths start at the root,
     /// which is always the first writable entry.
     fn allows(&self, path: &Path) -> bool {
-        let path = match self.writable.first() {
-            Some(root) if path.is_relative() => resolve(&root.join(path)),
-            _ => resolve(path),
-        };
+        let path = self.absolute(path);
+        !self.locked.covers(&path) && self.in_writable(&path)
+    }
+
+    /// Beneath a writable path, before the git lock applies.
+    fn in_writable(&self, path: &Path) -> bool {
         path.starts_with("/dev") || self.writable.iter().any(|w| path.starts_with(w))
     }
+
+    fn absolute(&self, path: &Path) -> PathBuf {
+        match self.writable.first() {
+            Some(root) if path.is_relative() => resolve(&root.join(path)),
+            _ => resolve(path),
+        }
+    }
+}
+
+/// Whether `path` (resolved) is one of `root`'s git control paths, which
+/// the file tools must refuse just as the sandbox does for the shell.
+pub fn is_git_control(root: &Path, path: &Path) -> bool {
+    let private = PRIVATE_GIT_DIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    locked_git_paths(root, &private).covers(&resolve(path))
+}
+
+/// `git` for slag's own commands: commits, snapshots, diffs, worktrees.
+/// Hooks and fsmonitor are off. Under Landlock, where model commands can
+/// still write `.git/config`, it refuses to run once that config gains
+/// a program to run (see `git_guard`).
+pub fn git() -> std::process::Command {
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = git_guard::tampered() {
+        let mut refuse = std::process::Command::new("sh");
+        refuse.arg("-c").arg(git_guard::REFUSAL).arg("sh").arg(dir);
+        return refuse;
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(GIT_GUARD);
+    cmd
+}
+
+/// `git()` for async callers.
+pub fn git_async() -> Command {
+    let std = git();
+    let mut cmd = Command::new(std.get_program());
+    cmd.args(std.get_args());
+    cmd
 }
 
 /// The path a denial note in `output` names, for one-line summaries such
 /// as a test run's status.
 pub fn blocked_path(output: &str) -> Option<&str> {
     output.lines().find_map(|line| {
-        let rest = line.strip_prefix(BLOCKED_NOTE)?;
-        Some(rest.split_once(BLOCKED_TAIL).map_or(rest, |(path, _)| path))
+        [(BLOCKED_NOTE, BLOCKED_TAIL), (GIT_NOTE, GIT_TAIL)]
+            .into_iter()
+            .find_map(|(note, tail)| {
+                let rest = line.strip_prefix(note)?;
+                Some(rest.split_once(tail).map_or(rest, |(path, _)| path))
+            })
     })
 }
 
@@ -341,12 +495,24 @@ fn probe() -> Backend {
     Backend::None
 }
 
-fn seatbelt_profile(params: usize) -> String {
+/// `writable` subpath params, then a deny block for `entries` literal and
+/// `trees` subpath params. The deny comes last, so it wins.
+fn seatbelt_profile(writable: usize, entries: usize, trees: usize) -> String {
     let mut profile = String::from(SEATBELT_HEAD);
-    for i in 0..params {
+    for i in 0..writable {
         profile.push_str(&format!("    (subpath (param \"W{i}\"))\n"));
     }
     profile.push_str(SEATBELT_DEVICES);
+    if entries + trees > 0 {
+        profile.push_str("(deny file-write*\n");
+        for i in 0..entries {
+            profile.push_str(&format!("    (literal (param \"L{i}\"))\n"));
+        }
+        for i in 0..trees {
+            profile.push_str(&format!("    (subpath (param \"T{i}\"))\n"));
+        }
+        profile.push_str(")\n");
+    }
     profile
 }
 
@@ -362,8 +528,10 @@ fn writable_paths(
 ) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf()];
     paths.extend(git_dirs(root));
+    // On macOS only this user's `$TMPDIR` under /private/var/folders, not
+    // the tree that holds every user's caches and temp dirs.
     let temps: &[&str] = if cfg!(target_os = "macos") {
-        &["/private/tmp", "/private/var/folders"]
+        &["/private/tmp"]
     } else {
         &["/tmp", "/var/tmp"]
     };
@@ -405,7 +573,12 @@ fn git_dirs(root: &Path) -> Vec<PathBuf> {
             vec![dot_git]
         };
     }
-    let Some(gitdir) = std::fs::read_to_string(&dot_git).ok().and_then(|s| {
+    linked_git_dirs(&dot_git, root)
+}
+
+/// The private and common git dirs a linked worktree's `.git` file names.
+fn linked_git_dirs(dot_git: &Path, root: &Path) -> Vec<PathBuf> {
+    let Some(gitdir) = std::fs::read_to_string(dot_git).ok().and_then(|s| {
         s.trim()
             .strip_prefix("gitdir:")
             .map(|g| g.trim().to_string())
@@ -421,6 +594,33 @@ fn git_dirs(root: &Path) -> Vec<PathBuf> {
     dirs.into_iter()
         .map(|d| d.canonicalize().unwrap_or(d))
         .collect()
+}
+
+/// The git control paths for `root`'s repository and slag's private ones.
+/// The `.git` git would find for the root (its own or a parent repo's) is
+/// locked even when absent, so a model-run `git init` cannot hand slag a
+/// repository whose config the model wrote.
+fn locked_git_paths(root: &Path, private: &[PathBuf]) -> Locked {
+    let entry = root
+        .ancestors()
+        .map(|a| a.join(".git"))
+        .find(|g| g.exists())
+        .unwrap_or_else(|| root.join(".git"));
+    let mut locked = Locked::default();
+    let mut dirs = if entry.is_file() {
+        let dirs = linked_git_dirs(&entry, root);
+        locked.entries.push(entry);
+        dirs
+    } else {
+        vec![entry]
+    };
+    dirs.extend(private.iter().cloned());
+    for dir in dirs {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        locked.trees.extend(GIT_CONTROL.iter().map(|c| dir.join(c)));
+        locked.entries.push(dir);
+    }
+    locked
 }
 
 /// Output lines from tools that only read: macOS privacy (TCC) refuses
@@ -457,7 +657,9 @@ fn path_near(line: &str, at: usize) -> Option<PathBuf> {
                 '\'' | '"' | ':' | ',' | ';' | '(' | ')' | '[' | ']' | '`' | '‘' | '’'
             )
         });
-        if !(token.starts_with('/') || token.starts_with("~/") || token.starts_with("../")) {
+        // Absolute, home-relative, or a relative path with a directory in
+        // it (`.git/hooks/x`), which resolves from the root. Not a URL.
+        if !(token.starts_with('/') || token.contains('/') && !token.contains("://")) {
             continue;
         }
         if s < at {
@@ -645,7 +847,8 @@ mod landlock {
 
     /// Enforce the ruleset in the child between fork and exec. The parent
     /// keeps the fd open for as long as the sandbox lives.
-    pub fn confine(cmd: &mut tokio::process::Command, ruleset: RawFd) {
+    pub fn confine(cmd: &mut std::process::Command, ruleset: RawFd) {
+        use std::os::unix::process::CommandExt;
         // SAFETY: the closure makes two raw syscalls and allocates nothing,
         // which is all a post-fork child may do.
         unsafe {
@@ -662,19 +865,154 @@ mod landlock {
     }
 }
 
+/// The Landlock stand-in for a read-only `.git/config`. When a sandbox
+/// first covers a repository, record what its git control files would
+/// make git run; slag's own git refuses once that changes. Config edits
+/// that run nothing (`push -u`, a model's `git config user.email`) pass.
+#[cfg(target_os = "linux")]
+mod git_guard {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// `$1` is the git dir whose control files changed.
+    pub const REFUSAL: &str = "echo \"slag: refusing to run git: a sandboxed command changed \
+         what git would run from $1 (hooks, filters, drivers, or a .git pointer). Review and \
+         undo it; Landlock cannot keep it read-only.\" >&2; exit 1";
+
+    struct Baseline {
+        /// The sandbox root that first covered `path`.
+        root: PathBuf,
+        path: PathBuf,
+        print: String,
+    }
+
+    static BASELINES: Mutex<Vec<Baseline>> = Mutex::new(Vec::new());
+
+    /// Keep the first fingerprint each locked entry had: it predates every
+    /// model command, which runs only after its sandbox exists.
+    pub fn record(root: &Path, locked: &super::Locked) {
+        let mut baselines = BASELINES.lock().unwrap_or_else(|e| e.into_inner());
+        for path in &locked.entries {
+            if !baselines.iter().any(|b| &b.path == path) {
+                let print = fingerprint(path);
+                baselines.push(Baseline {
+                    root: root.to_path_buf(),
+                    path: path.clone(),
+                    print,
+                });
+            }
+        }
+    }
+
+    /// The first changed entry among the repositories this process works
+    /// in: sandboxes rooted at the working directory or beside it (duel
+    /// casts live in sibling worktrees). Others belong to someone else.
+    pub fn tampered() -> Option<PathBuf> {
+        let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+        let baselines = BASELINES.lock().unwrap_or_else(|e| e.into_inner());
+        baselines
+            .iter()
+            .filter(|b| b.root == cwd || b.root.parent() == cwd.parent())
+            .find(|b| fingerprint(&b.path) != b.print)
+            .map(|b| b.path.clone())
+    }
+
+    /// A `.git` file's pointer, or a git dir's program-running config
+    /// entries as git itself parses them (`git config` runs nothing).
+    pub(super) fn fingerprint(path: &Path) -> String {
+        if path.is_file() {
+            return std::fs::read_to_string(path).unwrap_or_default();
+        }
+        let mut out = String::new();
+        for name in ["config", "config.worktree"] {
+            let file = path.join(name);
+            if !file.exists() {
+                continue;
+            }
+            // From `/`, so a broken repository around the working
+            // directory cannot make git refuse to read the file.
+            let Ok(list) = std::process::Command::new("git")
+                .args(["config", "--includes", "--file"])
+                .arg(&file)
+                .args(["--list", "--null"])
+                .current_dir("/")
+                .output()
+            else {
+                continue;
+            };
+            for entry in String::from_utf8_lossy(&list.stdout).split('\0') {
+                let key = entry.split('\n').next().unwrap_or("");
+                if runs_program(key) {
+                    out.push_str(entry);
+                    out.push('\0');
+                }
+            }
+        }
+        out
+    }
+
+    /// Config keys whose value git runs, or that pull in more config.
+    pub(super) fn runs_program(key: &str) -> bool {
+        let key = key.to_ascii_lowercase();
+        let last = key.rsplit('.').next().unwrap_or("");
+        key.starts_with("alias.")
+            || key.starts_with("include")
+            || matches!(
+                last,
+                "hookspath"
+                    | "fsmonitor"
+                    | "sshcommand"
+                    | "editor"
+                    | "pager"
+                    | "askpass"
+                    | "gitproxy"
+                    | "external"
+                    | "textconv"
+                    | "command"
+                    | "clean"
+                    | "smudge"
+                    | "process"
+                    | "driver"
+                    | "program"
+                    | "helper"
+                    | "cmd"
+                    | "update"
+                    | "packobjectshook"
+                    | "uploadpack"
+                    | "receivepack"
+                    | "worktree"
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sandbox(backend: Backend, writable: &[&str]) -> Sandbox {
-        Sandbox::with(backend, writable.iter().map(PathBuf::from).collect())
+        Sandbox::with(
+            backend,
+            writable.iter().map(PathBuf::from).collect(),
+            Locked::default(),
+        )
     }
 
     #[test]
     fn profile_denies_writes_then_allows_each_param() {
-        let profile = seatbelt_profile(2);
+        let profile = seatbelt_profile(2, 1, 2);
         let deny = profile.find("(deny file-write*)").expect("deny rule");
         let allow = profile.find("(allow file-write*").expect("allow rule");
+        let lock = profile.find("(deny file-write*\n").expect("git lock");
+        assert!(
+            allow < lock,
+            "the git lock must come last to win: {profile}"
+        );
+        assert!(profile.contains("(literal (param \"L0\"))"));
+        assert!(profile.contains("(subpath (param \"T1\"))"));
+        assert!(
+            !seatbelt_profile(1, 0, 0).contains("(deny file-write*\n"),
+            "an empty deny denies all"
+        );
         assert!(
             profile.starts_with("(version 1)\n(allow default)"),
             "{profile}"
@@ -736,16 +1074,16 @@ mod tests {
             ],
             Some(home),
             Some(Path::new("/var/tmpdir-x")),
-            &[PathBuf::from("/opt/cargo")],
+            &[PathBuf::from("/opt/cargo/registry")],
         );
         assert_eq!(paths[0], root.path());
         for want in [
-            "/home/smith/.cargo",
-            "/home/smith/.rustup",
-            "/home/smith/Library/Caches",
-            "/home/smith/.local/share/pnpm",
+            "/home/smith/.cargo/registry",
+            "/home/smith/.npm/_cacache",
+            "/home/smith/Library/Caches/pip",
+            "/home/smith/.local/share/pnpm/store",
             "/var/tmpdir-x",
-            "/opt/cargo",
+            "/opt/cargo/registry",
             "/srv/data",
         ] {
             assert!(
@@ -753,17 +1091,106 @@ mod tests {
                 "{want} missing: {paths:?}"
             );
         }
+        // Program paths: on PATH, or run later by a tool outside.
+        for program in [
+            "/home/smith",
+            "/home/smith/.cargo",
+            "/home/smith/.cargo/bin",
+            "/home/smith/.rustup",
+            "/home/smith/.npm",
+            "/home/smith/.bun",
+            "/home/smith/.local/share/pnpm",
+            "/home/smith/Library/Caches",
+        ] {
+            assert!(
+                !paths.iter().any(|p| Path::new(program).starts_with(p)),
+                "{program} is writable: {paths:?}"
+            );
+        }
         let temp = if cfg!(target_os = "macos") {
-            "/private/var/folders"
+            "/private/tmp"
         } else {
             "/tmp"
         };
         assert!(paths.contains(&PathBuf::from(temp)), "{paths:?}");
         assert!(
-            !paths.contains(&PathBuf::from("/home/smith")),
-            "home itself stays read-only"
+            !paths.iter().any(|p| p == Path::new("/private/var/folders")),
+            "every user's temp tree stays read-only"
         );
         assert!(!paths.iter().any(|p| p.ends_with("relative/ignored")));
+    }
+
+    #[test]
+    fn git_control_paths_lock_even_before_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let fresh = locked_git_paths(&root, &[]);
+        assert!(fresh.covers(&root.join(".git")), "{fresh:?}");
+        assert!(fresh.covers(&root.join(".git/hooks/pre-commit")));
+        assert!(fresh.covers(&root.join(".git/config")));
+        assert!(!fresh.covers(&root.join(".git/objects/ab/cdef")));
+        assert!(!fresh.covers(&root.join("src/main.rs")));
+
+        let shadow = root.join("shadow.git");
+        let both = locked_git_paths(&root, &[shadow.clone()]);
+        assert!(both.covers(&shadow.join("config")) && both.covers(&shadow.join("hooks/x")));
+    }
+
+    #[test]
+    fn seatbelt_and_bwrap_lock_git_control_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "").unwrap();
+        let ws = root.to_string_lossy().into_owned();
+        let mut sb = sandbox(Backend::Bwrap, &[&ws]);
+        sb.locked = locked_git_paths(&root, &[]);
+
+        let args: Vec<String> = sb
+            .seatbelt_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&format!("L0={ws}/.git")), "{args:?}");
+        assert!(args.contains(&format!("T0={ws}/.git/config")), "{args:?}");
+
+        let args: Vec<String> = sb
+            .bwrap_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let git = format!("{ws}/.git");
+        let pos = |flag: &str, path: &str| {
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == path && w[2] == path)
+        };
+        let ws_bind = pos("--bind", &ws).expect("workspace bind");
+        let git_bind = pos("--bind", &git).expect("the git dir is its own mount");
+        let config = pos("--ro-bind", &format!("{git}/config")).expect("config read-only");
+        let hooks = pos("--ro-bind", &format!("{git}/hooks")).expect("hooks read-only");
+        assert!(
+            ws_bind < git_bind && git_bind < config && git_bind < hooks,
+            "{args:?}"
+        );
+        assert!(
+            pos("--ro-bind", &format!("{git}/config.worktree")).is_none(),
+            "absent drops"
+        );
+    }
+
+    #[test]
+    fn a_blocked_git_write_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = root.to_string_lossy().into_owned();
+        let mut sb = sandbox(Backend::Seatbelt, &[&ws]);
+        sb.locked = locked_git_paths(&root, &[]);
+        let out = "bash: .git/hooks/pre-commit: Operation not permitted";
+        let note = sb.denial_note(out, true).expect("note");
+        assert!(note.starts_with(GIT_NOTE), "{note}");
+        assert_eq!(blocked_path(&note), Some(".git/hooks/pre-commit"));
+        assert!(is_git_control(&root, &root.join(".git/hooks/pre-commit")));
+        assert!(!is_git_control(&root, &root.join("src/lib.rs")));
     }
 
     #[test]
@@ -836,10 +1263,15 @@ mod tests {
     #[test]
     fn blocked_path_reads_the_note_back() {
         let sb = sandbox(Backend::Seatbelt, &["/ws"]);
-        let note = sb.denial_note("touch: /Users/x/probe: Operation not permitted", true).unwrap();
+        let note = sb
+            .denial_note("touch: /Users/x/probe: Operation not permitted", true)
+            .unwrap();
         let output = format!("running\n{note}\n");
         assert_eq!(blocked_path(&output), Some("/Users/x/probe"));
-        assert_eq!(blocked_path("touch: /Users/x/probe: Operation not permitted"), None);
+        assert_eq!(
+            blocked_path("touch: /Users/x/probe: Operation not permitted"),
+            None
+        );
     }
 
     #[test]
@@ -860,7 +1292,10 @@ mod tests {
         assert!(sb.allows(&dir.path().join("new/deeper/file")));
         assert!(sb.allows(&ws.join("a/../b")));
         assert!(!sb.allows(&ws.join("../escape")));
-        assert!(sb.allows(Path::new("sub/new-file")), "relative paths start at the root");
+        assert!(
+            sb.allows(Path::new("sub/new-file")),
+            "relative paths start at the root"
+        );
         assert!(!sb.allows(Path::new("../escape")));
         assert!(sb.allows(Path::new("/dev/null")));
     }
@@ -879,6 +1314,139 @@ mod tests {
         let off = Sandbox::for_root(dir.path());
         std::env::remove_var("SLAG_SANDBOX");
         assert_eq!(off.backend(), Backend::None);
+    }
+
+    /// The critic's vectors, end to end: a sandboxed command plants a git
+    /// hook or fsmonitor, or swaps `.git`, then slag commits; or it drops
+    /// a program where a tool runs it later. None of it may run outside.
+    #[tokio::test]
+    async fn plants_never_become_code_outside_the_sandbox() {
+        use super::super::tools::ToolBox;
+        use super::super::ToolCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let sh = |cmd: &str| {
+            let ok = std::process::Command::new("bash")
+                .args(["-c", cmd])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{cmd}");
+        };
+        sh("git init -q -b main && git config user.email t@t && git config user.name t");
+        let sb = Sandbox::new(&root, &[]);
+        let backend = sb.backend();
+        if backend == Backend::None {
+            eprintln!("skipped: no sandbox backend works here");
+            return;
+        }
+        let tb = ToolBox::new(&root).with_sandbox(sb);
+        let tool = |name: &str, args: serde_json::Value| {
+            let call = ToolCall {
+                id: "t1".into(),
+                name: name.into(),
+                arguments: args.to_string(),
+            };
+            let tb = tb.clone();
+            async move { tb.dispatch(&call).await }
+        };
+        let bash = |command: &str| tool("bash", serde_json::json!({ "command": command }));
+
+        // The model's own git keeps working: objects, index, refs.
+        let out = bash("echo x > f && git add f && git commit -qm model && echo model-ok").await;
+        assert!(out.output.contains("model-ok"), "{}", out.output);
+
+        let marker = root.join("planted-ran");
+        let hook = format!(
+            "printf '#!/bin/sh\\ntouch {m}\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+            m = marker.display()
+        );
+        let planted = bash(&hook).await.output;
+        let fsmonitor = bash(&format!(
+            "git config core.fsmonitor 'touch {}'",
+            marker.display()
+        ))
+        .await
+        .output;
+        let written = tool(
+            "write_file",
+            serde_json::json!({ "path": ".git/hooks/post-commit", "content": "#!/bin/sh\n" }),
+        )
+        .await;
+        assert!(
+            written.is_error && written.output.contains("read-only"),
+            "{}",
+            written.output
+        );
+
+        match backend {
+            Backend::Landlock => {
+                // Landlock cannot refuse the write; the guard sees it.
+                let print = git_guard_print(&root);
+                let config = std::fs::read_to_string(root.join(".git/config")).unwrap_or_default();
+                assert!(
+                    print.contains("core.fsmonitor"),
+                    "{fsmonitor}\n{config}\nprint: {print:?}"
+                );
+            }
+            _ => {
+                assert!(planted.contains("blocked by slag's sandbox"), "{planted}");
+                assert!(!root.join(".git/hooks/pre-commit").exists(), "{planted}");
+                let config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+                assert!(!config.contains("fsmonitor"), "{fsmonitor}\n{config}");
+                let swap = bash("mv .git .git-old").await.output;
+                assert!(
+                    root.join(".git/config").exists() && !root.join(".git-old").exists(),
+                    "{swap}"
+                );
+            }
+        }
+
+        std::fs::write(root.join("g"), "g\n").unwrap();
+        crate::proof::git_commit_in(&root, "i1", "after the plants").await;
+        let log = git()
+            .args(["log", "--oneline"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&log.stdout).contains("forge(i1)"));
+        assert!(!marker.exists(), "a plant ran in slag's own git");
+
+        // Program paths: on PATH, or run later by a tool outside.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let env_or = |var: &str, rel: &str| {
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(rel))
+        };
+        for dir in [
+            env_or("CARGO_HOME", ".cargo").join("bin"),
+            env_or("RUSTUP_HOME", ".rustup"),
+            home.join("Library/Caches"),
+            home.join(".npm/_npx"),
+        ] {
+            if !dir.is_dir() {
+                continue;
+            }
+            let probe = dir.join("slag-sandbox-probe");
+            let _ = std::fs::remove_file(&probe);
+            let out = bash(&format!("touch '{}'", probe.display())).await.output;
+            let leaked = probe.exists();
+            let _ = std::fs::remove_file(&probe);
+            assert!(!leaked, "{} is writable: {out}", dir.display());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn git_guard_print(root: &Path) -> String {
+        git_guard::fingerprint(&root.join(".git"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn git_guard_print(_root: &Path) -> String {
+        unreachable!("Landlock is Linux only")
     }
 
     /// End to end through the bash tool: a write to `$HOME` is refused and

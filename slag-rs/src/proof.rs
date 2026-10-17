@@ -62,14 +62,22 @@ pub static REPO_GIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 
 /// Git add + commit with forge message
 pub async fn git_commit(id: &str, work: &str) {
+    git_commit_in(std::path::Path::new("."), id, work).await;
+}
+
+/// `git_commit` in `dir`. It runs outside the sandbox, so it goes through
+/// `sandbox::git_async`: a hook or fsmonitor a model planted never runs.
+pub async fn git_commit_in(dir: &std::path::Path, id: &str, work: &str) {
     let _guard = REPO_GIT_LOCK.lock().await;
     let msg = format!("forge({id}): {work}");
-    let _ = tokio::process::Command::new("git")
+    let _ = crate::engine::sandbox::git_async()
         .args(["add", "-A"])
+        .current_dir(dir)
         .output()
         .await;
-    let _ = tokio::process::Command::new("git")
+    let _ = crate::engine::sandbox::git_async()
         .args(["commit", "-m", &msg, "--quiet"])
+        .current_dir(dir)
         .output()
         .await;
 }
@@ -163,13 +171,24 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(root, "rs/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
-        write(root, "rs/src/lib.rs", "#[test]\nfn adds() { assert_eq!(1 + 1, 2); }\n");
+        // shell-words is one of slag's own dependencies, so a machine that
+        // builds slag has it in the registry cache.
+        write(
+            root,
+            "rs/Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nshell-words = \"1\"\n",
+        );
+        write(
+            root,
+            "rs/src/lib.rs",
+            "#[test]\nfn splits() { assert_eq!(shell_words::split(\"a b\").unwrap().len(), 2); }\n",
+        );
         write(root, "js/package.json", r#"{"name": "p", "scripts": {"test": "node --test"}}"#);
         write(root, "js/a.test.js", "require('node:test')('adds', () => {});\n");
         write(root, "py/test_a.py", "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n");
         for (tool, sub, cmd) in [
-            ("cargo", "rs", "cargo test --quiet"),
+            ("cargo", "rs", "cargo test --offline --quiet"),
             ("npm", "js", "npm test --silent"),
             ("python3", "py", "python3 -m unittest"),
         ] {
@@ -180,6 +199,48 @@ mod tests {
             let (ok, output) = run_shell_in(cmd, &root.join(sub)).await;
             assert!(ok, "{cmd} failed under the sandbox:\n{output}");
         }
+    }
+
+    /// A hook or fsmonitor that reached `.git` anyway (planted before the
+    /// sandbox, or under Landlock) never runs in slag's own commit.
+    #[tokio::test]
+    async fn slag_commits_run_no_planted_hook_or_fsmonitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = |name: &str| root.join(name);
+        let sh = |cmd: &str| {
+            let ok = std::process::Command::new("bash")
+                .args(["-c", cmd])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{cmd}");
+        };
+        sh("git init -q -b main && git config user.email t@t && git config user.name t");
+        sh(&format!(
+            "printf '#!/bin/sh\\ntouch {}\\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit",
+            marker("hook-ran").display()
+        ));
+        sh(&format!("git config core.fsmonitor 'touch {}'", marker("fsmonitor-ran").display()));
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+
+        git_commit_in(root, "i1", "plant check").await;
+        let status = crate::engine::sandbox::git()
+            .args(["status", "--short"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let log = crate::engine::sandbox::git()
+            .args(["log", "--oneline"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&log.stdout).contains("forge(i1)"), "commit made");
+        assert!(status.status.success());
+        assert!(!marker("hook-ran").exists(), "slag's commit ran the planted hook");
+        assert!(!marker("fsmonitor-ran").exists(), "slag's git ran the planted fsmonitor");
     }
 
     #[tokio::test]

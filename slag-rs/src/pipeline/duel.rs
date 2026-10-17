@@ -595,7 +595,7 @@ async fn run_shell_in(cmd: &str, dir: &Path) -> (bool, String) {
 }
 
 async fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::engine::sandbox::git_async()
         .args(args)
         .current_dir(dir)
         .output()
@@ -785,7 +785,7 @@ mod tests {
             vec!["config", "user.name", "slag"],
             vec!["commit", "--allow-empty", "-m", "base"],
         ] {
-            let out = std::process::Command::new("git")
+            let out = crate::engine::sandbox::git()
                 .args(&args)
                 .current_dir(&repo)
                 .output()
@@ -848,7 +848,7 @@ mod tests {
         // Worktrees and cast branches are gone.
         assert!(!repo.parent().unwrap().join("slag-anvil-i9-r1a").exists());
         assert!(!repo.parent().unwrap().join("slag-anvil-i9-r1b").exists());
-        let branches = std::process::Command::new("git")
+        let branches = crate::engine::sandbox::git()
             .args(["branch", "--list", "forge/*"])
             .current_dir(&repo)
             .output()
@@ -897,7 +897,7 @@ mod tests {
     }
 
     fn git(repo: &Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new("git")
+        crate::engine::sandbox::git()
             .args(args)
             .current_dir(repo)
             .output()
@@ -954,15 +954,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_commit_surfaces_instead_of_false_merge() {
-        use std::os::unix::fs::PermissionsExt;
         let (_tmp, repo) = test_repo();
-        // Failing pre-commit hook: worktrees share the main repo's hooks.
-        // Stand-in for gpgsign failures / missing identity in real repos.
-        let hooks_dir = repo.join(".git/hooks");
-        std::fs::create_dir_all(&hooks_dir).unwrap();
-        let hook = hooks_dir.join("pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A signing failure: worktrees share the main repo's config. slag's
+        // own git runs no hooks, so a failing hook no longer stands in.
+        git(&repo, &["config", "commit.gpgsign", "true"]);
+        git(&repo, &["config", "gpg.program", "false"]);
 
         let win_dir = worktree::create_in(&repo, "i6-r1a").await.unwrap();
         worktree::create_in(&repo, "i6-r1b").await.unwrap();

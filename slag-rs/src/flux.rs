@@ -622,7 +622,7 @@ fn read_tail(path: &str, lines: usize) -> String {
 }
 
 fn git_diff_stat() -> String {
-    std::process::Command::new("git")
+    crate::engine::sandbox::git()
         .args(["diff", "--stat", "HEAD~3"])
         .output()
         .ok()
@@ -823,7 +823,7 @@ mod tests {
 
 fn git_log_and_diff() -> String {
     let diff = git_diff_stat();
-    let log = std::process::Command::new("git")
+    let log = crate::engine::sandbox::git()
         .args(["log", "--oneline", "-5"])
         .output()
         .ok()

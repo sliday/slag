@@ -154,7 +154,7 @@ pub struct Stats {
 static START_HEAD: Mutex<Option<String>> = Mutex::new(None);
 
 fn git(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").args(args).output().ok()?;
+    let out = crate::engine::sandbox::git().args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }

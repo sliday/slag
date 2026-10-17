@@ -283,7 +283,7 @@ fn os_version() -> String {
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let out = crate::engine::sandbox::git()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -578,7 +578,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::engine::sandbox::git()
                 .arg("-C")
                 .arg(root)
                 .args(args)

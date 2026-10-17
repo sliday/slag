@@ -92,7 +92,7 @@ fn open_run_log(config: &EngineConfig) -> RunLog {
 }
 
 fn git_branch() -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::engine::sandbox::git()
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()?;
