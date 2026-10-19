@@ -280,7 +280,7 @@ impl Echo {
                     return;
                 }
                 out.push(String::new());
-                out.push(tui::rule_line(text, &tui::clock(self.elapsed(at)), self.width));
+                out.push(tui::rule_line(text, &format!("at {}", tui::clock(self.elapsed(at))), self.width));
             }
             Mark::Status { icon, tone, text } => {
                 if let Some(path) = text.strip_prefix("Blueprint: ") {
@@ -671,7 +671,7 @@ impl Echo {
         let stats = self.stats.clone().unwrap_or_default();
         let w = self.width;
         out.push(String::new());
-        out.push(tui::rule_line("ASSAY", &tui::clock(self.elapsed(at)), w));
+        out.push(tui::rule_line("ASSAY", &format!("at {}", tui::clock(self.elapsed(at))), w));
 
         // The verdict: one word, one clause.
         let left = counts.ore + counts.molten;
@@ -693,7 +693,7 @@ impl Echo {
 
         // Why, when it failed: the gap, or each cracked ingot's last reason.
         if let Some(gap) = &self.goal_gap {
-            out.extend(wrap_indented(gap, w, 4, 3).into_iter().map(|l| paint(WARM, &l)));
+            out.extend(wrap_indented(gap, w, 4, 6).into_iter().map(|l| paint(WARM, &l)));
         }
         let cracked: Vec<&Ingot> = self.plan.iter().filter(|i| i.status == Status::Cracked).collect();
         for ingot in &cracked {
@@ -703,15 +703,16 @@ impl Echo {
                 .and_then(|p| p.why.clone())
                 .unwrap_or_else(|| "every heat failed its proof".to_string());
             let name = tui::clip(&title(&ingot.work), (w / 3).max(12));
-            // `    ✗ id  name  — why`: twelve fixed columns besides the three.
-            let room = w.saturating_sub(12 + ingot.id.len() + name.chars().count());
-            out.push(format!(
-                "    {} {}  {}  {}",
-                paint(WARM, "✗"),
-                paint(WARM, &ingot.id),
-                name,
-                dim(&format!("— {}", tui::clip(&why, room.max(8))))
-            ));
+            // The reason is the evidence: it wraps under itself, never
+            // trails off while the screen has room for it.
+            let head = format!("    {} {}  {}  ", paint(WARM, "✗"), paint(WARM, &ingot.id), name);
+            let indent = 6 + ingot.id.chars().count() + 2;
+            out.extend(
+                tui::wrap(&head, &format!("— {why}"), w, indent, 3)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, l)| if i == 0 { l } else { dim(&l) }),
+            );
         }
 
         // The next command, the one thing to type.
@@ -750,17 +751,21 @@ impl Echo {
                         continue;
                     }
                     let cmd = p.cmd.clone().unwrap_or_else(|| unescape(&ingot.proof));
-                    let room = w.saturating_sub(22 + ingot.id.len());
-                    // The exit code sits in its own column: a reader scans
-                    // down it for anything that is not 0.
-                    let left = format!(
-                        "  {}  {} {}  {}",
+                    // The command is what ran, so it wraps rather than
+                    // losing its tail; the exit code keeps its own column on
+                    // the first line, where a reader scans for anything not 0.
+                    let head = format!(
+                        "  {}  {} {}  ",
                         dim(&format!("{:<6}", if ran.is_empty() { "ran" } else { "" })),
                         paint(PURE, "✓"),
-                        paint(PURE, &ingot.id),
-                        tui::clip(&cmd, room.max(8))
+                        paint(PURE, &ingot.id)
                     );
-                    ran.push(tui::spread(&left, &dim("exit 0"), w));
+                    let indent = tui::visible_len(&head);
+                    let mut rows = tui::wrap(&head, &cmd, w.saturating_sub(8), indent, 3);
+                    if let Some(first) = rows.first_mut() {
+                        *first = tui::spread(first, &dim("exit 0"), w);
+                    }
+                    ran.extend(rows);
                     continue;
                 }
                 // Forged, but this tape kept no outcome for its proof: say

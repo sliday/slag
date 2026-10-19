@@ -175,6 +175,12 @@ pub(crate) struct DashState {
     pub(crate) goal: Option<bool>,
     /// The highest warden round that has spoken, for the next command.
     pub(crate) warden_rounds: u32,
+    /// The pipeline phase last marked in the feed (`tui::phase`'s count),
+    /// so turn 1 of the founder never reads as turn 1 of the surveyor.
+    pub(crate) phase_gen: u64,
+    /// The header's word for the phase between ingots (`surveying`,
+    /// `judging`), from the last phase rule; empty before the first.
+    pub(crate) phase: String,
     /// The route last announced. An unchanged route is not news, so it is
     /// printed once and then only when it moves.
     pub(crate) route: Option<String>,
@@ -207,6 +213,23 @@ impl DashState {
             row.heat = ingot.heat;
             row.status = status;
         }
+    }
+
+    /// A new pipeline phase began: rule it off in the feed, so the turn
+    /// numbers that restart under it read as a new phase, not a reset.
+    pub(crate) fn enter_phase(&mut self, header: &str) {
+        let (name, detail) = header.split_once(" · ").unwrap_or((header, ""));
+        let row = if detail.is_empty() { format!("── {name}") } else { format!("── {name} · {detail}") };
+        self.push_feed(palette(tui::PURE), row);
+        self.turn_row = None;
+        let word = match name.trim() {
+            "SURVEYOR" => "surveying",
+            "FOUNDER" => "casting",
+            "FORGE" => "forging",
+            "WARDEN" => "judging",
+            _ => return,
+        };
+        self.phase = word.into();
     }
 
     /// Take in a newer PLAN.md mid-run: rows for ingots the view has not
@@ -1084,6 +1107,9 @@ fn run_phase(state: &DashState) -> String {
         let shown: Vec<&str> = forging.iter().take(3).copied().collect();
         return format!("forging {}", shown.join(" "));
     }
+    if !state.phase.is_empty() {
+        return state.phase.clone();
+    }
     if state.turn_started.is_some() || state.turn > 0 {
         return "planning".into();
     }
@@ -1721,6 +1747,8 @@ pub async fn run(
     let plan_total =
         plan.lines().filter(|l| l.trim_start().starts_with("(ingot ")).count();
     let mut state = DashState {
+        // Phases announced before this view attached are already history.
+        phase_gen: tui::phase().0,
         started: Some(Instant::now()),
         commission: std::fs::read_to_string(crate::config::ORE_FILE)
             .ok()
@@ -1971,6 +1999,13 @@ async fn event_loop(
                 }
             }
             _ = interval.tick() => {
+                // Phase headers reach no event either; `tui` keeps the last.
+                let (gen, header) = tui::phase();
+                if gen != state.phase_gen {
+                    state.phase_gen = gen;
+                    state.enter_phase(&header);
+                    dirty = true;
+                }
                 // A mold cast mid-run reaches no event; the file says it.
                 if let Some(plan) = plan_watch.changed() {
                     state.absorb_plan(&plan);

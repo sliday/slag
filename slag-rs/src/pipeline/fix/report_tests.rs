@@ -51,9 +51,24 @@ fn both_verdicts_render_with_every_escape_whole() {
 }
 
 #[test]
+fn a_cut_title_is_shown_whole_from_the_issue_body() {
+    let mut out = outcome(Verdict::Fixed);
+    let line = "median() returns the wrong value for an even-length list; tests/test_stats.py::test_median_even fails";
+    out.issue.title = crate::tui::truncate(line, 60);
+    out.issue.body = format!("{line}\n\nmore detail");
+    let text = crate::tui::with_color(false, || report_lines(&out, 79)).join("\n");
+    assert!(text.contains("test_median_even"), "{text}");
+    assert!(text.contains("fails"), "{text}");
+    assert!(!text.contains('…'), "{text}");
+}
+
+#[test]
 fn the_reproduction_reads_as_a_failure_without_the_fix() {
     let text = crate::tui::with_color(false, || report_lines(&outcome(Verdict::Fixed), 120)).join("\n");
-    assert!(text.contains("✓ FIXED"), "{text}");
+    assert!(text.contains("✓ FIXED in 2 attempts"), "{text}");
+    // The issue is shown whole, wrapped, never cut with an ellipsis.
+    assert!(text.contains("returns '-hello-world-'"), "{text}");
+    assert!(!text.contains('…') && !text.contains("..."), "{text}");
     assert!(text.contains("✗ without the fix: exit 1"), "{text}");
     assert!(!text.contains('['), "plain output carries no escape body: {text}");
 }

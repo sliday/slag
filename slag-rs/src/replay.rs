@@ -115,6 +115,7 @@ async fn play_stream(tape: &Tape, opts: &Opts, stop: Option<u64>) {
     let instant = stop.is_some();
     let mut view = Stream::new(tty, opts.size.map(|(w, _)| w as usize))
         .defer_footer(instant)
+        .screenful(instant && tty)
         .owning_fatal(true);
     let epoch = Instant::now();
     let mut last_t = 0u64;
@@ -141,11 +142,19 @@ async fn play_stream(tape: &Tape, opts: &Opts, stop: Option<u64>) {
         view.cue_at(&timed.cue, epoch + Duration::from_millis(timed.t));
     }
     let stopped_early = stop.is_some_and(|s| s < tape.duration());
+    // What a terminal of this height would still show once the replay
+    // reached the moment: the rows above the footer, or above the prompt
+    // that returns when the replay ends.
+    let rows = crossterm::terminal::size().map(|(_, r)| r as usize).unwrap_or(24);
     if stopped_early {
-        // Draw the footer as it stood at the stop, then hold the frame.
+        // Print the screen, then draw the footer as it stood at the stop
+        // and hold the frame. The cursor row and the footer take two rows:
+        // one line more would scroll, and push the top line into history.
+        view.flush_screen(rows.saturating_sub(2));
         view.tick_at(epoch + Duration::from_millis(stop.unwrap_or(0)));
     } else {
         view.finish_at(epoch + Duration::from_millis(tape.duration()));
+        view.flush_screen(rows.saturating_sub(1));
     }
     if let Some(hold) = hold_for(opts, stopped_early) {
         tokio::time::sleep(hold).await;
@@ -209,8 +218,9 @@ async fn drive_dashboard(
             // Keep drawing through a long wait so the clocks on screen move.
             let resume = Instant::now() + wait;
             while Instant::now() < resume {
-                if quit_pressed(Duration::from_millis(1))? {
-                    return Ok(());
+                match key(Duration::from_millis(1))? {
+                    Key::Quit => return Ok(()),
+                    Key::Resize | Key::None => {}
                 }
                 let left = resume.saturating_duration_since(Instant::now());
                 tokio::time::sleep(left.min(frame)).await;
@@ -240,8 +250,12 @@ async fn drive_dashboard(
     let hold = hold_for(opts, true).unwrap_or(Duration::ZERO);
     let until = Instant::now() + hold;
     while Instant::now() < until {
-        if quit_pressed(Duration::from_millis(100))? {
-            break;
+        match key(Duration::from_millis(100))? {
+            Key::Quit => break,
+            // A held frame follows the window: drawn again at the new size,
+            // not left as the old one.
+            Key::Resize => crate::dashboard::replay_draw(terminal, state).map_err(SlagError::Io)?,
+            Key::None => {}
         }
     }
     Ok(())
@@ -253,22 +267,36 @@ fn absorb(state: &mut crate::dashboard::DashState, cue: &Cue) {
     match cue {
         Cue::Event(e) => crate::dashboard::apply_event(state, e.clone()),
         Cue::Plan(plan) => state.absorb_plan(plan),
+        Cue::Mark(crate::render::tape::Mark::Header { text }) => state.enter_phase(text),
         _ => {}
     }
 }
 
-/// q, Esc or Ctrl-C within `wait`. Raw mode swallows the shell's Ctrl-C,
-/// so the replay has to hear it as a key.
-fn quit_pressed(wait: Duration) -> Result<bool, SlagError> {
+/// What the terminal said while a replay waited.
+enum Key {
+    /// q, Esc or Ctrl-C. Raw mode swallows the shell's Ctrl-C, so the
+    /// replay has to hear it as a key.
+    Quit,
+    Resize,
+    None,
+}
+
+fn key(wait: Duration) -> Result<Key, SlagError> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     if !crossterm::event::poll(wait).map_err(SlagError::Io)? {
-        return Ok(false);
+        return Ok(Key::None);
     }
-    match crossterm::event::read().map_err(SlagError::Io)? {
-        Event::Key(k) if k.kind == KeyEventKind::Press => Ok(matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-            || (k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')))),
-        _ => Ok(false),
-    }
+    Ok(match crossterm::event::read().map_err(SlagError::Io)? {
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                && (matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
+                    || (k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')))) =>
+        {
+            Key::Quit
+        }
+        Event::Resize(..) => Key::Resize,
+        _ => Key::None,
+    })
 }
 
 #[cfg(test)]
