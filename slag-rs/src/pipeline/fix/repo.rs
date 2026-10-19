@@ -92,10 +92,14 @@ pub fn test_home(src: &str, tests: &[String]) -> Option<String> {
     // Copy the name of a real test file, not a runner script that only
     // lives among them (`tests/run.sh` would name a new test `prune.sh`).
     let same_lang: Vec<&String> = tests.iter().filter(|t| t.ends_with(&format!(".{ext}"))).collect();
+    // With no named test to copy, only Rust's naming is safe to invent:
+    // cargo runs every tests/*.rs. Elsewhere a made-up name is how a test
+    // ends up where the runner never looks (`tests/run_tests.sh` would
+    // name it `tests/prune.sh`, which no glob of the runner reaches).
     let sibling = same_lang
         .iter()
         .find(|t| test_subject(t).is_some_and(|s| !t.ends_with(&format!("/{s}.{ext}"))))
-        .or(same_lang.first())?;
+        .or(same_lang.first().filter(|_| ext == "rs"))?;
     let subject = test_subject(sibling)?;
     let (dir, file) = sibling.rsplit_once('/').unwrap_or(("", sibling.as_str()));
     let lower = file.to_ascii_lowercase();
@@ -469,6 +473,96 @@ pub fn removed_lines(old: &str, new: &str) -> Vec<String> {
 pub fn split_inline_tests(text: &str) -> Option<(&str, &str)> {
     let at = text.find("#[cfg(test)]")?;
     Some(text.split_at(at))
+}
+
+/// How the repository's test command finds its tests, in words a test
+/// author can act on: the runner script itself when it is one, else the
+/// runner's discovery rule. A test the runner never reaches proves nothing,
+/// and the commonest way to write one is not knowing this.
+pub fn runner_wiring(root: &Path, cmd: &str) -> Option<String> {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    if let ["bash" | "sh", script, ..] = words.as_slice() {
+        let text = std::fs::read_to_string(root.join(script)).ok()?;
+        let body: Vec<&str> = text.lines().take(60).collect();
+        return Some(format!(
+            "`{cmd}` runs this script, so a new test runs only if this script reaches it:\n{}",
+            body.join("\n")
+        ));
+    }
+    if cmd.contains("unittest") {
+        let dir = words.windows(2).find(|w| w[0] == "-s").map_or(".", |w| w[1]);
+        let pattern = words.windows(2).find(|w| w[0] == "-p").map_or("test*.py", |w| w[1]);
+        return Some(format!(
+            "unittest discovery runs files named {pattern} in {dir}/, and the TestCase classes \
+             in them"
+        ));
+    }
+    if cmd.contains("pytest") {
+        return Some("pytest collects test_*.py and *_test.py files, and the test_* functions \
+                     and Test* classes in them"
+            .into());
+    }
+    if cmd == "cargo test" || cmd.starts_with("cargo test ") {
+        return Some("cargo test runs every tests/*.rs file and every #[cfg(test)] module".into());
+    }
+    if cmd.starts_with("go test") {
+        return Some("go test runs the Test* functions in *_test.go files beside the code".into());
+    }
+    if cmd.starts_with("make ") {
+        let target = words.get(1).copied().unwrap_or("test");
+        let text = std::fs::read_to_string(root.join("Makefile")).ok()?;
+        let recipe: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with(&format!("{target}:")))
+            .take_while(|l| l.starts_with(&format!("{target}:")) || l.starts_with('\t'))
+            .collect();
+        return (!recipe.is_empty()).then(|| format!("`{cmd}` runs:\n{}", recipe.join("\n")));
+    }
+    let script = if matches!(words.first(), Some(&"npm" | &"pnpm" | &"yarn")) {
+        let raw = std::fs::read_to_string(root.join("package.json")).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        json.pointer("/scripts/test")?.as_str()?.to_string()
+    } else {
+        cmd.to_string()
+    };
+    let rule = if script.contains("node --test") {
+        let named: Vec<&str> = script.split_whitespace().skip(2).collect();
+        if named.is_empty() {
+            "node --test runs **/*.test.{js,mjs,cjs}, **/*-test.*, **/*_test.*, **/test-*.* and \
+             the files in test/ directories"
+                .to_string()
+        } else {
+            format!("node --test runs only the files it names: {}", named.join(" "))
+        }
+    } else if script.contains("jest") || script.contains("vitest") {
+        "it runs *.test.* and *.spec.* files and the files in __tests__/ directories".to_string()
+    } else {
+        format!("it runs `{script}`")
+    };
+    Some(format!("`{cmd}`: {rule}"))
+}
+
+/// The same test file, made unable to run: a line no language accepts,
+/// or for a shell script an `exit` before anything else. If the test
+/// command still passes with this in place, it never ran the file.
+pub fn unrunnable(path: &str, text: &str) -> String {
+    let shell = path.ends_with(".sh") || path.ends_with(".bash") || text.starts_with("#!/bin/sh")
+        || text.starts_with("#!/usr/bin/env bash") || text.starts_with("#!/bin/bash");
+    let probe = if shell { "exit 97\n" } else { "slag_probe = = = 1;\n" };
+    match text.split_once('\n') {
+        Some((first, rest)) if first.starts_with("#!") => format!("{first}\n{probe}{rest}"),
+        _ => format!("{probe}{text}"),
+    }
+}
+
+/// Source files a test can live in: code, not data a test reads.
+pub fn is_code(path: &str) -> bool {
+    let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
+    matches!(
+        ext,
+        "py" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "rs" | "go" | "rb" | "sh" | "bash"
+            | "java" | "kt" | "php" | "ex" | "exs" | "swift" | "cs" | "scala" | "c" | "cc" | "cpp"
+    )
 }
 
 /// A new test file beside `existing`, named so the runner still finds it:
@@ -1001,6 +1095,8 @@ mod tests {
             Some("tests/test_prune.sh (new file)"),
             "named like the tests, not like the runner"
         );
+        let runner_only = vec!["tests/run_tests.sh".to_string()];
+        assert_eq!(test_home("bin/rotate.sh", &runner_only), None, "no name invented from a runner");
     }
 
     #[test]
@@ -1041,6 +1137,27 @@ mod tests {
         assert!(removed_lines(old, reindented).is_empty(), "indentation is not an edit");
         assert!(removed_lines(old, &format!("{old}test('b', () => {{}});\n")).is_empty(), "additions only");
         assert_eq!(removed_lines("a\nb\n", "").len(), 2, "a deleted file loses every line");
+    }
+
+    #[test]
+    fn the_runners_wiring_is_said_plainly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "tests/run_tests.sh", "for t in tests/test_*.sh; do bash \"$t\"; done\n");
+        let script = runner_wiring(dir.path(), "bash tests/run_tests.sh").unwrap();
+        assert!(script.contains("for t in tests/test_*.sh"), "{script}");
+        let py = runner_wiring(dir.path(), "python3 -m unittest discover -s tests").unwrap();
+        assert!(py.contains("test*.py in tests/"), "{py}");
+        assert!(runner_wiring(dir.path(), "cargo test").unwrap().contains("tests/*.rs"));
+        write(dir.path(), "package.json", r#"{"scripts": {"test": "node --test test/a.test.js"}}"#);
+        let node = runner_wiring(dir.path(), "npm test").unwrap();
+        assert!(node.contains("only the files it names: test/a.test.js"), "{node}");
+    }
+
+    #[test]
+    fn an_unrunnable_copy_fails_in_every_language_it_is_written_in() {
+        assert_eq!(unrunnable("tests/rotate.sh", "#!/usr/bin/env bash\nset -e\n"), "#!/usr/bin/env bash\nexit 97\nset -e\n");
+        assert!(unrunnable("tests/test_x.py", "import x\n").starts_with("slag_probe = = = 1;\nimport x"));
+        assert!(is_code("tests/rotate.sh") && is_code("test/a.test.js") && !is_code("tests/fixtures/data.json"));
     }
 
     #[test]

@@ -1893,22 +1893,48 @@ fn near_miss_hint(content: &str, old: &str) -> String {
         .find(|l| !l.trim().is_empty())
         .unwrap_or(old)
         .trim();
-    let mut scored: Vec<(f64, usize, &str)> = content
-        .lines()
+    let lines: Vec<&str> = content.lines().collect();
+    let mut scored: Vec<(f64, usize)> = lines
+        .iter()
         .enumerate()
-        .map(|(i, line)| (similarity(line.trim(), probe), i + 1, line))
-        .filter(|(score, _, _)| *score > 0.0)
+        .map(|(i, line)| (similarity(line.trim(), probe), i))
+        .filter(|(score, _)| *score > 0.0)
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    if scored.is_empty() {
+    let Some(&(_, best)) = scored.first() else {
         return "no similar lines found".into();
+    };
+    // The whole region old_string most likely meant, verbatim, so the next
+    // try can copy it instead of guessing again. A model shown one line at
+    // a time misses the same way ten times running.
+    let span = old.lines().count().max(1);
+    let from = best.saturating_sub(1);
+    let to = (best + span + 1).min(lines.len());
+    let mut out = format!(
+        "closest lines, verbatim; copy old_string from them exactly, without the `N| ` prefix \
+         ({}-{}):",
+        from + 1,
+        to
+    );
+    for (i, line) in lines[from..to].iter().enumerate() {
+        out.push_str(&format!("\n{}| {line}", from + i + 1));
     }
-    let mut out = String::from("closest lines (whitespace shown as · and →):");
-    for (_, num, line) in scored.iter().take(3) {
+    if lines[best].trim() == probe && !old.lines().any(|l| l == lines[best]) {
         out.push_str(&format!(
-            "\n  {num}: {}",
-            line.replace(' ', "·").replace('\t', "→")
+            "\nline {} differs only in whitespace (shown as · and →): {}",
+            best + 1,
+            lines[best].replace(' ', "·").replace('\t', "→")
         ));
+    }
+    let others: Vec<String> = scored
+        .iter()
+        .skip(1)
+        .filter(|(_, i)| *i < from || *i >= to)
+        .take(2)
+        .map(|(_, i)| (i + 1).to_string())
+        .collect();
+    if !others.is_empty() {
+        out.push_str(&format!("\nother candidates: line {}", others.join(", line ")));
     }
     out
 }
@@ -3041,7 +3067,24 @@ mod tests {
             .await;
         assert!(out.is_error);
         assert!(out.output.contains("closest lines"), "{}", out.output);
-        assert!(out.output.contains('·'), "{}", out.output);
+        assert!(out.output.contains("2|     let z = 9;"), "the region, verbatim: {}", out.output);
+        assert!(out.output.contains("1| fn main() {"), "with a line of context: {}", out.output);
+    }
+
+    #[tokio::test]
+    async fn edit_near_miss_names_a_whitespace_only_difference() {
+        let (dir, tb) = setup();
+        write(&dir, "f.rs", "fn main() {\n\tlet z = 9;\n}\n");
+        prime(&tb, "f.rs").await;
+        let out = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "f.rs", "old_string": "let z = 9;\nlet w = 1;", "new_string": "let z = 0;"}),
+            ))
+            .await;
+        assert!(out.is_error);
+        assert!(out.output.contains("differs only in whitespace"), "{}", out.output);
+        assert!(out.output.contains("→let·z·=·9;"), "{}", out.output);
     }
 
     #[tokio::test]

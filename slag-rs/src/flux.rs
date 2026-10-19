@@ -607,8 +607,15 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         and it is often not the file where the symptom shows.\n\
         2. Write the regression test a reader of the issue would recognize:\n\
         - the issue's own scenario: the inputs, values, and calls it names, asserting \
-        the result it says is expected. One test per case the issue lists, each named \
-        after the behavior it checks.\n\
+        the result it says is expected. One test per case the issue lists, plus the \
+        boundary next to each case (empty input, exactly at a limit, one past it), each \
+        named after the behavior it checks.\n\
+        - in the existing tests' idiom: imports at the top of the file, their helpers \
+        and fixtures, their assertion style.\n\
+        - where the test command already looks (TESTS above says how the runner finds \
+        tests): extend an existing test file, or wire a new file in the way the existing \
+        ones are. slag makes each new test file unable to run and reruns the tests; a \
+        file the runner never reaches is sent back.\n\
         - through the public function, method, or command the issue describes, never \
         the internals of your fix.\n\
         - in the test file for the module you fix (see TESTS above). When that module \
