@@ -1,0 +1,1 @@
+{"id": "08-cursor-pagination", "lang": "javascript", "difficulty": "hard", "summary": "crawlPages never terminates on a repeated cursor and does not dedupe the cursor item the API repeats at page boundaries.", "order": 8, "traps": ["exact-input", "pagination", "error-propagation"]}

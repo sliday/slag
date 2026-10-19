@@ -1,0 +1,1 @@
+{"id": "08-csv-chunk-boundary", "lang": "python", "difficulty": "hard", "summary": "iter_rows splits chunks on raw newlines without quote tracking, corrupting quoted fields at any chunk size.", "order": 8, "traps": ["exact-input", "csv-edge", "full-suite"]}

@@ -1,0 +1,11 @@
+diff --git a/ledgercsv/reader.py b/ledgercsv/reader.py
+index 9fa31b6..18d19bc 100644
+--- a/ledgercsv/reader.py
++++ b/ledgercsv/reader.py
+@@ -9,5 +9,5 @@ def read_rows(path):
+     The first line of the file is the header row. Every row maps a
+     header name to the field text.
+     """
+-    with open(path, newline="") as f:
++    with open(path, encoding="utf-8-sig", newline="") as f:
+         return list(csv.DictReader(f))

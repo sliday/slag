@@ -1,0 +1,1 @@
+{"id": "04-async-order", "lang": "javascript", "difficulty": "medium", "summary": "fetchAll pushes results in completion order via forEach and a counter, so slow loads reorder the result array.", "order": 4, "traps": ["exact-input", "async-order"]}

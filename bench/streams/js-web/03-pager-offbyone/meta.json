@@ -1,0 +1,1 @@
+{"id": "03-pager-offbyone", "lang": "javascript", "difficulty": "medium", "summary": "paginate treats page as 0-based (start = page * perPage) and floors totalPages, shifting every page and dropping the remainder.", "order": 3, "traps": ["exact-input", "pagination"]}

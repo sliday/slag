@@ -1,0 +1,26 @@
+diff --git a/src/query.js b/src/query.js
+index bb7bc12..d892562 100644
+--- a/src/query.js
++++ b/src/query.js
+@@ -6,17 +6,10 @@
+  */
+ function parseQuery(str) {
+   const out = {};
+-  if (!str) return out;
+-  for (const pair of str.split("&")) {
+-    const eq = pair.indexOf("=");
+-    const key = eq === -1 ? pair : pair.slice(0, eq);
+-    const value = eq === -1 ? "" : pair.slice(eq + 1);
+-    if (Object.hasOwn(out, key)) {
+-      if (Array.isArray(out[key])) out[key].push(value);
+-      else out[key] = [out[key], value];
+-    } else {
+-      out[key] = value;
+-    }
++  const params = new URLSearchParams(str);
++  for (const key of new Set(params.keys())) {
++    const values = params.getAll(key);
++    out[key] = values.length === 1 ? values[0] : values;
+   }
+   return out;
+ }

@@ -1,0 +1,9 @@
+{
+  "name": "query-toolkit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Query string helpers for the search UI",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}

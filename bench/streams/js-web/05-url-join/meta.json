@@ -1,0 +1,1 @@
+{"id": "05-url-join", "lang": "javascript", "difficulty": "medium", "summary": "buildUrl concatenates base and path directly, producing doubled or missing slashes at the join.", "order": 5, "traps": ["exact-input", "url-query"]}

@@ -1,0 +1,1 @@
+{"id": "07-dst-schedule", "lang": "python", "difficulty": "hard", "summary": "next_run advances by 24h in UTC, so runs shift an hour on DST transition days instead of staying at 09:30 wall time.", "order": 7, "traps": ["exact-input", "tz-naive", "full-suite"]}

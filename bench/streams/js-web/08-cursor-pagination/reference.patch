@@ -1,0 +1,36 @@
+diff --git a/src/crawl.js b/src/crawl.js
+index e73a244..4e1b37b 100644
+--- a/src/crawl.js
++++ b/src/crawl.js
+@@ -4,16 +4,27 @@
+  * Walk a cursor based API and resolve with every item in order.
+  * `fetchPage(cursor)` resolves with `{ items, nextCursor }`; the
+  * cursor is null for the first page and `nextCursor` is null at the
+- * end.
++ * end. The API is inclusive of the cursor item, so items already
++ * emitted are skipped, and a cursor that was seen before ends the
++ * crawl.
+  */
+ async function crawlPages(fetchPage) {
+   const all = [];
++  const emitted = new Set();
++  const seenCursors = new Set();
+   let cursor = null;
+   for (;;) {
+     const page = await fetchPage(cursor);
+-    all.push(...page.items);
+-    if (page.nextCursor == null) return all;
+-    cursor = page.nextCursor;
++    for (const item of page.items) {
++      if (!emitted.has(item)) {
++        emitted.add(item);
++        all.push(item);
++      }
++    }
++    const next = page.nextCursor;
++    if (next == null || seenCursors.has(next)) return all;
++    seenCursors.add(next);
++    cursor = next;
+   }
+ }
+ 
