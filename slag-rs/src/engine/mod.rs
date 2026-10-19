@@ -142,6 +142,10 @@ pub enum Role {
     /// checks cost: billed as a smith, they hide inside forge spend, and
     /// a user cannot decide whether tempering is worth it.
     Warden,
+    /// The harness improver (`slag fix --evolve`): editor, composer,
+    /// selector, and reflector sessions. Its own row, so the ledger keeps
+    /// what improving the harness cost apart from the fix itself.
+    Harness,
 }
 
 impl Role {
@@ -155,6 +159,7 @@ impl Role {
             Role::Compact => "compact",
             Role::Duel => "duel",
             Role::Warden => "warden",
+            Role::Harness => "harness",
         }
     }
 }

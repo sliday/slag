@@ -77,6 +77,27 @@ pub fn fallback_model() -> Option<String> {
     env_or_file("SLAG_MODEL_FALLBACK", "fallback_model")
 }
 
+/// The harness editor's model (`SLAG_MODEL_EDITOR` env, `model_editor`
+/// file key), for `slag fix --evolve`. `None` means the plan model.
+pub fn editor_model() -> Option<String> {
+    env_or_file("SLAG_MODEL_EDITOR", "model_editor")
+}
+
+/// The harness library directory (`SLAG_HARNESS_LIBRARY` env,
+/// `harness_library` file key), `~/` expanded. `None` lets the library
+/// pick the repository's own or the per-user default.
+pub fn harness_library() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    env_or_file("SLAG_HARNESS_LIBRARY", "harness_library")
+        .and_then(|v| parse_path_list(&v, home.as_deref()).into_iter().next())
+}
+
+/// Dollar ceiling for everything one `slag fix --evolve` spends
+/// (`SLAG_EVOLVE_BUDGET` env, `evolve_budget` file key).
+pub fn evolve_budget() -> Option<f64> {
+    cost_cap("SLAG_EVOLVE_BUDGET", "evolve_budget")
+}
+
 /// Unattended persistent-retry mode (`SLAG_UNATTENDED_RETRY` env,
 /// `unattended_retry` file key). Truthy values: 1/true/on/yes. When on,
 /// capacity errors (429/529) retry past the normal attempt budget with

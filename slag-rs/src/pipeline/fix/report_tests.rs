@@ -31,6 +31,7 @@ fn outcome(verdict: Verdict) -> Outcome {
         phases: Phases::default(),
         time: Some("wall 4s · api 4s · tools 0s".into()),
         spend: Some("$0.01".into()),
+        evolve: None,
     }
 }
 

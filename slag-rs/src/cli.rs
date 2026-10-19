@@ -222,6 +222,45 @@ pub struct FixArgs {
     /// Full-screen dashboard
     #[arg(long)]
     pub tui: bool,
+
+    /// Evolve the harness on this issue first (Harness² task-level
+    /// recursion): K reference runs, K invariant and K domain edits each
+    /// probed in its own copy of the repository, K composed harnesses, and
+    /// a blind pick when K > 1. 0 (default) keeps the fast path
+    #[arg(long, value_name = "K", default_value_t = 0)]
+    pub evolve: u8,
+
+    /// With --evolve: chain K steps (depth) instead of K in parallel (width)
+    #[arg(long)]
+    pub sequential: bool,
+
+    /// The execution harness: a directory, `library` (this domain's most
+    /// relevant library entries, no probing), or `none` (the default)
+    #[arg(long, value_name = "DIR|library|none")]
+    pub harness: Option<String>,
+
+    /// Model for the harness editor, composer, selector and reflector
+    /// (overrides SLAG_MODEL_EDITOR; default the plan model)
+    #[arg(long, value_name = "MODEL")]
+    pub editor_model: Option<String>,
+
+    /// Hard dollar cap on everything --evolve spends (overrides
+    /// SLAG_EVOLVE_BUDGET; default 2)
+    #[arg(long, value_name = "USD")]
+    pub evolve_budget: Option<f64>,
+
+    /// Hard token cap on everything --evolve spends (default 4000000)
+    #[arg(long, value_name = "N")]
+    pub evolve_tokens: Option<u64>,
+
+    /// The library domain (default: detected from the test command and
+    /// the manifests: python, node, rust, go, shell, general)
+    #[arg(long, value_name = "NAME")]
+    pub domain: Option<String>,
+
+    /// The harness library directory (overrides SLAG_HARNESS_LIBRARY)
+    #[arg(long, value_name = "DIR")]
+    pub library: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -362,8 +401,35 @@ pub fn status_json() -> Result<String, SlagError> {
         "context_tokens": last_prompt,
         "context_pct": context_pct,
         "last_event": last_event,
+        "evolve": evolve_status(Path::new(EVOLVE_LATEST)),
     });
     Ok(obj.to_string())
+}
+
+/// Where `slag fix --evolve` leaves its latest record.
+pub const EVOLVE_LATEST: &str = ".slag/evolve/latest.json";
+
+/// The latest `--evolve` run's cost per stage and what it adopted, or
+/// null when this directory never evolved a harness.
+fn evolve_status(path: &Path) -> serde_json::Value {
+    let Some(record) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return serde_json::Value::Null;
+    };
+    let pick = |key: &str| record.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "run": pick("run"),
+        "k": pick("k"),
+        "mode": pick("mode"),
+        "stages": pick("stages"),
+        "total": pick("total"),
+        "adopted": pick("adopted"),
+        "adopted_harness": pick("adopted_harness"),
+        "capped": pick("capped"),
+        "library": pick("library"),
+    })
 }
 
 /// `session $0.42 · account $18.31 remaining` (item 36). Either half can

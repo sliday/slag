@@ -515,15 +515,50 @@ impl HookPayload {
 /// missing must not wedge a forge, and must not block a tool either.
 pub const CODE_FAILED: i32 = -1;
 
+/// Where a snapshot's command hooks run. The operator's own hooks run
+/// plain, from the process directory. A harness's hooks (`crate::harness`)
+/// were written by a model, so they run in the read-only sandbox from the
+/// session's workspace: they can read and answer, never write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandScope {
+    pub read_only: bool,
+    pub cwd: Option<std::path::PathBuf>,
+    pub env: Vec<(String, String)>,
+}
+
 /// Run one command hook to completion under its timeout, feeding the
 /// payload on stdin and applying the exit-code protocol to the result.
 pub async fn run_command(def: &HookDef, payload: &HookPayload) -> HookOutcome {
+    run_command_in(def, payload, &CommandScope::default()).await
+}
+
+/// `run_command` inside a scope. A read-only scope fails closed: with no
+/// OS sandbox to hold it, the hook does not run at all.
+pub async fn run_command_in(def: &HookDef, payload: &HookPayload, scope: &CommandScope) -> HookOutcome {
     let started = Instant::now();
     let HookKind::Command(cmd) = &def.kind else {
         return failed(def, started, format!("hook `{}` is not a command", def.name));
     };
 
-    let spawned = Command::new("sh")
+    // The sandbox must outlive the spawn: Landlock applies its ruleset in
+    // the child between fork and exec.
+    let sandbox = if scope.read_only {
+        match crate::engine::sandbox::Sandbox::read_only() {
+            Ok(sandbox) => Some(sandbox),
+            Err(e) => return failed(def, started, format!("hook `{}` not run: {e}", def.name)),
+        }
+    } else {
+        None
+    };
+    let mut command = match &sandbox {
+        Some(sandbox) => sandbox.wrap("sh"),
+        None => Command::new("sh"),
+    };
+    if let Some(dir) = &scope.cwd {
+        command.current_dir(dir);
+    }
+    command.envs(scope.env.iter().map(|(k, v)| (k, v)));
+    let spawned = command
         .arg("-c")
         .arg(cmd)
         .stdin(Stdio::piped())
@@ -565,8 +600,11 @@ pub async fn run_command(def: &HookDef, payload: &HookPayload) -> HookOutcome {
 /// vocabulary the caller has to understand.
 pub async fn run_hook(snap: &HookSnapshot, def: &HookDef, payload: &HookPayload) -> HookOutcome {
     let started = Instant::now();
+    if snap.scope.read_only && !matches!(def.kind, HookKind::Command(_)) {
+        return failed(def, started, format!("hook `{}`: a harness hook must be a command", def.name));
+    }
     match &def.kind {
-        HookKind::Command(_) => run_command(def, payload).await,
+        HookKind::Command(_) => run_command_in(def, payload, &snap.scope).await,
         HookKind::Prompt { prompt, model } => {
             let Some(cfg) = &snap.engine else {
                 return failed(def, started, no_config(&def.name));
@@ -1003,6 +1041,9 @@ pub struct HookSnapshot {
     /// hooks: a smith rewriting `slag.toml` mid-run cannot repoint its
     /// own verifier at a cheaper model.
     pub engine: Option<crate::config::EngineConfig>,
+    /// How command hooks run: plain for the operator's, sandboxed for a
+    /// harness's.
+    pub scope: CommandScope,
 }
 
 /// Hand-written so the API key can never reach a log line. `EngineConfig`
@@ -1030,7 +1071,14 @@ impl HookSnapshot {
             hooks,
             disabled,
             engine: None,
+            scope: CommandScope::default(),
         }
+    }
+
+    /// Run this snapshot's command hooks in `scope`.
+    pub fn with_scope(mut self, scope: CommandScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Freeze the model config alongside the hooks.
@@ -1165,6 +1213,10 @@ pub async fn fire_with(
 ) -> HookRun {
     let mut run = HookRun::default();
     let tx = events.cloned();
+    let mut payload = payload;
+    if let Some(dir) = &snap.scope.cwd {
+        payload.cwd = Some(dir.display().to_string());
+    }
 
     for def in snap.select(event, tool) {
         if let Some(cond) = &def.if_cond {
@@ -1184,9 +1236,10 @@ pub async fn fire_with(
             let payload = payload.clone();
             let steer = steer.cloned();
             let tx = tx.clone();
+            let scope = snap.scope.clone();
             tokio::spawn(async move {
                 announce_start(&tx, &def);
-                let outcome = run_command(&def, &payload).await;
+                let outcome = run_command_in(&def, &payload, &scope).await;
                 announce_finish(&tx, &def, &outcome);
                 if def.async_rewake {
                     if let (Some(reason), Some(queue)) = (outcome.block, steer) {
@@ -1237,6 +1290,32 @@ mod tests {
             run_async: false,
             async_rewake: false,
         }
+    }
+
+    /// A harness hook is model-written: it may read and answer, never
+    /// write. With no OS sandbox to hold it, it does not run at all.
+    #[tokio::test]
+    async fn a_harness_hook_reads_but_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("planted.txt");
+        let scope = CommandScope {
+            read_only: true,
+            cwd: Some(dir.path().to_path_buf()),
+            env: vec![("SLAG_HARNESS".into(), "/the/harness".into())],
+        };
+        let hook = cmd_hook(&format!("echo hi > '{}'; echo \"at $SLAG_HARNESS\"", planted.display()));
+        let o = run_command_in(&hook, &HookPayload::new(HookEvent::PostTool), &scope).await;
+        assert!(!planted.exists(), "a harness hook cannot write");
+        if crate::engine::sandbox::Sandbox::read_only().is_ok() {
+            assert_eq!(o.code, 0, "{o:?}");
+            assert_eq!(o.context.as_deref(), Some("at /the/harness"));
+        } else {
+            assert_eq!(o.code, CODE_FAILED, "fails closed: {o:?}");
+        }
+        // The operator's own snapshot still runs a hook plainly.
+        let plain = run_command(&cmd_hook(&format!("echo hi > '{}'", planted.display())), &HookPayload::new(HookEvent::Stop)).await;
+        assert_eq!(plain.code, 0);
+        assert!(planted.exists());
     }
 
     #[test]

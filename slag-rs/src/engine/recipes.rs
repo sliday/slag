@@ -61,6 +61,31 @@ pub fn index(root: &Path, available_tools: &[String]) -> String {
     index_in(root, config_dir().as_deref(), available_tools)
 }
 
+/// `discover` plus a harness's own recipes (`<harness>/recipes/`), which
+/// list first. `None` is exactly `discover`.
+pub fn discover_with(root: &Path, harness: Option<&Path>) -> Vec<Recipe> {
+    let mut out = Vec::new();
+    if let Some(dir) = harness {
+        collect(&dir.join("recipes"), &mut out);
+    }
+    out.extend(discover(root));
+    out
+}
+
+/// `index` with a harness's recipes listed first. The snapshot cache does
+/// not cover a harness, so a harness that brings recipes renders fresh;
+/// one that brings none renders exactly what `index` does.
+pub fn index_with(root: &Path, harness: Option<&Path>, available_tools: &[String]) -> String {
+    let mut own = Vec::new();
+    if let Some(dir) = harness {
+        collect(&dir.join("recipes"), &mut own);
+    }
+    if own.is_empty() {
+        return index(root, available_tools);
+    }
+    render_index(&discover_with(root, harness), available_tools, root)
+}
+
 /// Config directory: $SLAG_CONFIG_DIR override, else ~/.config/slag.
 /// Mirrors config.rs resolution; implemented locally to keep engine
 /// submodules self-contained.
@@ -77,6 +102,13 @@ fn discover_in(root: &Path, config_dir: Option<&Path>) -> Vec<Recipe> {
     if let Some(cd) = config_dir {
         collect(&cd.join("recipes"), &mut out);
     }
+    out
+}
+
+/// The recipes in one `recipes/` directory, sorted by name.
+pub fn collect_dir(dir: &Path) -> Vec<Recipe> {
+    let mut out = Vec::new();
+    collect(dir, &mut out);
     out
 }
 

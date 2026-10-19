@@ -144,6 +144,9 @@ pub struct ToolBox {
     /// config at the first shell call, so a toolbox that never shells out
     /// never probes; tests pin one with `with_sandbox`.
     sandbox: Arc<OnceLock<super::sandbox::Sandbox>>,
+    /// A harness's recipe root (`crate::harness`), searched before the
+    /// workspace and config recipes. `None` searches exactly those two.
+    harness_recipes: Option<PathBuf>,
 }
 
 impl ToolBox {
@@ -161,7 +164,14 @@ impl ToolBox {
             policy: Arc::new(super::policy::Policy::default()),
             steer: None,
             sandbox: Arc::new(OnceLock::new()),
+            harness_recipes: None,
         }
+    }
+
+    /// Offer a harness's recipes beside the workspace and config ones.
+    pub fn with_harness_recipes(mut self, dir: Option<PathBuf>) -> Self {
+        self.harness_recipes = dir;
+        self
     }
 
     /// Pin the shell sandbox instead of resolving it from config.
@@ -1592,7 +1602,7 @@ impl ToolBox {
     /// (loud-collision pattern) — rename one of the recipes to proceed.
     async fn recipe_view(&self, args: &Value) -> Result<String, SlagError> {
         let name = req_str(args, "recipe_view", "name")?;
-        let found = recipes::discover(&self.root);
+        let found = recipes::discover_with(&self.root, self.harness_recipes.as_deref());
         let hits: Vec<&recipes::Recipe> = found.iter().filter(|r| r.name == name).collect();
         match hits.len() {
             0 => {
