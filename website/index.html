@@ -466,7 +466,7 @@
           </thead>
           <tbody>
             <tr><td><code>slag fix ISSUE</code></td><td>Fix one issue in this repository and commit it on a new branch. Takes free text, an issue number, or a GitHub issue URL. <code>--pr</code> opens a draft PR. <code>--tries N</code>, <code>--test CMD</code>, <code>--temper</code>, <code>--tui</code>, <code>--model</code> and <code>--plan-model</code> tune the run</td></tr>
-            <tr><td><code>slag fix --evolve K</code></td><td>Experimental. Evolve the harness on this issue first (Harness², arXiv 2610.14224). It costs several fix attempts, capped at $2 by default. <code>--harness library</code> reuses past lessons with no probing</td></tr>
+            <tr><td><code>slag fix --evolve K</code></td><td>Experimental. Evolve the harness on this issue first (Harness², arXiv 2610.14224). It costs several fix attempts, capped at $2 by default. On slag's own bench it has not beaten plain <code>--tries 4</code>. <code>--harness library</code> reuses past lessons with no probing</td></tr>
             <tr><td><code>slag "commission"</code></td><td>Write <code>.slag/PRD.md</code> from the commission and run the full pipeline</td></tr>
             <tr><td><code>slag</code></td><td>Forge the <code>.slag/PRD.md</code> already in this directory</td></tr>
             <tr><td><code>slag key [KEY] [--provider NAME]</code></td><td>Show provider setup or store its key</td></tr>

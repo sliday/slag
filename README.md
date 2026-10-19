@@ -259,7 +259,7 @@ A failed attempt retries on the plan model, starting from the failure slag saw. 
 `slag fix --evolve K` and `--harness` are experimental. They implement Harness² (Xu et al., "Harness²: Recursive Agent Harnessing for an Open World", Google Cloud AI Research, 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224)): slag edits the harness it works in (prompt files, recipes, scripts, hooks), issue by issue, with no model change. `--evolve 1` runs up to four fix attempts and four improver sessions, plus validation retries, before it delivers, so expect several times the spend of a plain `slag fix`. A $2 cap applies by default. Without these flags, `slag fix` runs exactly as described above.
 
 <!-- harness2-result -->
-No measured accuracy result for `--evolve` is published yet.
+Measured on 2026-10-19 with `bench/streams` (two streams of eight issues, work model ministral-3b, editor gpt-4.1-mini): `--evolve 1` fixed 6 of 16 issues. Plain `slag fix --tries 4`, at matched compute, fixed 7 of 16 for less money. The library from issues 1-4, applied to issues 5-8, fixed 6 of 16 runs against 5 of 16 for the plain path, inside run-to-run noise. On that bench `--evolve` costs 30 to 500 times a plain fix and shows no gain, so treat it as a way to study harness adaptation, not as a way to fix more issues. If a stage fails after a run has verified, evolve stops and delivers that run.
 
 ```bash
 slag fix "export drops the last day"                   # fast path, no harness
