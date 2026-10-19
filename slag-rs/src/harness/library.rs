@@ -157,7 +157,17 @@ impl Library {
              what evidence backs it. Newest first.\n\n"
         );
         for e in self.entries(domain) {
-            let parts = super::Harness::load(&e.dir.join("harness")).summary();
+            let mut parts = super::Harness::load(&e.dir.join("harness")).summary();
+            if let Ok(dirs) = std::fs::read_dir(e.dir.join("candidates")) {
+                let mut more: Vec<String> = dirs
+                    .flatten()
+                    .map(|d| format!("{} ({})", d.file_name().to_string_lossy(), super::Harness::load(&d.path()).summary()))
+                    .collect();
+                more.sort();
+                if !more.is_empty() {
+                    parts.push_str(&format!(" | candidates: {}", more.join(", ")));
+                }
+            }
             s.push_str(&format!(
                 "- {}: cue: {} | lesson: {} | confidence: {} | harness: {}\n",
                 e.id,
@@ -536,6 +546,7 @@ mod tests {
         assert!(exp.contains("candidates/dom-1/"), "{exp}");
         let index = std::fs::read_to_string(lib.domain_dir("python").join("INDEX.md")).unwrap();
         assert!(index.contains("export-drops-the-last-day") && index.contains("recipe ends"), "{index}");
+        assert!(index.contains("candidates: dom-1 (recipe dates)"), "{index}");
         let listed = lib.entries("python");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].repository, "shop");
