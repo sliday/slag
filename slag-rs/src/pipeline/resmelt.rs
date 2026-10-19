@@ -131,7 +131,7 @@ pub async fn resmelt_ingot(
 }
 
 fn gather_failure_logs(id: &str) -> String {
-    let log_dir = Path::new(crate::config::LOG_DIR);
+    let log_dir = Path::new(crate::config::project_path(crate::config::LOG_DIR));
     let mut logs = String::new();
 
     if let Ok(entries) = std::fs::read_dir(log_dir) {
@@ -158,7 +158,7 @@ fn gather_failure_logs(id: &str) -> String {
 
 fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
+    let path = format!("{}/{ts}_{label}.log", crate::config::project_path(crate::config::LOG_DIR));
     let _ = std::fs::write(&path, content);
 }
 

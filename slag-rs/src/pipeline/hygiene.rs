@@ -23,7 +23,7 @@ pub fn install_ignores(root: &Path, commission: Option<&str>) -> io::Result<()> 
         }
     }
     detect_stacks(root, 0, &mut 1_000, &mut stacks)?;
-    let mut patterns = vec!["/logs/"];
+    let mut patterns = vec!["/.slag/", "/logs/"];
     if stacks[0] {
         patterns.extend([
             "__pycache__/",
@@ -301,7 +301,7 @@ fn snapshot_without_git(
         }
         *budget -= 1;
         let entry = entry?;
-        if entry.file_name() == ".git" || directory == root && entry.file_name() == "logs" {
+        if entry.file_name() == ".git" || directory == root && matches!(entry.file_name().to_str(), Some("logs" | ".slag")) {
             continue;
         }
         let kind = entry.file_type()?;

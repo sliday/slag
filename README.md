@@ -24,7 +24,7 @@ slag key
 slag "Build a REST API with auth and rate limiting"
 ```
 
-That third line writes `PRD.md` for you and runs the full pipeline. Get a key at [openrouter.ai/keys](https://openrouter.ai/workspaces/default/keys).
+That third line writes `.slag/PRD.md` for you and runs the full pipeline. Get a key at [openrouter.ai/keys](https://openrouter.ai/workspaces/default/keys).
 
 Use an environment key to skip `slag key`:
 
@@ -33,7 +33,9 @@ export OPENROUTER_API_KEY=sk-or-...
 slag "Build a CLI tool that converts CSV to JSON"
 ```
 
-Run `slag` without an argument to forge an existing `PRD.md`.
+Run `slag` without an argument to forge an existing commission.
+
+New commissions keep coordination files in gitignored `.slag/`. Existing projects with root `PLAN.md` or `PRD.md` keep their root layout.
 
 ## Providers and keys
 
@@ -167,6 +169,8 @@ slag takes a different approach:
 
 slag runs a 4-phase pipeline:
 
+File names below refer to `.slag/` for new commissions.
+
 ```
 PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGRESS.md
  (ore)    (analyze)    (analysis)      (design)   (ingots)   (strike)    (ledger)
@@ -174,11 +178,13 @@ PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGR
 
 ### Phase 1: SURVEYOR
 
-Reads your `PRD.md` (the ore) and produces `BLUEPRINT.md`, a deep analysis with architecture decisions, dependency graph, risk assessment, and forging sequence. Runs on the plan model.
+Small local commissions share a short contract between the builder and reviewer. The contract covers named behavior and conventional CLI interfaces: help, stdin, package entry points, and stated defaults. The reviewer runs the suite and CLI probes in a read-only sandbox.
+
+The surveyor reads `.slag/PRD.md` (the ore). It writes `.slag/BLUEPRINT.md` with architecture decisions, dependencies, risks, and the forging sequence. It uses the plan model.
 
 ### Phase 2: FOUNDER
 
-Reads the blueprint and casts S-expression ingots into `PLAN.md`. Each ingot is a single task:
+The founder reads the blueprint and casts S-expression ingots into `.slag/PLAN.md`. Each ingot holds one task:
 
 ```
 (ingot :id "i1" :status ore :solo t :grade 1 :skill default :heat 0 :max 5
@@ -348,8 +354,8 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 
 | Command | Role |
 |---------|------|
-| `slag "commission"` | Write `PRD.md` and run the full pipeline |
-| `slag` | Forge the `PRD.md` already in this directory |
+| `slag "commission"` | Write `.slag/PRD.md` and run the full pipeline |
+| `slag` | Forge the `.slag/PRD.md` already in this directory |
 | `slag fix ISSUE` | Fix one issue in this repository and commit it on a new branch |
 | `slag key [KEY] [--provider NAME]` | Show provider setup or store its key |
 | `slag cost` | Show session spend and an OpenRouter balance when available |
@@ -417,12 +423,13 @@ The parser accepts these eleven fields and keeps any other `:key value` pair you
 
 | File | Role |
 |------|------|
-| `PRD.md` | Requirements input (ore) |
-| `BLUEPRINT.md` | Surveyor analysis output |
-| `PLAN.md` | Ingot crucible (task list) |
-| `AGENTS.md` | Scratch notes. slag creates it holding one line, `## Alloy Recipes`, and reads the whole file into every ingot prompt (the survey, found, and re-smelt passes do not read it). After that only the smith writes to it, when the prompt asks it to jot a pattern down. |
-| `PROGRESS.md` | Work history ledger |
-| `logs/` | Debug logs (slag heap) |
+| `.slag/PRD.md` | Requirements input (ore) |
+| `.slag/BLUEPRINT.md` | Surveyor analysis output |
+| `.slag/PLAN.md` | Ingot crucible (task list) |
+| `.slag/AGENTS.md` | Coordinator scratch notes. The coordinator creates a `## Alloy Recipes` stub. Forge prompts read this file. |
+| `.slag/BAR.md` | Acceptance criteria and required checks |
+| `.slag/PROGRESS.md` | Work history ledger |
+| `.slag/logs/` | Debug logs (slag heap) |
 | `recipes/<name>/RECIPE.md` | The real recipes. Each one is a markdown file with `---` frontmatter (name, description, optional requires_tools). slag indexes `./recipes/` and `~/.config/slag/recipes/` and offers the list to the smith. |
 
 ## Requirements

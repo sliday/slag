@@ -341,7 +341,7 @@ pub const SESSION_COSTS: &str = ".slag/session-costs.json";
 /// external consumers can poll a forge without scraping the TUI. Never
 /// demands a key: like `status`, it inspects state that already exists.
 pub fn status_json() -> Result<String, SlagError> {
-    let crucible_path = Path::new(crate::config::CRUCIBLE);
+    let crucible_path = Path::new(crate::config::project_path(crate::config::CRUCIBLE));
     let (present, counts) = if crucible_path.exists() {
         (true, crate::crucible::Crucible::load(crucible_path)?.counts())
     } else {
@@ -350,7 +350,7 @@ pub fn status_json() -> Result<String, SlagError> {
 
     // Newest event log = the live (or last) smith invocation. Its stem
     // doubles as the run id; there is no other run identity on disk.
-    let log = newest_log(Path::new(crate::config::LOG_DIR));
+    let log = newest_log(Path::new(crate::config::project_path(crate::config::LOG_DIR)));
     let mut usage = crate::engine::Usage::default();
     let (mut last_event, mut last_prompt) = (None, None);
     if let Some(path) = &log {
@@ -504,7 +504,7 @@ fn session_costs_usage(path: &Path) -> Option<crate::engine::Usage> {
 /// `slag cost`: this run's spend and the account balance.
 pub async fn show_cost() -> Result<(), SlagError> {
     let usage = session_costs_usage(Path::new(SESSION_COSTS))
-        .or_else(|| newest_log(Path::new(crate::config::LOG_DIR))
+        .or_else(|| newest_log(Path::new(crate::config::project_path(crate::config::LOG_DIR)))
             .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|contents| log_usage(&contents)))
         .unwrap_or_default();
@@ -670,13 +670,13 @@ pub struct RunRow {
 /// `slag runs` — list past runs, newest first. Reads directory metadata
 /// plus head/tail windows only.
 pub fn show_runs() -> Result<(), SlagError> {
-    let rows = list_runs(Path::new(crate::config::LOG_DIR));
+    let rows = list_runs(Path::new(crate::config::project_path(crate::config::LOG_DIR)));
     if rows.is_empty() {
         println!("\n  No runs found. Run `slag \"Your Commission\"` to start.\n");
         return Ok(());
     }
 
-    println!("\n  {}RUNS{} ({}/*.jsonl)\n", fg(tui::HOT), reset(), crate::config::LOG_DIR);
+    println!("\n  {}RUNS{} ({}/*.jsonl)\n", fg(tui::HOT), reset(), crate::config::project_path(crate::config::LOG_DIR));
     const MAX_ROWS: usize = 20;
     for row in rows.iter().take(MAX_ROWS) {
         let (glyph, color) = match row.ok {

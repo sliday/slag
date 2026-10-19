@@ -156,7 +156,7 @@ pub fn append_entry(entry: &ProgressEntry) -> Result<(), std::io::Error> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LEDGER)?;
+        .open(crate::config::project_path(LEDGER))?;
 
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M");
     writeln!(f)?;
@@ -208,7 +208,7 @@ pub fn files_changed_since_last_commit() -> Vec<String> {
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn init_patterns_section() -> Result<(), std::io::Error> {
-    let ledger_path = std::path::Path::new(LEDGER);
+    let ledger_path = std::path::Path::new(crate::config::project_path(LEDGER));
     if ledger_path.exists() {
         let content = std::fs::read_to_string(ledger_path)?;
         if content.contains("## Codebase Patterns") {
@@ -219,7 +219,7 @@ pub fn init_patterns_section() -> Result<(), std::io::Error> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LEDGER)?;
+        .open(crate::config::project_path(LEDGER))?;
 
     writeln!(f, "\n## Codebase Patterns")?;
     writeln!(f, "_Populated during forging. Helps future ingots understand the codebase._\n")?;
@@ -234,7 +234,7 @@ pub fn append_pattern(pattern: &str) -> Result<(), std::io::Error> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LEDGER)?;
+        .open(crate::config::project_path(LEDGER))?;
 
     writeln!(f, "- {pattern}")?;
     Ok(())

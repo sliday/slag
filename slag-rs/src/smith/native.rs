@@ -237,7 +237,7 @@ impl NativeSmith {
         let (tx, mut rx) = events::channel();
         let (tx_jsonl, rx_jsonl) = events::channel();
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S_%f");
-        let jsonl_path = PathBuf::from(crate::config::LOG_DIR).join(format!("engine-{ts}.jsonl"));
+        let jsonl_path = PathBuf::from(crate::config::project_path(crate::config::LOG_DIR)).join(format!("engine-{ts}.jsonl"));
         let jsonl = events::spawn_jsonl_sink(rx_jsonl, jsonl_path);
 
         let hook_tx = self.hooks.events.clone();
@@ -535,7 +535,7 @@ mod tests {
                 let server = MockServer::start().await;
                 let mutation = if shell {
                     serde_json::json!({"name": "bash", "arguments": serde_json::json!({
-                        "command": "python3 -c 'from pathlib import Path; Path(\"artifact.txt\").write_text(\"tampered\")'",
+                        "command": "touch forbidden-marker",
                     }).to_string()})
                 } else {
                     serde_json::json!({"name": "write_file", "arguments": serde_json::json!({
@@ -574,6 +574,7 @@ mod tests {
                 };
                 let result = smith.invoke("Inspect artifact.txt and return a verdict.").await;
                 assert!(result.is_err(), "document={document}, shell={shell}: {result:?}");
+                assert!(!dir.path().join("forbidden-marker").exists());
                 assert_eq!(std::fs::read_to_string(dir.path().join("artifact.txt")).unwrap(), "original\n");
                 let requests = server.received_requests().await.unwrap();
                 let request = requests.iter().find(|request| request.url.path() == "/chat/completions").unwrap();

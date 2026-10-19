@@ -114,9 +114,11 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
             Review the commission's explicit requirements with independent evidence. \
             Read the relevant artifact files and run focused checks. Batch related reads. \
             Do not edit files, restore git state, or add requirements. \
-            slag owns PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
+            slag owns .slag/ and legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
             Ignore these coordinator files in cleanliness checks. \
             Judge behavior and tests; allow normal local imports and project conventions. \
+            Only contract-named checks are required. Treat inferred check commands as optional candidates. \
+            An optional failure affects the verdict only if it proves an unmet contract requirement. \
             Stop after sufficient evidence. Return the requested verdict as text. \
             Include concrete evidence for a PASS and an unmet requirement for each GAP. \
             Never claim a check passed without its result."
@@ -191,7 +193,7 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
          - Minimal diffs. Change only what the ingot requires; no drive-by fixes, no \
            reformatting, no stray comments.\n\
          - Never touch .env files. Never commit unless the ingot explicitly asks.\n\
-         - slag owns PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
+         - slag owns .slag/ and legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
            Read them for context. Do not write, restore, remove, or commit them. \
            Ignore them in cleanliness checks.\n\
          - ≤25 words of commentary between tool calls; finish summary ≤120 words.\n\
@@ -268,7 +270,7 @@ pub fn workspace_snapshot(root: &Path, model: &str) -> String {
 
     let facts = project_facts(root);
     if !facts.is_empty() {
-        s.push_str("\n## Verify commands\n");
+        s.push_str("\n## Possible verification commands (inferred; the contract defines required checks)\n");
         for fact in &facts {
             s.push_str(&format!("- {fact}\n"));
         }
@@ -366,7 +368,13 @@ fn project_facts(root: &Path) -> Vec<String> {
         facts.push("cargo test".to_string());
     }
 
-    if root.join("pytest.ini").exists() || root.join("pyproject.toml").exists() {
+    let pytest_config = std::fs::read_to_string(root.join("pyproject.toml")).is_ok_and(|raw| {
+        raw.lines().any(|line| {
+            let section = line.split('#').next().unwrap_or_default().trim();
+            section == "[tool.pytest]" || section.starts_with("[tool.pytest.") && section.ends_with(']')
+        })
+    });
+    if root.join("pytest.ini").exists() || pytest_config {
         facts.push("pytest".to_string());
     }
 
@@ -658,6 +666,16 @@ mod tests {
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         let facts = project_facts(dir.path());
         assert_eq!(facts.len(), 8);
+    }
+
+    #[test]
+    fn packaging_metadata_does_not_invent_a_pytest_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pyproject.toml");
+        std::fs::write(&path, "[project]\nname = \"csv-to-json\"\n[project.scripts]\ncsv-to-json = \"csv_to_json:main\"\n").unwrap();
+        assert!(!project_facts(dir.path()).contains(&"pytest".to_string()));
+        std::fs::write(&path, "[tool.pytest.ini_options]\naddopts = \"-v\"\n").unwrap();
+        assert!(project_facts(dir.path()).contains(&"pytest".to_string()));
     }
 
     #[test]

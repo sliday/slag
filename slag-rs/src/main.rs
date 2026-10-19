@@ -190,7 +190,7 @@ async fn main() {
 /// resumable. Printed on the error path only, after the ratatui teardown,
 /// so it lands on the real terminal where copy-paste works.
 fn resume_hint() {
-    let path = Path::new(config::CRUCIBLE);
+    let path = Path::new(crate::config::project_path(config::CRUCIBLE));
     if !path.exists() {
         return;
     }
@@ -242,7 +242,8 @@ async fn forge(
     let _provider_run = error::ProviderRunGuard::begin();
     // Only a forge writes logs. `slag key` run from $HOME should not leave
     // an empty ~/logs behind.
-    let _ = std::fs::create_dir_all(config::LOG_DIR);
+    if commission.is_some() { config::prepare_project()?; }
+    let _ = std::fs::create_dir_all(crate::config::project_path(config::LOG_DIR));
 
     // Register in the PID registry so `slag ps` sees this forge; the
     // entry is removed on clean exit, and a crashed forge's stale entry
@@ -514,7 +515,7 @@ fn show_status() -> Result<(), error::SlagError> {
     let width = tui::width();
     let label = |name: &str| tui::dim(&format!("{name:<10}"));
 
-    let crucible_path = Path::new(config::CRUCIBLE);
+    let crucible_path = Path::new(crate::config::project_path(config::CRUCIBLE));
     if !crucible_path.exists() {
         println!();
         println!(
@@ -530,17 +531,17 @@ fn show_status() -> Result<(), error::SlagError> {
     let counts = crucible.counts();
     println!();
 
-    if let Ok(ore) = std::fs::read_to_string(config::ORE_FILE) {
+    if let Ok(ore) = std::fs::read_to_string(crate::config::project_path(config::ORE_FILE)) {
         if let Some(commission) = dashboard::commission_line(&ore) {
             println!("  {}  {}", label("commission"), tui::clip(&commission, width.saturating_sub(14)));
         }
     }
-    let blueprint = match std::fs::read_to_string(config::BLUEPRINT) {
-        Ok(doc) => format!("{} · {} lines", config::BLUEPRINT, doc.lines().count()),
+    let blueprint = match std::fs::read_to_string(crate::config::project_path(config::BLUEPRINT)) {
+        Ok(doc) => format!("{} · {} lines", crate::config::project_path(config::BLUEPRINT), doc.lines().count()),
         Err(_) => tui::dim("not drafted yet"),
     };
     println!("  {}  {blueprint}", label("blueprint"));
-    println!("  {}  {} · {} ingots", label("crucible"), config::CRUCIBLE, counts.total);
+    println!("  {}  {} · {} ingots", label("crucible"), crate::config::project_path(config::CRUCIBLE), counts.total);
     println!("{}", tui::counts_text(&counts, width));
     println!();
 
@@ -586,7 +587,7 @@ fn show_status() -> Result<(), error::SlagError> {
             "  {}  {}less {}/*_ASSAY_{}_*.log{}  {}",
             label("next"),
             fg(tui::HOT),
-            config::LOG_DIR,
+            crate::config::project_path(config::LOG_DIR),
             first.id,
             reset(),
             tui::dim("the failing proof's own output")

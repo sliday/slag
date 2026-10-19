@@ -35,6 +35,7 @@ struct RecoveryLog {
 
 pub(crate) struct CoordinatorGuard {
     root: std::path::PathBuf,
+    log_root: std::path::PathBuf,
     files: Vec<CoordinatorFile>,
     logs: Vec<RecoveryLog>,
     log_links: Vec<(std::path::PathBuf, std::path::PathBuf)>,
@@ -59,12 +60,22 @@ impl CoordinatorGuard {
             builder.mode(0o700);
         }
         builder.create(&backup)?;
+        let log_root = crate::config::project_path_in(&root, crate::config::LOG_DIR);
         let mut guard = Self {
-            root, files: Vec::new(), logs: Vec::new(), log_links: Vec::new(),
+            root, log_root, files: Vec::new(), logs: Vec::new(), log_links: Vec::new(),
             log_dirs: Vec::new(), backup, armed: false,
         };
+        let mut paths = Vec::new();
+        if crate::config::project_path_in(&guard.root, crate::config::ORE_FILE) != guard.root.join(crate::config::ORE_FILE) {
+            paths.push(guard.root.join(".slag/layout"));
+        }
         for name in COORDINATOR_FILES {
-            let path = guard.root.join(name);
+            let resolved = crate::config::project_path_in(&guard.root, name);
+            let legacy = guard.root.join(name);
+            if resolved != legacy { paths.push(legacy); }
+            paths.push(resolved);
+        }
+        for path in paths {
             let body = match std::fs::read(&path) {
                 Ok(body) => Some(body),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -73,7 +84,7 @@ impl CoordinatorGuard {
             let symlink = std::fs::read_link(&path).ok();
             guard.files.push(CoordinatorFile { path, body, symlink });
         }
-        for path in recovery_paths(&guard.root.join("logs"))? {
+        for path in recovery_paths(&guard.log_root)? {
             let metadata = std::fs::symlink_metadata(&path)?;
             if metadata.file_type().is_symlink() {
                 let target = std::fs::read_link(&path)?;
@@ -120,6 +131,7 @@ impl CoordinatorGuard {
             }
             remove_recovery_path(&file.path)?;
             if let Some(target) = &file.symlink {
+                ensure_recovery_dir(file.path.parent().unwrap(), &self.root)?;
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(target, &file.path)?;
                 #[cfg(not(unix))]
@@ -132,13 +144,14 @@ impl CoordinatorGuard {
                     if let Some(body) = &file.body { std::fs::write(&file.path, body)?; }
                 }
             } else if let Some(body) = &file.body {
+                ensure_recovery_dir(file.path.parent().unwrap(), &self.root)?;
                 std::fs::write(&file.path, body)?;
             }
             changed.push(file.path.file_name().unwrap().to_string_lossy().into_owned());
         }
         for log in &self.logs {
             let current = std::fs::read(&log.backup)?;
-            let rel = log.path.strip_prefix(self.root.join("logs")).unwrap();
+            let rel = log.path.strip_prefix(&self.log_root).unwrap();
             let tail = recovery_tail(rel, &log.body, &current);
             let intact = current.starts_with(&log.body) && current[log.body.len()..] == tail;
             if !intact {
@@ -166,10 +179,10 @@ impl CoordinatorGuard {
                 std::os::unix::fs::symlink(target, path)?;
                 #[cfg(not(unix))]
                 std::os::windows::fs::symlink_file(target, path)?;
-                changed.push(format!("logs/{}", path.strip_prefix(self.root.join("logs")).unwrap().display()));
+                changed.push(format!("logs/{}", path.strip_prefix(&self.log_root).unwrap().display()));
             }
         }
-        let log_root = self.root.join("logs");
+        let log_root = self.log_root.clone();
         for path in recovery_paths(&log_root)?.into_iter().rev() {
             if self.logs.iter().any(|log| log.path == path)
                 || self.log_links.iter().any(|(link, _)| *link == path) { continue; }
@@ -368,10 +381,10 @@ pub async fn run(
     tui::show_banner();
 
     let resumed_unverified = if commission.is_none() {
-        unverified_goal_round(std::path::Path::new(crate::config::LEDGER))
+        unverified_goal_round(std::path::Path::new(crate::config::project_path(crate::config::LEDGER)))
     } else { None };
     let resumed_gap = if commission.is_none() {
-        pending_goal_gap(std::path::Path::new(crate::config::LEDGER))
+        pending_goal_gap(std::path::Path::new(crate::config::project_path(crate::config::LEDGER)))
     } else {
         None
     };
@@ -396,10 +409,10 @@ pub async fn run(
     let prior_head = commission.and_then(|_| review_head());
     // Fire furnace if needed
     let ore = fire_furnace(commission)?;
-    let base_path = std::path::Path::new(crate::config::LOG_DIR).join("commission-base");
+    let base_path = std::path::Path::new(crate::config::project_path(crate::config::LOG_DIR)).join("commission-base");
     if commission.is_some() {
         if let Some(base) = prior_head.or_else(review_head) {
-            std::fs::create_dir_all(crate::config::LOG_DIR)?;
+            std::fs::create_dir_all(crate::config::project_path(crate::config::LOG_DIR))?;
             std::fs::write(&base_path, base)?;
         }
     }
@@ -446,7 +459,7 @@ pub async fn run(
     // Phase 1: Survey. An extended ore re-surveys: the blueprint the
     // founder reads must describe the project the addendum asked for, not
     // the one before it.
-    if ore == Ore::Extended || !std::path::Path::new(crate::config::BLUEPRINT).exists() {
+    if ore == Ore::Extended || !std::path::Path::new(crate::config::project_path(crate::config::BLUEPRINT)).exists() {
         let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
         surveyor::run(smith.as_ref()).await?;
     }
@@ -459,14 +472,14 @@ pub async fn run(
     // pass, not a loop -- a surveyor that cannot cover the gap when told
     // exactly what it is will not cover it on an identical third try.
     if !direct && resumed_gap.is_none() && resumed_unverified.is_none() {
-        if let Some(gap) = checkpoint(config, &hooks, "BLUEPRINT", crate::config::BLUEPRINT).await {
+        if let Some(gap) = checkpoint(config, &hooks, "BLUEPRINT", crate::config::project_path(crate::config::BLUEPRINT)).await {
             let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
             surveyor::run_with_guidance(smith.as_ref(), Some(&gap)).await?;
         }
     }
 
     // Phase 2: Found
-    let crucible_path = std::path::Path::new(crate::config::CRUCIBLE);
+    let crucible_path = std::path::Path::new(crate::config::project_path(crate::config::CRUCIBLE));
     let needs_founder = !crucible_path.exists() || {
         let content = std::fs::read_to_string(crucible_path).unwrap_or_default();
         !content.contains("(ingot ")
@@ -477,7 +490,7 @@ pub async fn run(
         // Same question one level down: forged, do these ingots add up to
         // the commission? A missing capability costs nothing to fix here
         // and a full forge to fix later.
-        if let Some(gap) = checkpoint(config, &hooks, "PLAN", crate::config::CRUCIBLE).await {
+        if let Some(gap) = checkpoint(config, &hooks, "PLAN", crate::config::project_path(crate::config::CRUCIBLE)).await {
             founder::run_with_guidance(smith.as_ref(), Some(&gap)).await?;
         }
     } else if ore == Ore::Extended {
@@ -713,7 +726,7 @@ fn pending_goal_gap(path: &std::path::Path) -> Option<(usize, String)> {
 fn empty_project(root: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else { return false };
     entries.filter_map(Result::ok).all(|entry| {
-        matches!(entry.file_name().to_str(), Some(".git" | ".gitignore" | "logs"))
+        matches!(entry.file_name().to_str(), Some(".git" | ".gitignore" | "logs" | ".slag"))
     })
 }
 
@@ -726,10 +739,10 @@ fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagE
     let commands: Vec<_> = std::iter::once(&plan.proof).chain(&plan.commands).cloned().collect();
     let checks = format!("REQUIRED RUN COMMANDS: {}", serde_json::to_string(&commands).unwrap());
     let contract = format!("## CHECKLIST\n{checklist}\n\n{checks}\n");
-    std::fs::write(crate::config::BLUEPRINT, format!(
+    std::fs::write(crate::config::project_path(crate::config::BLUEPRINT), format!(
         "# Local utility\n\n{commission}\n\n{contract}"
     ))?;
-    std::fs::write(warden::BAR_FILE, format!(
+    std::fs::write(crate::config::project_path(warden::BAR_FILE), format!(
         "## THE BAR\nDeliver the named behavior in the original commission.\n\n{contract}\n\
          ## HOW TO INSPECT\n\
          Read the product and test source, then run the declared suite and CLI probes.\n\
@@ -746,7 +759,7 @@ fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagE
     ingot.bar.clear();
     ingot.proof = commands.iter().map(|command| format!("( {command} )")).collect::<Vec<_>>().join(" && ");
     ingot.work = commission.to_string();
-    Crucible::new(std::path::Path::new(crate::config::CRUCIBLE), vec![ingot]).save()?;
+    Crucible::new(std::path::Path::new(crate::config::project_path(crate::config::CRUCIBLE)), vec![ingot]).save()?;
     Ok(())
 }
 
@@ -818,7 +831,8 @@ pub(crate) enum Ore {
 }
 
 fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
-    let ore_path = std::path::Path::new(crate::config::ORE_FILE);
+    if commission.is_some() { crate::config::prepare_project()?; }
+    let ore_path = std::path::Path::new(crate::config::project_path(crate::config::ORE_FILE));
 
     if ore_path.exists() {
         // A commission for a project that already has ore used to be
@@ -865,14 +879,14 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     tui::status_line("░", tui::COLD, "Ore loaded");
 
     // Create AGENTS.md
-    let alloy_path = std::path::Path::new(crate::config::ALLOY_FILE);
+    let alloy_path = std::path::Path::new(crate::config::project_path(crate::config::ALLOY_FILE));
     if !alloy_path.exists() {
         std::fs::write(alloy_path, "## Alloy Recipes\n")?;
         tui::status_line("+", tui::COLD, "Recipes ready");
     }
 
     // Create PROGRESS.md
-    let ledger_path = std::path::Path::new(crate::config::LEDGER);
+    let ledger_path = std::path::Path::new(crate::config::project_path(crate::config::LEDGER));
     if !ledger_path.exists() {
         std::fs::write(
             ledger_path,
@@ -882,21 +896,16 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     }
 
     // Create logs dir
-    std::fs::create_dir_all(crate::config::LOG_DIR)?;
+    std::fs::create_dir_all(crate::config::project_path(crate::config::LOG_DIR))?;
 
     // Initial commit, scoped to the files slag just wrote. `git add -A`
     // here swept whatever the user had lying around — including .env —
     // into a commit they never asked for.
-    let _ = crate::engine::sandbox::git()
-        .args([
-            "add",
-            "--",
-            ".gitignore",
-            crate::config::ORE_FILE,
-            crate::config::ALLOY_FILE,
-            crate::config::LEDGER,
-        ])
-        .output();
+    let mut initial_files = vec!["add", "--", ".gitignore"];
+    if crate::config::project_path(crate::config::ORE_FILE) == crate::config::ORE_FILE {
+        initial_files.extend([crate::config::ORE_FILE, crate::config::ALLOY_FILE, crate::config::LEDGER]);
+    }
+    let _ = crate::engine::sandbox::git().args(initial_files).output();
     let _ = crate::engine::sandbox::git()
         .args(["commit", "-m", "fire: furnace lit", "--quiet"])
         .output();
@@ -1021,10 +1030,32 @@ mod coordinator_tests {
     }
 
     #[test]
+    fn coordinator_guard_restores_new_layout_files_and_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".slag/logs")).unwrap();
+        std::fs::write(dir.path().join(".slag/layout"), "1\n").unwrap();
+        let plan = dir.path().join(".slag/PLAN.md");
+        let log = dir.path().join(".slag/logs/session.log");
+        std::fs::write(&plan, "forged").unwrap();
+        std::fs::write(&log, "evidence").unwrap();
+        let guard = CoordinatorGuard::capture(dir.path()).unwrap();
+        std::fs::write(&plan, "ore").unwrap();
+        std::fs::write(dir.path().join("PLAN.md"), "root attack").unwrap();
+        std::fs::write(&log, "erased").unwrap();
+        std::fs::remove_dir_all(dir.path().join(".slag")).unwrap();
+        guard.restore().unwrap();
+        assert_eq!(std::fs::read_to_string(plan).unwrap(), "forged");
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "evidence");
+        assert!(!dir.path().join("PLAN.md").exists());
+        assert!(dir.path().join(".slag/layout").is_file());
+    }
+
+    #[test]
     fn only_empty_projects_qualify_for_direct_scope() {
         let dir = tempfile::tempdir().unwrap();
         assert!(empty_project(dir.path()));
         std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join(".slag")).unwrap();
         std::fs::create_dir(dir.path().join("logs")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "logs/\n").unwrap();
         assert!(empty_project(dir.path()));
@@ -1093,8 +1124,15 @@ mod ore_tests {
     fn a_cold_directory_still_fires_the_furnace() {
         in_dir(|| {
             assert_eq!(fire_furnace(Some("Build a shooter")).unwrap(), Ore::Fired);
-            let prd = std::fs::read_to_string(crate::config::ORE_FILE).unwrap();
+            let prd = std::fs::read_to_string(crate::config::project_path(crate::config::ORE_FILE)).unwrap();
             assert!(prd.contains("Build a shooter"), "{prd}");
+            for name in COORDINATOR_FILES {
+                assert!(!std::path::Path::new(name).exists(), "root coordination file: {name}");
+            }
+            assert!(std::path::Path::new(".slag/logs").is_dir());
+            let files = crate::engine::sandbox::git().args(["ls-files"]).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&files.stdout), ".gitignore\n");
+            assert_eq!(fire_furnace(None).unwrap(), Ore::Unchanged);
             assert!(!prd.contains("Addendum"), "a first commission is the ore, not an addendum");
         });
     }

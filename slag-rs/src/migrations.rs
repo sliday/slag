@@ -42,7 +42,7 @@ pub fn run() {
         apply(&path, "model slugs", rewrite_model_slugs);
     }
     apply(
-        Path::new(crate::config::CRUCIBLE),
+        Path::new(crate::config::project_path(crate::config::CRUCIBLE)),
         "crucible header",
         upgrade_crucible_header,
     );

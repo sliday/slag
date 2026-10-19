@@ -109,13 +109,13 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
                         tool("source", "write_file", json!({"path": "wc.py", "content": SOURCE})),
                         tool("tests", "write_file", json!({"path": "test_wc.py", "content": TEST})),
                     ];
-                    for name in ["PLAN.md", "PROGRESS.md", "BLUEPRINT.md", "BAR.md", "PRD.md", "AGENTS.md", "logs/attack.log"] {
+                    for name in [".slag/PLAN.md", ".slag/PROGRESS.md", ".slag/BLUEPRINT.md", ".slag/BAR.md", ".slag/PRD.md", ".slag/AGENTS.md", ".slag/logs/attack.log"] {
                         calls.push(tool(name, "write_file", json!({"path": name, "content": "stale coordinator state"})));
                     }
-                    calls.push(tool("restore", "bash", json!({"command": "git restore PLAN.md PROGRESS.md"})));
+                    calls.push(tool("restore", "bash", json!({"command": "git restore .slag/PLAN.md .slag/PROGRESS.md"})));
                     let stale = "(ingot :id \"i1\" :status ore :solo nil :grade 1 :heat 0 :max 3 :proof \"python3 -m unittest\" :work \"Count words\")";
                     let code = format!(
-                        "from pathlib import Path; Path(\"PLAN\" + \".md\").write_text({}); Path(\"PROGRESS\" + \".md\").write_text(\"stale ledger\")",
+                        "from pathlib import Path; (Path(\".\" + \"slag\") / (\"PLAN\" + \".md\")).write_text({}); (Path(\".\" + \"slag\") / (\"PROGRESS\" + \".md\")).write_text(\"stale ledger\")",
                         serde_json::to_string(stale).unwrap()
                     );
                     calls.push(tool("indirect", "bash", json!({"command": format!("python3 -c '{code}'")})));
@@ -135,8 +135,8 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
             assert!(!names.contains(&"finish"), "{names:?}");
             if results.is_empty() {
                 assert!(git(&review_root, &["status", "--porcelain"]).is_empty());
-                assert!(git(&review_root, &["show", "HEAD:PLAN.md"]).contains(":status forged"));
-                assert!(git(&review_root, &["show", "HEAD:PROGRESS.md"]).contains("heats:1"));
+                assert!(std::fs::read_to_string(review_root.join(".slag/PLAN.md")).unwrap().contains(":status forged"));
+                assert!(std::fs::read_to_string(review_root.join(".slag/PROGRESS.md")).unwrap().contains("heats:1"));
                 return response(json!({"content": null, "tool_calls": ([
                     tool("inspect", "read_file", json!({"path": "wc.py"})),
                     tool("inspect-tests", "read_file", json!({"path": "test_wc.py"})),
@@ -155,21 +155,27 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
         .assert()
         .success()
         .stdout(contains("FORGED"));
-    let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
+    let plan = std::fs::read_to_string(root.path().join(".slag/PLAN.md")).unwrap();
     assert_eq!(plan.matches("(ingot ").count(), 1, "{plan}");
     assert!(plan.contains(":status forged"), "{plan}");
     assert!(plan.contains(":heat 1"), "{plan}");
-    assert_eq!(git(root.path(), &["show", "HEAD:PLAN.md"]), plan);
-    let ledger = git(root.path(), &["show", "HEAD:PROGRESS.md"]);
+    let tracked = git(root.path(), &["ls-files"]);
+    assert!(!tracked.lines().any(|path| path.starts_with(".slag/") || matches!(path, "PLAN.md" | "PROGRESS.md" | "PRD.md" | "BLUEPRINT.md" | "BAR.md" | "AGENTS.md")), "{tracked}");
+    let ledger = std::fs::read_to_string(root.path().join(".slag/PROGRESS.md")).unwrap();
     assert_eq!(ledger.matches("heats:1").count(), 1, "{ledger}");
     assert!(ledger.contains("Warden round 1"), "{ledger}");
     assert!(ledger.contains("goal met"), "{ledger}");
     assert!(!ledger.contains("stale ledger"), "{ledger}");
     assert_eq!(
-        std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap(),
+        std::fs::read_to_string(root.path().join(".slag/AGENTS.md")).unwrap(),
         "## Alloy Recipes\n"
     );
-    assert!(!root.path().join("logs/attack.log").exists());
+    assert!(!root.path().join(".slag/logs/attack.log").exists());
+    let status = Command::new(env!("CARGO_BIN_EXE_slag"))
+        .current_dir(root.path()).args(["status", "--json"]).assert().success().get_output().stdout.clone();
+    let status: Value = serde_json::from_slice(&status).unwrap();
+    assert_eq!(status["crucible"], true);
+    assert_eq!(status["ingots"]["forged"], 1);
     assert!(git(root.path(), &["status", "--porcelain"]).is_empty());
     server.verify().await;
 }
@@ -212,10 +218,10 @@ async fn direct_commission_keeps_the_final_warden_failure() {
         .failure()
         .stdout(contains("GOAL NOT MET"))
         .stderr(contains("wc.py prints zero"));
-    let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
+    let plan = std::fs::read_to_string(root.path().join(".slag/PLAN.md")).unwrap();
     assert!(plan.contains(":status forged"), "{plan}");
     assert!(plan.contains(":heat 1"), "{plan}");
-    let ledger = git(root.path(), &["show", "HEAD:PROGRESS.md"]);
+    let ledger = std::fs::read_to_string(root.path().join(".slag/PROGRESS.md")).unwrap();
     assert!(ledger.contains("goal not met"), "{ledger}");
     assert!(ledger.contains("wc.py prints zero"), "{ledger}");
     assert!(git(root.path(), &["status", "--porcelain"]).is_empty());

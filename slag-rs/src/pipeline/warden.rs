@@ -139,14 +139,14 @@ pub fn parse_verdict(raw: &str) -> Verdict {
 /// against the same statement; a bar that moves between rounds cannot be
 /// lost against.
 pub async fn bar(cfg: &EngineConfig, hooks: &EngineHooks) -> Result<String, SlagError> {
-    let path = std::path::Path::new(BAR_FILE);
+    let path = std::path::Path::new(crate::config::project_path(BAR_FILE));
     if let Ok(existing) = std::fs::read_to_string(path) {
         if !existing.trim().is_empty() {
             return Ok(existing);
         }
     }
-    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
-    let blueprint = std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "No blueprint".into());
+    let ore = std::fs::read_to_string(crate::config::project_path(ORE_FILE)).map_err(|_| SlagError::NoOre)?;
+    let blueprint = std::fs::read_to_string(crate::config::project_path(BLUEPRINT)).unwrap_or_else(|_| "No blueprint".into());
 
     tui::header("WARDEN · setting the bar");
     let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Warden);
@@ -191,7 +191,7 @@ pub async fn judge_artifact(
     hooks: &EngineHooks,
     round: usize,
 ) -> Result<Verdict, SlagError> {
-    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
+    let ore = std::fs::read_to_string(crate::config::project_path(ORE_FILE)).map_err(|_| SlagError::NoOre)?;
     let bar = match bar(cfg, hooks).await {
         Ok(bar) => bar,
         Err(e) => {
@@ -231,14 +231,14 @@ fn artifact_commands(bar: &str) -> Vec<String> {
     {
         return commands;
     }
-    crate::crucible::Crucible::load(std::path::Path::new(crate::config::CRUCIBLE))
+    crate::crucible::Crucible::load(std::path::Path::new(crate::config::project_path(crate::config::CRUCIBLE)))
         .map(|plan| plan.ingots.into_iter().filter(|ingot| ingot.status == crate::sexp::Status::Forged)
             .map(|ingot| ingot.proof).filter(|proof| !proof.is_empty() && proof != "true").collect())
         .unwrap_or_default()
 }
 
 fn log_raw(raw: &str) {
-    let path = std::path::Path::new(crate::config::LOG_DIR).join(format!(
+    let path = std::path::Path::new(crate::config::project_path(crate::config::LOG_DIR)).join(format!(
         "warden-raw-{}-{}.log", chrono::Local::now().format("%Y%m%d%H%M%S%f"), std::process::id()
     ));
     let _ = std::fs::write(path, raw);
@@ -324,7 +324,7 @@ pub async fn judge_plan_doc(
     kind: &str,
     doc_path: &str,
 ) -> Result<Verdict, SlagError> {
-    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
+    let ore = std::fs::read_to_string(crate::config::project_path(ORE_FILE)).map_err(|_| SlagError::NoOre)?;
     let doc = std::fs::read_to_string(doc_path).unwrap_or_default();
     if doc.trim().is_empty() {
         return Ok(Verdict::unverified(format!("{doc_path} is empty; nothing to judge")));
@@ -370,7 +370,7 @@ pub async fn judge_ingot(
 /// rejected and why, without interrupting the forge.
 fn record(round: usize, v: &Verdict) {
     use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(LEDGER) else {
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crate::config::project_path(LEDGER)) else {
         return;
     };
     let outcome = if v.fulfilled { "goal met" } else if v.is_unverified() { "goal unverified" } else { "goal not met" };

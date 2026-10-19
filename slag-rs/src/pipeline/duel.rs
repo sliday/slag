@@ -537,7 +537,7 @@ fn base64(data: &[u8]) -> String {
 /// (tests, detached repos).
 async fn heat_tick(repo: &Path, ingot: &Ingot, hooks: &EngineHooks) {
     let _guard = CRUCIBLE_LOCK.lock().await;
-    if let Ok(mut crucible) = Crucible::load(&repo.join(CRUCIBLE)) {
+    if let Ok(mut crucible) = Crucible::load(&crate::config::project_path_in(repo, CRUCIBLE)) {
         crucible.increment_heat(&ingot.id);
         let heat = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(0);
         if crucible.save().is_ok() {
@@ -558,7 +558,7 @@ fn append_ledger(repo: &Path, ingot: &Ingot, winner: char, rounds: u8) {
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(repo.join(LEDGER))
+        .open(crate::config::project_path_in(repo, LEDGER))
         .and_then(|mut f| {
             use std::io::Write;
             f.write_all(entry.as_bytes())
