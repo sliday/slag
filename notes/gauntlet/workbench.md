@@ -382,6 +382,33 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Integrity pass; the tail UNVERIFIED is true but caused by slag's proof tooling (read-only sandbox: "No usable temporary directory"; nested-quote SyntaxError).
 - BIGGEST_GAP: r7 overcorrected toward interface breadth; codex wins on the behavior the sentence names. Sent as efficiency r8: core semantics first, private TMPDIR for read-only sessions, proof residue in temp copies, user-facing commit messages.
 
+### efficiency r8 merged
+- Contracts put named behavior and its standard meaning first, with edge-case probes; interface conveniences secondary. Read-only sessions get a private TMPDIR; probes written to temp files instead of nested quoting; install checks in temp copies; user-facing commit messages.
+- Live gpt-6.1-sol: wc 139 s / 119k / $0.16 FORGED; csv 141 s / 126k / $0.15 FORGED; node 114 s / 106k / $0.13 FORGED; tail rerun 149 s / 121k / $0.17 FORGED. Builder checks passed (wc flags/streaming, CSV boundaries, NFC, tail follow).
+- Integration: 1165 unit tests green, clippy clean. Critic commission-r7 running with a fifth unseen prompt (duration parser).
+
+### Harness² r3 merged
+- SharedBudget charges dollars only for priced calls (dated prices for Ministral 3B/8B/14B, overrides, OpenRouter cost); unpriced models count toward the token cap and are named; caps checked every turn; reference runs always finish; stage spend "≈ $x est.".
+- `--harness library` applies every component of the top entries; done screen lists entry (components).
+- Admission refuses evidence with no run label; confidence from run counts ("low, could be noise: why" for 1 vs 1).
+- Builder live (ministral-3b + gpt-4.1, $1.42): run 1 $0.66 of $2, entry admitted, confidence low; next task with `--harness library` fixed in 2 attempts for $0.04; run 2 nothing verified, NO_ENTRY. Composer chose KEEP_BASE in both, once even though inv-1 PASSED and the base FAILED (queue: a passing candidate must outrank a failing base).
+- Integration: 1172 unit tests green, clippy clean. Critic harness2-r2 running with a matched-compute control (base `--tries 4`).
+
+### commission critic r7 (Fable, fresh, gpt-6.1-sol, 5 prompts incl. unseen durations): WINNER bar, slag wins its first vote
+- Named behavior at parity: wc matches system wc incl. NBSP (codex miscounts NBSP), -l/-w/-c, 50 MB streamed in 0.5 s; CSV BOM + quoted newline + ragged rejected; NFC words; real tail with -n/+N and partial-line buffering; durations h/m/s combos with positioned errors.
+- slag times 108-160 s, $0.10-0.14 per commission; codex 79-124 s.
+- Votes (both orders): wc codex, csv codex, node split (critic slag), tail **slag (fx and critic)**, durations codex → 1-3-1.
+- Integrity pass, caveat: 1 of 3 wc runs died in 15 s on a false "no valid comparison contract" (`direct/reference.rs:38-40` argv-prefix rule, no repair).
+- BIGGEST_GAP: slag's own scaffolding is the junk judges reject: probe scripts and reference fixtures committed into the repo; keyword-forced stdin/`-`/--help (`direct.rs:206-224`). Sent as efficiency r9 with the contract-crash repair.
+- Vote trend across rounds: 0-6, 0-6, 0-2-1, 0-3-1, 1-3-1.
+
+### fix critic r3 (Fable, fresh): WINNER bar
+- openai gpt-4.1-mini: 14/16 hidden pass (slag's own FIXED 12/16; rust-hawkconf 0/2, sh-backup-rotate 0/2 refused to commit), median 20.5 s, p90 128 s. mistral-small: 6/6 on executed runs; 10 runs NOT RUN because of a LEAD FAULT (conflict markers in the in-place adapter during a merge). Spend $0.79.
+- Existing-test rewrites in committed fixes: 0 of 22 (r4 guard holds).
+- fx votes codex 16/16 (both orders, all 8 tasks). Model mismatch: slag on gpt-4.1-mini vs codex on gpt-6.1-sol.
+- BIGGEST_GAP: thin or orphaned regression tests (sh-backup-rotate test outside the runner; 1 test vs 2-5). Sent as fix r6: mechanical "runner executes the new test" check, issue cases + boundary, declared-change loophole closed, edit-miss hints.
+- Next fix critic runs model for model (gpt-6.1-sol both sides) from a copied bench.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.

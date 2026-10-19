@@ -1,20 +1,25 @@
-Committed `8a5105b` on `gauntlet/efficiency`.
+Committed `1cae627` on `gauntlet/efficiency`.
 
-| Commission | Seconds | Tokens | Estimated spend | Verdict |
+| Run | Seconds | Tokens | Spend | Verdict |
 |---|---:|---:|---:|---|
-| wc | 139.4 | 118,874 | $0.1590 | FORGED |
-| CSV | 141.4 | 125,529 | $0.1500 | FORGED |
-| Node | 113.7 | 105,544 | $0.1294 | FORGED |
-| Tail rerun | 148.5 | 121,301 | $0.1713 | FORGED |
+| wc 1 | 128.3 | 134,447 | $0.1617 | FORGED |
+| wc 2 | 124.1 | 121,433 | $0.1396 | FORGED |
+| wc 3 | 115.2 | 112,173 | $0.1413 | FORGED |
+| CSV | 148.9 | 136,980 | $0.1634 | FORGED |
+| Node | 160.0 | 114,933 | $0.1242 | FORGED |
+| Tail | 142.8 | 139,471 | $0.1734 | FORGED |
+| Durations | 96.5 | 109,948 | $0.1022 | FORGED |
 
-Independent checks passed for fresh-clone suites, wc flags and streaming, CSV boundaries, NFC counts, and tail follow behavior.
+Total estimated spend: **$1.0058**.
 
-Total spend: **$0.8005**, including the initial UNVERIFIED tail run. The fix preserves source evidence throughout the bounded review.
+All three wc runs avoided contract crashes. Fresh-clone checks passed across all seven repositories. Tracked files contain no probes or reference fixtures.
 
-Cargo passed **1,233 tests**, with one ignored. Clippy passed with warnings denied. Both checkouts are clean.
+Durations uses positional input without file/stdin extras. CSV rejects malformed rows without partial JSON.
 
-[Report: changed files, test names, phase totals, and exact commands](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/efficiency-round8.md).
+Cargo passed **1,251 tests**, with one ignored. Clippy passed with warnings denied. Both checkouts are clean.
 
-ASK: Complete Round 8 semantics, sandbox reliability, residue cleanup, live checks, and commit.
+[Report: changes, tests, per-phase usage, exact commands, and `git ls-files` for each repository](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/efficiency-round9.md).
+
+ASK: Complete Round 9 instrument isolation, interface rules, reference repair, live checks, and commit.
 🟩Got 🟩Had 🟩Did
 🧠 —
