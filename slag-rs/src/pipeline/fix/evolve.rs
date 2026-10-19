@@ -1112,6 +1112,9 @@ impl Evolver<'_, '_> {
             .with_max_turns(max_turns)
             .with_tool_allowlist(tools)
             .with_required_reads(required_reads(ws))
+            // An improver compares many files; it keeps every read in view
+            // and leaves room to the token budget alone.
+            .with_recent_rounds(usize::MAX)
             .without_finish()
             .with_transcript_root(self.sh.run_dir.clone())
             .with_events(tx);

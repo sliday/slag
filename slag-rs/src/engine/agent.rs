@@ -419,6 +419,13 @@ impl ForgeAgent {
         }
     }
 
+    /// Keep the last `rounds` tool rounds verbatim (default 2). A session
+    /// that reads many files to compare them needs them all in view.
+    pub fn with_recent_rounds(mut self, rounds: usize) -> Self {
+        self.recent_tool_rounds = rounds.max(1);
+        self
+    }
+
     /// Hold the session's final answer until it has read these files.
     /// A model that claims to have read evidence it never opened gets the
     /// list back, as long as turns remain.
@@ -1825,6 +1832,32 @@ mod tests {
         let outcomes = editor.dispatch_batch(&[tc("b", "bash", serde_json::json!({"command": "touch marker"}))]).await;
         assert!(outcomes[0].is_error && outcomes[0].output.contains("unavailable"), "{:?}", outcomes[0]);
         assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    async fn a_session_can_keep_every_tool_round_in_view() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(dir.path().join(name), format!("evidence {name}\n")).unwrap();
+        }
+        let script = || {
+            vec![
+                resp_tools(vec![tc("1", "read_file", serde_json::json!({"path": "a.md"}))]),
+                resp_tools(vec![tc("2", "read_file", serde_json::json!({"path": "b.md"}))]),
+                resp_tools(vec![tc("3", "read_file", serde_json::json!({"path": "c.md"}))]),
+                resp_text("done", FinishReason::Stop),
+            ]
+        };
+        let kept = |p: &MockProvider| {
+            let last = p.requests().last().unwrap().messages.clone();
+            ["a.md", "b.md", "c.md"].iter().filter(|n| last.iter().any(|m| m.role == "tool" && m.content.contains(&format!("evidence {n}")))).count()
+        };
+        let short = MockProvider::new(script());
+        agent(short.clone(), dir.path()).without_finish().run("s".into(), "t".into()).await.unwrap();
+        assert_eq!(kept(&short), 2, "the default keeps two rounds verbatim");
+        let long = MockProvider::new(script());
+        agent(long.clone(), dir.path()).without_finish().with_recent_rounds(usize::MAX).run("s".into(), "t".into()).await.unwrap();
+        assert_eq!(kept(&long), 3);
     }
 
     #[tokio::test]
