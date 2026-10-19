@@ -5,9 +5,10 @@
 //! network and no real key.
 //!
 //! The scripted model has one behavior a harness can change: a smith
-//! whose system prompt carries `ALWAYS ADD A TEST` writes a regression
-//! test beside the fix, and one without it does not. That is the
-//! behavioral contrast the probes measure and the library records.
+//! whose system prompt carries `ALWAYS ADD A TEST` (a harness recipe's
+//! trigger line in the index) writes a regression test beside the fix,
+//! and one without it does not. That is the behavioral contrast the
+//! probes measure and the library records.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,16 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-const RULE: &str = "ALWAYS ADD A TEST: write tests/value_test.sh beside every fix.";
+const RULE: &str = "ALWAYS ADD A TEST: when you fix a value, load this to write tests/value_test.sh";
+const FACT: &str = "In this repository, every test is a shell script under tests/.";
+
+fn recipe() -> Value {
+    json!({"path": "context/harness/recipes/tests/RECIPE.md", "content": format!("---\nname: tests\ndescription: {RULE}\n---\nWrite tests/value_test.sh: grep -qx 2 value.txt\n")})
+}
+
+fn memory() -> Value {
+    json!({"path": "context/harness/memory.md", "content": format!("{FACT}\n")})
+}
 
 /// Answers by role; keeps every request's system prompt for the asserts.
 #[derive(Clone, Default)]
@@ -48,11 +58,11 @@ fn text(content: &str) -> ResponseTemplate {
     }))
 }
 
-const REFLECTION: &str = "<edits>\ncomponent: systemprompt.md\ncandidates: inv-1, comp-1\n\
-    change: a rule to add a regression test beside every fix\n\
+const REFLECTION: &str = "<edits>\ncomponent: recipes/tests/RECIPE.md\ncandidates: inv-1, comp-1\n\
+    change: a recipe whose trigger names the test file to write beside the fix\n\
     observed: base-1 changed value.txt only; comp-1-run also wrote tests/value_test.sh\n\
     verdict: helped\n</edits>\n<experience>\ncue: the smith fixes the value but adds no regression test\n\
-    lesson: put a one-line rule in systemprompt.md that names the test file to write beside the fix\n\
+    lesson: add a recipe whose trigger names the test file to write beside the fix\n\
     evidence: row 1; base-1 vs comp-1-run in contrast.md\nconfidence: medium, one run each\n</experience>";
 
 impl Respond for Roles {
@@ -69,8 +79,8 @@ impl Respond for Roles {
         }
         if first.contains("YOUR DIMENSION: INV") {
             return match turn {
-                0 => tool_call(vec![("write_file", json!({"path": "context/harness/systemprompt.md", "content": format!("{RULE}\n")}))]),
-                _ => text("<notes>\nsystemprompt.md: base-1 changed value.txt and wrote no test.\n</notes>"),
+                0 => tool_call(vec![("write_file", recipe()), ("write_file", memory())]),
+                _ => text("<notes>\nrecipes/tests: base-1 changed value.txt and wrote no test.\n</notes>"),
             };
         }
         if first.contains("YOUR DIMENSION: DOM") {
@@ -86,11 +96,12 @@ impl Respond for Roles {
         }
         if first.contains("You are composing") {
             return match turn {
-                0 => tool_call(vec![(
-                    "write_file",
-                    json!({"path": "context/harness/systemprompt.md", "content": format!("{RULE}\nKeep the change small.\n")}),
-                )]),
-                _ => text("<notes>\nkept -> inv-1 systemprompt.md -> base-1 wrote no test; inv-1 did\n</notes>"),
+                0 => tool_call(vec![
+                    ("write_file", recipe()),
+                    ("write_file", memory()),
+                    ("write_file", json!({"path": "context/harness/systemprompt.md", "content": "Keep the change small.\n"})),
+                ]),
+                _ => text("<notes>\nkept -> inv-1 recipes/tests -> base-1 wrote no test; inv-1 did\n</notes>"),
             };
         }
         if first.contains("You are choosing which of") {
@@ -227,11 +238,11 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
     assert!(rec["library"].as_str().unwrap().starts_with("added"), "{rec:#}");
     let domain = home.path().join("library/shell");
     let index = std::fs::read_to_string(domain.join("INDEX.md")).unwrap();
-    assert!(index.contains("value-is-wrong") && index.contains("systemprompt.md"), "{index}");
+    assert!(index.contains("value-is-wrong") && index.contains("recipe tests"), "{index}");
     let entry = std::fs::read_dir(&domain).unwrap().flatten().find(|e| e.path().is_dir()).unwrap().path();
     let exp = std::fs::read_to_string(entry.join("EXPERIENCE.md")).unwrap();
     assert!(exp.contains("cue: the smith fixes the value") && exp.contains("verdict: helped"), "{exp}");
-    assert!(std::fs::read_to_string(entry.join("harness/systemprompt.md")).unwrap().contains(RULE));
+    assert!(std::fs::read_to_string(entry.join("harness/recipes/tests/RECIPE.md")).unwrap().contains(RULE));
 
     // Improver sessions never saw a shell or a finish tool.
     let systems = roles.systems.lock().unwrap().clone();
@@ -270,20 +281,20 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     assert!(!systems.iter().any(|s| s.contains("You are composing") || s.contains("YOUR DIMENSION")), "no improver ran");
     let smith = systems.iter().find(|s| s.contains("# slag smith")).expect("a smith ran");
     assert!(smith.contains("# Harness") && smith.contains(RULE), "the lesson reached the smith's prompt");
+    assert!(smith.contains(FACT), "the repository's own facts come along");
+    assert!(!smith.contains("Keep the change small."), "the adopting task's procedure stays behind");
     let files = sh(repo.path(), "git show --name-only --format= HEAD");
     assert!(files.contains("tests/value_test.sh"), "the applied harness changed behavior: {files}");
 
-    // Another repository gets no always-on text from it: that text was
-    // written for the task that adopted it.
+    // Another repository gets the recipe, not this one's facts.
     let other = buggy_repo();
     roles.systems.lock().unwrap().clear();
     let out = run(slag(other.path(), &server, home.path(), &args)).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
-    assert!(stdout.contains("no shell library entry applies here"), "{stdout}");
     let systems = roles.systems.lock().unwrap().clone();
     let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
-    assert!(!smith.contains("# Harness"), "{smith}");
+    assert!(smith.contains(RULE) && !smith.contains(FACT), "{smith}");
 
     // Without --harness, the fast path's prompt carries no harness at all.
     let third = buggy_repo();

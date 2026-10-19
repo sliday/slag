@@ -996,8 +996,9 @@ impl Evolver<'_, '_> {
         let checked = match soft(self.improver(label, ws, system.clone(), task.clone(), &WRITER_TOOLS, EDITOR_TURNS).await)? {
             Err(e) => Err(format!("the session failed: {e}")),
             Ok(reply) => {
+                let first = check_tree(&edited, start, &reply).await;
                 cand.notes = reply;
-                match harness::validate::validate(&edited).await {
+                match first {
                     Ok(dropped) => Ok(dropped),
                     Err(msg) => {
                         cand.retried = true;
@@ -1010,10 +1011,11 @@ impl Evolver<'_, '_> {
                         match soft(self.improver(&format!("{label}-retry"), ws, system, again, &WRITER_TOOLS, EDITOR_TURNS).await)? {
                             Err(e) => Err(format!("the retry failed: {e}")),
                             Ok(reply) => {
+                                let second = check_tree(&edited, start, &reply).await;
                                 if !reply.trim().is_empty() {
                                     cand.notes = reply;
                                 }
-                                harness::validate::validate(&edited).await
+                                second
                             }
                         }
                     }
@@ -1410,6 +1412,14 @@ impl Evolved {
             (Ok(()), Some(lib), Some(lesson)) => {
                 let repository = self.sh.top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let adopted = self.adopted();
+                let mut evidence: Vec<(String, PathBuf)> = Vec::new();
+                for row in &backed {
+                    for c in carriers(row, &self.record) {
+                        if c.label != self.record.adopted && !evidence.iter().any(|(l, _)| *l == c.label) {
+                            evidence.push((c.label.clone(), c.dir.clone()));
+                        }
+                    }
+                }
                 let entry = library::NewEntry {
                     title: &self.record.issue,
                     repository: &repository,
@@ -1417,6 +1427,7 @@ impl Evolved {
                     harness: &adopted,
                     lesson: &lesson,
                     rows: &rows,
+                    evidence: &evidence,
                 };
                 match lib.add(&self.sh.settings.domain, &entry) {
                     Ok(dir) => format!("added {}", dir.strip_prefix(&lib.root).unwrap_or(&dir).display()),
@@ -1621,6 +1632,21 @@ fn contrast(r: &Rollout, base: &[&Rollout]) -> Contrast {
     }
 }
 
+/// The candidates that changed the component a row names, as an edited
+/// harness. The row may spell the path from the working directory.
+fn carriers<'r>(row: &library::EditRow, record: &'r Record) -> Vec<&'r Candidate> {
+    let component = row.component.trim().trim_start_matches("./");
+    let component = component
+        .strip_prefix("context/harness/")
+        .or_else(|| component.strip_prefix("harness/"))
+        .unwrap_or(component);
+    record
+        .candidates
+        .iter()
+        .filter(|c| c.outcome == "edited" && c.components.iter().any(|p| p == component))
+        .collect()
+}
+
 /// The edit rows slag's own measurements back. A row counts when it
 /// names a harness component some candidate changed, and the runs under
 /// the harnesses that carried the change beat the reference runs (for
@@ -1634,17 +1660,7 @@ fn backed_rows(rows: &[library::EditRow], record: &Record) -> Vec<library::EditR
     }
     rows.iter()
         .filter(|row| {
-            let component = row.component.trim().trim_start_matches("./");
-            let component = component
-                .strip_prefix("context/harness/")
-                .or_else(|| component.strip_prefix("harness/"))
-                .unwrap_or(component);
-            let carriers: Vec<&str> = record
-                .candidates
-                .iter()
-                .filter(|c| c.outcome == "edited" && c.components.iter().any(|p| p == component))
-                .map(|c| c.label.as_str())
-                .collect();
+            let carriers: Vec<&str> = carriers(row, record).into_iter().map(|c| c.label.as_str()).collect();
             let runs: Vec<Contrast> = record
                 .runs
                 .iter()
@@ -1717,6 +1733,20 @@ pub(super) fn guard(dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Validate what a writing session left, after one check of its own: a
+/// reply that spells out file writes as text while the tree did not
+/// change wrote nothing, which a model can mistake for done.
+async fn check_tree(edited: &Path, start: &Path, reply: &str) -> Result<Vec<String>, String> {
+    let pseudo = ["write_file(", "edit_file(", "functions.write_file", "functions.edit_file"];
+    if harness::tree(edited) == harness::tree(start) && pseudo.iter().any(|p| reply.contains(p)) {
+        return Err("the harness failed validation:\n- your reply spelled out write_file or edit_file calls \
+                    as text, and text changes nothing: call the write_file tool for each file you meant \
+                    to write, then reply with your notes"
+            .into());
+    }
+    harness::validate::validate(edited).await
 }
 
 /// Errors that end the whole fix pass through; any other session failure
@@ -2035,6 +2065,20 @@ mod tests {
             let _ = std::fs::remove_dir(path.parent().unwrap());
         }
         assert!(guard(dir.path()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_spells_out_writes_wrote_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (start, edited) = (dir.path().join("start"), dir.path().join("edited"));
+        std::fs::create_dir_all(&start).unwrap();
+        std::fs::create_dir_all(&edited).unwrap();
+        let reply = "await functions.write_file({path: \"context/harness/memory.md\"})\n<notes>kept</notes>";
+        let err = check_tree(&edited, &start, reply).await.unwrap_err();
+        assert!(headline(&err).contains("spelled out write_file"), "{err}");
+        assert!(check_tree(&edited, &start, "<notes>KEEP_BASE</notes>").await.is_ok());
+        std::fs::write(edited.join("memory.md"), "In this repository, tests use unittest.\n").unwrap();
+        assert!(check_tree(&edited, &start, reply).await.is_ok(), "a changed tree is the validator's to judge");
     }
 
     #[test]

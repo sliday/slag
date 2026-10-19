@@ -3,9 +3,10 @@
 //! an index.
 //!
 //! ```text
-//! <library>/<domain>/INDEX.md                    one line per entry
-//! <library>/<domain>/<entry>/EXPERIENCE.md       cue, lesson, evidence, edit rows
-//! <library>/<domain>/<entry>/harness/            the adopted tree, executable as is
+//! <library>/<domain>/INDEX.md                      one line per entry
+//! <library>/<domain>/<entry>/EXPERIENCE.md         cue, lesson, evidence, edit rows
+//! <library>/<domain>/<entry>/harness/              the adopted tree, executable as is
+//! <library>/<domain>/<entry>/candidates/<label>/   a candidate tree whose edit backs the lesson
 //! ```
 //!
 //! The library lives per user (`<config dir>/library`), or wherever
@@ -68,6 +69,10 @@ pub struct NewEntry<'a> {
     pub harness: &'a Path,
     pub lesson: &'a Lesson,
     pub rows: &'a [EditRow],
+    /// Candidate trees, by label, that carried an edit the lesson rests on
+    /// and were not adopted. An edit from a rejected candidate can be the
+    /// one that helped, and the library keeps it executable.
+    pub evidence: &'a [(String, PathBuf)],
 }
 
 impl Library {
@@ -117,7 +122,7 @@ impl Library {
         let mut n = 0;
         for e in entries.iter().take(SNAPSHOT_ENTRIES) {
             let mut files = tree(&e.dir);
-            files.retain(|p, _| p == "EXPERIENCE.md" || p.starts_with("harness/"));
+            files.retain(|p, _| p == "EXPERIENCE.md" || p.starts_with("harness/") || p.starts_with("candidates/"));
             if write_tree(&files, &dst.join(&e.id)).is_ok() {
                 n += 1;
             }
@@ -137,6 +142,9 @@ impl Library {
         }
         let dir = self.domain_dir(domain).join(&id);
         write_tree(&tree(entry.harness), &dir.join("harness"))?;
+        for (label, tree_dir) in entry.evidence {
+            write_tree(&tree(tree_dir), &dir.join("candidates").join(clean(label)))?;
+        }
         std::fs::write(dir.join("EXPERIENCE.md"), experience_md(domain, entry))?;
         self.write_index(domain)?;
         Ok(dir)
@@ -167,12 +175,14 @@ impl Library {
     /// rank by the words their title, cue and lesson share with `query`,
     /// with a bonus for the same repository; ties keep the newer entry.
     ///
-    /// An adopted harness's always-on text is written for the task that
-    /// adopted it, and only a repository's own entries carry it over: the
-    /// best of those comes whole. From every other entry, and from the
-    /// next ones, only recipes come, with their own scripts: they cost
-    /// nothing until a trigger loads them. Returns the ids that gave
-    /// anything, best first.
+    /// Only what transfers without a probe comes over. An adopted tree's
+    /// always-on procedure, guardrails, tool guidance and hooks were
+    /// written for the task that adopted them, and only `--evolve` adapts
+    /// them. Recipes, with their own scripts, cost nothing until their
+    /// trigger loads one, so they come from every relevant entry,
+    /// candidate trees included. From the same repository, the `memory.md`
+    /// lines that state a fact "in this repository" come too. Returns the
+    /// ids that gave anything, best first.
     pub fn apply(&self, domain: &str, query: &str, repository: &str, dst: &Path) -> Vec<String> {
         let mut scored: Vec<(usize, Entry)> = self
             .entries(domain)
@@ -188,22 +198,50 @@ impl Library {
             .collect();
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
         let mut used = Vec::new();
-        let mut files = std::collections::BTreeMap::new();
+        let mut files: std::collections::BTreeMap<String, Vec<u8>> = std::collections::BTreeMap::new();
+        let mut facts: Vec<String> = Vec::new();
+        let mut claimed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (i, (score, e)) in scored.into_iter().take(APPLY_ENTRIES).enumerate() {
             if i > 0 && score == 0 {
                 break;
             }
-            let whole = i == 0 && e.repository == repository;
-            let mut add = tree(&e.dir.join("harness"));
-            if !whole {
-                let taken: Vec<String> = files.keys().filter_map(|k: &String| recipe_name(k)).collect();
-                add.retain(|p, _| recipe_name(p).is_some_and(|n| !taken.contains(&n)));
+            let mut gave = false;
+            // The adopted tree first, then the candidate trees behind the lesson.
+            let mut trees = vec![e.dir.join("harness")];
+            if let Ok(dirs) = std::fs::read_dir(e.dir.join("candidates")) {
+                let mut more: Vec<PathBuf> = dirs.flatten().map(|d| d.path()).collect();
+                more.sort();
+                trees.extend(more);
             }
-            if add.is_empty() {
-                continue;
+            // A recipe name belongs to the first tree that brings it.
+            for t in trees {
+                let mut mine = std::collections::BTreeSet::new();
+                for (path, bytes) in tree(&t) {
+                    let Some(name) = recipe_name(&path) else { continue };
+                    if claimed.contains(&name) {
+                        continue;
+                    }
+                    mine.insert(name);
+                    files.insert(path, bytes);
+                    gave = true;
+                }
+                claimed.extend(mine);
             }
-            files.extend(add);
-            used.push(e.id);
+            if e.repository == repository {
+                let memory = std::fs::read_to_string(e.dir.join("harness").join("memory.md")).unwrap_or_default();
+                for line in memory.lines().filter(|l| l.to_ascii_lowercase().contains("in this repository")) {
+                    if !facts.iter().any(|f| f == line) {
+                        facts.push(line.to_string());
+                        gave = true;
+                    }
+                }
+            }
+            if gave {
+                used.push(e.id);
+            }
+        }
+        if !facts.is_empty() {
+            files.insert("memory.md".into(), format!("{}\n", facts.join("\n")).into_bytes());
         }
         let _ = write_tree(&files, dst);
         used
@@ -357,6 +395,14 @@ fn experience_md(domain: &str, e: &NewEntry) -> String {
         "\n## Harness\n\nThe adopted harness is in `harness/`: {}.\n",
         super::Harness::load(e.harness).summary()
     ));
+    for (label, dir) in e.evidence {
+        s.push_str(&format!(
+            "The lesson also rests on `{label}`, which was not adopted; its tree is in \
+             `candidates/{}/`: {}.\n",
+            clean(label),
+            super::Harness::load(dir).summary()
+        ));
+    }
     s
 }
 
@@ -465,6 +511,14 @@ mod tests {
         );
         write_tree(&files, &harness).unwrap();
         let (rows, lesson) = parse_reflection(REFLECTION);
+        let rejected = dir.path().join("dom");
+        let mut other = std::collections::BTreeMap::new();
+        other.insert(
+            "recipes/dates/RECIPE.md".to_string(),
+            b"---\nname: dates\ndescription: load this when dates cross a month\n---\nCheck both months.\n".to_vec(),
+        );
+        write_tree(&other, &rejected).unwrap();
+        let evidence = vec![("dom-1".to_string(), rejected.clone())];
         let entry = NewEntry {
             title: "export drops the last day",
             repository: "shop",
@@ -472,27 +526,31 @@ mod tests {
             harness: &harness,
             lesson: lesson.as_ref().unwrap(),
             rows: &rows,
+            evidence: &evidence,
         };
         let stored = lib.add("python", &entry).unwrap();
         assert!(stored.join("harness/recipes/ends/RECIPE.md").exists());
+        assert!(stored.join("candidates/dom-1/recipes/dates/RECIPE.md").exists(), "a rejected candidate's backing edit is kept");
         let exp = std::fs::read_to_string(stored.join("EXPERIENCE.md")).unwrap();
         assert!(exp.contains("cue: an issue reports a range") && exp.contains("verdict: helped"), "{exp}");
+        assert!(exp.contains("candidates/dom-1/"), "{exp}");
         let index = std::fs::read_to_string(lib.domain_dir("python").join("INDEX.md")).unwrap();
         assert!(index.contains("export-drops-the-last-day") && index.contains("recipe ends"), "{index}");
         let listed = lib.entries("python");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].repository, "shop");
 
-        // Another repository gets only the recipes: always-on text was
-        // written for the task that adopted it.
+        // Another repository gets the recipes only, the rejected
+        // candidate's included: always-on text was written for its task.
         let out = dir.path().join("applied");
         let used = lib.apply("python", "the range report loses its last day", "other", &out);
         assert_eq!(used.len(), 1);
-        assert!(out.join("recipes/ends/RECIPE.md").exists());
+        assert!(out.join("recipes/ends/RECIPE.md").exists() && out.join("recipes/dates/RECIPE.md").exists());
         assert!(!out.join("memory.md").exists());
-        // The same repository gets the whole tree.
+        // The same repository also gets its facts, and only those lines.
         lib.apply("python", "anything", "shop", &out);
-        assert!(std::fs::read_to_string(out.join("memory.md")).unwrap().contains("src/d.py"));
+        let memory = std::fs::read_to_string(out.join("memory.md")).unwrap();
+        assert!(memory.contains("src/d.py") && !memory.contains("unittest"), "{memory}");
         // An empty domain applies nothing.
         assert!(lib.apply("rust", "x", "shop", &dir.path().join("none")).is_empty());
 
