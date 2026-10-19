@@ -281,7 +281,7 @@ slag sets the entry's confidence from its own counts, and keeps the reflector's 
 | medium | 2 or more carrying runs agree on that outcome measure, and none disagrees |
 | low | anything less: one run against one, a difference in turns or tool errors alone, or runs that disagree. The entry says "could be noise" and why |
 
-Each entry holds the adopted harness, any rejected candidate whose edit backed the lesson, and an EXPERIENCE.md. An INDEX.md lists the entries per domain:
+Two candidates can edit one file in different ways, so a row that names its candidates counts only the runs under those candidates, or under a harness holding the same bytes. Each entry holds the adopted harness, the components of any rejected candidate whose edit measurably helped (an edit that hurt stays on record in the rows, never in a tree), and an EXPERIENCE.md. An INDEX.md lists the entries per domain:
 
 ```text
 ~/.config/slag/library/<domain>/INDEX.md
@@ -290,7 +290,7 @@ Each entry holds the adopted harness, any rejected candidate whose edit backed t
 ~/.config/slag/library/<domain>/<entry>/candidates/<label>/
 ```
 
-The domain is the repository's stack (`python`, `node`, `rust`, `go`, `shell`, or `general`), read from the test command and the manifests; `--domain` overrides it. A repository can keep its own library at `.slag/library`. Later `--evolve` runs start from the base harness, and their editors and composers read the library as examples. `--harness library` applies the domain's most relevant entries without a probe and with no model call. Entries rank by the words their title, cue and lesson share with the issue, with a bonus for the same repository. The best entry always applies, and up to two more when they share a word with the issue or come from the same repository. Every component of an applied entry comes over: its adopted harness, then each rejected candidate whose edit backed the lesson. Always-on files from several entries stack, best entry first, up to the 8000-byte cap; a recipe or script name keeps the first entry's copy; hook lines join. From another repository, the lines that state a fact "in this repository" stay behind. The run prints, and the done screen keeps, which entries applied and what each gave:
+The domain is the repository's stack (`python`, `node`, `rust`, `go`, `shell`, or `general`), read from the test command and the manifests; `--domain` overrides it. A repository can keep its own library at `.slag/library`. Later `--evolve` runs start from the base harness, and their editors and composers read the library as examples. `--harness library` applies the domain's most relevant entries without a probe and with no model call. Entries rank by the words their title, cue and lesson share with the issue, with a bonus for the same repository. The best entry always applies, and up to two more when they share a word with the issue or come from the same repository. Every component of an applied entry comes over: its adopted harness, then the components of rejected candidates that helped. Always-on files from several entries stack, best entry first, up to the 8000-byte cap; a recipe or script name keeps the first entry's copy; hook lines join. From another repository, the lines that state a fact "in this repository" stay behind. The run prints, and the done screen keeps, which entries applied and what each gave:
 
 ```text
 note    harness from the python library: 20261019-170212-export-drops-the-last-day (memory.md, recipes/ends, systemprompt.md)

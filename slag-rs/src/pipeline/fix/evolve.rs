@@ -1562,11 +1562,17 @@ impl Evolved {
             (Ok(()), Some(lib), Some(lesson)) => {
                 let repository = self.sh.top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let adopted = self.adopted();
-                let mut evidence: Vec<(String, PathBuf)> = Vec::new();
-                for row in &backed {
-                    for c in carriers(row, &self.record) {
-                        if c.label != self.record.adopted && !evidence.iter().any(|(l, _)| *l == c.label) {
-                            evidence.push((c.label.clone(), c.dir.clone()));
+                // A rejected candidate's edit that helped travels with the
+                // entry; one that hurt is on record in the rows, never
+                // applied.
+                let mut evidence: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+                for row in backed.iter().filter(|r| r.verdict.starts_with("helped")) {
+                    let component = component_of(row).to_string();
+                    for c in carriers(row, &self.record).into_iter().filter(|c| c.label != self.record.adopted) {
+                        match evidence.iter_mut().find(|(l, _, _)| *l == c.label) {
+                            Some((_, _, parts)) if !parts.contains(&component) => parts.push(component.clone()),
+                            Some(_) => {}
+                            None => evidence.push((c.label.clone(), c.dir.clone(), vec![component.clone()])),
                         }
                     }
                 }
@@ -1899,18 +1905,36 @@ fn measured_confidence(backed: &[Support]) -> String {
     }
 }
 
-/// The candidates that changed the component a row names, as an edited
-/// harness. The row may spell the path from the working directory.
-fn carriers<'r>(row: &library::EditRow, record: &'r Record) -> Vec<&'r Candidate> {
+/// The harness path a row names; the row may spell it from the working
+/// directory.
+fn component_of(row: &library::EditRow) -> &str {
     let component = row.component.trim().trim_start_matches("./");
-    let component = component
+    component
         .strip_prefix("context/harness/")
         .or_else(|| component.strip_prefix("harness/"))
-        .unwrap_or(component);
-    record
+        .unwrap_or(component)
+}
+
+/// The candidates that carried the edit a row describes: they changed the
+/// component it names. Two candidates can change one file in different
+/// ways, so when the row names its candidates, a carrier is one of them,
+/// or holds the same bytes there as one of them (a composer that kept it).
+fn carriers<'r>(row: &library::EditRow, record: &'r Record) -> Vec<&'r Candidate> {
+    let component = component_of(row);
+    let changed: Vec<&Candidate> = record
         .candidates
         .iter()
         .filter(|c| c.outcome == "edited" && c.components.iter().any(|p| p == component))
+        .collect();
+    let named: Vec<&Candidate> = changed.iter().copied().filter(|c| library::cites(&row.candidates, &c.label)).collect();
+    if named.is_empty() {
+        return changed;
+    }
+    let bytes = |c: &Candidate| std::fs::read(c.dir.join(component)).ok();
+    let theirs: Vec<Option<Vec<u8>>> = named.iter().map(|c| bytes(c)).collect();
+    changed
+        .into_iter()
+        .filter(|c| named.iter().any(|n| n.label == c.label) || theirs.contains(&bytes(c)))
         .collect()
 }
 
@@ -2596,6 +2620,57 @@ mod tests {
         assert_eq!(turns.level(), "low");
         assert!(turns.line().contains("turns or tool errors alone"), "{}", turns.line());
         assert!(measured_confidence(&[one, turns]).starts_with("low: "));
+    }
+
+    #[test]
+    fn two_edits_to_one_file_are_two_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cand = |label: &str, kind: Kind, prompt: &str| {
+            std::fs::create_dir_all(dir.path().join(label)).unwrap();
+            std::fs::write(dir.path().join(label).join("systemprompt.md"), prompt).unwrap();
+            Candidate {
+                label: label.into(),
+                kind,
+                round: 1,
+                outcome: "edited".into(),
+                retried: false,
+                fallback: None,
+                dropped: Vec::new(),
+                components: vec!["systemprompt.md".into()],
+                applied: Vec::new(),
+                dir: dir.path().join(label),
+                start: PathBuf::new(),
+                notes: String::new(),
+            }
+        };
+        let mut inv = run("inv-1", Kind::Invariant, true, &["a.py"], 6, 0);
+        inv.harness = "inv-1".into();
+        let mut dom = run("dom-1", Kind::Domain, false, &[], 6, 2);
+        dom.harness = "dom-1".into();
+        let mut comp = run("comp-1-run", Kind::Composed, true, &["a.py"], 6, 0);
+        comp.harness = "comp-1".into();
+        let record = Record {
+            runs: vec![run("base-1", Kind::Reference, false, &[], 6, 0), inv, dom, comp],
+            candidates: vec![
+                cand("inv-1", Kind::Invariant, "Run the full suite.\n"),
+                cand("dom-1", Kind::Domain, "Think about time zones.\n"),
+                cand("comp-1", Kind::Composed, "Run the full suite.\n"),
+            ],
+            ..Default::default()
+        };
+        let row = |candidates: &str, verdict: &str| library::EditRow {
+            component: "harness/systemprompt.md".into(),
+            candidates: candidates.into(),
+            verdict: verdict.into(),
+            ..Default::default()
+        };
+        let labels = |r: &library::EditRow| carriers(r, &record).iter().map(|c| c.label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels(&row("inv-1", "helped")), ["inv-1", "comp-1"], "the composer kept inv-1's bytes");
+        assert_eq!(labels(&row("dom-1", "hurt")), ["dom-1"]);
+        assert_eq!(labels(&row("", "helped")).len(), 3, "a row that names no candidate counts every edit to the file");
+        let helped = support(&row("inv-1", "helped"), &record);
+        assert_eq!((helped.agree, helped.against, helped.level()), (2, 0, "medium"), "dom-1's other edit is not against it");
+        assert_eq!(backed_rows(&[row("inv-1", "helped"), row("dom-1", "hurt")], &record).len(), 2);
     }
 
     #[test]

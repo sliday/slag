@@ -69,10 +69,11 @@ pub struct NewEntry<'a> {
     pub harness: &'a Path,
     pub lesson: &'a Lesson,
     pub rows: &'a [EditRow],
-    /// Candidate trees, by label, that carried an edit the lesson rests on
-    /// and were not adopted. An edit from a rejected candidate can be the
-    /// one that helped, and the library keeps it executable.
-    pub evidence: &'a [(String, PathBuf)],
+    /// Candidates that were not adopted but carried an edit that helped,
+    /// by label, with their harness tree and the components that helped.
+    /// An edit from a rejected candidate can be the one that helped, and
+    /// the library keeps those components executable, and only those.
+    pub evidence: &'a [(String, PathBuf, Vec<String>)],
     /// slag's own confidence, from the run counts and the measure that
     /// separated them; the entry's `confidence`, ahead of the reflector's.
     pub confidence: &'a str,
@@ -147,8 +148,9 @@ impl Library {
         }
         let dir = self.domain_dir(domain).join(&id);
         write_tree(&tree(entry.harness), &dir.join("harness"))?;
-        for (label, tree_dir) in entry.evidence {
-            write_tree(&tree(tree_dir), &dir.join("candidates").join(clean(label)))?;
+        for (label, tree_dir, components) in entry.evidence {
+            let kept = tree(tree_dir).into_iter().filter(|(p, _)| part_of(p, components)).collect();
+            write_tree(&kept, &dir.join("candidates").join(clean(label)))?;
         }
         std::fs::write(dir.join("EXPERIENCE.md"), experience_md(domain, entry))?;
         self.write_index(domain)?;
@@ -243,7 +245,9 @@ impl Library {
                             continue;
                         }
                         block_list.push(block);
-                        gave.push(path);
+                        if !gave.contains(&path) {
+                            gave.push(path);
+                        }
                     } else if path == super::HOOKS {
                         for line in text.lines().filter(|l| !l.trim().is_empty()) {
                             if hooks.iter().any(|h| h == line) {
@@ -462,12 +466,12 @@ fn experience_md(domain: &str, e: &NewEntry) -> String {
         "\n## Harness\n\nThe adopted harness is in `harness/`: {}.\n",
         super::Harness::load(e.harness).summary()
     ));
-    for (label, dir) in e.evidence {
+    for (label, _, components) in e.evidence {
         s.push_str(&format!(
-            "The lesson also rests on `{label}`, which was not adopted; its tree is in \
-             `candidates/{}/`: {}.\n",
+            "The lesson also rests on `{label}`, which was not adopted; the components of it that \
+             helped ({}) are in `candidates/{}/`.\n",
+            components.join(", "),
             clean(label),
-            super::Harness::load(dir).summary()
         ));
     }
     s
@@ -491,6 +495,12 @@ fn parse_entry(id: &str, dir: &Path, text: &str) -> Entry {
         lesson: field("lesson"),
         confidence: field("confidence"),
     }
+}
+
+/// Whether a harness file belongs to one of `components`: the file
+/// itself, or any file of the same recipe.
+fn part_of(path: &str, components: &[String]) -> bool {
+    components.iter().any(|c| c == path || recipe_name(c).is_some_and(|n| recipe_name(path).as_ref() == Some(&n)))
 }
 
 /// `recipes/<name>/...` names its recipe.
@@ -602,8 +612,10 @@ mod tests {
             "recipes/dates/RECIPE.md".to_string(),
             b"---\nname: dates\ndescription: load this when dates cross a month\n---\nCheck both months.\n".to_vec(),
         );
+        other.insert("recipes/dates/scripts/check.sh".to_string(), b"true\n".to_vec());
+        other.insert("guardrails.md".to_string(), b"Never touch the tests.\n".to_vec());
         write_tree(&other, &rejected).unwrap();
-        let evidence = vec![("dom-1".to_string(), rejected.clone())];
+        let evidence = vec![("dom-1".to_string(), rejected.clone(), vec!["recipes/dates/RECIPE.md".to_string()])];
         let entry = NewEntry {
             title: "export drops the last day",
             repository: "shop",
@@ -618,6 +630,8 @@ mod tests {
         let stored = lib.add("python", &entry).unwrap();
         assert!(stored.join("harness/recipes/ends/RECIPE.md").exists());
         assert!(stored.join("candidates/dom-1/recipes/dates/RECIPE.md").exists(), "a rejected candidate's backing edit is kept");
+        assert!(stored.join("candidates/dom-1/recipes/dates/scripts/check.sh").exists(), "with its recipe's scripts");
+        assert!(!stored.join("candidates/dom-1/guardrails.md").exists(), "a component that did not help stays behind");
         let exp = std::fs::read_to_string(stored.join("EXPERIENCE.md")).unwrap();
         assert!(exp.contains("cue: an issue reports a range") && exp.contains("verdict: helped"), "{exp}");
         assert!(exp.contains("candidates/dom-1/"), "{exp}");
@@ -625,7 +639,7 @@ mod tests {
         assert!(exp.contains("## What slag measured\n\n- recipes/dates/RECIPE.md helped"), "{exp}");
         let index = std::fs::read_to_string(lib.domain_dir("python").join("INDEX.md")).unwrap();
         assert!(index.contains("export-drops-the-last-day") && index.contains("recipe ends"), "{index}");
-        assert!(index.contains("candidates: dom-1 (recipe dates)"), "{index}");
+        assert!(index.contains("candidates: dom-1 (recipe dates") && !index.contains("guardrails"), "{index}");
         let listed = lib.entries("python");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].repository, "shop");
