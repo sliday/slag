@@ -1781,16 +1781,23 @@ pub(super) fn guard(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate what a writing session left, after one check of its own: a
-/// reply that spells out file writes as text while the tree did not
-/// change wrote nothing, which a model can mistake for done.
+/// Validate what a writing session left, after one check of its own: an
+/// unchanged tree is an answer only when the notes say KEEP_BASE. Notes
+/// that describe kept or adopted edits over an unchanged tree, or that
+/// spell out file writes as text, wrote nothing, which a model can
+/// mistake for done.
 async fn check_tree(edited: &Path, start: &Path, reply: &str) -> Result<Vec<String>, String> {
-    let pseudo = ["write_file(", "edit_file(", "functions.write_file", "functions.edit_file"];
-    if harness::tree(edited) == harness::tree(start) && pseudo.iter().any(|p| reply.contains(p)) {
-        return Err("the harness failed validation:\n- your reply spelled out write_file or edit_file calls \
-                    as text, and text changes nothing: call the write_file tool for each file you meant \
-                    to write, then reply with your notes"
-            .into());
+    if harness::tree(edited) == harness::tree(start) && !reply.contains("KEEP_BASE") {
+        let pseudo = ["write_file(", "edit_file(", "functions.write_file", "functions.edit_file"];
+        let why = if pseudo.iter().any(|p| reply.contains(p)) {
+            "your reply spelled out write_file or edit_file calls as text, and text changes nothing"
+        } else {
+            "your notes describe changes, and `context/harness/` is unchanged"
+        };
+        return Err(format!(
+            "the harness failed validation:\n- {why}: call the write_file tool for each file you mean to \
+             keep, then reply with your notes, or reply KEEP_BASE if no change is warranted"
+        ));
     }
     harness::validate::validate(edited).await
 }
@@ -2143,6 +2150,9 @@ mod tests {
         let err = check_tree(&edited, &start, reply).await.unwrap_err();
         assert!(headline(&err).contains("spelled out write_file"), "{err}");
         assert!(check_tree(&edited, &start, "<notes>KEEP_BASE</notes>").await.is_ok());
+        let claimed = "<notes>\nadopted -> recipes/x/RECIPE.md from dom-1 -> its run passed\n</notes>";
+        let err = check_tree(&edited, &start, claimed).await.unwrap_err();
+        assert!(headline(&err).contains("describe changes"), "{err}");
         std::fs::write(edited.join("memory.md"), "In this repository, tests use unittest.\n").unwrap();
         assert!(check_tree(&edited, &start, reply).await.is_ok(), "a changed tree is the validator's to judge");
     }
