@@ -63,7 +63,7 @@ The repo has three layers:
 
 ### Project Files the Pipeline Reads and Writes
 
-New commissions use gitignored `.slag/`. Projects with root `PLAN.md` or `PRD.md` keep the root layout. The `.slag/layout` marker pins the new layout.
+New commissions use gitignored `.slag/`. Slag stores its ignore patterns in `.git/info/exclude`. Language cache rules stay in `.gitignore`. Projects with root `PLAN.md` or `PRD.md` keep the root layout. The `.slag/layout` marker pins the new layout.
 
 | File | Role |
 |------|------|

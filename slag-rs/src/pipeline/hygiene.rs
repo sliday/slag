@@ -23,7 +23,8 @@ pub fn install_ignores(root: &Path, commission: Option<&str>) -> io::Result<()> 
         }
     }
     detect_stacks(root, 0, &mut 1_000, &mut stacks)?;
-    let mut patterns = vec!["/.slag/", "/logs/"];
+    install_local_ignores(root)?;
+    let mut patterns = Vec::new();
     if stacks[0] {
         patterns.extend([
             "__pycache__/",
@@ -59,7 +60,7 @@ pub fn install_ignores(root: &Path, commission: Option<&str>) -> io::Result<()> 
     for pattern in patterns {
         if body
             .lines()
-            .any(|line| line.trim() == pattern || pattern == "/logs/" && line.trim() == "logs/")
+            .any(|line| line.trim() == pattern)
         {
             continue;
         }
@@ -76,12 +77,88 @@ pub fn install_ignores(root: &Path, commission: Option<&str>) -> io::Result<()> 
     Ok(())
 }
 
+fn install_local_ignores(root: &Path) -> io::Result<()> {
+    let output = crate::engine::sandbox::git()
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        if String::from_utf8_lossy(&output.stderr).contains("not a git repository") {
+            return Ok(());
+        }
+        return Err(io::Error::other(String::from_utf8_lossy(&output.stderr)));
+    }
+    let relative = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+    let path = root.join(relative.trim());
+    let root = root.canonicalize()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("exclude has no parent"))?;
+    let mut ancestor = parent;
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| io::Error::other("exclude has no existing parent"))?;
+    }
+    let control = crate::engine::sandbox::git()
+        .args(["rev-parse", "--git-common-dir"]).current_dir(&root).output()?;
+    if !control.status.success() {
+        return Err(io::Error::other(String::from_utf8_lossy(&control.stderr)));
+    }
+    let control = String::from_utf8(control.stdout).map_err(io::Error::other)?;
+    let control = root.join(control.trim()).canonicalize()?;
+    let ancestor = ancestor.canonicalize()?;
+    if !ancestor.starts_with(&root) && !ancestor.starts_with(control) {
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if ["/.slag/", "/logs/"]
+            .iter()
+            .all(|pattern| existing.lines().any(|line| line.trim() == *pattern))
+        {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "local excludes leave the workspace",
+        ));
+    }
+    for part in parent.strip_prefix(&root).unwrap_or(parent).components() {
+        if matches!(part, Component::ParentDir) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local excludes leave the workspace",
+            ));
+        }
+    }
+    require_regular_ignore(&path)?;
+    let mut body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let original_len = body.len();
+    for pattern in ["/.slag/", "/logs/"] {
+        if body.lines().any(|line| line.trim() == pattern) {
+            continue;
+        }
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(pattern);
+        body.push('\n');
+    }
+    if body.len() != original_len {
+        std::fs::create_dir_all(parent)?;
+        require_regular_ignore(&path)?;
+        std::fs::write(path, body)?;
+    }
+    Ok(())
+}
 fn require_regular_ignore(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(()),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "cannot update a symlink or nonregular .gitignore",
+            "cannot update a symlink or nonregular ignore file",
         )),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -363,6 +440,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn coordinator_ignores_stay_local_and_language_rules_remain_portable() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]);
+        install_ignores(root.path(), Some("Python CLI")).unwrap();
+        let ignore = std::fs::read_to_string(root.path().join(".gitignore")).unwrap();
+        assert!(ignore.contains("__pycache__/"));
+        assert!(!ignore.contains(".slag"));
+        assert!(!ignore.contains("logs"));
+        let exclude = root.path().join(".git/info/exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        assert!(first.lines().any(|line| line == "/.slag/"));
+        assert!(first.lines().any(|line| line == "/logs/"));
+        install_ignores(root.path(), Some("Python CLI")).unwrap();
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), first);
+        std::fs::create_dir(root.path().join(".slag")).unwrap();
+        std::fs::write(root.path().join(".slag/PLAN.md"), "state").unwrap();
+        std::fs::create_dir(root.path().join("logs")).unwrap();
+        std::fs::write(root.path().join("logs/trace"), "state").unwrap();
+        git(
+            root.path(),
+            &["check-ignore", ".slag/PLAN.md", "logs/trace"],
+        );
+    }
+
+    #[test]
+    fn local_excludes_support_separate_git_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]);
+        let control = config.path().join("git-metadata");
+        std::fs::rename(root.path().join(".git"), &control).unwrap();
+        std::fs::write(root.path().join(".git"), format!("gitdir: {}\n", control.display())).unwrap();
+        install_ignores(root.path(), None).unwrap();
+        let exclude = std::fs::read_to_string(control.join("info/exclude")).unwrap();
+        assert!(exclude.lines().any(|line| line == "/.slag/"));
+        assert!(exclude.lines().any(|line| line == "/logs/"));
+    }
+
+    #[test]
+    fn language_neutral_commissions_create_only_local_excludes() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]);
+        install_ignores(root.path(), Some("write a greeting")).unwrap();
+        assert!(!root.path().join(".gitignore").exists());
+        assert!(root.path().join(".git/info/exclude").is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_excludes_refuse_symlinks_and_external_parents() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]);
+        let target = outside.path().join("exclude");
+        std::fs::write(&target, "preserve\n").unwrap();
+        let exclude = root.path().join(".git/info/exclude");
+        std::fs::remove_file(&exclude).unwrap();
+        symlink(&target, &exclude).unwrap();
+        assert_eq!(
+            install_ignores(root.path(), None).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(&exclude).unwrap();
+        std::fs::remove_dir(root.path().join(".git/info")).unwrap();
+        symlink(outside.path(), root.path().join(".git/info")).unwrap();
+        assert_eq!(
+            install_ignores(root.path(), None).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve\n");
+    }
     #[test]
     fn commission_detects_the_stack_before_files_exist() {
         for (commission, expected) in [

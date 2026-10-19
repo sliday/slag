@@ -147,7 +147,7 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
     flux.push_str("\n\nVERIFICATION CONTRACT: The independent reviewer runs the suite and CLI with a read-only filesystem. \
         Use in-memory data or committed fixtures under tests/fixtures. Create fixture files during construction, before verification. Tests must not create or delete workspace fixtures. \
         Use subprocess CLI tests to exercise each named flag and behavior. Assert exact expected results, not only exit codes or output shapes. Keep scratch files in TMPDIR, not the product tree. \
-        For package installation, prepare a project virtual environment before review; never use global pip or bypass PEP 668. \
+        The documented suite must pass from a fresh clone without prior installation. Use source or module launches in tests, not an installed console command. For package installation probes, prepare a project virtual environment before review; never use global pip or bypass PEP 668. \
         For named reference tools, check the requested behavior against the reference instead of guessing fixture expectations. \
         Inspect a failing assertion and its input before changing code or tests. Never change expectations just to fit the implementation.\n\n");
 
@@ -386,8 +386,9 @@ const DELIVERY_RULES: &str = "\
     Document the intended launch and test commands.\n\
     Include the local modules, dependency declarations, and configuration needed for that command.\n\
     For a package deliverable, include the metadata needed for its intended installation or distribution.\n\
-    Check one suitable launch method, such as a console entry point or python -m.\n\
-    Do not require multiple launch methods unless the commission asks for them.\n\
+    A Python package CLI supports its installed console script and python -m PACKAGE through __main__.py.\n\
+    File/text CLIs accept stdin without a file and with literal -. Named top-N arguments support FILE N and a flag.\n\
+    The documented full suite passes from a fresh clone without prior installation.\n\
     Require installation only when the commission or its stated invocation requires it.\n\
     Do not require a packaging format, a publish step, or a fixed test count without that requirement.";
 
