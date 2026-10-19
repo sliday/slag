@@ -15,6 +15,8 @@
     --foreground0: #c7c7c7;
     --foreground1: #6b7385;
     --foreground2: #4f5b66;
+    /* Body copy on --background0 at 6.4:1 (AA); --foreground1 stays the palette's dim gray */
+    --text-dim: #8a93a6;
 
     /* Border colors */
     --box-border-color: #6b7385;
@@ -157,7 +159,7 @@ a:hover {
 
 .disclaimer {
   margin-top: 1lh;
-  color: var(--foreground1);
+  color: var(--text-dim);
   font-size: 0.8125rem;
   line-height: 1.5;
 }
@@ -191,9 +193,16 @@ a:hover {
   color: var(--slag-bright);
 }
 
+/* The header's sparks burst past its edge on purpose; keep them from
+   widening the page on phones. clip, unlike hidden, adds no scroll container. */
+html, body {
+  overflow-x: clip;
+}
+
 /* Pipeline diagrams */
 .diagram pre {
   padding: 2ch;
+  white-space: pre;
   overflow-x: auto;
   font-size: 0.8125rem;
   line-height: 1.4;
@@ -231,7 +240,7 @@ a:hover {
 
 .phase-desc {
   margin-top: 0.5lh;
-  color: var(--foreground1);
+  color: var(--text-dim);
   line-height: 1.5;
 }
 
@@ -253,7 +262,7 @@ a:hover {
 
 .decisions p {
   margin-top: 0.5lh;
-  color: var(--foreground1);
+  color: var(--text-dim);
   line-height: 1.5;
 }
 
@@ -351,7 +360,7 @@ a:hover {
 }
 
 .footer a {
-  color: var(--slag-cold);
+  color: var(--text-dim);
 }
 
 .footer a:hover {

@@ -62,8 +62,8 @@
 
         <!-- Logo - div instead of pre (no gray bg) -->
         <div class="hero-logo"><span style="color: var(--slag-cold);">░░░</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-pure);">█</span>  <span style="color: var(--slag-pure); font-weight: bold;">SLAG</span>  <span style="color: var(--slag-pure);">█</span><span style="color: var(--slag-bright);">▓</span><span style="color: var(--slag-hot);">▒</span><span style="color: var(--slag-warm);">▒</span><span style="color: var(--slag-cold);">░░░</span></div>
-        <p style="color: var(--slag-pure); margin-top: 1lh; font-size: 1.1rem; font-weight: bold; text-align: center; position: relative; z-index: 1;">Fix issues fast, with any model.</p>
-        <p style="margin-top: 0.5lh; color: var(--foreground1); text-align: center; position: relative; z-index: 1;">Point slag at an issue. It writes a regression test, fixes the code, and proves the fix with your own tests. You review one commit on a branch, or a draft PR with <code>--pr</code>. One flag picks the provider. Hand it a sentence instead and it forges a whole project in proof-gated ingots.</p>
+        <h1 style="color: var(--slag-pure); margin-top: 1lh; font-size: clamp(1.4rem, 3.2vw, 2rem); line-height: 1.2; text-align: center; position: relative; z-index: 1;">Fix issues fast, with any model.</h1>
+        <p style="margin-top: 0.5lh; color: var(--text-dim); text-align: center; position: relative; z-index: 1;">Point slag at an issue. It writes a regression test, fixes the code, and proves the fix with your own tests. You review one commit on a branch, or a draft PR with <code>--pr</code>. One flag picks the provider. Hand it a sentence instead and it forges a whole project in proof-gated ingots.</p>
         <figure class="hero-video">
           <video id="hero-video" autoplay muted loop playsinline preload="metadata" poster="/media/slag-hero-poster.webp" width="1600" height="900" aria-label="Demo, 29 seconds, no sound, recorded from real slag 2.9.0 runs. slag fix &quot;Leaderboard order is wrong&quot; runs the tests, writes a regression test, fixes the code, shows the new test fails without the fix, and commits on a branch: FIXED in 1 attempt, wall 4 seconds. slag key --provider shows each preset&#39;s default models, and SLAG_MODEL_PLAN=openai::gpt-4.1-mini moves the plan role to OpenAI. slag &quot;a tested Python greet() function&quot; --temper 1: the warden sends back the plan, the ingot forges, and the warden then rejects the goal because pip install fails, and names the next command.">
             <source src="/media/slag-hero.webm" type='video/webm; codecs="vp9"' />
@@ -543,7 +543,7 @@
         <div class="temp-bar" style="margin-top:0; margin-bottom: 0.5lh;">
           <span style="color: var(--slag-cold);">&#x25B1;&#x25B1;&#x25B1;</span><span style="color: var(--slag-warm);">&#x25B0;</span><span style="color: var(--slag-hot);">&#x25B0;</span><span style="color: var(--slag-bright);">&#x25B0;</span><span style="color: var(--slag-pure);">&#x25B0;</span>
         </div>
-        <p style="color: var(--foreground2);">
+        <p style="color: var(--text-dim);">
           <a href="https://github.com/sliday/slag">GitHub</a>
           &middot;
           <a href="https://github.com/sliday/slag/releases/latest">Releases</a>
