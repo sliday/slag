@@ -28,6 +28,7 @@ fn outcome(verdict: Verdict) -> Outcome {
         commit: ok.then(|| "0f6ac66".into()),
         pr: None,
         notes: vec!["a note".into()],
+        files: vec![],
         phases: Phases::default(),
         time: Some("wall 4s · api 4s · tools 0s".into()),
         spend: Some("$0.01".into()),
