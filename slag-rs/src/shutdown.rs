@@ -107,7 +107,7 @@ pub fn run_all() -> usize {
 /// molten, so a clean finish never rewrites the file.
 pub fn register_crucible_rescue() {
     register(|| {
-        let path = std::path::Path::new(crate::config::CRUCIBLE);
+        let path = std::path::Path::new(crate::config::project_path(crate::config::CRUCIBLE));
         if !path.exists() {
             return;
         }

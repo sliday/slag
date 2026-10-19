@@ -44,11 +44,11 @@ pub fn attempt_key(id: &str, heat: u8) -> String {
 }
 
 fn manifest_path(root: &Path, key: &str) -> PathBuf {
-    root.join(CHECKPOINT_DIR).join(format!("{key}.jsonl"))
+    crate::config::project_path_in(root, CHECKPOINT_DIR).join(format!("{key}.jsonl"))
 }
 
 fn objects_dir(root: &Path) -> PathBuf {
-    root.join(CHECKPOINT_DIR).join("objects")
+    crate::config::project_path_in(root, CHECKPOINT_DIR).join("objects")
 }
 
 /// Per-attempt checkpoint recorder. Cheap to build; safe to build many
@@ -102,7 +102,7 @@ impl Checkpoint {
             .to_string_lossy()
             .into_owned();
         // Never checkpoint the checkpoint store or the slag heap itself.
-        if rel.starts_with("logs/") || rel.starts_with("logs\\") {
+        if rel.starts_with("logs/") || rel.starts_with("logs\\") || rel.starts_with(".slag/") {
             return;
         }
         // Never checkpoint the orchestrator's own state files: a rewind
@@ -234,7 +234,7 @@ fn rewind_attempt_key(root: &Path, key: &str) -> usize {
 /// Rewind the most recently written attempt manifest (the `slag rewind`
 /// default). Returns (attempt key, files restored) when one exists.
 pub fn rewind_latest(root: &Path) -> Option<(String, usize)> {
-    let dir = root.join(CHECKPOINT_DIR);
+    let dir = crate::config::project_path_in(root, CHECKPOINT_DIR);
     let mut newest: Option<(std::time::SystemTime, String)> = None;
     for entry in std::fs::read_dir(&dir).ok()? {
         let Ok(entry) = entry else { continue };

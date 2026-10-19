@@ -15,12 +15,12 @@ use crate::tui;
 pub async fn extend(smith: &dyn Smith) -> Result<usize, SlagError> {
     tui::header("FOUNDER · extending mold");
 
-    let ore = std::fs::read_to_string(ORE_FILE).map_err(|_| SlagError::NoOre)?;
+    let ore = std::fs::read_to_string(crate::config::project_path(ORE_FILE)).map_err(|_| SlagError::NoOre)?;
     let blueprint =
-        std::fs::read_to_string(BLUEPRINT).unwrap_or_else(|_| "No blueprint".into());
+        std::fs::read_to_string(crate::config::project_path(BLUEPRINT)).unwrap_or_else(|_| "No blueprint".into());
     let addendum = latest_addendum(&ore);
 
-    let crucible_path = std::path::PathBuf::from(CRUCIBLE);
+    let crucible_path = std::path::PathBuf::from(crate::config::project_path(CRUCIBLE));
     let mut crucible = Crucible::load(&crucible_path)?;
     let done = crucible
         .ingots
@@ -89,9 +89,9 @@ pub async fn run_with_guidance(
 ) -> Result<(), SlagError> {
     tui::header("FOUNDER · casting mold");
 
-    let ore = std::fs::read_to_string(ORE_FILE)
+    let ore = std::fs::read_to_string(crate::config::project_path(ORE_FILE))
         .map_err(|_| SlagError::NoOre)?;
-    let blueprint = std::fs::read_to_string(BLUEPRINT)
+    let blueprint = std::fs::read_to_string(crate::config::project_path(BLUEPRINT))
         .unwrap_or_else(|_| "No blueprint".into());
 
     let mut prompt = with_briefing_rules(&flux::founder_prompt(&ore, &blueprint));
@@ -132,7 +132,7 @@ pub async fn run_with_guidance(
     }
 
     // Create crucible
-    let crucible_path = std::path::PathBuf::from(CRUCIBLE);
+    let crucible_path = std::path::PathBuf::from(crate::config::project_path(CRUCIBLE));
     let crucible = Crucible::new(&crucible_path, ingots.clone());
     crucible.save()?;
 
@@ -214,7 +214,7 @@ fn parse_new_ingots(raw: &str) -> Vec<crate::sexp::Ingot> {
 
 fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
+    let path = format!("{}/{ts}_{label}.log", crate::config::project_path(crate::config::LOG_DIR));
     let _ = std::fs::write(&path, content);
 }
 

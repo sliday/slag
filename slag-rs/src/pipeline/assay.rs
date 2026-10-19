@@ -15,7 +15,7 @@ pub fn show() -> Result<(), SlagError> {
     if tui::is_quiet() {
         return Ok(());
     }
-    let crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    let crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
     let counts = crucible.counts();
 
     tui::header("ASSAY");
@@ -86,19 +86,19 @@ pub fn show() -> Result<(), SlagError> {
     println!(
         "\n  {}blueprint: {}{}",
         super::fg(tui::COLD),
-        crate::config::BLUEPRINT,
+        crate::config::project_path(crate::config::BLUEPRINT),
         super::reset()
     );
     println!(
         "  {}crucible:  {}{}",
         super::fg(tui::COLD),
-        crate::config::CRUCIBLE,
+        crate::config::project_path(crate::config::CRUCIBLE),
         super::reset()
     );
     println!(
         "  {}slag heap: {}{}",
         super::fg(tui::COLD),
-        crate::config::LOG_DIR,
+        crate::config::project_path(crate::config::LOG_DIR),
         super::reset()
     );
 

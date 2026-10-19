@@ -805,7 +805,7 @@ pub fn run_id_for_plan(plan: &str) -> String {
 /// be "default" and the whole first invocation's spend (surveyor +
 /// founder included) would be lost to resumes.
 fn current_run_id() -> String {
-    run_id_for_plan(&std::fs::read_to_string(CRUCIBLE).unwrap_or_default())
+    run_id_for_plan(&std::fs::read_to_string(crate::config::project_path(CRUCIBLE)).unwrap_or_default())
 }
 
 /// "default" (no `;; CRUCIBLE` header on disk) is not a job identity:
@@ -1748,7 +1748,7 @@ pub async fn run(
     // is recomputed at every save: on a fresh commission the crucible
     // does not exist yet at this point, and its header (and so the id)
     // only appears once the founder writes PLAN.md.
-    let plan = std::fs::read_to_string(CRUCIBLE).unwrap_or_default();
+    let plan = std::fs::read_to_string(crate::config::project_path(CRUCIBLE)).unwrap_or_default();
     let run_id = run_id_for_plan(&plan);
     let plan_total =
         plan.lines().filter(|l| l.trim_start().starts_with("(ingot ")).count();
@@ -1756,7 +1756,7 @@ pub async fn run(
         // Phases announced before this view attached are already history.
         phase_gen: tui::phase().0,
         started: Some(Instant::now()),
-        commission: std::fs::read_to_string(crate::config::ORE_FILE)
+        commission: std::fs::read_to_string(crate::config::project_path(crate::config::ORE_FILE))
             .ok()
             .and_then(|prd| commission_line(&prd)),
         ..Default::default()
@@ -1808,12 +1808,12 @@ struct PlanWatch {
 
 impl PlanWatch {
     fn changed(&mut self) -> Option<String> {
-        let modified = std::fs::metadata(CRUCIBLE).and_then(|m| m.modified()).ok()?;
+        let modified = std::fs::metadata(crate::config::project_path(CRUCIBLE)).and_then(|m| m.modified()).ok()?;
         if self.seen == Some(modified) {
             return None;
         }
         self.seen = Some(modified);
-        std::fs::read_to_string(CRUCIBLE).ok()
+        std::fs::read_to_string(crate::config::project_path(CRUCIBLE)).ok()
     }
 }
 

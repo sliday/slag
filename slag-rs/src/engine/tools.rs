@@ -1274,7 +1274,8 @@ impl ToolBox {
     async fn spawn_background(&self, command: &str) -> Result<String, SlagError> {
         static BG_SEQ: AtomicU64 = AtomicU64::new(1);
         let id = format!("bg-{}", BG_SEQ.fetch_add(1, Ordering::Relaxed));
-        let rel = format!("{BG_LOG_DIR}/{id}.log");
+        let dir = crate::config::project_path_in(&self.root, BG_LOG_DIR);
+        let rel = format!("{}/{id}.log", dir.strip_prefix(&self.root).unwrap().display());
         let log_path = self.root.join(&rel);
         if let Some(parent) = log_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -1331,7 +1332,7 @@ impl ToolBox {
 
     fn is_heap_path(&self, path: &Path) -> bool {
         let Ok(relative) = path.strip_prefix(&self.root) else { return false };
-        relative.starts_with("logs") || relative.components().any(|c| {
+        (relative.starts_with("logs") || relative.starts_with(".slag")) || relative.components().any(|c| {
             let name = c.as_os_str().to_string_lossy();
             name == ".git" || name.starts_with("slag-anvil-")
         })
@@ -1346,16 +1347,16 @@ impl ToolBox {
             .collect::<Vec<_>>();
         let mut rg = String::new();
         let mut prune = Vec::new();
-        for (name, pattern) in [("logs", "/logs/**"), (".git", ".git"), ("slag-anvil-", "slag-anvil-*")] {
+        for (name, pattern) in [("logs", "/logs/**"), (".slag", "/.slag/**"), (".git", ".git"), ("slag-anvil-", "slag-anvil-*")] {
             let explicit = names.iter().any(|n| {
                 if name == "slag-anvil-" { n.starts_with(name) } else { n == name }
             });
-            if explicit || (name == "logs" && target != self.root) {
+            if explicit || (matches!(name, "logs" | ".slag") && target != self.root) {
                 continue;
             }
             rg.push_str(&format!(" -g {}", sh_quote(&format!("!{pattern}"))));
-            prune.push(if name == "logs" {
-                "-path './logs'".to_string()
+            prune.push(if matches!(name, "logs" | ".slag") {
+                format!("-path './{name}'")
             } else {
                 format!("-name {}", sh_quote(pattern))
             });
@@ -1544,7 +1545,7 @@ impl ToolBox {
             .chain(Path::new(pattern).components())
             .any(|component| {
                 let name = component.as_os_str().to_string_lossy();
-                name == "logs" || name == ".git" || name.starts_with("slag-anvil-")
+                name == "logs" || name == ".slag" || name == ".git" || name.starts_with("slag-anvil-")
             });
         let mut files = Vec::new();
         let mut stack = vec![(dir.to_path_buf(), PathBuf::new())];
@@ -1555,7 +1556,7 @@ impl ToolBox {
                 let path = entry.path();
                 let name = entry.file_name();
                 let child = relative.join(&name);
-                let hidden_heap = name == ".git" || name.to_string_lossy().starts_with("slag-anvil-");
+                let hidden_heap = name == ".git" || name == ".slag" || name.to_string_lossy().starts_with("slag-anvil-");
                 if path.is_dir() {
                     let hidden_dir = (relative.as_os_str().is_empty() && name == "logs") || hidden_heap;
                     if !hidden_dir || explicit {
@@ -1590,10 +1591,10 @@ impl ToolBox {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         full.hash(&mut hasher);
         let name = format!("{:016x}.txt", hasher.finish());
-        let dir = self.root.join(TOOL_RESULT_DIR);
+        let dir = crate::config::project_path_in(&self.root, TOOL_RESULT_DIR);
         tokio::fs::create_dir_all(&dir).await.ok()?;
         tokio::fs::write(dir.join(&name), full).await.ok()?;
-        Some(format!("{TOOL_RESULT_DIR}/{name}"))
+        Some(format!("{}/{name}", dir.strip_prefix(&self.root).ok()?.display()))
     }
 
     /// Load a recipe's full RECIPE.md by name. Workspace recipes resolve
@@ -4543,7 +4544,7 @@ Collecting\n\
     #[tokio::test]
     async fn broad_file_searches_skip_the_heap_but_keep_application_logs() {
         let (dir, tb) = setup();
-        for name in ["logs", "src/logs", "nested/slag-anvil-i1", ".git/worktrees"] {
+        for name in ["logs", ".slag", "src/logs", "nested/slag-anvil-i1", ".git/worktrees"] {
             std::fs::create_dir_all(dir.path().join(name)).unwrap();
             write(&dir, &format!("{name}/needle.txt"), "needle\n");
         }
@@ -4561,6 +4562,7 @@ Collecting\n\
             assert!(!out.output.lines().any(|l| l.starts_with("logs/")), "{}", out.output);
             assert!(!out.output.contains("slag-anvil-i1"), "{}", out.output);
             assert!(!out.output.contains(".git/"), "{}", out.output);
+            assert!(!out.output.contains(".slag/"), "{}", out.output);
         }
     }
 

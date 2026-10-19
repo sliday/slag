@@ -13,6 +13,58 @@ pub const ALLOY_FILE: &str = "AGENTS.md";
 pub const LEDGER: &str = "PROGRESS.md";
 pub const LOG_DIR: &str = "logs";
 
+pub fn prepare_project() -> std::io::Result<()> {
+    if std::path::Path::new(CRUCIBLE).exists() || std::path::Path::new(ORE_FILE).exists() {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(".slag") {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "the .slag directory must be a regular workspace directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(".slag"),
+        Err(e) => Err(e),
+    }?;
+    match std::fs::symlink_metadata(".slag/layout") {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "the .slag layout marker must be a regular file")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::write(".slag/layout", "1\n"),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn project_path(name: &'static str) -> &'static str {
+    project_relative(std::path::Path::new("."), name)
+}
+
+pub fn project_path_in(root: &std::path::Path, name: &'static str) -> PathBuf {
+    root.join(project_relative(root, name))
+}
+
+fn project_relative(root: &std::path::Path, name: &'static str) -> &'static str {
+    let marked = std::fs::symlink_metadata(root.join(".slag/layout"))
+        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
+    if !marked && (root.join(CRUCIBLE).exists() || root.join(ORE_FILE).exists() || !root.join(".slag").is_dir()) {
+        return name;
+    }
+    match name {
+        BLUEPRINT => ".slag/BLUEPRINT.md",
+        CRUCIBLE => ".slag/PLAN.md",
+        ORE_FILE => ".slag/PRD.md",
+        ALLOY_FILE => ".slag/AGENTS.md",
+        LEDGER => ".slag/PROGRESS.md",
+        "BAR.md" => ".slag/BAR.md",
+        LOG_DIR => ".slag/logs",
+        "logs/checkpoints" => ".slag/logs/checkpoints",
+        "logs/transcripts" => ".slag/logs/transcripts",
+        "logs/facets" => ".slag/logs/facets",
+        "logs/bg" => ".slag/logs/bg",
+        "logs/tool-results" => ".slag/logs/tool-results",
+        _ => name,
+    }
+}
+
+
 /// Behavior constants
 pub const MAX_ANVILS: usize = 3;
 pub const HIGH_GRADE: u8 = 3;
@@ -2356,5 +2408,41 @@ openrouter_api_key = "old-key"
         );
 
         clear_engine_env();
+    }
+}
+
+#[cfg(test)]
+mod project_paths_tests {
+    use super::*;
+
+    #[test]
+    fn new_layout_resolves_coordination_and_logs_under_slag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".slag")).unwrap();
+        for name in [ORE_FILE, BLUEPRINT, CRUCIBLE, ALLOY_FILE, LEDGER, "BAR.md", LOG_DIR] {
+            assert_eq!(project_path_in(dir.path(), name), dir.path().join(".slag").join(name));
+        }
+    }
+
+    #[test]
+    fn layout_marker_keeps_new_paths_after_a_root_plan_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".slag")).unwrap();
+        std::fs::write(dir.path().join(".slag/layout"), "1\n").unwrap();
+        std::fs::write(dir.path().join(CRUCIBLE), "stale root plan").unwrap();
+        assert_eq!(project_path_in(dir.path(), CRUCIBLE), dir.path().join(".slag/PLAN.md"));
+        assert_eq!(project_path_in(dir.path(), LOG_DIR), dir.path().join(".slag/logs"));
+    }
+
+    #[test]
+    fn root_plan_or_ore_keeps_legacy_layout_with_existing_slag_directory() {
+        for marker in [CRUCIBLE, ORE_FILE] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".slag")).unwrap();
+            std::fs::write(dir.path().join(marker), "legacy").unwrap();
+            for name in [ORE_FILE, BLUEPRINT, CRUCIBLE, ALLOY_FILE, LEDGER, "BAR.md", LOG_DIR] {
+                assert_eq!(project_path_in(dir.path(), name), dir.path().join(name));
+            }
+        }
     }
 }

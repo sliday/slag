@@ -83,8 +83,8 @@ pub struct Report {
 /// Aggregate every `logs/*.jsonl` under `root`, using cached facets
 /// unless `refresh`.
 pub fn gather(root: &Path, refresh: bool) -> Report {
-    let log_dir = root.join(crate::config::LOG_DIR);
-    let facet_dir = root.join(FACET_DIR);
+    let log_dir = crate::config::project_path_in(root, crate::config::LOG_DIR);
+    let facet_dir = crate::config::project_path_in(root, FACET_DIR);
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&log_dir)
         .ok()
         .into_iter()

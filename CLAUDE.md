@@ -18,8 +18,8 @@ The repo has three layers:
 
 ### 4-Phase Pipeline
 
-1. **SURVEYOR**: Reads `PRD.md` (ore), produces `BLUEPRINT.md` on the plan model
-2. **FOUNDER**: Reads blueprint, generates S-expression ingots in `PLAN.md`
+1. **SURVEYOR**: Reads `.slag/PRD.md` (ore), produces `.slag/BLUEPRINT.md` on the plan model
+2. **FOUNDER**: Reads blueprint, generates S-expression ingots in `.slag/PLAN.md`
 3. **FORGE**: Picks ore, runs an agent session with tools, verifies with `:proof`, commits on pass
 4. **ASSAY**: Final report with pass/fail status. `pipeline::run` calls it on every outcome except `Cancelled`, so a cracked run still prints its counts.
 
@@ -63,14 +63,17 @@ The repo has three layers:
 
 ### Project Files the Pipeline Reads and Writes
 
+New commissions use gitignored `.slag/`. Projects with root `PLAN.md` or `PRD.md` keep the root layout. The `.slag/layout` marker pins the new layout.
+
 | File | Role |
 |------|------|
-| `PRD.md` | Requirements input (ore) |
-| `BLUEPRINT.md` | Surveyor analysis output |
-| `PLAN.md` | Ingot crucible (task list) |
-| `AGENTS.md` | Scratch notes. `pipeline/mod.rs` writes the one-line `## Alloy Recipes` stub; `flux.rs` reads it into every ingot prompt, not the survey/found/re-smelt ones. No code appends to it. |
-| `PROGRESS.md` | Work history ledger |
-| `logs/` | Debug logs (slag heap) |
+| `.slag/PRD.md` | Requirements input (ore) |
+| `.slag/BLUEPRINT.md` | Surveyor analysis output |
+| `.slag/PLAN.md` | Ingot crucible (task list) |
+| `.slag/AGENTS.md` | Coordinator scratch notes. The coordinator creates a `## Alloy Recipes` stub. Forge prompts read this file. |
+| `.slag/BAR.md` | Acceptance criteria and required checks |
+| `.slag/PROGRESS.md` | Work history ledger |
+| `.slag/logs/` | Debug logs (slag heap) |
 | `recipes/<name>/RECIPE.md` | The recipes proper (`engine/recipes.rs`): frontmatter-fenced markdown discovered under `<root>/recipes/` and the config dir, indexed into the prompt and loadable by name |
 
 ### Configuration

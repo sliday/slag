@@ -641,7 +641,7 @@ impl Echo {
     /// The blueprint's opening, enough to recognise it: its first lines of
     /// prose, clipped, and how much more there is.
     fn excerpt(&mut self, out: &mut Vec<String>) {
-        let path = self.blueprint_head.take().unwrap_or_else(|| crate::config::BLUEPRINT.to_string());
+        let path = self.blueprint_head.take().unwrap_or_else(|| crate::config::project_path(crate::config::BLUEPRINT).to_string());
         let Some(doc) = &self.blueprint else {
             out.push(self.labelled("◆", PURE, "blueprint", &path));
             return;
@@ -804,8 +804,8 @@ impl Echo {
         if let (Some(b), Some(h)) = (&stats.branch, &stats.head) {
             work.push(format!("{b} @ {h}"));
         }
-        work.push(format!("{}/", crate::config::LOG_DIR));
-        work.push(crate::config::CRUCIBLE.to_string());
+        work.push(format!("{}/", crate::config::project_path(crate::config::LOG_DIR)));
+        work.push(crate::config::project_path(crate::config::CRUCIBLE).to_string());
         out.push(self.fact("work", &work.join(" · ")));
 
         // What it took.
@@ -855,7 +855,7 @@ impl Echo {
 /// and the run's own figures. The dashboard's alternate screen took the
 /// in-run assay with it, so the caller prints this after it closes.
 pub fn assay_report(width: usize) -> Vec<String> {
-    let Ok(plan) = std::fs::read_to_string(crate::config::CRUCIBLE) else {
+    let Ok(plan) = std::fs::read_to_string(crate::config::project_path(crate::config::CRUCIBLE)) else {
         return Vec::new();
     };
     let stats = Stats::capture();

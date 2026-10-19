@@ -72,7 +72,7 @@ fn load_instruction(path: &str, missing: &str, body: &Option<FileBody>) -> Strin
 /// Metadata only: the size question never costs a second read of a file
 /// the flux is already loading.
 pub fn oversized_instructions() -> Vec<String> {
-    oversized_instructions_in(&[BLUEPRINT, ALLOY_FILE, CRUCIBLE])
+    oversized_instructions_in(&[crate::config::project_path(BLUEPRINT), crate::config::project_path(ALLOY_FILE), crate::config::project_path(CRUCIBLE)])
 }
 
 fn oversized_instructions_in(paths: &[&str]) -> Vec<String> {
@@ -93,9 +93,9 @@ fn oversized_instructions_in(paths: &[&str]) -> Vec<String> {
 /// Build the prompt (flux) for striking an ingot.
 /// Includes the task, blueprint, project rules, and a compact plan state.
 pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
-    let blueprint = load_instruction(BLUEPRINT, "None", &read_instruction(BLUEPRINT));
-    let alloy = load_instruction(ALLOY_FILE, "None yet", &read_instruction(ALLOY_FILE));
-    let crucible = compact_plan(&std::fs::read_to_string(CRUCIBLE).unwrap_or_default());
+    let blueprint = load_instruction(BLUEPRINT, "None", &read_instruction(crate::config::project_path(BLUEPRINT)));
+    let alloy = load_instruction(ALLOY_FILE, "None yet", &read_instruction(crate::config::project_path(ALLOY_FILE)));
+    let crucible = compact_plan(&std::fs::read_to_string(crate::config::project_path(CRUCIBLE)).unwrap_or_default());
     let override_header = INSTRUCTION_OVERRIDE_HEADER;
 
     let complex_note = if ingot.grade >= HIGH_GRADE {
@@ -130,7 +130,7 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         === PLAN STATE (read only) ===\n\
         {crucible}\n\
         \n\
-        slag owns PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/.\n\
+        slag owns .slag/ and legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/.\n\
         Do not write, restore, remove, or commit these paths. Do not run git commands.\n\
         Ignore coordinator files and generated caches when you inspect cleanliness.\n\n",
         id = ingot.id,
@@ -209,15 +209,15 @@ pub fn spend_note(record: Option<&crate::dashboard::CostRecord>) -> String {
 
 /// Reload the persisted whole-job spend for the current crucible.
 fn session_spend() -> String {
-    let plan = std::fs::read_to_string(CRUCIBLE).unwrap_or_default();
+    let plan = std::fs::read_to_string(crate::config::project_path(CRUCIBLE)).unwrap_or_default();
     let run_id = crate::dashboard::run_id_for_plan(&plan);
     spend_note(crate::dashboard::load_session_cost(&run_id).as_ref())
 }
 
 /// Build the re-smelt analysis prompt for a cracked ingot
 pub fn prepare_resmelt_flux(ingot: &Ingot, failure_logs: &str) -> String {
-    let blueprint = load_instruction(BLUEPRINT, "None", &read_instruction(BLUEPRINT));
-    let crucible = load_instruction(CRUCIBLE, "Empty", &read_instruction(CRUCIBLE));
+    let blueprint = load_instruction(BLUEPRINT, "None", &read_instruction(crate::config::project_path(BLUEPRINT)));
+    let crucible = load_instruction(CRUCIBLE, "Empty", &read_instruction(crate::config::project_path(CRUCIBLE)));
     let git_state = git_log_and_diff();
     let spend = session_spend();
 
@@ -485,7 +485,7 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          Do not edit files. Do not install packages. Do not run git commands.\n\
          Judge the stated sub-goal. Add no features, test counts, naming rules, or bans on normal project imports.\n\
          {DELIVERY_RULES}\n\
-         Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\n\
+         Ignore .slag/, legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\n\
          Judge only this sub-goal. Work outside it is not your concern, and \
          a gap you name that belongs to another ingot wastes a heat here.\n\n\
          Name ONE gap: the biggest that still matters for THIS sub-goal.\n\n\
@@ -522,7 +522,7 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          Judge the commission's stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
          {DELIVERY_RULES}\n\
          Add no features, test counts, naming rules, or bans on normal project imports.\n\
-         Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\
+         Ignore .slag/, legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\
          Name one unmet requirement if the artifact fails. Cite the command output or source that proves your verdict.\n\
          Return unverified if you cannot inspect the artifact or verify a required behavior.\n\n\
          Tool results include their tool-call IDs. Cite only IDs from successful inspection results.\n\
@@ -729,7 +729,7 @@ pub fn profile() -> String {
     ]
     .into_iter()
     .filter(|(path, _)| {
-        std::fs::read_to_string(path).is_ok_and(|c| !c.trim().is_empty())
+        std::fs::read_to_string(crate::config::project_path(path)).is_ok_and(|c| !c.trim().is_empty())
     })
     .map(|(_, label)| label)
     .collect();

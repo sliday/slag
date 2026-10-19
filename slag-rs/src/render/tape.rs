@@ -783,7 +783,7 @@ impl Snapshots {
     }
 
     fn plan_if_moved(&mut self) -> Option<Cue> {
-        let plan = std::fs::read_to_string(crate::config::CRUCIBLE).ok()?;
+        let plan = std::fs::read_to_string(crate::config::project_path(crate::config::CRUCIBLE)).ok()?;
         if self.plan.as_deref() == Some(plan.as_str()) {
             return None;
         }
@@ -794,7 +794,7 @@ impl Snapshots {
     fn close_heat(&mut self, id: &str, ok: bool) -> Option<Proof> {
         let at = self.heats.iter().position(|(i, _, _)| i == id)?;
         let (id, heat, since) = self.heats.remove(at);
-        Some(read_proof(std::path::Path::new(crate::config::LOG_DIR), &id, heat, ok, since))
+        Some(read_proof(std::path::Path::new(crate::config::project_path(crate::config::LOG_DIR)), &id, heat, ok, since))
     }
 
     fn after(&mut self, cue: &Cue) -> Vec<Cue> {
@@ -813,7 +813,7 @@ impl Snapshots {
             out.extend(self.plan_if_moved());
         }
         if matches!(cue, Cue::Mark(_)) {
-            if let Ok(doc) = std::fs::read_to_string(crate::config::ORE_FILE) {
+            if let Ok(doc) = std::fs::read_to_string(crate::config::project_path(crate::config::ORE_FILE)) {
                 if self.ore.as_deref() != Some(doc.as_str()) {
                     self.ore = Some(doc.clone());
                     out.push(Cue::Doc { name: crate::config::ORE_FILE.to_string(), text: doc });
@@ -821,7 +821,7 @@ impl Snapshots {
             }
         }
         if matches!(cue, Cue::Mark(Mark::Status { .. })) {
-            if let Ok(doc) = std::fs::read_to_string(crate::config::BLUEPRINT) {
+            if let Ok(doc) = std::fs::read_to_string(crate::config::project_path(crate::config::BLUEPRINT)) {
                 if self.blueprint.as_deref() != Some(doc.as_str()) {
                     self.blueprint = Some(doc.clone());
                     out.push(Cue::Doc { name: crate::config::BLUEPRINT.to_string(), text: doc });
@@ -926,7 +926,7 @@ fn newest_log(dir: &Path, needle: &str, since: std::time::SystemTime) -> Option<
 /// `logs/tape-<ts>.jsonl`, beside the run's other logs.
 pub fn default_path() -> PathBuf {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    PathBuf::from(crate::config::LOG_DIR).join(format!("tape-{ts}.jsonl"))
+    PathBuf::from(crate::config::project_path(crate::config::LOG_DIR)).join(format!("tape-{ts}.jsonl"))
 }
 
 #[cfg(test)]

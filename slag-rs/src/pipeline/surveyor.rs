@@ -33,7 +33,7 @@ pub async fn run_with_guidance(
 ) -> Result<(), SlagError> {
     tui::header("SURVEYOR · deep analysis");
 
-    let ore = std::fs::read_to_string(ORE_FILE)
+    let ore = std::fs::read_to_string(crate::config::project_path(ORE_FILE))
         .map_err(|_| SlagError::NoOre)?;
 
     let mut prompt = flux::surveyor_prompt(&ore);
@@ -74,7 +74,7 @@ pub async fn run_with_guidance(
     // here replaces the document every later phase reads. Keeping a thin
     // blueprint beats replacing it with one line about a blueprint.
     if !flux::looks_like_a_document(&raw) {
-        if std::path::Path::new(BLUEPRINT).exists() {
+        if std::path::Path::new(crate::config::project_path(BLUEPRINT)).exists() {
             tui::status_line("!", tui::WARM, "surveyor returned a summary; keeping the existing blueprint");
             return Ok(());
         }
@@ -82,7 +82,7 @@ pub async fn run_with_guidance(
             "the surveyor returned a summary, not a blueprint".to_string(),
         ));
     }
-    std::fs::write(BLUEPRINT, &raw)?;
+    std::fs::write(crate::config::project_path(BLUEPRINT), &raw)?;
     tui::status_line("█", tui::PURE, &format!("Blueprint: {BLUEPRINT}"));
 
     // Show preview
@@ -107,7 +107,7 @@ pub async fn run_with_guidance(
 
 fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
+    let path = format!("{}/{ts}_{label}.log", crate::config::project_path(crate::config::LOG_DIR));
     let _ = std::fs::write(&path, content);
 }
 

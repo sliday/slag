@@ -63,7 +63,7 @@ pub async fn run(
         emit(&hooks.events, EngineEvent::Warning { message });
     }
     let result = run_inner(config, max_anvils, hooks, &run_log).await;
-    if let Ok(crucible) = Crucible::load(Path::new(CRUCIBLE)) {
+    if let Ok(crucible) = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE))) {
         let counts = crucible.counts();
         run_log.append(&RunEntry::Assay {
             total: counts.total,
@@ -89,11 +89,11 @@ fn open_run_log(config: &EngineConfig) -> RunLog {
         model: config.model_base.clone(),
         duel: duel_label(config.duel).to_string(),
         flux_profile: crate::flux::profile(),
-        crucible_hash: std::fs::read(CRUCIBLE)
+        crucible_hash: std::fs::read(crate::config::project_path(CRUCIBLE))
             .ok()
             .map(|b| format!("{:016x}", crate::engine::tools::fnv64(&b))),
     };
-    RunLog::create(Path::new(crate::config::LOG_DIR), &run_id, meta)
+    RunLog::create(Path::new(crate::config::project_path(crate::config::LOG_DIR)), &run_id, meta)
 }
 
 fn git_branch() -> Option<String> {
@@ -135,7 +135,7 @@ async fn run_inner(
         // is stale (panicked anvil or interrupted previous run) — reset it
         // to Ore so it gets rescheduled instead of busy-spinning forever.
         let guard = CRUCIBLE_LOCK.lock().await;
-        let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+        let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
 
         let state: Vec<_> = crucible.ingots
             .iter()
@@ -289,7 +289,7 @@ async fn run_inner(
                 match result {
                     Ok((id, Ok(kind))) => {
                         let _guard = CRUCIBLE_LOCK.lock().await;
-                        let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                        let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
                         crucible.set_status(&id, Status::Forged);
                         crucible.save()?;
                         let heat = crucible.get(&id).map(|i| i.heat).unwrap_or(0);
@@ -306,7 +306,7 @@ async fn run_inner(
                         // Not a failure: put the ingot back in the queue so
                         // `slag resume` reforges it, and stop after draining.
                         let _guard = CRUCIBLE_LOCK.lock().await;
-                        let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                        let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
                         crucible.set_status(&id, Status::Ore);
                         crucible.save()?;
                         cancelled = true;
@@ -316,7 +316,7 @@ async fn run_inner(
                         // flight. Back to ore for `slag resume`, and stop
                         // scheduling once this batch drains.
                         let _guard = CRUCIBLE_LOCK.lock().await;
-                        let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                        let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
                         crucible.set_status(&id, Status::Ore);
                         crucible.save()?;
                         budget_stop = Some((spent, cap));
@@ -337,7 +337,7 @@ async fn run_inner(
                     Ok((id, Err(_))) => {
                         let ingot = {
                             let _guard = CRUCIBLE_LOCK.lock().await;
-                            Crucible::load(Path::new(CRUCIBLE))?.get(&id).cloned()
+                            Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?.get(&id).cloned()
                         };
                         if let Some(ingot) = ingot {
                             let smith = crate::smith::make_base_smith(config, hooks);
@@ -352,7 +352,7 @@ async fn run_inner(
                             }
                             if result.is_err() {
                                 let _guard = CRUCIBLE_LOCK.lock().await;
-                                let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                                let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
                                 crucible.set_status(&id, Status::Cracked);
                                 crucible.save()?;
                                 let heat = crucible.get(&id).map(|i| i.heat).unwrap_or(0);
@@ -389,7 +389,7 @@ async fn run_inner(
             }
 
             // Show status
-            let crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             if !tui::is_quiet() {
                 print!("\n  ");
                 tui::ingot_status_line(&crucible.counts());
@@ -418,14 +418,14 @@ async fn run_inner(
         let struck = strike_ingot(&ingot, smith.as_ref(), hooks, config).await;
         if let Err(SlagError::Cancelled) = struck {
             let _guard = CRUCIBLE_LOCK.lock().await;
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             crucible.set_status(&ingot.id, Status::Ore);
             crucible.save()?;
             return Err(SlagError::Cancelled);
         }
         if let Err(SlagError::RunBudgetExhausted { spent, cap }) = struck {
             let _guard = CRUCIBLE_LOCK.lock().await;
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             crucible.set_status(&ingot.id, Status::Ore);
             crucible.save()?;
             drop(_guard);
@@ -441,7 +441,7 @@ async fn run_inner(
         }
         if struck.is_ok() {
             let _guard = CRUCIBLE_LOCK.lock().await;
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             crucible.set_status(&ingot.id, Status::Forged);
             crucible.save()?;
             let heat = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(0);
@@ -454,7 +454,7 @@ async fn run_inner(
             let base_smith = crate::smith::make_base_smith(config, hooks);
             let result = resmelt_unlocked(&ingot, base_smith.as_ref()).await;
             let _guard = CRUCIBLE_LOCK.lock().await;
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             if let Err(e) = result.as_ref() {
                 if e.is_deterministic_provider() {
                     crucible.set_status(&ingot.id, Status::Ore);
@@ -475,7 +475,7 @@ async fn run_inner(
             }
         }
 
-        let crucible = Crucible::load(Path::new(CRUCIBLE))?;
+        let crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
         if !tui::is_quiet() {
             print!("\n  ");
             tui::ingot_status_line(&crucible.counts());
@@ -491,7 +491,7 @@ fn unverified_review(error: &SlagError) -> bool {
 async fn resmelt_unlocked(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagError> {
     let mut draft = {
         let _guard = CRUCIBLE_LOCK.lock().await;
-        Crucible::load(Path::new(CRUCIBLE))?
+        Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?
     };
     let other_ids: std::collections::HashSet<_> = draft.ingots.iter()
         .filter(|i| i.id != ingot.id).map(|i| i.id.clone()).collect();
@@ -499,7 +499,7 @@ async fn resmelt_unlocked(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagEr
     let replacements = draft.ingots.into_iter()
         .filter(|i| !other_ids.contains(&i.id)).collect();
     let _guard = CRUCIBLE_LOCK.lock().await;
-    let mut current = Crucible::load(Path::new(CRUCIBLE))?;
+    let mut current = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
     current.replace(&ingot.id, replacements);
     current.save()?;
     Ok(())
@@ -507,7 +507,7 @@ async fn resmelt_unlocked(ingot: &Ingot, smith: &dyn Smith) -> Result<(), SlagEr
 
 async fn restore_unfinished_batch(batch: &[Ingot]) -> Result<(), SlagError> {
     let _guard = CRUCIBLE_LOCK.lock().await;
-    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
     for baseline in batch {
         if let Some(ingot) = crucible.get_mut(&baseline.id) {
             if ingot.status != Status::Forged {
@@ -522,7 +522,7 @@ async fn restore_unfinished_batch(batch: &[Ingot]) -> Result<(), SlagError> {
 
 async fn unburn_heat(id: &str) -> Result<(), SlagError> {
     let _guard = CRUCIBLE_LOCK.lock().await;
-    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
     if let Some(ingot) = crucible.get_mut(id) {
         ingot.heat = ingot.heat.saturating_sub(1);
     }
@@ -532,7 +532,7 @@ async fn unburn_heat(id: &str) -> Result<(), SlagError> {
 
 async fn set_back_to_ore(id: &str) -> Result<(), SlagError> {
     let _guard = CRUCIBLE_LOCK.lock().await;
-    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
     crucible.set_status(id, Status::Ore);
     crucible.save()?;
     Ok(())
@@ -658,7 +658,7 @@ async fn forge_ingot(
         let mut fallback = ingot.clone();
         {
             let _guard = CRUCIBLE_LOCK.lock().await;
-            if let Ok(crucible) = Crucible::load(Path::new(CRUCIBLE)) {
+            if let Ok(crucible) = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE))) {
                 if let Some(current) = crucible.get(&ingot.id) {
                     fallback.heat = current.heat;
                 }
@@ -725,7 +725,7 @@ async fn finish_run_over_budget(
 ) -> Result<(), SlagError> {
     let ore_left = {
         let _guard = CRUCIBLE_LOCK.lock().await;
-        Crucible::load(Path::new(CRUCIBLE)).map(|c| c.counts().ore).unwrap_or(0)
+        Crucible::load(Path::new(crate::config::project_path(CRUCIBLE))).map(|c| c.counts().ore).unwrap_or(0)
     };
     let note = run_budget_note(spent, cap, ore_left);
     emit(&hooks.events, EngineEvent::Warning { message: note.clone() });
@@ -755,7 +755,7 @@ fn append_assay_note(note: &str) {
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LEDGER)
+        .open(crate::config::project_path(LEDGER))
         .and_then(|mut f| {
             use std::io::Write;
             f.write_all(entry.as_bytes())
@@ -831,7 +831,7 @@ async fn resume_crashed_ingot(
         Ok(response) => match verify_and_seal(ingot, &response).await {
             Ok(()) => {
                 let _guard = CRUCIBLE_LOCK.lock().await;
-                let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+                let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
                 crucible.set_status(&ingot.id, Status::Forged);
                 crucible.save()?;
                 append_ledger(ingot, ingot.heat);
@@ -849,7 +849,7 @@ async fn resume_crashed_ingot(
         },
         Err(e @ SlagError::Cancelled) => {
             let _guard = CRUCIBLE_LOCK.lock().await;
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             crucible.set_status(&ingot.id, Status::Ore);
             crucible.save()?;
             Err(e)
@@ -858,7 +858,7 @@ async fn resume_crashed_ingot(
             // Back to ore; the scheduler's loop-top budget gate ends the
             // run with the standard pause note.
             let _guard = CRUCIBLE_LOCK.lock().await;
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             crucible.set_status(&ingot.id, Status::Ore);
             crucible.save()?;
             Ok(())
@@ -903,7 +903,7 @@ async fn back_to_ore_after_resume(
         );
     }
     let _guard = CRUCIBLE_LOCK.lock().await;
-    let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+    let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
     crucible.set_status(&ingot.id, Status::Ore);
     crucible.save()?;
     Ok(())
@@ -1029,7 +1029,7 @@ async fn check_verification(cmd: &str) -> proof::ShellCheck {
 }
 
 fn direct_contract() -> bool {
-    std::fs::read_to_string(super::warden::BAR_FILE).ok()
+    std::fs::read_to_string(crate::config::project_path(super::warden::BAR_FILE)).ok()
         .is_some_and(|bar| bar.lines().any(|line| line.starts_with("REQUIRED RUN COMMANDS: ")))
 }
 
@@ -1141,7 +1141,7 @@ async fn strike_ingot(
         // Update heat in crucible file
         let current = {
             let _guard = CRUCIBLE_LOCK.lock().await;
-            let mut crucible = Crucible::load(Path::new(CRUCIBLE))?;
+            let mut crucible = Crucible::load(Path::new(crate::config::project_path(CRUCIBLE)))?;
             crucible.increment_heat(&ingot.id);
             crucible.save()?;
             let current = crucible.get(&ingot.id).map(|i| i.heat).unwrap_or(heat);
@@ -1399,7 +1399,7 @@ fn append_ledger(ingot: &Ingot, heat: u8) {
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LEDGER)
+        .open(crate::config::project_path(LEDGER))
         .and_then(|mut f| {
             use std::io::Write;
             f.write_all(entry.as_bytes())
@@ -1408,7 +1408,7 @@ fn append_ledger(ingot: &Ingot, heat: u8) {
 
 fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let path = format!("{}/{ts}_{label}.log", crate::config::LOG_DIR);
+    let path = format!("{}/{ts}_{label}.log", crate::config::project_path(crate::config::LOG_DIR));
     let _ = std::fs::write(&path, content);
 }
 

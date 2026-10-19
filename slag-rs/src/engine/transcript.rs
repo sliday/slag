@@ -92,7 +92,7 @@ pub fn sanitize_id(id: &str) -> String {
 
 /// Transcript path for one attempt.
 pub fn path_for(root: &Path, id: &str, heat: u8) -> PathBuf {
-    root.join(TRANSCRIPT_DIR)
+    crate::config::project_path_in(root, TRANSCRIPT_DIR)
         .join(format!("{}-h{heat}.jsonl", sanitize_id(id)))
 }
 

@@ -941,7 +941,8 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             }
 
             if self.read_only_tools {
-                if let Some(outcome) = outcomes.iter().find(|o| o.output.starts_with(REVIEW_VIOLATION)) {
+                if let Some(outcome) = calls.iter().zip(&outcomes).find_map(|(call, outcome)|
+                    (outcome.is_error && review_write_attempt(call)).then_some(outcome)) {
                     return Err(SlagError::SmithFailed(outcome.output.clone()));
                 }
             }
@@ -1023,7 +1024,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         if crate::pipeline::warden::parse_verdict(&raw).gap.contains("no readable verdict") {
             if let Some(root) = &self.coordinator_root {
                 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let logs = root.join("logs");
+                let logs = crate::config::project_path_in(root, crate::config::LOG_DIR);
                 if std::fs::create_dir_all(&logs).is_ok() {
                     let name = format!("warden-raw-{}-{}-{}.log",
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(), std::process::id(),
@@ -1519,7 +1520,7 @@ fn review_tool(name: &str) -> bool {
 }
 
 fn coordinator_path(path: &std::path::Path) -> bool {
-    matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == "logs")
+    matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == "logs" || name == ".slag")
         || matches!(path.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md"))
 }
 
@@ -1540,7 +1541,7 @@ pub(crate) fn coordinator_command_error(command: &str) -> Option<&'static str> {
     let reads_only = ToolBox::path_access(&call).is_some_and(|(_, writer)| !writer);
     if !reads_only && words.iter().any(|w| {
         let path = std::path::Path::new(w.trim_matches(['>', '<']));
-        path.components().any(|c| matches!(c, std::path::Component::Normal(name) if matches!(name.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md" | "logs"))))
+        path.components().any(|c| matches!(c, std::path::Component::Normal(name) if matches!(name.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md" | "logs" | ".slag"))))
     }) {
         return Some("slag owns coordinator files and logs; inspect them with read_file and change only artifact files");
     }
@@ -1612,7 +1613,7 @@ async fn guarded_dispatch(
 }
 
 fn declared_verification(root: &std::path::Path, command: &str) -> bool {
-    let Ok(bar) = std::fs::read_to_string(root.join("BAR.md")) else { return false };
+    let Ok(bar) = std::fs::read_to_string(crate::config::project_path_in(root, "BAR.md")) else { return false };
     let Some(required) = bar.lines().find_map(|line| line.strip_prefix("REQUIRED RUN COMMANDS: ")
         .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())) else { return false };
     let Ok(actual) = shell_words::split(command) else { return false };
@@ -1620,26 +1621,38 @@ fn declared_verification(root: &std::path::Path, command: &str) -> bool {
         .is_some_and(|words| !words.is_empty() && actual.starts_with(&words)))
 }
 
+fn review_write_attempt(call: &ToolCall) -> bool {
+    if matches!(call.name.as_str(), "write_file" | "edit_file")
+        || ToolBox::path_access(call).is_some_and(|(_, writer)| writer)
+    {
+        return true;
+    }
+    call.name == "bash" && serde_json::from_str::<serde_json::Value>(&call.arguments).ok()
+        .and_then(|args| args.get("command").and_then(serde_json::Value::as_str)
+            .and_then(review_command_error)).is_some()
+}
+
 async fn review_shell(call: &ToolCall, root: Option<&std::path::Path>) -> ToolOutcome {
     use std::process::Stdio;
     let violation = |message: String| ToolOutcome {
         output: format!("{REVIEW_VIOLATION} {message}"), is_error: true,
     };
-    let Some(root) = root else { return violation("review has no workspace root".into()); };
+    let failed = |message: String| ToolOutcome { output: message, is_error: true };
+    let Some(root) = root else { return failed("review has no workspace root".into()); };
     let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
         Ok(args) => args,
-        Err(e) => return violation(format!("invalid shell arguments: {e}")),
+        Err(e) => return failed(format!("invalid shell arguments: {e}")),
     };
     let Some(command) = args.get("command").and_then(serde_json::Value::as_str) else {
-        return violation("review shell needs a command".into());
+        return failed("review shell needs a command".into());
     };
     if args.get("run_in_background").and_then(serde_json::Value::as_bool) == Some(true) {
-        return violation("background commands are forbidden during review".into());
+        return failed("background commands are forbidden during review".into());
     }
     if let Some(reason) = review_command_error(command) { return violation(reason.into()); }
     let sandbox = match super::sandbox::Sandbox::read_only() {
         Ok(sandbox) => sandbox,
-        Err(e) => return violation(e.to_string()),
+        Err(e) => return failed(e.to_string()),
     };
     let timeout = args.get("timeout").and_then(serde_json::Value::as_u64).unwrap_or(20).clamp(1, 30);
     let mut cmd = sandbox.wrap("/bin/sh");
@@ -1653,29 +1666,29 @@ async fn review_shell(call: &ToolCall, root: Option<&std::path::Path>) -> ToolOu
     cmd.process_group(0);
     let child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => return violation(format!("cannot start read-only shell: {e}")),
+        Err(e) => return failed(format!("cannot start read-only shell: {e}")),
     };
     #[cfg(unix)]
     let pgid = child.id();
     let output = match tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait_with_output()).await {
         Ok(Ok(output)) => output,
-        Ok(Err(e)) => return violation(format!("read-only shell failed: {e}")),
+        Ok(Err(e)) => return failed(format!("read-only shell failed: {e}")),
         Err(_) => {
             #[cfg(unix)]
             if let Some(pgid) = pgid {
                 let _ = tokio::process::Command::new("/bin/kill").args(["-KILL", &format!("-{pgid}")]).status().await;
             }
-            return violation(format!("read-only shell exceeded {timeout}s"));
+            return failed(format!("read-only shell exceeded {timeout}s"));
         }
     };
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);
     text.push_str(&stderr);
-    let lower = if output.status.success() { stderr.to_ascii_lowercase() } else { text.to_ascii_lowercase() };
-    if ["operation not permitted", "permission denied", "read-only file system", "sandbox_apply:", "no usable temporary directory"]
-        .iter().any(|marker| lower.contains(marker))
+    if text.lines().any(|line| line.starts_with("sandbox-exec: sandbox_apply:")
+        || line.starts_with("[sandbox] write outside the workspace was blocked by slag's sandbox:")
+        || line.starts_with("[sandbox] write to git's hooks or config was blocked by slag's sandbox:"))
     {
-        return violation(format!("the read-only shell refused access\n{}", preview(&text, 2_000)));
+        return failed(format!("the read-only shell refused access\n{}", preview(&text, 2_000)));
     }
     if text.chars().count() > 30_000 { text = text.chars().take(30_000).collect(); }
     if !output.status.success() {
@@ -2056,9 +2069,9 @@ mod tests {
         std::fs::write(dir.path().join("artifact.py"), "VALUE = 42\n").unwrap();
         for mutation in [
             tc("w", "write_file", serde_json::json!({"path": "artifact.py", "content": "wrong"})),
+            tc("e", "edit_file", serde_json::json!({"path": "artifact.py", "old_string": "42", "new_string": "0"})),
             tc("b", "bash", serde_json::json!({"command": "touch marker"})),
             tc("p", "bash", serde_json::json!({"command": "python3 -m pip install --target /tmp/forbidden-package pytest"})),
-            tc("t", "bash", serde_json::json!({"command": "python3 -c 'import tempfile; tempfile.NamedTemporaryFile()'"})),
         ] {
             let provider = MockProvider::new(vec![
                 resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "artifact.py"})), mutation]),
@@ -2073,6 +2086,59 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readonly_review_keeps_grounded_pass_after_optional_pytest_traceback() {
+        use std::os::unix::fs::PermissionsExt;
+        if super::super::sandbox::backend() == super::super::sandbox::Backend::None { return; }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test_cli.py"),
+            "import unittest\nclass Tests(unittest.TestCase):\n def test_plain(self): pass\n def test_pretty(self): pass\n").unwrap();
+        std::fs::write(dir.path().join("cli.py"), "print('[1, 2]')\n").unwrap();
+        std::fs::write(dir.path().join("pytest"),
+            "#!/bin/sh\nprintf '%s\\n' 'Traceback (most recent call last):' \
+ '  File \"tempfile.py\", line 224, in _get_default_tempdir' \
+ 'FileNotFoundError: [Errno 2] No usable temporary directory found' \
+ 'PermissionError: [Errno 1] Operation not permitted'\nexit 1\n").unwrap();
+        std::fs::set_permissions(dir.path().join("pytest"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![
+                tc("suite", "bash", serde_json::json!({"command": "python3 -m unittest discover --verbose"})),
+                tc("cli", "bash", serde_json::json!({"command": "python3 cli.py --pretty"})),
+            ]),
+            resp_tools(vec![tc("optional", "bash", serde_json::json!({
+                "command": "PATH=.:$PATH PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider",
+            }))]),
+            resp_text("VERDICT: pass\nEVIDENCE: [\"suite\", \"cli\"]", FinishReason::Stop),
+        ]);
+        let result = agent(provider.clone(), dir.path()).with_coordinator_root(dir.path())
+            .with_read_only_tools().with_required_inspection().with_required_runs()
+            .run("review".into(), "REQUIRED RUN COMMANDS: [\"python3 -m unittest discover\", \"python3 cli.py --pretty\"]\nInspect the CLI.".into())
+            .await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&result).fulfilled, "{result}");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        let failed = requests[2].messages.iter().find(|message| message.tool_call_id.as_deref() == Some("optional")).unwrap();
+        assert!(failed.content.starts_with("ERROR: Traceback"), "{}", failed.content);
+        assert!(failed.content.contains("No usable temporary directory"));
+        assert!(!failed.content.contains(REVIEW_VIOLATION));
+    }
+
+    #[tokio::test]
+    async fn readonly_review_reports_refused_shell_as_an_error_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("bad", "bash", serde_json::json!({"command": "echo ok", "run_in_background": true}))]),
+            resp_tools(vec![tc("read", "read_file", serde_json::json!({"path": "artifact.py"}))]),
+            resp_text("VERDICT: pass\nEVIDENCE: [\"read\"]", FinishReason::Stop),
+        ]);
+        std::fs::write(dir.path().join("artifact.py"), "print(42)\n").unwrap();
+        let result = agent(provider.clone(), dir.path()).with_coordinator_root(dir.path()).with_read_only_tools()
+            .run("review".into(), "inspect artifact".into()).await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&result).fulfilled, "{result}");
+        assert!(provider.requests()[1].messages.last().unwrap().content.starts_with("ERROR: background commands"));
+    }
+
     #[tokio::test]
     async fn readonly_review_shell_runs_probes_or_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2083,7 +2149,7 @@ mod tests {
         let result = review_shell(&call, Some(dir.path())).await;
         if super::super::sandbox::backend() == super::super::sandbox::Backend::None {
             assert!(result.is_error);
-            assert!(result.output.starts_with(REVIEW_VIOLATION));
+            assert!(!result.output.starts_with(REVIEW_VIOLATION));
         } else {
             assert!(!result.is_error, "{}", result.output);
             assert!(result.output.contains("42"));
