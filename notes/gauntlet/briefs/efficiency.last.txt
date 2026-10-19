@@ -1,21 +1,22 @@
-Committed `b29df60` on `gauntlet/efficiency`. No push. Both the worktree and main checkout are clean.
+Committed `42e90c0` on `gauntlet/efficiency`. Live acceptance remains partial.
 
-Verdicts now require successful inspection IDs from the current session. Reviewers receive the workspace tree and changed files upfront. Resume rejudges UNVERIFIED work.
+| Final OpenAI run | Tokens | Seconds | Verdict | CLI check |
+|---|---:|---:|---|---|
+| wc.py | 75,632 | 39.0 | CRACKED; no warden verdict | Runs; miscounts unterminated lines |
+| CSV→JSON | 72,934 | 37.0 | CRACKED; no warden verdict | `--pretty` works; package installation fails |
+| Node top words | 51,842 | 29.1 | FORGED, heat 1 | Correct output; five tests pass |
 
-| Live run | Tokens | Seconds | Verdict |
-|---|---:|---:|---|
-| Exact csv2json commission | 70,793 | 37.492 | FORGED |
-| Forced ungrounded pass | 4,766 | 2.374 | UNVERIFIED |
-| Resume afterward | 7,733 | 4.266 | FORGED, grounded |
+Wc and CSV exhausted their small final spend caps. First-pass Python reliability remains unresolved.
 
-The CLI runs, including `--pretty`. The package includes setup metadata, a console entry point, and three passing tests.
+The changes add concrete noun checks, grounded suite and CLI runs, early read-only verification, cache ignores, scratch cleanup, and raw verdict logs.
 
-- `cargo test`: **exit 0**, 1,079 passed, one ignored.
-- Strict clippy: **exit 0**, zero warnings.
-- Total estimated live spend: **$0.025**, including an additional blocked review.
+- Cargo: **1,121 passed**, one ignored; exit **0**.
+- Clippy with `-D warnings`: exit **0**.
+- Total estimated live spend: **$1.4853**.
+- Worktree and main checkout: clean. No push.
 
-[Full results, regression tests, changed files, and phase tables](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/warden-round3-results.md)
+The [report](notes/gauntlet/efficiency-round4.md) lists all 14 changed files, regression names, per-phase token tables, experiments, and exact commands.
 
-ASK: Ground warden evidence, improve workspace context, and verify honest resume behavior.
-🟩Got 🟩Had 🟩Did
-🧠 —
+ASK: Improve small-commission quality and verify three live runs.
+🟩Got 🟩Had 🟨Did — Python live acceptance remains incomplete.
+🧠 High

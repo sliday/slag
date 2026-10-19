@@ -300,6 +300,29 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Phase 2 clean: 256 ESC all paired, piped 79/119 chars, NO_COLOR 0 ESC, tmux resize exact, `--help` clean. Spend $0.004.
 - Remaining gap (polish, sent as TUI r5): a no-op edit ("already applied") shows a ✓ card, then the review says no test was added.
 
+### bench2 (Harness² instrument) merged
+- 16 ordered tasks: `bench/streams/py-data` and `bench/streams/js-web`, 8 each, recurring traps per domain (exact-input reproduction, BOMs, money rounding, unicode, timezones, async order, cache staleness, pagination).
+- Instrument: verify-fixtures 16/16, noop 0/16, reference 16/16, leak probe clean; lead re-checked after merge (noop 0/8 py-data, reference 8/8 js-web).
+- Weak executor chosen: `mistral` / `ministral-3b-latest`, baseline **2/8 py-data, 2/8 js-web** (one try, no commit). ministral-8b 7/8 (no headroom), gpt-4.1-nano 5/8 and 4/8.
+- Lead correction: kimi had changed the shared adapter's defaults (`--tries 1 --no-commit`), which would silently change every classic-bench number. Now opt-in via `SLAG_FIX_TRIES`, `SLAG_FIX_NO_COMMIT=1`, `SLAG_FIX_ARGS`; default runs `slag fix` as a user would.
+
+### TUI r5 merged; fix r5 sent
+- TUI r5: no-op edits show "– edit <file>  no change" (explicit `unchanged` flag from the tools layer); no repeated note; no 0.0 s phases; meta capped at column 80; cracked count said once. 1056 tests green, clippy clean.
+- Bug found by the TUI builder: `slag fix` committed untracked files that existed before the run. Sent as fix r5: commit exactly the session's paths, by explicit path list.
+
+### fix r5 and efficiency r4 merged
+- Fix r5: paths dirty before the run never enter the commit (cause: untracked out.txt/err.txt grew during the run); `git add -- <list>`; report "left untouched: N files you had before"; PR body lists committed paths. A fix that can only touch pre-dirty files now fails and says so.
+- Efficiency r4 (42e90c0): direct commissions derive a runnable contract (package, CLI, named flags, suite) shared by blueprint, smith and bar; the warden must cite its own successful suite and CLI-probe runs; builder checks run read-only; stack-aware .gitignore; scratch cleanup; raw unreadable verdicts logged. Builder's final acceptance: Node FORGED heat 1 (51.8k tokens, 29 s, 5 tests); wc and CSV CRACKED under tiny self-imposed caps ($0.018/run), so not a fair measure. Wc cracked on a real bug (unterminated last line), CSV on a real one (not installable). Spend $1.49.
+- Integration: 1083 unit tests green, clippy clean. Critic commission-r3 running with default caps, gpt-4.1-mini and a codex-comparable OpenAI model.
+
+### commission critic r3 (Fable, fresh, default caps): WINNER bar 0-6
+- gpt-4.1-mini: wc 29 s / 75k / $0.017 FORGED but wrong line count without trailing newline; csv 58 s / 119k UNVERIFIED (false, see below), not installable; top-words 33 s / 55k FORGED, 5 tests.
+- gpt-5.2 (best OpenAI model slag could drive): wc 50 s / 53k FORGED, matches system wc; csv 34 s / 29k FORGED, installable, no console script; top-words 36 s / 33k FORGED, 7 tests. "spend unknown" (no price entry).
+- Codex reference: 6, 13 (console script), 15 tests. Votes 0-6 (fx and critic).
+- INTEGRITY pass on all 5 FORGED. One false UNVERIFIED: exact-argv grounding (`grounding.rs:81`) rejected `unittest discover --verbose`.
+- BIGGEST_GAP: slag cannot drive gpt-5.4+/gpt-6.x: always sends `reasoning_effort` on /v1/chat/completions with tools (`forge.rs:939`, `provider.rs:443`); OpenAI requires /v1/responses. The comparison was model-mismatched.
+- Sent: provider r7 (OpenAI Responses transport + pricing), efficiency r5 (meaning-based grounding match; "like <tool>" edge-case probes; optional `.slag/` for coordination files).
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
