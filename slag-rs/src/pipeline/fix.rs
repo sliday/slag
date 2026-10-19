@@ -18,8 +18,11 @@
 //!    with the source change reverted) and lands as one commit on a fresh
 //!    `slag/fix-*` branch, or a draft PR with `--pr`.
 
+mod evolve;
 mod issue;
 mod repo;
+
+pub(crate) use issue::slug;
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -83,6 +86,9 @@ pub async fn run(
     // call when there is no issue, or the result cannot land where asked.
     if args.issue_file.is_none() && args.issue.iter().all(|w| w.trim().is_empty()) {
         return Err(SlagError::Config(issue::USAGE.into()));
+    }
+    if args.sequential && args.evolve == 0 {
+        return Err(SlagError::Config("--sequential needs --evolve K".into()));
     }
     if args.pr {
         if git.is_none() {
@@ -273,12 +279,15 @@ struct Outcome {
     /// report prints: a dashboard left open must not inflate the wall.
     time: Option<String>,
     spend: Option<String>,
+    /// What `--evolve` did, stage by stage. `None` on the fast path.
+    evolve: Option<evolve::Summary>,
 }
 
 /// Seconds per phase of one fix, summed across attempts.
 #[derive(Debug, Default, Clone, Copy)]
 struct Phases {
     gather: f64,
+    evolve: f64,
     session: f64,
     verify: f64,
     repro: f64,
@@ -293,6 +302,7 @@ impl Phases {
     fn line(&self) -> String {
         [
             ("gather", self.gather),
+            ("evolve", self.evolve),
             ("session", self.session),
             ("verify", self.verify),
             ("reproduce", self.repro),
@@ -364,7 +374,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     let context =
         context_block(job, &issue, &files, &test_files, test.as_ref(), baseline.as_ref());
     let rescuer = Rescuer { register: &register_shutdown, stop: repo::kill_running };
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         job,
         config,
         hooks,
@@ -373,8 +383,27 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         before: &before,
         usable_test: usable_test.as_deref(),
         rescuer: &rescuer,
+        smith: SmithOpts::default(),
     };
     let tries = job.args.tries.max(1);
+
+    // The execution harness (`crate::harness`): `--harness DIR`, the
+    // library's entries for this domain, or none at all. The fast path
+    // asks for none and pays for none of this.
+    let harnessed = job.args.harness.is_some() || job.args.evolve > 0;
+    let domain = match (&job.args.domain, harnessed) {
+        (Some(d), _) => d.clone(),
+        (None, true) => {
+            let top = job.git.as_ref().map_or(job.cwd.as_path(), |g| g.top.as_path());
+            crate::harness::library::domain_of(top, test.as_ref().map(|t| t.cmd.as_str()))
+        }
+        (None, false) => String::new(),
+    };
+    let library = harnessed
+        .then(|| crate::harness::library::Library::resolve(job.args.library.as_deref(), &job.cwd))
+        .flatten();
+    let base = base_harness(job, &issue, &domain, library.as_ref(), hooks).await?;
+    ctx.smith.harness = base.as_deref().map(|d| Arc::new(crate::harness::Harness::load(d)));
 
     let mut failure: Option<Failure> = None;
     let mut checks: Vec<Run> = Vec::new();
@@ -383,8 +412,47 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     let mut declared: Option<String> = None;
     let mut passed = false;
     let mut attempts = 0u8;
+    let mut first = 1u8;
 
-    for attempt in 1..=tries {
+    // `--evolve K` takes the first attempt's place: the recursion runs in
+    // copies of the repository, and the fix it delivers lands here only to
+    // face the same checks as any attempt.
+    let mut evolved = None;
+    if job.args.evolve > 0 {
+        attempts = 1;
+        first = 2;
+        emit(&hooks.events, EngineEvent::HeatTick { id: FIX_ID.into(), heat: 1 });
+        let settings = evolve::Settings::resolve(job, config, domain.clone(), library.clone(), base.clone());
+        let clock = std::time::Instant::now();
+        let ev = evolve::run(&ctx, baseline.as_ref(), settings).await?;
+        phases.evolve += clock.elapsed().as_secs_f64();
+        ctx.smith.harness = Some(Arc::new(crate::harness::Harness::load(&ev.adopted())));
+        match ev.deliver(job, &before) {
+            Err(why) => {
+                note(hooks, &format!("evolve: {why}"), false);
+                failure = Some(Failure::new(why.clone(), why));
+            }
+            Ok(Some(response)) => {
+                let label = format!("evolved fix ({})", ev.chosen_label().unwrap_or_default());
+                match ctx.check(&label, &response, &mut phases).await? {
+                    Attempted::Passed { checks: c, summary: s, changed: ch, declared: d } => {
+                        (checks, summary, changed, declared) = (c, s, ch, d);
+                        passed = true;
+                    }
+                    Attempted::Failed { failure: f, summary: s, changed: ch } => {
+                        (failure, summary, changed) = (Some(f), s, ch);
+                    }
+                }
+            }
+            Ok(None) => failure = ev.failure().map(|(line, detail)| Failure::new(line, detail)),
+        }
+        evolved = Some(ev);
+    }
+
+    for attempt in first..=tries {
+        if passed {
+            break;
+        }
         attempts = attempt;
         emit(&hooks.events, EngineEvent::HeatTick { id: FIX_ID.into(), heat: attempt });
         // The first attempt runs on the work model. Anything that needs a
@@ -425,6 +493,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         phases,
         time: None,
         spend: None,
+        evolve: None,
     };
     if let Some(git) = &job.git {
         out.stat = git.stat(&changed);
@@ -446,6 +515,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         if !changed.is_empty() {
             out.notes.push("the last attempt's changes are left in the working tree".into());
         }
+        reflect(&ctx, evolved, &mut out).await;
         stamp(&mut out);
         return Ok(out);
     }
@@ -618,8 +688,85 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     let clock = std::time::Instant::now();
     land(job, &mut out, &changed, &before);
     out.phases.land = clock.elapsed().as_secs_f64();
+    reflect(&ctx, evolved, &mut out).await;
     stamp(&mut out);
     Ok(out)
+}
+
+/// The base harness H0, as a directory, when there is one: `--harness
+/// DIR` (validated in a copy, so the user's tree is never pruned), or for
+/// `--harness library` a tree the library builds for this issue with no
+/// model call. A tree that fails validation is dropped with a note.
+async fn base_harness(
+    job: &Job,
+    issue: &Issue,
+    domain: &str,
+    library: Option<&crate::harness::library::Library>,
+    hooks: &EngineHooks,
+) -> Result<Option<PathBuf>, SlagError> {
+    let spec = job.args.harness.as_deref().map(str::trim).unwrap_or_default();
+    let scratch = job.cwd.join(".slag").join("harness");
+    let dir = match spec {
+        "" | "none" => return Ok(None),
+        "library" => {
+            let Some(lib) = library else {
+                note(hooks, "harness: no library is configured; running without one", false);
+                return Ok(None);
+            };
+            let dst = scratch.join("library");
+            let repository = job
+                .git
+                .as_ref()
+                .and_then(|g| g.top.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let used = lib.apply(domain, &issue.render(), &repository, &dst);
+            if used.is_empty() {
+                note(hooks, &format!("harness: no {domain} library entry applies here; running without one"), false);
+                return Ok(None);
+            }
+            note(hooks, &format!("harness: {domain} library entries {}", used.join(", ")), true);
+            dst
+        }
+        path => {
+            let given = PathBuf::from(path);
+            if !given.is_dir() {
+                return Err(SlagError::Config(format!("--harness {path}: no such directory")));
+            }
+            let dst = scratch.join("given");
+            crate::harness::copy_tree(&given, &dst)?;
+            dst
+        }
+    };
+    match crate::harness::validate::validate(&dir).await {
+        Ok(_) => {
+            let loaded = crate::harness::Harness::load(&dir);
+            note(hooks, &format!("harness: {}", loaded.summary()), true);
+            Ok((!loaded.is_empty()).then_some(dir))
+        }
+        Err(why) => {
+            let first = why.lines().find_map(|l| l.trim().strip_prefix("- ")).unwrap_or(why.as_str());
+            note(hooks, &format!("harness dropped, it failed validation: {first}"), false);
+            Ok(None)
+        }
+    }
+}
+
+/// After an evolved fix: reflect, update the library, and put the stage
+/// table on the report.
+async fn reflect(ctx: &Ctx<'_>, evolved: Option<evolve::Evolved>, out: &mut Outcome) {
+    let Some(mut ev) = evolved else { return };
+    let clock = std::time::Instant::now();
+    let verdict = match &out.verdict {
+        Verdict::Fixed => match out.checks.first() {
+            Some(c) => format!("fixed, `{}` {}", c.cmd, c.status()),
+            None => "fixed".to_string(),
+        },
+        Verdict::Failed(why) => format!("not fixed: {why}"),
+    };
+    ev.reflect(ctx, &verdict).await;
+    out.phases.evolve += clock.elapsed().as_secs_f64();
+    out.evolve = Some(ev.summary());
 }
 
 fn note_repro(hooks: &EngineHooks, repro: &Repro, cmd: &str) {
@@ -645,6 +792,17 @@ struct Ctx<'a> {
     before: &'a BTreeMap<String, repo::Content>,
     usable_test: Option<&'a str>,
     rescuer: &'a Rescuer<'a>,
+    smith: SmithOpts,
+}
+
+/// How a fix session's smith is built beyond the model: the harness it
+/// runs under and, inside `--evolve`, where its transcript goes and which
+/// budget it spends. The default is the plain fast path.
+#[derive(Clone, Default)]
+struct SmithOpts {
+    harness: Option<Arc<crate::harness::Harness>>,
+    transcripts: Option<PathBuf>,
+    spend: Option<(crate::engine::agent::SpendAccum, f64)>,
 }
 
 /// One session, judged by slag.
@@ -693,7 +851,21 @@ impl Ctx<'_> {
     ) -> Result<Attempted, SlagError> {
         let (job, hooks) = (self.job, self.hooks);
         let prompt = crate::flux::fix_prompt(&self.issue.render(), self.context, retry);
-        let smith = crate::smith::make_smith(self.config, "default", grade, hooks);
+        // `job.cwd` is the directory `make_smith` would root at; an evolve
+        // run points it at a copy of the repository instead.
+        let mut smith = crate::smith::native::NativeSmith::forge(
+            self.config.clone(),
+            "default",
+            grade,
+            job.cwd.clone(),
+            hooks,
+        )
+        .with_harness(self.smith.harness.clone())
+        .with_transcript_root(self.smith.transcripts.clone());
+        if let Some((spend, cap)) = &self.smith.spend {
+            smith = smith.with_ingot_spend(spend.clone()).with_cost_cap(Some(*cap));
+        }
+        let smith: Box<dyn crate::smith::Smith> = Box::new(smith);
         let clock = std::time::Instant::now();
         let response = super::forge::invoke_absorbing_transients(
             smith.as_ref(),
@@ -722,8 +894,20 @@ impl Ctx<'_> {
                 );
             }
         };
-        let agent_cmd = crate::proof::extract_cmd(&response);
-        let summary = strip_cmd_lines(&response);
+        self.check(label, &response, phases).await
+    }
+
+    /// slag's own checks on what a session left on disk: something
+    /// changed, no existing test was lost, the tests pass, and with
+    /// `--temper` the warden agrees. `response` is the session's finish
+    /// text, which carries its `CMD:` line.
+    async fn check(&self, label: &str, response: &str, phases: &mut Phases) -> Result<Attempted, SlagError> {
+        let (job, hooks) = (self.job, self.hooks);
+        let fail = |failure: Failure, summary: String| {
+            Ok(Attempted::Failed { failure, summary, changed: self.changed_now() })
+        };
+        let agent_cmd = crate::proof::extract_cmd(response);
+        let summary = strip_cmd_lines(response);
         let changed = self.changed_now();
 
         if let Some(git) = &job.git {
@@ -1985,6 +2169,12 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
         let n = if n.starts_with("revised once after review: ") { "revised once after review; the revision closed the gap" } else { n };
         lines.extend(wrapped("note", n, 3));
     }
+    if let Some(ev) = &out.evolve {
+        lines.extend(wrapped("evolve", &ev.head, 3));
+        for line in ev.stages.iter().chain(&ev.lines) {
+            lines.extend(wrapped("", line, 2));
+        }
+    }
 
     // What it took.
     let mut took = Vec::new();
@@ -2026,6 +2216,14 @@ mod tests {
                 model: None,
                 plan_model: None,
                 tui: false,
+                evolve: 0,
+                sequential: false,
+                harness: None,
+                editor_model: None,
+                evolve_budget: None,
+                evolve_tokens: None,
+                domain: None,
+                library: None,
             },
             temper: false,
             cwd: dir.to_path_buf(),
@@ -2554,6 +2752,7 @@ mod tests {
             phases: Phases::default(),
             time: None,
             spend: None,
+            evolve: None,
         };
         let msg = commit_message(&out);
         assert!(msg.starts_with("fix: Crash on empty input\n"), "{msg}");

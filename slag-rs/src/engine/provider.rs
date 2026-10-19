@@ -2370,7 +2370,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_429_then_succeeds() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
@@ -2621,7 +2621,10 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_backoff_survives_new_clients_and_keeps_hosts_separate() {
-        let server = MockServer::start().await;
+        // A pooled server's address outlives its test, and the process-wide
+        // rate limiter is keyed on it: the 429 tests take a fresh server so
+        // one test's failures and waits never reach another's.
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).set_body_string("rate limit"))
             .expect(7).mount(&server).await;
@@ -2646,14 +2649,14 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&limiter, &path_alias));
         let other_preset = shared_rate_limiter(ProviderPreset::OpenAI, &server.uri());
         assert!(!std::sync::Arc::ptr_eq(&limiter, &other_preset));
-        let other_server = MockServer::start().await;
+        let other_server = MockServer::builder().start().await;
         let other_host = shared_rate_limiter(ProviderPreset::Mistral, &other_server.uri());
         assert!(!std::sync::Arc::ptr_eq(&limiter, &other_host));
     }
 
     #[tokio::test]
     async fn concurrent_clients_share_rate_limit_waits_and_retry_gate() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = calls.clone();
         Mock::given(method("POST"))
@@ -2691,7 +2694,7 @@ mod tests {
 
     #[tokio::test]
     async fn unattended_rate_limit_keeps_the_shared_gate_after_recovery() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0").set_body_string("rate limit"))
             .up_to_n_times(1).expect(1).mount(&server).await;
@@ -2708,7 +2711,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_success_does_not_clear_a_new_rate_limit() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST")).and(body_partial_json(json!({"model": "slow"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()).set_delay(Duration::from_millis(100)))
             .expect(1).mount(&server).await;
@@ -2730,7 +2733,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_rate_limit_wait_observes_cancellation() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60").set_body_string("rate limit"))
             .expect(1).mount(&server).await;
@@ -2806,7 +2809,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_after_overrides_computed_backoff() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -3406,7 +3409,7 @@ mod tests {
     #[tokio::test]
     async fn unattended_capacity_errors_retry_past_the_budget_with_heartbeats() {
         for status in [429u16, 529] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(
@@ -3550,7 +3553,7 @@ mod tests {
     /// to 6 hours. A raised flag now aborts before the next request.
     #[tokio::test]
     async fn cancel_flag_aborts_a_retry_wait_before_the_next_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string("limited"))
@@ -3724,7 +3727,7 @@ mod tests {
             (503, "Service unavailable", ProviderErrorCategory::Overloaded, "restores service"),
             (500, "Internal error", ProviderErrorCategory::Server, "restores service"),
         ] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(status).insert_header("x-should-retry", "true").set_body_string(body))
@@ -3754,7 +3757,7 @@ mod tests {
 
     #[tokio::test]
     async fn groq_tpm_with_billing_url_waits_and_retries() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST")).and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string(GROQ_TPM_BODY))
             .up_to_n_times(1).expect(1).mount(&server).await;
@@ -3776,7 +3779,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_headers_override_billing_text_on_429() {
         for header in ["retry-after", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST")).and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(429).insert_header(header, "1").set_body_string("Check billing limits"))
                 .expect(1).mount(&server).await;
@@ -3804,7 +3807,7 @@ mod tests {
             (ProviderPreset::Xai, 403, "Your team has exhausted its credits. Purchase credits to continue."),
             (ProviderPreset::OpenAI, 429, r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#),
         ] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST")).and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(status).set_body_string(body))
                 .expect(1).mount(&server).await;
@@ -4313,7 +4316,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_retry_after_waits_and_stops_at_the_attempt_budget() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1")
                 .set_body_json(json!({"error": {"message": "rate limit"}})))

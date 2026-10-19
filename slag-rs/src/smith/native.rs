@@ -38,6 +38,13 @@ pub struct NativeSmith {
     /// surveyor and founder spend separate even on one model.
     role: Role,
     scope_only: bool,
+    /// The execution harness (`crate::harness`) this smith runs under.
+    /// `None` builds the prompt, tools and hooks exactly as before.
+    harness: Option<Arc<crate::harness::Harness>>,
+    /// Where the session transcript goes; `None` keeps the run directory.
+    transcript_root: Option<PathBuf>,
+    /// A dollar cap over `ingot_spend` that overrides `SLAG_MAX_COST_INGOT`.
+    cost_cap: Option<f64>,
 }
 
 impl NativeSmith {
@@ -54,6 +61,9 @@ impl NativeSmith {
             ingot_spend: SpendAccum::default(),
             role: Role::Smith,
             scope_only: false,
+            harness: None,
+            transcript_root: None,
+            cost_cap: None,
         }
     }
 
@@ -76,6 +86,9 @@ impl NativeSmith {
             ingot_spend: SpendAccum::default(),
             role: Role::Plan,
             scope_only: false,
+            harness: None,
+            transcript_root: None,
+            cost_cap: None,
         }
     }
 
@@ -123,6 +136,9 @@ impl NativeSmith {
             ingot_spend: SpendAccum::default(),
             role: Role::Duel,
             scope_only: false,
+            harness: None,
+            transcript_root: None,
+            cost_cap: None,
         }
     }
 
@@ -130,6 +146,25 @@ impl NativeSmith {
     /// (duel casts are rebuilt every round; the accumulator persists).
     pub fn with_ingot_spend(mut self, acc: SpendAccum) -> Self {
         self.ingot_spend = acc;
+        self
+    }
+
+    /// Run under an execution harness. An empty one changes nothing.
+    pub fn with_harness(mut self, harness: Option<Arc<crate::harness::Harness>>) -> Self {
+        self.harness = harness.filter(|h| !h.is_empty());
+        self
+    }
+
+    /// Journal the session's transcript under `root` instead of the run
+    /// directory.
+    pub fn with_transcript_root(mut self, root: Option<PathBuf>) -> Self {
+        self.transcript_root = root;
+        self
+    }
+
+    /// Cap the shared spend accumulator at `cap` dollars.
+    pub fn with_cost_cap(mut self, cap: Option<f64>) -> Self {
+        self.cost_cap = cap;
         self
     }
 
@@ -167,7 +202,7 @@ impl NativeSmith {
         let mut system = if self.scope_only {
             "Classify the commission's scope. Return only the requested JSON. Do not build or inspect files. For a fresh Python unittest project, choose python3 -m unittest so the proof discovers the complete test suite.".into()
         } else {
-            prompt::build(&self.root, &model, self.mode).join()
+            prompt::build_with(&self.root, &model, self.mode, self.harness.as_deref()).join()
         };
         if self.role == Role::Warden {
             system.push_str("\n\nREAD-ONLY REVIEW: You cannot write anywhere, including temporary directories. \
@@ -236,7 +271,8 @@ impl NativeSmith {
         let window = if self.scope_only { None } else { provider.context_length(&model).await };
         let toolbox = ToolBox::new(&self.root)
             .with_policy(crate::engine::policy::Policy::from_config())
-            .with_steer(self.hooks.steer.clone());
+            .with_steer(self.hooks.steer.clone())
+            .with_harness_recipes(self.harness.as_ref().and_then(|h| h.recipe_root()));
         let mut agent = ForgeAgent::new(provider, toolbox, &model)
             .with_coordinator_root(self.root.clone())
             .with_context_window(window)
@@ -271,6 +307,15 @@ impl NativeSmith {
         }
         if let Some(cancel) = &self.hooks.cancel {
             agent = agent.with_cancel(cancel.clone());
+        }
+        if let Some(harness) = &self.harness {
+            agent = agent.with_harness_hooks(harness.hooks(&self.root).map(Arc::new));
+        }
+        if let Some(root) = &self.transcript_root {
+            agent = agent.with_transcript_root(root.clone());
+        }
+        if self.cost_cap.is_some() {
+            agent = agent.with_cost_cap(self.cost_cap);
         }
 
         let result = agent.run(system, prompt_text.to_string()).await;
@@ -314,6 +359,17 @@ mod tests {
             duel_rounds_override: None,
             screenshot_cmd: None,
         }
+    }
+
+    #[test]
+    fn an_empty_harness_is_no_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let smith = NativeSmith::forge(cfg(), "default", 1, dir.path().into(), &EngineHooks::default())
+            .with_harness(Some(Arc::new(crate::harness::Harness::load(dir.path()))));
+        assert!(smith.harness.is_none(), "an empty harness must not reach the prompt");
+        std::fs::write(dir.path().join("memory.md"), "Tests use unittest.\n").unwrap();
+        let smith = smith.with_harness(Some(Arc::new(crate::harness::Harness::load(dir.path()))));
+        assert!(smith.harness.is_some());
     }
 
     #[test]

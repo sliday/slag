@@ -381,6 +381,15 @@ pub struct ForgeAgent {
     /// default; the plan-model factory flips it so plan spend separates
     /// from base spend even when both route to the same model id.
     role: Role,
+    /// A harness's hooks (`crate::harness`), fired around each tool call
+    /// before the operator's own. `None` fires only the operator's.
+    harness_hooks: Option<Arc<hooks::HookSnapshot>>,
+    /// The only tools this session may see and call. `None` keeps the
+    /// usual set.
+    tool_allowlist: Option<Vec<String>>,
+    /// Files, by path from the root, the session must read before it may
+    /// end on text. Empty asks for nothing.
+    required_reads: Vec<String>,
 }
 
 impl ForgeAgent {
@@ -409,7 +418,37 @@ impl ForgeAgent {
             coordinator_root: None,
             recent_tool_rounds: RECENT_TOOL_ROUNDS,
             role: Role::Smith,
+            harness_hooks: None,
+            tool_allowlist: None,
+            required_reads: Vec::new(),
         }
+    }
+
+    /// Keep the last `rounds` tool rounds verbatim (default 2). A session
+    /// that reads many files to compare them needs them all in view.
+    pub fn with_recent_rounds(mut self, rounds: usize) -> Self {
+        self.recent_tool_rounds = rounds.max(1);
+        self
+    }
+
+    /// Hold the session's final answer until it has read these files.
+    /// A model that claims to have read evidence it never opened gets the
+    /// list back, as long as turns remain.
+    pub fn with_required_reads(mut self, paths: Vec<String>) -> Self {
+        self.required_reads = paths;
+        self
+    }
+
+    /// Fire a harness's hooks around every tool call.
+    pub fn with_harness_hooks(mut self, snap: Option<Arc<hooks::HookSnapshot>>) -> Self {
+        self.harness_hooks = snap;
+        self
+    }
+
+    /// Offer and accept only these tools.
+    pub fn with_tool_allowlist(mut self, tools: &[&str]) -> Self {
+        self.tool_allowlist = Some(tools.iter().map(|t| t.to_string()).collect());
+        self
     }
 
     /// Withhold the `finish` tool.
@@ -631,6 +670,7 @@ impl ForgeAgent {
         let mut nudges = 0usize;
         let mut tool_validation_errors = 0usize;
         let mut inspected = false;
+        let mut read: Vec<String> = Vec::new();
         let require_verification = self.require_verification && !self.no_finish && !self.no_tools;
         let mut finish_cmd_nudged = false;
         let mut finish_repair_pending = false;
@@ -788,6 +828,23 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     });
                     continue;
                 }
+                let unread: Vec<&str> = self
+                    .required_reads
+                    .iter()
+                    .filter(|p| !read.iter().any(|r| r == *p || r.ends_with(&format!("/{p}"))))
+                    .map(String::as_str)
+                    .collect();
+                if !unread.is_empty() && turn < self.max_turns {
+                    messages.push(ChatMessage::assistant(resp.content.clone(), None));
+                    messages.push(ChatMessage::user(format!(
+                        "You have not read these files, and your answer must rest on them. Read them with \
+                         read_file, then answer again: {}",
+                        unread.join(", ")
+                    )));
+                    record_msg(tw, &messages[messages.len() - 2]);
+                    record_msg(tw, messages.last().unwrap());
+                    continue;
+                }
                 let report = self.ground_review_report(resp.content, &inspections, &required_runs);
                 emit(&self.events, EngineEvent::Finish { summary: report.clone() });
                 return Ok(report);
@@ -858,6 +915,14 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             let mut finish_summary: Option<String> = None;
             for (call, outcome) in calls.iter().zip(&outcomes) {
                 inspected |= !outcome.is_error && matches!(call.name.as_str(), "read_file" | "bash");
+                if call.name == "read_file" && !outcome.is_error {
+                    if let Some(path) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|p| p.trim_start_matches("./").to_string()))
+                    {
+                        read.push(path);
+                    }
+                }
                 let mut content = if outcome.is_error {
                     format!("ERROR: {}", outcome.output)
                 } else {
@@ -1200,6 +1265,9 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                 if self.read_only_tools {
                     specs.retain(|t| review_tool(&t.name));
                 }
+                if let Some(allow) = &self.tool_allowlist {
+                    specs.retain(|t| allow.contains(&t.name));
+                }
                 specs
             } else {
                 Vec::new()
@@ -1305,9 +1373,17 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         let root = self.coordinator_root.clone();
         let read_only = self.read_only_tools;
         let no_tools = self.no_tools;
+        let harness = self.harness_hooks.clone();
+        let refused = self.tool_allowlist.as_ref().is_some_and(|allow| !allow.contains(&call.name));
         tokio::spawn(async move {
             if no_tools {
                 return ToolOutcome { output: "tools are unavailable in this session".into(), is_error: true };
+            }
+            if refused {
+                return ToolOutcome {
+                    output: format!("{} is unavailable in this session", call.name),
+                    is_error: true,
+                };
             }
             if read_only && !review_tool(&call.name) {
                 return ToolOutcome {
@@ -1315,7 +1391,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     is_error: true,
                 };
             }
-            dispatch_hooked(toolbox, call, steer, events, root.as_deref(), read_only).await
+            dispatch_hooked(toolbox, call, steer, events, root.as_deref(), read_only, harness.as_deref()).await
         })
     }
 }
@@ -1327,6 +1403,10 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
 /// then goes back through PostToolUse or ToolError, whose output is
 /// appended to what the smith reads. With no hooks configured this is a
 /// snapshot read and two empty selects — the cost the common case pays.
+///
+/// A harness's hooks fire first on the way in, so the operator's own
+/// guards judge the call a harness may have rewritten, and last on the
+/// way out.
 async fn dispatch_hooked(
     toolbox: ToolBox,
     mut call: ToolCall,
@@ -1334,9 +1414,30 @@ async fn dispatch_hooked(
     events: Option<EventTx>,
     coordinator_root: Option<&std::path::Path>,
     read_only_tools: bool,
+    harness: Option<&hooks::HookSnapshot>,
 ) -> ToolOutcome {
     if read_only_tools {
         return guarded_dispatch(&toolbox, &call, coordinator_root, true).await;
+    }
+    let mut harness_context = Vec::new();
+    if let Some(snap) = harness {
+        let pre = hooks::fire_with(
+            snap,
+            hooks::HookEvent::PreTool,
+            hooks::HookPayload::new(hooks::HookEvent::PreTool).with_tool(&call.name, &call.arguments),
+            &call.name,
+            &call.arguments,
+            steer.as_ref(),
+            events.as_ref(),
+        )
+        .await;
+        if let Some(reason) = pre.blocked {
+            return ToolOutcome { output: format!("blocked by hook: {reason}"), is_error: true };
+        }
+        if let Some(rewritten) = pre.rewritten_arguments() {
+            call.arguments = rewritten;
+        }
+        harness_context = pre.context;
     }
     let pre = hooks::fire(
         hooks::HookEvent::PreTool,
@@ -1381,11 +1482,31 @@ async fn dispatch_hooked(
 
     // A post hook's exit 2 cannot un-run the call, so its reason joins the
     // result as context the smith must answer for.
-    let mut appended = pre.context;
+    let mut appended = harness_context;
+    appended.extend(pre.context);
     appended.extend(post.context);
     if let Some(reason) = post.blocked {
         appended.push(format!("hook objected: {reason}"));
         outcome.is_error = true;
+    }
+    if let Some(snap) = harness {
+        let post = hooks::fire_with(
+            snap,
+            event,
+            hooks::HookPayload::new(event)
+                .with_tool(&call.name, &call.arguments)
+                .with_output(&outcome.output),
+            &call.name,
+            &call.arguments,
+            steer.as_ref(),
+            events.as_ref(),
+        )
+        .await;
+        appended.extend(post.context);
+        if let Some(reason) = post.blocked {
+            appended.push(format!("hook objected: {reason}"));
+            outcome.is_error = true;
+        }
     }
     if !appended.is_empty() {
         outcome.output = format!("{}\n\n{}", outcome.output, appended.join("\n"));
@@ -1832,6 +1953,87 @@ mod tests {
         ForgeAgent::new(provider, ToolBox::new(root), "test/model")
             .with_cost_cap(None)
             .with_run_cap(None)
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_offers_and_accepts_only_its_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let editor = agent(MockProvider::new(vec![]), dir.path()).with_tool_allowlist(&["read_file", "write_file"]);
+        let names: Vec<String> = editor.request(Vec::new(), true, None).tools.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["read_file", "write_file"]);
+        let outcomes = editor.dispatch_batch(&[tc("b", "bash", serde_json::json!({"command": "touch marker"}))]).await;
+        assert!(outcomes[0].is_error && outcomes[0].output.contains("unavailable"), "{:?}", outcomes[0]);
+        assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    async fn a_session_can_keep_every_tool_round_in_view() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(dir.path().join(name), format!("evidence {name}\n")).unwrap();
+        }
+        let script = || {
+            vec![
+                resp_tools(vec![tc("1", "read_file", serde_json::json!({"path": "a.md"}))]),
+                resp_tools(vec![tc("2", "read_file", serde_json::json!({"path": "b.md"}))]),
+                resp_tools(vec![tc("3", "read_file", serde_json::json!({"path": "c.md"}))]),
+                resp_text("done", FinishReason::Stop),
+            ]
+        };
+        let kept = |p: &MockProvider| {
+            let last = p.requests().last().unwrap().messages.clone();
+            ["a.md", "b.md", "c.md"].iter().filter(|n| last.iter().any(|m| m.role == "tool" && m.content.contains(&format!("evidence {n}")))).count()
+        };
+        let short = MockProvider::new(script());
+        agent(short.clone(), dir.path()).without_finish().run("s".into(), "t".into()).await.unwrap();
+        assert_eq!(kept(&short), 2, "the default keeps two rounds verbatim");
+        let long = MockProvider::new(script());
+        agent(long.clone(), dir.path()).without_finish().with_recent_rounds(usize::MAX).run("s".into(), "t".into()).await.unwrap();
+        assert_eq!(kept(&long), 3);
+    }
+
+    #[tokio::test]
+    async fn an_answer_waits_until_the_required_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("context/runs/base-1")).unwrap();
+        std::fs::write(dir.path().join("context/runs/base-1/trajectory.md"), "turn 1\n").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_text("KEEP_BASE: I read everything.", FinishReason::Stop),
+            resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "./context/runs/base-1/trajectory.md"}))]),
+            resp_text("KEEP_BASE: base-1 already passed.", FinishReason::Stop),
+        ]);
+        let editor = agent(provider.clone(), dir.path())
+            .without_finish()
+            .with_required_reads(vec!["context/runs/base-1/trajectory.md".into()]);
+        let reply = editor.run("edit".into(), "task".into()).await.unwrap();
+        assert_eq!(reply, "KEEP_BASE: base-1 already passed.");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        let nudge = &requests[1].messages.last().unwrap().content;
+        assert!(nudge.contains("You have not read these files") && nudge.contains("context/runs/base-1/trajectory.md"), "{nudge}");
+    }
+
+    #[tokio::test]
+    async fn harness_hooks_answer_around_a_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let snap = hooks::HookSnapshot::from_entries(
+            vec![
+                ("post_tool".into(), "name=note matcher=read_file cmd='echo harness saw it'".into()),
+                ("pre_tool".into(), "name=stop matcher=write_file cmd='echo no writes here >&2; exit 2'".into()),
+            ],
+            false,
+        );
+        let a = agent(MockProvider::new(vec![]), dir.path()).with_harness_hooks(Some(Arc::new(snap)));
+        let outcomes = a
+            .dispatch_batch(&[
+                tc("r", "read_file", serde_json::json!({"path": "a.txt"})),
+                tc("w", "write_file", serde_json::json!({"path": "b.txt", "content": "y"})),
+            ])
+            .await;
+        assert!(outcomes[0].output.ends_with("harness saw it"), "{:?}", outcomes[0]);
+        assert!(outcomes[1].is_error && outcomes[1].output.contains("no writes here"), "{:?}", outcomes[1]);
+        assert!(!dir.path().join("b.txt").exists());
     }
 
     #[tokio::test]

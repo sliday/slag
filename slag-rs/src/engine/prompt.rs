@@ -83,10 +83,28 @@ pub fn append_reminder(carrier: &mut String, body: &str) {
 
 /// Build the full banded system prompt for one smith session.
 pub fn build(root: &Path, model: &str, mode: PromptMode) -> PromptBands {
+    build_with(root, model, mode, None)
+}
+
+/// `build` with an execution harness (`crate::harness`): its always-on
+/// text closes the stable band, which stays byte-stable for the session,
+/// and its recipes join the index. An empty harness, or none, builds
+/// exactly what `build` does.
+pub fn build_with(
+    root: &Path,
+    model: &str,
+    mode: PromptMode,
+    harness: Option<&crate::harness::Harness>,
+) -> PromptBands {
+    let mut stable = stable_band(model, mode);
+    if let Some(band) = harness.map(crate::harness::Harness::band).filter(|b| !b.is_empty()) {
+        stable.push_str("\n\n");
+        stable.push_str(&band);
+    }
     PromptBands {
-        stable: stable_band(model, mode),
+        stable,
         context: workspace_snapshot(root, model),
-        volatile: volatile_band(root),
+        volatile: volatile_band(root, harness.and_then(crate::harness::Harness::recipe_root).as_deref()),
     }
 }
 
@@ -356,7 +374,7 @@ fn project_facts(root: &Path) -> Vec<String> {
     facts
 }
 
-fn volatile_band(root: &Path) -> String {
+fn volatile_band(root: &Path, harness_recipes: Option<&Path>) -> String {
     let date = chrono::Local::now().format("%Y-%m-%d");
     // MCP names count here too, so a recipe gated on `requires_tools:
     // mcp__github__create_issue` appears exactly when that server is up.
@@ -364,7 +382,7 @@ fn volatile_band(root: &Path) -> String {
         .into_iter()
         .map(|s| s.name)
         .collect();
-    let index = super::tools::recipes::index(root, &tool_names);
+    let index = super::tools::recipes::index_with(root, harness_recipes, &tool_names);
     format!(
         "# Session\n- date: {date}\n\n{index}\n\nIf a recipe matches the task, load it with \
          recipe_view before working. Err on the side of loading."
@@ -471,7 +489,7 @@ mod tests {
     #[test]
     fn volatile_date_has_no_clock_time() {
         let dir = tempfile::tempdir().unwrap();
-        let v = volatile_band(dir.path());
+        let v = volatile_band(dir.path(), None);
         let date_line = v.lines().find(|l| l.starts_with("- date:")).unwrap();
         let stamp = date_line.trim_start_matches("- date:").trim();
         assert_eq!(stamp.len(), 10, "expected YYYY-MM-DD, got {stamp}");
@@ -670,10 +688,56 @@ mod tests {
         assert!(bands.join().contains("(none installed)"));
     }
 
+    /// The fast path's contract: a harness with nothing in it, or none on
+    /// disk, builds the very bytes a run without one builds.
+    #[test]
+    fn an_empty_harness_leaves_every_band_byte_identical() {
+        let (_guard, _config) = crate::config::isolated_config_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let blank = tempfile::tempdir().unwrap();
+        std::fs::write(blank.path().join("systemprompt.md"), "\n").unwrap();
+        std::fs::write(blank.path().join("guardrails.md"), "").unwrap();
+        std::fs::create_dir_all(blank.path().join("recipes")).unwrap();
+        for h in [
+            crate::harness::Harness::load(blank.path()),
+            crate::harness::Harness::load(&blank.path().join("absent")),
+        ] {
+            for mode in [PromptMode::Forge, PromptMode::Plan, PromptMode::Review] {
+                let plain = build(dir.path(), "qwen/qwen3-coder", mode);
+                let with = build_with(dir.path(), "qwen/qwen3-coder", mode, Some(&h));
+                assert_eq!(plain.stable, with.stable);
+                assert_eq!(plain.context, with.context);
+                assert_eq!(plain.volatile, with.volatile);
+            }
+        }
+    }
+
+    #[test]
+    fn a_harness_closes_the_stable_band_and_joins_the_recipe_index() {
+        let (_guard, _config) = crate::config::isolated_config_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let h = tempfile::tempdir().unwrap();
+        std::fs::write(h.path().join("systemprompt.md"), "Reproduce first.\n").unwrap();
+        std::fs::create_dir_all(h.path().join("recipes/ends")).unwrap();
+        std::fs::write(
+            h.path().join("recipes/ends/RECIPE.md"),
+            "---\nname: ends\ndescription: load this when a range loses an end\n---\nAssert both ends.\n",
+        )
+        .unwrap();
+        let harness = crate::harness::Harness::load(h.path());
+        let plain = build(dir.path(), "qwen/qwen3-coder", PromptMode::Forge);
+        let with = build_with(dir.path(), "qwen/qwen3-coder", PromptMode::Forge, Some(&harness));
+        assert!(with.stable.starts_with(&plain.stable), "the harness only appends");
+        assert!(with.stable.ends_with("## Procedure\nReproduce first."), "{}", with.stable);
+        assert_eq!(with.context, plain.context);
+        assert!(with.volatile.contains("- ends: load this when a range loses an end"), "{}", with.volatile);
+        assert!(!plain.volatile.contains("- ends:"));
+    }
+
     #[test]
     fn volatile_band_carries_load_biasing_preamble() {
         let dir = tempfile::tempdir().unwrap();
-        let v = volatile_band(dir.path());
+        let v = volatile_band(dir.path(), None);
         assert!(v.contains("## Recipes"));
         assert!(v.contains("load it with recipe_view"), "{v}");
         assert!(v.contains("Err on the side of loading"), "{v}");

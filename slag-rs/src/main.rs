@@ -17,6 +17,7 @@ mod dashboard;
 mod engine;
 mod error;
 mod flux;
+mod harness;
 mod insights;
 mod migrations;
 mod pipeline;

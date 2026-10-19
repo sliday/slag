@@ -32,6 +32,7 @@ fn outcome(verdict: Verdict) -> Outcome {
         phases: Phases::default(),
         time: Some("wall 4s · api 4s · tools 0s".into()),
         spend: Some("$0.01".into()),
+        evolve: None,
     }
 }
 
@@ -77,7 +78,7 @@ fn the_reproduction_reads_as_a_failure_without_the_fix() {
 #[test]
 fn the_card_drops_instant_phases_and_does_not_repeat_the_review() {
     let mut out = outcome(Verdict::Fixed);
-    out.phases = Phases { gather: 0.1, session: 9.6, verify: 0.1, repro: 0.1, review: 0.0, land: 0.1 };
+    out.phases = Phases { gather: 0.1, evolve: 0.0, session: 9.6, verify: 0.1, repro: 0.1, review: 0.0, land: 0.1 };
     out.notes = vec!["revised once after review: no regression test was added: add one".into()];
     let text = crate::tui::with_color(false, || report_lines(&out, 79)).join("\n");
     assert!(text.contains("session 9.6s"), "{text}");

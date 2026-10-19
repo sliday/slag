@@ -111,6 +111,7 @@ Each role uses its selected provider's default unless you set a model:
 | plan | Grade 3+ ingots, surveyor, founder | `SLAG_MODEL_PLAN` | `model_plan` | `--plan-model` |
 | duel | Cast B in a twin-cast duel | `SLAG_MODEL_ALT` | `model_alt` | |
 | judge | Assays duel casts | `SLAG_MODEL_JUDGE` | `model_judge` | `--judge-model` |
+| editor | Harness editor, composer, selector, reflector in `slag fix --evolve`. Default: the plan model | `SLAG_MODEL_EDITOR` | `model_editor` | `--editor-model` (on `slag fix`) |
 
 Model precedence is flag, then environment, then file, then the provider default. Use lowercase keys in the file and uppercase names in the environment.
 
@@ -221,6 +222,77 @@ slag fix --issue-file ISSUE.md --pr
 
 A failed attempt retries on the plan model, starting from the failure slag saw. `--tries N` sets the attempts (default 3), `--no-commit` leaves the fix in the working tree, `--pr` pushes the branch and opens a draft PR, and `--temper` adds the warden as an independent judge. Outside git, slag tracks the changes in a private temporary repository and commits nothing.
 
+## Recursive harnessing
+
+`slag fix` can improve the harness it works in, issue by issue, with no model change. The method follows Harness² (Xu et al., "Harness²: Recursive Agent Harnessing for an Open World", Google Cloud AI Research, 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224)). Without the flags below, `slag fix` runs exactly as described above.
+
+```bash
+slag fix "export drops the last day"                   # fast path, no harness
+slag fix --harness ./my-harness "export drops ..."     # run under a harness directory
+slag fix --harness library "export drops ..."          # apply the library, no probing
+slag fix --evolve 1 "export drops ..."                 # evolve the harness on this issue
+slag fix --evolve 3 --sequential "export drops ..."    # three chained steps instead
+```
+
+### The harness
+
+A harness is a directory of plain files. slag loads each component through a surface it already has:
+
+| Paper component | File | How slag loads it |
+|-----------------|------|-------------------|
+| C1 system prompt | `systemprompt.md` | Appended to the stable prompt band |
+| C2 guardrails | `guardrails.md` | The same band |
+| C3 memory | `memory.md` | The same band |
+| C4 tool guidance | `tool_guidance.md` | The same band |
+| C6 skills | `recipes/<name>/RECIPE.md` | The recipe index; `recipe_view` loads one on demand |
+| C7 scripts | `scripts/<file>`, `recipes/<name>/scripts/<file>` | Named in the band; the smith runs them with `bash`, in the shell sandbox |
+| C8 plugin | `hooks.toml` | Command hooks around each tool call, in the read-only sandbox |
+| C5 subagents | none | slag's agent loop has no delegation tool, so the validator drops `sub_agents/` |
+
+A hook line uses the `[hooks]` syntax, such as `post_tool = "name=lint matcher=edit_file cmd='sh $SLAG_HARNESS/scripts/lint.sh'"`. `$SLAG_HARNESS` points at the harness directory. An empty harness, or a missing one, changes nothing: every prompt stays byte-identical to a run without one.
+
+### Task level: `--evolve K`
+
+1. **Reference.** K fix attempts under the current harness.
+2. **Propose.** For each of K, an invariant editor (procedure, tool use, verification) and a domain editor (what a practitioner of this kind of repository knows) each edit a copy of the harness.
+3. **Probe.** Each candidate runs the same issue on the same model, in its own throwaway copy of the repository.
+4. **Compose.** K composers read every run and every candidate and write a successor harness: merge edits, adopt one candidate, or keep the base. Each decision names the run moment that supports it.
+5. **Execute and select.** Each successor runs. With K = 1 the composed run delivers when it passes. With K > 1 a blind selector picks among the verified fixes without knowing which harness made them.
+
+`--sequential` chains K propose, probe and compose steps, each building on the last checkpoint, instead of running K in parallel. A candidate whose harness equals one already run reuses that run instead of paying for another.
+
+Every run is one fix attempt in a copy of the working tree, uncommitted work included. slag verifies each run exactly as the fast path verifies a fix: its own test run, the lost-test guard, and the reversal check. Those exit codes are behavioral evidence for the composer, never a reason to skip the comparison. The chosen fix then lands in your repository and passes the same checks there before it commits. When no run verifies, the standard attempts continue under the composed harness.
+
+### Harnessing level: the library
+
+After the fix, a reflector reads the whole record. It writes one row per edited component, with a verdict of `helped`, `hurt`, `no observed effect` or `confounded`, and at most one lesson: a cue for the kind of situation and an operation on a named component. The library gains an entry only when slag's own measurements back a `helped` or `hurt` row: the runs under the harnesses that carried the edit beat the reference runs (or fell behind them) on the first measure that separates them, in this order: whether the fix verified, whether its new test catches the bug, tool errors, turns. The lesson must also name a harness component. A verdict the numbers contradict stays the reflector's opinion. Each entry holds the adopted harness, any rejected candidate whose edit backed the lesson, and an EXPERIENCE.md. An INDEX.md lists the entries per domain:
+
+```text
+~/.config/slag/library/<domain>/INDEX.md
+~/.config/slag/library/<domain>/<entry>/EXPERIENCE.md
+~/.config/slag/library/<domain>/<entry>/harness/
+~/.config/slag/library/<domain>/<entry>/candidates/<label>/
+```
+
+The domain is the repository's stack (`python`, `node`, `rust`, `go`, `shell`, or `general`), read from the test command and the manifests; `--domain` overrides it. A repository can keep its own library at `.slag/library`. Later `--evolve` runs start from the base harness, and their editors and composers read the library as examples. `--harness library` applies what transfers without a probe, from the domain's most relevant entries and with no model call. An adopted harness's procedure, guardrails, tool guidance and hooks were written for the task that adopted them, and only `--evolve` adapts them, so they stay behind. Recipes come from every relevant entry, including a rejected candidate whose edit backed the lesson: a recipe costs nothing until its trigger loads it. From the same repository, the `memory.md` lines that state a fact "in this repository" come too.
+
+### Safety and cost
+
+- Improver sessions (editor, composer, selector, reflector) get their evidence as files under `.slag/evolve/<run>/sessions/<name>/context/`. They have file tools rooted there and no shell. slag reads back only `context/harness/` and the reply. An answer that comes before the session opened its evidence (each run's trajectory and checks, each candidate's diff) goes back with the list of files still unread.
+- A guard refuses any working directory that holds a grader verdict, a rubric, a score file, a `hidden/` directory, or a bench path. Absolute paths of your repository read as `<repo>`.
+- A harness lives outside your repository, so no harness edit can touch your code or tests. Harness scripts run through the smith's sandboxed shell. Harness hooks run in the read-only sandbox without credential variables (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`), die at their timeout, and do not run at all where no OS sandbox exists.
+- The chosen fix lands in your repository only when every path it changed is a plain path inside the tree, outside `.git`, `.slag` and `logs`, and under no symbolic link. A link at a changed path is replaced, never written through.
+- The validator rejects a recipe without a trigger (`description:` of four words or more), a named script the harness does not ship, a script that does not parse, always-on text over 8000 bytes, a hook that is not a plain command, and notes that describe edits, or spell out file writes as text, over a tree that did not change (an unchanged tree needs KEEP_BASE in the notes). A rejected tree gets one retry with the validator's message, then falls back to the tree it started from, and the record says so.
+- `--evolve 1` costs up to four fix attempts and four improver sessions, plus one for each validation retry. The done screen and `slag status --json` (under `evolve`) show each stage's sessions, time, tokens and spend. `--evolve-budget USD` (default $2) and `--evolve-tokens N` (default 4,000,000) cap everything the recursion spends. Once either is reached, no further session starts, and the dollar cap also stops a session in flight at its next turn. A capped run says so and delivers the best verified fix found so far.
+- `.slag/evolve/<run>/record.json` keeps the whole record: every run with what slag measured, every candidate with its outcome, the composer's and editors' notes, the selection, and the library outcome.
+
+| Setting | Env | `config.toml` key | Flag |
+|---------|-----|-------------------|------|
+| Editor model (default: the plan model) | `SLAG_MODEL_EDITOR` | `model_editor` | `--editor-model` |
+| Library directory | `SLAG_HARNESS_LIBRARY` | `harness_library` | `--library` |
+| Dollar cap (default 2) | `SLAG_EVOLVE_BUDGET` | `evolve_budget` | `--evolve-budget` |
+| Token cap (default 4000000) | `SLAG_EVOLVE_TOKENS` | | `--evolve-tokens` |
+
 ## Sandbox
 
 The smith's shell commands can read anything and reach the network. They can write only inside the workspace, `/tmp`, your own `$TMPDIR`, and `~/.npm/_logs`. Package caches stay read-only, because each one holds code that a later build outside the sandbox runs: cargo extracts a cached `.crate` without checking it, npm and pip caches serve the metadata that carries their own checksums, and Go's build cache holds compiled objects. Builds that only read the caches keep working: `cargo test --offline` with dependencies already extracted, `npm test`, `python3 -m unittest`. npm, pnpm, Yarn, bun, pip, uv and the Go build cache get a throwaway cache under `$TMPDIR/slag-cache-$USER` instead, so `npm install` and `go test` still work. A `CARGO_TARGET_DIR` outside the workspace becomes `<workspace>/target`. Cargo has no such switch for its registry: a crate that is not already extracted fails with a note that says to run `cargo fetch` outside slag, vendor it, or add the cache to `sandbox_writable`. Nothing on your `PATH` is writable either: not `~/.cargo/bin`, `~/.rustup`, the npx cache, or other users' temp dirs.
@@ -307,7 +379,7 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `SLAG_PROVIDER` | Default provider; `--provider` takes precedence |
 | `SLAG_BASE_URL` | Override the selected provider's API root |
 | `SLAG_<PROVIDER>_BASE_URL` | Override one provider's API root in a mixed run |
-| `SLAG_MODEL_BASE` / `_PLAN` / `_ALT` / `_JUDGE` | Per-role model ids |
+| `SLAG_MODEL_BASE` / `_PLAN` / `_ALT` / `_JUDGE` / `_EDITOR` | Per-role model ids |
 | `SLAG_DUEL` | `auto` (default), `on`, `off` |
 | `SLAG_DUEL_ROUNDS` | Override the duel round cap |
 | `SLAG_SANDBOX` | `auto` (default) or `off` for the shell sandbox |
@@ -318,6 +390,8 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `SLAG_CONFIG_DIR` | Move the config directory off `~/.config/slag` |
 | `SLAG_OPENROUTER_BASE` | Legacy OpenRouter-only base URL override |
 | `SLAG_CHAR_BUDGET` | Transcript char budget before an agent session compacts (default 600000). Lower it for small-context models. |
+| `SLAG_HARNESS_LIBRARY` | Harness library directory for `slag fix --evolve` and `--harness library` (file key `harness_library`) |
+| `SLAG_EVOLVE_BUDGET` / `SLAG_EVOLVE_TOKENS` | Dollar and token caps for `slag fix --evolve` (file key `evolve_budget` for dollars) |
 | `NO_COLOR` | Set to anything to drop color from the output |
 | `COLORTERM` | Read for `truecolor` / `24bit`; without it slag falls back to 256-color |
 
