@@ -605,6 +605,7 @@ impl ForgeAgent {
         let mut nudges = 0usize;
         let mut tool_validation_errors = 0usize;
         let mut inspected = false;
+        let mut inspections = crate::pipeline::warden::InspectionLog::default();
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
@@ -740,8 +741,9 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     record_msg(tw, messages.last().unwrap());
                     continue;
                 }
-                emit(&self.events, EngineEvent::Finish { summary: resp.content.clone() });
-                return Ok(resp.content);
+                let report = self.ground_review_report(resp.content, &inspections);
+                emit(&self.events, EngineEvent::Finish { summary: report.clone() });
+                return Ok(report);
             }
 
             // Budget gate sits before the assistant tool_calls message is
@@ -794,11 +796,16 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             let mut finish_summary: Option<String> = None;
             for (call, outcome) in calls.iter().zip(&outcomes) {
                 inspected |= !outcome.is_error && matches!(call.name.as_str(), "read_file" | "bash");
-                let content = if outcome.is_error {
+                let mut content = if outcome.is_error {
                     format!("ERROR: {}", outcome.output)
                 } else {
                     outcome.output.clone()
                 };
+                if self.read_only_tools {
+                    if let Some(reference) = inspections.record(call, outcome) {
+                        content.push_str(&format!("\n\n{reference}"));
+                    }
+                }
                 messages.push(ChatMessage::tool_result(&call.id, content));
                 record_msg(tw, messages.last().unwrap());
                 if call.name == "finish" && !outcome.is_error && finish_summary.is_none() {
@@ -864,8 +871,18 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         };
         emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
         self.track_spend(&resp.usage);
-        emit(&self.events, EngineEvent::Finish { summary: resp.content.clone() });
-        Ok(resp.content)
+        let report = self.ground_review_report(resp.content, &inspections);
+        emit(&self.events, EngineEvent::Finish { summary: report.clone() });
+        Ok(report)
+    }
+
+    fn ground_review_report(&self, raw: String, inspections: &crate::pipeline::warden::InspectionLog) -> String {
+        let has_verdict = raw.lines().any(|line| line.trim().trim_start_matches(['#', '*', '-', ' '])
+            .split_once(':').is_some_and(|(key, _)| key.trim_matches(['*', '_', '`']).trim().eq_ignore_ascii_case("VERDICT")));
+        if !self.read_only_tools || !self.require_inspection && !has_verdict { return raw; }
+        let verdict = crate::pipeline::warden::parse_grounded_verdict(&raw, inspections);
+        let outcome = if verdict.fulfilled { "pass" } else if verdict.is_unverified() { "unverified" } else { "fail" };
+        format!("VERDICT: {outcome}\nGAP: {}\nEVIDENCE: {}", verdict.gap, verdict.evidence)
     }
 
     /// Fold one response's cost into the shared ingot accumulator and the
@@ -1770,11 +1787,44 @@ mod tests {
         std::fs::write(dir.path().join("artifact.py"), "print('hello')").unwrap();
         let provider = MockProvider::new(vec![
             resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "artifact.py"}))]),
-            resp_text("VERDICT: PASS", FinishReason::Stop),
+            resp_text("VERDICT: PASS\nEVIDENCE: [\"r\"]", FinishReason::Stop),
         ]);
         let result = agent(provider, dir.path()).with_read_only_tools().with_required_inspection()
             .run("review".into(), "inspect artifact".into()).await.unwrap();
-        assert_eq!(result, "VERDICT: PASS");
+        let verdict = crate::pipeline::warden::parse_verdict(&result);
+        assert!(verdict.fulfilled);
+        assert!(verdict.evidence.contains("read_file \"artifact.py\""));
+    }
+
+    #[tokio::test]
+    async fn review_grounding_survives_history_trimming_and_the_final_budget_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.py"), "VALUE = 42\n").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("first", "read_file", serde_json::json!({"path": "artifact.py"}))]),
+            resp_tools(vec![tc("second", "read_file", serde_json::json!({"path": "artifact.py"}))]),
+            resp_text("VERDICT: pass\nEVIDENCE: [\"first\"]", FinishReason::Stop),
+        ]);
+        let mut reviewer = agent(provider.clone(), dir.path()).with_read_only_tools()
+            .with_required_inspection().with_max_turns(2);
+        reviewer.recent_tool_rounds = 1;
+        let result = reviewer.run("review".into(), "inspect artifact".into()).await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&result).fulfilled);
+        assert!(result.contains("[\"first\"] read_file \"artifact.py\""));
+        assert_eq!(provider.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn decorated_plan_verdicts_cannot_bypass_grounding() {
+        let dir = tempfile::tempdir().unwrap();
+        for verdict in ["\tVERDICT: pass", "\u{2003}VERDICT: pass", "#\tVERDICT: pass"] {
+            let provider = MockProvider::new(vec![resp_text(
+                &format!("{verdict}\nEVIDENCE: fabricated.py"), FinishReason::Stop,
+            )]);
+            let result = agent(provider, dir.path()).with_read_only_tools()
+                .run("plan review".into(), "judge document".into()).await.unwrap();
+            assert!(crate::pipeline::warden::parse_verdict(&result).is_unverified());
+        }
     }
 
     #[tokio::test]

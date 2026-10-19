@@ -15,11 +15,21 @@ use crate::smith::EngineHooks;
 use crate::error::SlagError;
 use crate::tui;
 
+mod grounding;
+pub(crate) use grounding::{InspectionLog, parse_grounded_verdict};
+
 /// How many warden rounds this run was armed with. Ambient like
 /// `tui::quiet` because it is one run-level integer read deep in the forge:
 /// threading it through four signatures to reach a single `if` costs more
 /// clarity than it buys.
 static ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REVIEW_BASE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_review_base(base: Option<String>) {
+    *REVIEW_BASE.lock().unwrap_or_else(|e| e.into_inner()) = base.map(|hash| hash.trim().to_string()).filter(|hash| {
+        matches!(hash.len(), 40 | 64) && hash.bytes().all(|c| c.is_ascii_hexdigit())
+    });
+}
 
 /// Arm the goal checks for this run. 0 leaves every warden asleep.
 pub fn set_rounds(n: usize) {
@@ -140,6 +150,7 @@ pub async fn bar(cfg: &EngineConfig, hooks: &EngineHooks) -> Result<String, Slag
 
     tui::header("WARDEN · setting the bar");
     let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Warden);
+    let prompt = format!("{}\n\n{}", workspace_context(), crate::flux::bar_prompt(&ore, &blueprint));
     // A model that explores with tools ends its turn on a finish summary
     // rather than the document, and "acceptance bar established" is exactly
     // the adjective this whole mechanism exists to avoid. Ask again plainly
@@ -147,7 +158,7 @@ pub async fn bar(cfg: &EngineConfig, hooks: &EngineHooks) -> Result<String, Slag
     // whole run and let it report success unjudged.
     let raw = crate::smith::invoke_document(
         smith.as_ref(),
-        &crate::flux::bar_prompt(&ore, &blueprint),
+        &prompt,
         crate::flux::DOCUMENT_ONLY_REMINDER,
         is_usable,
     )
@@ -191,8 +202,8 @@ pub async fn judge_artifact(
 
     tui::header(&format!("WARDEN · round {round}"));
     let smith = crate::smith::make_warden(cfg, hooks);
-    let prompt = format!("{}\n\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
-        crate::flux::warden_prompt(&ore, &bar), proof_output());
+    let prompt = format!("{}\n\n{}\n\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
+        workspace_context(), crate::flux::warden_prompt(&ore, &bar), proof_output());
     let raw = match smith
         .invoke(&prompt)
         .await
@@ -210,6 +221,75 @@ pub async fn judge_artifact(
     let verdict = parse_verdict(&raw);
     record(round, &verdict);
     Ok(verdict)
+}
+
+fn workspace_context() -> String {
+    let base = REVIEW_BASE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    workspace_context_in(std::path::Path::new("."), base.as_deref())
+}
+
+fn product_path(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    !super::COORDINATOR_FILES.iter().any(|name| path == std::path::Path::new(name))
+        && !path.starts_with("logs")
+        && !path.components().any(|part| {
+            let name = part.as_os_str().to_string_lossy();
+            matches!(name.as_ref(), ".git" | ".slag" | "__pycache__" | "node_modules" | ".venv" | "target")
+                || name.starts_with("slag-anvil-")
+        })
+}
+
+fn split_paths(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+    bytes.split(|b| *b == 0).filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).trim_start_matches("./").to_string())
+        .filter(|path| product_path(path)).collect()
+}
+
+fn git_paths(root: &std::path::Path, args: &[&str]) -> Option<std::collections::BTreeSet<String>> {
+    let output = crate::engine::sandbox::git().args(args).current_dir(root).output().ok()?;
+    output.status.success().then(|| split_paths(&output.stdout))
+}
+
+fn context_paths(paths: Option<&std::collections::BTreeSet<String>>) -> String {
+    let Some(paths) = paths else { return "Unavailable; inspect the workspace with read-only tools.".into() };
+    if paths.is_empty() { return "None.".into() }
+    let mut output = String::new();
+    for (index, path) in paths.iter().enumerate() {
+        let line = format!("- {}\n", serde_json::to_string(path).unwrap());
+        if index >= 120 || output.len() + line.len() > 4_000 {
+            output.push_str(&format!("... {} more paths; inspect the relevant directories.\n", paths.len() - index));
+            break;
+        }
+        output.push_str(&line);
+    }
+    output
+}
+
+fn workspace_context_in(root: &std::path::Path, base: Option<&str>) -> String {
+    let files = std::process::Command::new("rg")
+        .args(["--no-config", "--files", "--hidden", "--no-require-git", "--null",
+            "-g", "!/logs/**", "-g", "!**/.git/**", "-g", "!**/.slag/**",
+            "-g", "!**/slag-anvil-*/**", "-g", "!**/__pycache__/**",
+            "-g", "!**/node_modules/**", "-g", "!**/.venv/**", "-g", "!**/target/**"])
+        .current_dir(root).output().ok()
+        .filter(|output| output.status.success() || output.status.code() == Some(1))
+        .map(|output| split_paths(&output.stdout))
+        .or_else(|| git_paths(root, &["ls-files", "--cached", "--others", "--exclude-standard", "--exclude-per-directory=.ignore", "-z"]));
+    let changed = git_paths(root, &["diff", "--name-only", "--no-renames", "-z", base.unwrap_or("HEAD"), "--"])
+        .map(|paths| paths.into_iter().filter(|path| {
+            !root.join(path).exists() || files.as_ref().is_none_or(|files| files.contains(path))
+        }).collect());
+    let untracked = git_paths(root, &["ls-files", "--others", "--exclude-standard", "-z"])
+        .map(|paths| paths.into_iter().filter(|path| files.as_ref().is_none_or(|files| files.contains(path))).collect());
+    let changes = base.map(|hash| format!("CHANGES SINCE COMMISSION BASE {hash}"))
+        .unwrap_or_else(|| "BASELINE UNAVAILABLE: tracked changes below cover only the index and working tree".into());
+    format!(
+        "WORKSPACE TREE (product file paths; ignore rules and heap exclusions apply):\n{}\n\n\
+         {changes}:\n{}\n\n\
+         UNTRACKED PRODUCT FILES (commission ownership unknown):\n{}\n\n\
+         Paths describe scope, not inspection evidence. Read the relevant files before you judge them.",
+        context_paths(files.as_ref()), context_paths(changed.as_ref()), context_paths(untracked.as_ref()),
+    )
 }
 
 fn proof_output() -> String {
@@ -246,7 +326,9 @@ pub async fn judge_plan_doc(
 
     tui::header(&format!("WARDEN · {kind}"));
     let smith = crate::smith::make_plan_smith(cfg, hooks, crate::engine::Role::Warden);
-    match smith.invoke(&crate::flux::plan_warden_prompt(kind, &ore, &bar, &doc)).await {
+    let prompt = format!("{}\n\n{}\n\nDOCUMENT PATH: {doc_path}\nRead this file to obtain inspection evidence.",
+        workspace_context(), crate::flux::plan_warden_prompt(kind, &ore, &bar, &doc));
+    match smith.invoke(&prompt).await {
         Ok(raw) => Ok(parse_verdict(&raw)),
         Err(e) if e.is_deterministic_provider() => Err(e),
         Err(e) => Ok(Verdict::unverified(format!("the warden could not inspect {doc_path}: {e}"))),
@@ -267,8 +349,8 @@ pub async fn judge_ingot(
     ingot: &crate::sexp::Ingot,
 ) -> Verdict {
     let smith = crate::smith::make_warden(cfg, hooks);
-    let prompt = format!("{}\n\nPROOF COMMAND: {}\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
-        crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar), ingot.proof, proof_output());
+    let prompt = format!("{}\n\n{}\n\nPROOF COMMAND: {}\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
+        workspace_context(), crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar), ingot.proof, proof_output());
     match smith.invoke(&prompt).await {
         Ok(raw) => parse_verdict(&raw),
         Err(e) => Verdict::unverified(format!("the warden could not inspect the ingot: {e}")),
@@ -295,6 +377,77 @@ fn record(round: usize, v: &Verdict) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = crate::engine::sandbox::git().args(args).current_dir(root)
+            .env("GIT_AUTHOR_NAME", "slag test").env("GIT_AUTHOR_EMAIL", "test@slag.test")
+            .env("GIT_COMMITTER_NAME", "slag test").env("GIT_COMMITTER_EMAIL", "test@slag.test")
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn workspace_context_keeps_committed_changes_and_prunes_ignored_heap_files() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-b", "main"]);
+        std::fs::write(root.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.path().join(".ignore"), "scratch/\n").unwrap();
+        for name in ["old.py", "deleted.py", "README.md"] {
+            std::fs::write(root.path().join(name), "before\n").unwrap();
+        }
+        git(root.path(), &["add", "--", ".gitignore", ".ignore", "old.py", "deleted.py", "README.md"]);
+        git(root.path(), &["commit", "-m", "baseline"]);
+        let base = git(root.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(root.path().join("old.py"), "after\n").unwrap();
+        std::fs::remove_file(root.path().join("deleted.py")).unwrap();
+        for name in ["pkg/main.py", "pkg/logs/events.txt", "pkg/PRD.md", "pyproject.toml"] {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "product\n").unwrap();
+        }
+        git(root.path(), &["add", "-A"]);
+        git(root.path(), &["commit", "-m", "forge product"]);
+        for name in ["new.txt", "PLAN.md", "ignored.txt", "logs/session.txt", "scratch/notes.txt",
+            "slag-anvil-old/private.py", "pkg/slag-anvil-old/private.py", "target/cache.py",
+            ".slag/private.py", "__pycache__/cache.py", "node_modules/dependency.py"]
+        {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "private\n").unwrap();
+        }
+        let context = workspace_context_in(root.path(), Some(&base));
+        let tree = context.split("CHANGES SINCE COMMISSION BASE").next().unwrap();
+        assert!(tree.contains("pkg/main.py"));
+        assert!(tree.contains("pkg/logs/events.txt"));
+        assert!(tree.contains("pkg/PRD.md"));
+        assert!(!tree.contains("deleted.py"));
+        for hidden in ["PLAN.md", "ignored.txt", "session.txt", "scratch/notes.txt", "private.py", "cache.py", "dependency.py"] {
+            assert!(!context.contains(hidden), "{hidden} leaked into {context}");
+        }
+        let changes = context.split("CHANGES SINCE COMMISSION BASE").nth(1).unwrap()
+            .split("UNTRACKED PRODUCT FILES").next().unwrap();
+        for changed in ["old.py", "deleted.py", "pkg/main.py", "pyproject.toml"] {
+            assert!(changes.contains(changed), "{changed} missing from {changes}");
+        }
+        assert!(!changes.contains("README.md"));
+        assert!(context.contains("UNTRACKED PRODUCT FILES (commission ownership unknown):\n- \"new.txt\""));
+        let fallback = workspace_context_in(root.path(), None);
+        assert!(fallback.contains("BASELINE UNAVAILABLE"));
+        let changes = fallback.split("BASELINE UNAVAILABLE").nth(1).unwrap()
+            .split("UNTRACKED PRODUCT FILES").next().unwrap();
+        assert!(!changes.contains("old.py"));
+    }
+
+    #[test]
+    fn workspace_paths_have_bounded_size_and_escape_control_characters() {
+        let paths = ["src/a\nmisleading.py".to_string()].into_iter().collect();
+        assert_eq!(context_paths(Some(&paths)), "- \"src/a\\nmisleading.py\"\n");
+        let paths = (0..500).map(|n| format!("src/file_{n:04}.py")).collect();
+        let rendered = context_paths(Some(&paths));
+        assert!(rendered.len() < 4_100);
+        assert!(rendered.contains("380 more paths"));
+    }
 
     #[test]
     fn an_explicit_unverified_report_keeps_the_inspection_limit() {

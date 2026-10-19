@@ -716,7 +716,7 @@ impl Echo {
 
         // The next command, the one thing to type.
         let next = if self.goal_gap.is_some() {
-            Some((format!("slag --temper {} resume", self.warden_rounds + 1), "forges the gap as new ingots".to_string()))
+            Some((format!("slag --temper {} resume", self.warden_rounds + 1), if self.goal_gap.as_ref().is_some_and(|gap| crate::pipeline::warden::is_unverified_report(gap)) { "rechecks the goal with fresh evidence" } else { "forges the gap as new ingots" }.to_string()))
         } else if let Some(first) = cracked.first() {
             Some((format!("less logs/*_ASSAY_{}_*.log", first.id), "the failing proof's own output".to_string()))
         } else if left > 0 {

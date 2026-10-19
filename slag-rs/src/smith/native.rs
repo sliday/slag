@@ -175,7 +175,10 @@ impl NativeSmith {
                 Do not rerun unittest or pytest suites that create fixtures. Do not run py_compile or build commands. \
                 For Python syntax, use compile(open(path).read(), path, 'exec') in memory. \
                 For behavior, use existing files or in-memory inputs. Recorded proof plus source inspection can support a pass. \
-                A denied write ends this review as unverified. Return your verdict as text after inspection.");
+                A denied write ends this review as unverified. Return your verdict as text after inspection. \
+                EVIDENCE must be a JSON array of successful tool-call IDs from this session, for example [\"read-source\"]. \
+                Each successful tool result names its inspection ID. Do not put paths, commands, or prose in EVIDENCE. \
+                The coordinator resolves those IDs to the actual successful reads and commands.");
         }
         let effort = if self.scope_only {
             Some(Effort::Low)
@@ -366,7 +369,7 @@ mod tests {
                     .any(|message| message["role"] == "tool");
                 let message = if inspected {
                     serde_json::json!({
-                        "content": "VERDICT: pass\nGAP:\nEVIDENCE: output.txt contains accepted; cat output.txt prints accepted",
+                        "content": "VERDICT: pass\nGAP:\nEVIDENCE: [\"source\", \"check\"]",
                     })
                 } else {
                     serde_json::json!({
