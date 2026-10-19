@@ -116,34 +116,44 @@ impl Settings {
     }
 }
 
-/// Everything `--evolve` spends draws on one accumulator with one dollar
-/// cap, so a session stops mid-flight once the cap is reached; tokens are
-/// checked between stages.
+/// Everything `--evolve` spends draws on one shared budget: dollars from
+/// the calls slag can price, at the dated list rates, and every token. A
+/// session stops at its next turn once either cap is reached. A model
+/// with no price is charged no invented rate; the token cap budgets it.
 struct Budget {
-    usd: f64,
-    tokens: u64,
-    start: Usage,
-    spend: crate::engine::agent::SpendAccum,
+    shared: crate::engine::agent::SharedBudget,
 }
 
 impl Budget {
-    fn used(&self) -> Usage {
-        delta(&stats::snapshot().ledger.total(), &self.start)
-    }
-
-    fn dollars(&self) -> f64 {
-        *self.spend.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     fn over(&self) -> Option<String> {
-        let spent = self.dollars();
-        if spent >= self.usd {
-            return Some(format!("the evolve budget is spent: ${spent:.4} of ${:.2}", self.usd));
-        }
-        let tokens = tokens_of(&self.used());
-        (tokens >= self.tokens)
-            .then(|| format!("the evolve token cap is spent: {tokens} of {} tokens", self.tokens))
+        self.shared.over()
     }
+}
+
+/// Spend as every evolve line shows it: the priced dollars as an
+/// estimate, and the tokens no price covered, when there were any.
+fn spend_text(dollars: f64, unpriced: u64) -> String {
+    let est = format!("≈ ${dollars:.4} est.");
+    if unpriced > 0 {
+        format!("{est} + {} unpriced tokens", token_count(unpriced))
+    } else {
+        est
+    }
+}
+
+/// Whether slag can price a model's calls: a list or override price, or
+/// OpenRouter, which reports what each call cost.
+fn priced(model: &str) -> bool {
+    let (provider, bare) = match crate::config::provider_for_model(model) {
+        Ok(Some((provider, bare))) => (provider, bare),
+        _ => match crate::config::active_provider() {
+            Ok(provider) => (provider, model.to_string()),
+            Err(_) => return false,
+        },
+    };
+    provider == crate::config::ProviderPreset::OpenRouter
+        || crate::engine::pricing::override_price(provider, &bare).is_some()
+        || crate::engine::pricing::builtin_price(provider, &bare).is_some()
 }
 
 fn tokens_of(u: &Usage) -> u64 {
@@ -275,6 +285,14 @@ struct Candidate {
     notes: String,
 }
 
+/// Where a stage started: the clock, the run ledger, and the budget.
+struct Mark {
+    clock: Instant,
+    ledger: Usage,
+    dollars: f64,
+    unpriced: u64,
+}
+
 /// One stage's cost.
 #[derive(Debug, Clone, Serialize)]
 struct Stage {
@@ -285,7 +303,10 @@ struct Stage {
     completion_tokens: u64,
     total_tokens: u64,
     spend: String,
+    /// Priced dollars, estimated at the dated list rates.
     usd: Option<f64>,
+    /// Tokens from calls no price covered.
+    unpriced_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -374,7 +395,7 @@ pub(super) async fn run(ctx: &Ctx<'_>, baseline: Option<&Run>, settings: Setting
         None => std::fs::create_dir_all(&base)?,
     }
     let mode = if settings.sequential { "sequential" } else { "parallel" };
-    let record = Record {
+    let mut record = Record {
         run: run_id.clone(),
         issue: ctx.issue.title.clone(),
         domain: settings.domain.clone(),
@@ -386,12 +407,7 @@ pub(super) async fn run(ctx: &Ctx<'_>, baseline: Option<&Run>, settings: Setting
         adopted: "base".into(),
         ..Default::default()
     };
-    let budget = Budget {
-        usd: settings.usd,
-        tokens: settings.tokens,
-        start: stats::snapshot().ledger.total(),
-        spend: Default::default(),
-    };
+    let budget = Budget { shared: crate::engine::agent::SharedBudget::new(settings.usd, settings.tokens) };
     let sh = Shared {
         run_id,
         run_dir,
@@ -410,6 +426,19 @@ pub(super) async fn run(ctx: &Ctx<'_>, baseline: Option<&Run>, settings: Setting
             sh.settings.k, sh.settings.editor_model, sh.settings.usd, sh.settings.tokens, sh.settings.domain
         ),
     );
+    let mut unpriced: Vec<&str> = [ctx.config.model_base.as_str(), sh.settings.editor_model.as_str()]
+        .into_iter()
+        .filter(|m| !priced(m))
+        .collect();
+    unpriced.dedup();
+    if !unpriced.is_empty() {
+        let line = format!(
+            "no price for {}: its calls count toward the token cap only, and spend lines name its tokens apart",
+            unpriced.join(", ")
+        );
+        note(ctx.hooks, &format!("evolve: {line}"), false);
+        record.notes.push(line);
+    }
     let mut ev = Evolved { sh, record };
     let evolver = Evolver { ctx, baseline, sh: &ev.sh };
     let outcome = if ev.sh.settings.sequential {
@@ -558,22 +587,26 @@ impl Evolver<'_, '_> {
         tui::status_line(glyph, color, text);
     }
 
-    fn mark(&self) -> (Instant, Usage) {
-        (Instant::now(), stats::snapshot().ledger.total())
+    fn mark(&self) -> Mark {
+        let b = &self.sh.budget.shared;
+        Mark { clock: Instant::now(), ledger: stats::snapshot().ledger.total(), dollars: b.dollars(), unpriced: b.unpriced() }
     }
 
     /// Record one stage's time, tokens and spend.
-    fn close(&self, record: &mut Record, name: &str, sessions: usize, (clock, before): (Instant, Usage)) {
-        let used = delta(&stats::snapshot().ledger.total(), &before);
+    fn close(&self, record: &mut Record, name: &str, sessions: usize, mark: Mark) {
+        let used = delta(&stats::snapshot().ledger.total(), &mark.ledger);
+        let b = &self.sh.budget.shared;
+        let (dollars, unpriced) = ((b.dollars() - mark.dollars).max(0.0), b.unpriced().saturating_sub(mark.unpriced));
         let stage = Stage {
             name: name.to_string(),
             sessions,
-            secs: clock.elapsed().as_secs_f64(),
+            secs: mark.clock.elapsed().as_secs_f64(),
             prompt_tokens: used.prompt_tokens,
             completion_tokens: used.completion_tokens,
             total_tokens: tokens_of(&used),
-            spend: crate::engine::pricing::format_cost(&used),
-            usd: used.cost,
+            spend: spend_text(dollars, unpriced),
+            usd: Some(dollars),
+            unpriced_tokens: unpriced,
         };
         self.say("◆", tui::COLD, &stage_line(&stage));
         record.stages.push(stage);
@@ -732,7 +765,13 @@ impl Evolver<'_, '_> {
                 smith: SmithOpts {
                     harness: Some(Arc::new(Harness::load(dir))),
                     transcripts: Some(self.sh.run_dir.clone()),
-                    spend: Some((self.sh.budget.spend.clone(), self.sh.budget.usd)),
+                    // The reference runs are the plain fix: the cap may
+                    // stop what comes after them, never them midway.
+                    budget: Some(if kind == Kind::Reference {
+                        self.sh.budget.shared.counting_only()
+                    } else {
+                        self.sh.budget.shared.clone()
+                    }),
                 },
             };
             let mut phases = Phases::default();
@@ -1134,8 +1173,8 @@ impl Evolver<'_, '_> {
             .with_role(crate::engine::Role::Harness)
             .with_context_window(window)
             .with_effort(config.effort.or(Some(crate::engine::Effort::Medium)))
-            .with_ingot_spend(self.sh.budget.spend.clone())
-            .with_cost_cap(Some(self.sh.budget.usd))
+            .with_cost_cap(None)
+            .with_shared_budget(Some(self.sh.budget.shared.clone()))
             .with_max_turns(max_turns)
             .with_tool_allowlist(tools)
             .with_required_reads(required_reads(ws))
@@ -1591,11 +1630,9 @@ impl Evolved {
             prompt_tokens: self.record.stages.iter().map(|s| s.prompt_tokens).sum(),
             completion_tokens: self.record.stages.iter().map(|s| s.completion_tokens).sum(),
             total_tokens: self.record.stages.iter().map(|s| s.total_tokens).sum(),
-            spend: {
-                let used = self.sh.budget.used();
-                crate::engine::pricing::format_cost(&used)
-            },
-            usd: self.sh.budget.used().cost,
+            spend: spend_text(self.sh.budget.shared.dollars(), self.sh.budget.shared.unpriced()),
+            usd: Some(self.sh.budget.shared.dollars()),
+            unpriced_tokens: self.sh.budget.shared.unpriced(),
         };
         self.record.total = Some(total.clone());
         persist(&self.sh, &self.record);
@@ -1650,8 +1687,7 @@ fn stage_line(s: &Stage) -> String {
         "session"
     };
     let count = if s.sessions == 1 { format!("1 {unit}") } else { format!("{} {unit}s", s.sessions) };
-    let spend = if s.usd.is_some() { s.spend.as_str() } else { "spend unknown" };
-    format!("{:<10} {count} · {:.1}s · {} tok · {spend}", s.name, s.secs, token_count(s.total_tokens))
+    format!("{:<10} {count} · {:.1}s · {} tok · {}", s.name, s.secs, token_count(s.total_tokens), s.spend)
 }
 
 fn token_count(n: u64) -> String {
@@ -2223,7 +2259,7 @@ mod tests {
             },
             run_id: "t".into(),
             run_dir: top.join(".slag/evolve/t"),
-            budget: Budget { usd: 1.0, tokens: 1, start: Usage::default(), spend: Default::default() },
+            budget: Budget { shared: crate::engine::agent::SharedBudget::new(1.0, 1) },
             top: top.to_path_buf(),
             prefix: String::new(),
             base: top.join(".slag/evolve/t/harness/base"),
@@ -2387,12 +2423,13 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 500,
             total_tokens: 1_500,
-            spend: "spend unknown · 1.0k in / 500 out tokens".into(),
-            usd: None,
+            spend: spend_text(0.0042, 0),
+            usd: Some(0.0042),
+            unpriced_tokens: 0,
         };
-        assert_eq!(stage_line(&stage), "probe      2 runs · 3.2s · 1.5k tok · spend unknown");
-        let priced = Stage { name: "compose".into(), sessions: 1, usd: Some(0.0042), spend: "$0.0042".into(), ..stage };
-        assert_eq!(stage_line(&priced), "compose    1 session · 3.2s · 1.5k tok · $0.0042");
+        assert_eq!(stage_line(&stage), "probe      2 runs · 3.2s · 1.5k tok · ≈ $0.0042 est.");
+        let partly = Stage { name: "compose".into(), sessions: 1, spend: spend_text(0.0, 1_500), unpriced_tokens: 1_500, ..stage };
+        assert_eq!(stage_line(&partly), "compose    1 session · 3.2s · 1.5k tok · ≈ $0.0000 est. + 1.5k unpriced tokens");
         assert_eq!(headline("the harness failed validation:\n- recipe `x` has no trigger\n- y"), "recipe `x` has no trigger");
     }
 }

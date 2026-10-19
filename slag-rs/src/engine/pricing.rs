@@ -122,6 +122,13 @@ pub const LIST_PRICES: &[ListPrice] = &[
     ListPrice { provider: "mistral", model: "mistral-small-2603", input: 0.15, output: 0.6, cached_input: Some(0.015), date: "2026-10-15", source: "https://docs.mistral.ai/inference/pricing" },
     ListPrice { provider: "mistral", model: "mistral-large-2512", input: 0.5, output: 1.5, cached_input: Some(0.05), date: "2026-10-15", source: "https://docs.mistral.ai/inference/pricing" },
     ListPrice { provider: "mistral", model: "codestral-2508", input: 0.3, output: 0.9, cached_input: Some(0.03), date: "2026-10-15", source: "https://docs.mistral.ai/inference/pricing" },
+    // Ministral 3, checked 2026-10-19: the API echoes the `-latest` alias it was asked for.
+    ListPrice { provider: "mistral", model: "ministral-3b-latest", input: 0.1, output: 0.1, cached_input: None, date: "2026-10-19", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "ministral-3b-2512", input: 0.1, output: 0.1, cached_input: None, date: "2026-10-19", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "ministral-8b-latest", input: 0.15, output: 0.15, cached_input: None, date: "2026-10-19", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "ministral-8b-2512", input: 0.15, output: 0.15, cached_input: None, date: "2026-10-19", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "ministral-14b-latest", input: 0.2, output: 0.2, cached_input: None, date: "2026-10-19", source: "https://docs.mistral.ai/inference/pricing" },
+    ListPrice { provider: "mistral", model: "ministral-14b-2512", input: 0.2, output: 0.2, cached_input: None, date: "2026-10-19", source: "https://docs.mistral.ai/inference/pricing" },
     ListPrice { provider: "deepseek", model: "deepseek-flash", input: 0.3, output: 1.2, cached_input: Some(0.006), date: "2026-10-15", source: "https://api-docs.deepseek.com/quick_start/pricing/" },
     ListPrice { provider: "deepseek", model: "deepseek-v4-flash", input: 0.3, output: 1.2, cached_input: Some(0.006), date: "2026-10-15", source: "https://api-docs.deepseek.com/quick_start/pricing/" },
     ListPrice { provider: "deepseek", model: "deepseek-v4-pro", input: 1.32, output: 3.96, cached_input: Some(0.044), date: "2026-10-15", source: "https://api-docs.deepseek.com/quick_start/pricing/" },
@@ -513,6 +520,16 @@ mod tests {
         assert!(builtin_price(ProviderPreset::OpenRouter, "gpt-4.1-mini").is_none());
         assert!(builtin_price(ProviderPreset::Cerebras, "gpt-4.1-mini").is_none());
         assert!(builtin_price(ProviderPreset::Ollama, "qwen3:8b").is_none());
+    }
+
+    #[test]
+    fn the_small_mistral_models_have_dated_prices() {
+        use crate::config::ProviderPreset;
+        for (model, rate) in [("ministral-3b-latest", 0.1), ("ministral-8b-latest", 0.15), ("ministral-14b-2512", 0.2)] {
+            let price = builtin_price(ProviderPreset::Mistral, model).unwrap();
+            assert_eq!((price.input, price.output, price.date), (rate, rate, "2026-10-19"), "{model}");
+        }
+        assert!(builtin_price(ProviderPreset::Mistral, "ministral-99b-latest").is_none());
     }
 
     #[test]

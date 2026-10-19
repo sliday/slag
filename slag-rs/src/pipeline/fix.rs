@@ -802,7 +802,7 @@ struct Ctx<'a> {
 struct SmithOpts {
     harness: Option<Arc<crate::harness::Harness>>,
     transcripts: Option<PathBuf>,
-    spend: Option<(crate::engine::agent::SpendAccum, f64)>,
+    budget: Option<crate::engine::agent::SharedBudget>,
 }
 
 /// One session, judged by slag.
@@ -862,8 +862,8 @@ impl Ctx<'_> {
         )
         .with_harness(self.smith.harness.clone())
         .with_transcript_root(self.smith.transcripts.clone());
-        if let Some((spend, cap)) = &self.smith.spend {
-            smith = smith.with_ingot_spend(spend.clone()).with_cost_cap(Some(*cap));
+        if let Some(budget) = &self.smith.budget {
+            smith = smith.with_shared_budget(Some(budget.clone()));
         }
         let smith: Box<dyn crate::smith::Smith> = Box::new(smith);
         let clock = std::time::Instant::now();

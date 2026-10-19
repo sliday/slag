@@ -243,7 +243,11 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
     for s in rec["stages"].as_array().unwrap() {
         assert!(s["total_tokens"].as_u64().unwrap() > 0, "every stage spent tokens: {s}");
         assert!(s["secs"].as_f64().is_some() && s["spend"].as_str().is_some(), "{s}");
+        // The mock reports no cost: each stage says so, never a guess.
+        let spend = s["spend"].as_str().unwrap();
+        assert!(spend.starts_with("≈ $0.0000 est. + ") && spend.ends_with("unpriced tokens"), "{s}");
     }
+    assert!(rec["capped"].is_null(), "a model with no price never trips the dollar cap: {rec:#}");
     let cand = |label: &str| rec["candidates"].as_array().unwrap().iter().find(|c| c["label"] == label).unwrap().clone();
     assert_eq!(cand("inv-1")["outcome"], "edited");
     assert_eq!(cand("dom-1")["outcome"], "fallback", "an invalid tree twice falls back: {rec:#}");

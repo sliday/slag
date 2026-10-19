@@ -43,8 +43,8 @@ pub struct NativeSmith {
     harness: Option<Arc<crate::harness::Harness>>,
     /// Where the session transcript goes; `None` keeps the run directory.
     transcript_root: Option<PathBuf>,
-    /// A dollar cap over `ingot_spend` that overrides `SLAG_MAX_COST_INGOT`.
-    cost_cap: Option<f64>,
+    /// A budget shared with other sessions, in place of `SLAG_MAX_COST_INGOT`.
+    budget: Option<crate::engine::agent::SharedBudget>,
 }
 
 impl NativeSmith {
@@ -63,7 +63,7 @@ impl NativeSmith {
             scope_only: false,
             harness: None,
             transcript_root: None,
-            cost_cap: None,
+            budget: None,
         }
     }
 
@@ -88,7 +88,7 @@ impl NativeSmith {
             scope_only: false,
             harness: None,
             transcript_root: None,
-            cost_cap: None,
+            budget: None,
         }
     }
 
@@ -138,7 +138,7 @@ impl NativeSmith {
             scope_only: false,
             harness: None,
             transcript_root: None,
-            cost_cap: None,
+            budget: None,
         }
     }
 
@@ -162,9 +162,10 @@ impl NativeSmith {
         self
     }
 
-    /// Cap the shared spend accumulator at `cap` dollars.
-    pub fn with_cost_cap(mut self, cap: Option<f64>) -> Self {
-        self.cost_cap = cap;
+    /// Draw on a budget shared with other sessions; it replaces the
+    /// per-ingot dollar cap.
+    pub fn with_shared_budget(mut self, budget: Option<crate::engine::agent::SharedBudget>) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -314,8 +315,8 @@ impl NativeSmith {
         if let Some(root) = &self.transcript_root {
             agent = agent.with_transcript_root(root.clone());
         }
-        if self.cost_cap.is_some() {
-            agent = agent.with_cost_cap(self.cost_cap);
+        if let Some(budget) = &self.budget {
+            agent = agent.with_cost_cap(None).with_shared_budget(Some(budget.clone()));
         }
 
         let result = agent.run(system, prompt_text.to_string()).await;
