@@ -184,16 +184,18 @@ impl Library {
     /// the domain's most relevant entries, with no model call. Entries
     /// rank by the words their title, cue and lesson share with `query`,
     /// with a bonus for the same repository; ties keep the newer entry.
+    /// The best entry always applies; the next ones only when they share
+    /// a word with the query.
     ///
-    /// Only what transfers without a probe comes over. An adopted tree's
-    /// always-on procedure, guardrails, tool guidance and hooks were
-    /// written for the task that adopted them, and only `--evolve` adapts
-    /// them. Recipes, with their own scripts, cost nothing until their
-    /// trigger loads one, so they come from every relevant entry,
-    /// candidate trees included. From the same repository, the `memory.md`
-    /// lines that state a fact "in this repository" come too. Returns the
-    /// ids that gave anything, best first.
-    pub fn apply(&self, domain: &str, query: &str, repository: &str, dst: &Path) -> Vec<String> {
+    /// Every component of an applied entry comes over: the adopted tree,
+    /// then the candidate trees its lesson rests on. Always-on texts from
+    /// several entries stack, best entry first, while they fit the
+    /// validator's cap; recipes and scripts keep the first entry's copy of
+    /// a name; hook lines join. A line that states a fact "in this
+    /// repository" stays behind when the entry came from another
+    /// repository. Returns each entry that gave anything, with the
+    /// components it gave, best first.
+    pub fn apply(&self, domain: &str, query: &str, repository: &str, dst: &Path) -> Vec<(String, Vec<String>)> {
         let mut scored: Vec<(usize, Entry)> = self
             .entries(domain)
             .into_iter()
@@ -207,54 +209,72 @@ impl Library {
             })
             .collect();
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-        let mut used = Vec::new();
         let mut files: std::collections::BTreeMap<String, Vec<u8>> = std::collections::BTreeMap::new();
-        let mut facts: Vec<String> = Vec::new();
+        let mut texts: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
+        let mut hooks: Vec<String> = Vec::new();
         let mut claimed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut applied = Vec::new();
         for (i, (score, e)) in scored.into_iter().take(APPLY_ENTRIES).enumerate() {
             if i > 0 && score == 0 {
                 break;
             }
-            let mut gave = false;
-            // The adopted tree first, then the candidate trees behind the lesson.
+            let foreign = e.repository != repository;
+            let mut gave: Vec<String> = Vec::new();
             let mut trees = vec![e.dir.join("harness")];
             if let Ok(dirs) = std::fs::read_dir(e.dir.join("candidates")) {
                 let mut more: Vec<PathBuf> = dirs.flatten().map(|d| d.path()).collect();
                 more.sort();
                 trees.extend(more);
             }
-            // A recipe name belongs to the first tree that brings it.
             for t in trees {
                 let mut mine = std::collections::BTreeSet::new();
                 for (path, bytes) in tree(&t) {
-                    let Some(name) = recipe_name(&path) else { continue };
-                    if claimed.contains(&name) {
-                        continue;
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    if let Some((name, _)) = super::ALWAYS_ON.iter().find(|(f, _)| *f == path) {
+                        let block = if foreign { local_facts_out(&text) } else { text.trim().to_string() };
+                        let used: usize = texts.values().flatten().map(String::len).sum();
+                        let block_list = texts.entry(name).or_default();
+                        if block.is_empty() || block_list.contains(&block) || used + block.len() > super::validate::ALWAYS_ON_CAP {
+                            continue;
+                        }
+                        block_list.push(block);
+                        gave.push(path);
+                    } else if path == super::HOOKS {
+                        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                            if hooks.iter().any(|h| h == line) {
+                                continue;
+                            }
+                            hooks.push(line.to_string());
+                            if !gave.contains(&path) {
+                                gave.push(path.clone());
+                            }
+                        }
+                    } else {
+                        let key = recipe_name(&path).map(|n| format!("recipes/{n}")).unwrap_or_else(|| path.clone());
+                        if claimed.contains(&key) || files.contains_key(&path) {
+                            continue;
+                        }
+                        mine.insert(key.clone());
+                        files.insert(path, bytes);
+                        if !gave.contains(&key) {
+                            gave.push(key);
+                        }
                     }
-                    mine.insert(name);
-                    files.insert(path, bytes);
-                    gave = true;
                 }
                 claimed.extend(mine);
             }
-            if e.repository == repository {
-                let memory = std::fs::read_to_string(e.dir.join("harness").join("memory.md")).unwrap_or_default();
-                for line in memory.lines().filter(|l| l.to_ascii_lowercase().contains("in this repository")) {
-                    if !facts.iter().any(|f| f == line) {
-                        facts.push(line.to_string());
-                        gave = true;
-                    }
-                }
-            }
-            if gave {
-                used.push(e.id);
+            if !gave.is_empty() {
+                applied.push((e.id, gave));
             }
         }
-        if !facts.is_empty() {
-            files.insert("memory.md".into(), format!("{}\n", facts.join("\n")).into_bytes());
+        for (name, blocks) in texts {
+            files.insert(name.to_string(), format!("{}\n", blocks.join("\n\n")).into_bytes());
+        }
+        if !hooks.is_empty() {
+            files.insert(super::HOOKS.to_string(), format!("{}\n", hooks.join("\n")).into_bytes());
         }
         let _ = write_tree(&files, dst);
-        used
+        applied
     }
 }
 
@@ -439,6 +459,17 @@ fn parse_entry(id: &str, dir: &Path, text: &str) -> Entry {
 /// `recipes/<name>/...` names its recipe.
 fn recipe_name(path: &str) -> Option<String> {
     path.strip_prefix("recipes/")?.split('/').next().map(str::to_string)
+}
+
+/// A text without the lines that state a fact about the repository its
+/// entry came from.
+fn local_facts_out(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.to_ascii_lowercase().contains("in this repository"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// How many distinct words of four letters or more two texts share.

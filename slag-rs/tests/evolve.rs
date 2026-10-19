@@ -317,17 +317,19 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     let out = run(slag(repo.path(), &server, home.path(), &args)).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("harness: shell library entries"), "{stdout}");
+    let applied = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(applied.contains("harness from the shell library:"), "{stdout}");
+    assert!(applied.contains("recipes/tests") && applied.contains("memory.md") && applied.contains("systemprompt.md"), "{applied}");
     let systems = roles.systems.lock().unwrap().clone();
     assert!(!systems.iter().any(|s| s.contains("You are composing") || s.contains("YOUR DIMENSION")), "no improver ran");
     let smith = systems.iter().find(|s| s.contains("# slag smith")).expect("a smith ran");
     assert!(smith.contains("# Harness") && smith.contains(RULE), "the lesson reached the smith's prompt");
     assert!(smith.contains(FACT), "the repository's own facts come along");
-    assert!(!smith.contains("Keep the change small."), "the adopting task's procedure stays behind");
+    assert!(smith.contains("Keep the change small."), "every component of the entry applies, the system prompt too");
     let files = sh(repo.path(), "git show --name-only --format= HEAD");
     assert!(files.contains("tests/value_test.sh"), "the applied harness changed behavior: {files}");
 
-    // Another repository gets the recipe, not this one's facts.
+    // Another repository gets every component but this one's facts.
     let other = buggy_repo();
     roles.systems.lock().unwrap().clear();
     let out = run(slag(other.path(), &server, home.path(), &args)).await;
@@ -335,7 +337,7 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     assert!(out.status.success(), "{stdout}");
     let systems = roles.systems.lock().unwrap().clone();
     let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
-    assert!(smith.contains(RULE) && !smith.contains(FACT), "{smith}");
+    assert!(smith.contains(RULE) && smith.contains("Keep the change small.") && !smith.contains(FACT), "{smith}");
 
     // Without --harness, the fast path's prompt carries no harness at all.
     let third = buggy_repo();
