@@ -273,13 +273,19 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
     assert!(stdout.contains("without the fix"), "{stdout}");
 
     // Harnessing-level recursion: one contrast-backed entry, indexed.
-    assert!(rec["library"].as_str().unwrap().starts_with("added"), "{rec:#}");
+    let added = rec["library"].as_str().unwrap();
+    assert!(added.starts_with("added") && added.contains("(confidence medium, by slag's run counts)"), "{rec:#}");
+    let confidence = rec["confidence"].as_str().unwrap();
+    assert!(confidence.starts_with("medium: recipes/tests/RECIPE.md helped: 2 of 2 runs"), "inv-1 and comp-1 both carried it: {rec:#}");
     let domain = home.path().join("library/shell");
     let index = std::fs::read_to_string(domain.join("INDEX.md")).unwrap();
     assert!(index.contains("value-is-wrong") && index.contains("recipe tests"), "{index}");
     let entry = std::fs::read_dir(&domain).unwrap().flatten().find(|e| e.path().is_dir()).unwrap().path();
     let exp = std::fs::read_to_string(entry.join("EXPERIENCE.md")).unwrap();
     assert!(exp.contains("cue: the smith fixes the value") && exp.contains("verdict: helped"), "{exp}");
+    assert!(exp.contains("\nconfidence: medium: ") && exp.contains("reflector's confidence: medium, one run each"), "{exp}");
+    assert!(exp.contains("## What slag measured\n\n- recipes/tests/RECIPE.md helped: 2 of 2 runs"), "{exp}");
+    assert!(index.contains("confidence: medium: "), "{index}");
     assert!(std::fs::read_to_string(entry.join("harness/recipes/tests/RECIPE.md")).unwrap().contains(RULE));
 
     // An improver that answered without opening the runs was sent back

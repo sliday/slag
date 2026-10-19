@@ -73,6 +73,11 @@ pub struct NewEntry<'a> {
     /// and were not adopted. An edit from a rejected candidate can be the
     /// one that helped, and the library keeps it executable.
     pub evidence: &'a [(String, PathBuf)],
+    /// slag's own confidence, from the run counts and the measure that
+    /// separated them; the entry's `confidence`, ahead of the reflector's.
+    pub confidence: &'a str,
+    /// One line per backed row: what slag measured behind it.
+    pub measured: &'a [String],
 }
 
 impl Library {
@@ -360,12 +365,26 @@ pub fn parse_reflection(text: &str) -> (Vec<EditRow>, Option<Lesson>) {
 }
 
 /// Does the reflection earn a library entry? Only a lesson backed by an
-/// observed contrast does: some candidate changed the harness, and at
-/// least one `helped` or `hurt` row is one slag's own measurements back
-/// (`backed`, a subset of `rows`). `Err` says why not.
-pub fn admit(lesson: Option<&Lesson>, edited: bool, rows: &[EditRow], backed: &[EditRow]) -> Result<(), String> {
-    if lesson.is_none() {
+/// observed contrast does: some candidate changed the harness, at least
+/// one `helped` or `hurt` row is one slag's own measurements back
+/// (`backed`, a subset of `rows`), and the lesson's evidence cites a run
+/// of this round by its label (one of `labels`). `Err` says why not.
+pub fn admit(
+    lesson: Option<&Lesson>,
+    edited: bool,
+    rows: &[EditRow],
+    backed: &[EditRow],
+    labels: &[&str],
+) -> Result<(), String> {
+    let Some(given) = lesson else {
         return Err("the reflector wrote NO_ENTRY".into());
+    };
+    let evidence = given.evidence.trim().to_ascii_lowercase();
+    if evidence.is_empty() || matches!(evidence.as_str(), "none" | "n/a" | "-") {
+        return Err("the lesson cites no evidence".into());
+    }
+    if !labels.iter().any(|l| cites(&evidence, l)) {
+        return Err("the lesson's evidence cites no run of this round by its label".into());
     }
     if !edited {
         return Err("no candidate changed the harness".into());
@@ -389,6 +408,18 @@ pub fn admit(lesson: Option<&Lesson>, edited: bool, rows: &[EditRow], backed: &[
     Ok(())
 }
 
+/// Whether `text` names `label` as a whole word, ignoring case: `dom-1`
+/// is not `dom-10`.
+pub fn cites(text: &str, label: &str) -> bool {
+    let (text, label) = (text.to_ascii_lowercase(), label.to_ascii_lowercase());
+    !label.is_empty()
+        && text.match_indices(&label).any(|(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + label.len()..].chars().next();
+            !before.is_some_and(|c| c.is_ascii_alphanumeric()) && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+        })
+}
+
 /// Words that name a harness component in a lesson.
 const COMPONENT_WORDS: [&str; 9] = [
     "systemprompt",
@@ -405,7 +436,8 @@ const COMPONENT_WORDS: [&str; 9] = [
 fn experience_md(domain: &str, e: &NewEntry) -> String {
     let mut s = format!(
         "# {}\n\n- domain: {domain}\n- repository: {}\n- adopted: {}\n- recorded: {}\n\n\
-         ## Lesson\n\ncue: {}\nlesson: {}\nevidence: {}\nconfidence: {}\n\n## What each edit did\n",
+         ## Lesson\n\ncue: {}\nlesson: {}\nevidence: {}\nconfidence: {}\nreflector's confidence: {}\n\n\
+         ## What slag measured\n\n",
         one_line(e.title),
         e.repository,
         e.adopted,
@@ -413,8 +445,13 @@ fn experience_md(domain: &str, e: &NewEntry) -> String {
         one_line(&e.lesson.cue),
         one_line(&e.lesson.lesson),
         one_line(&e.lesson.evidence),
+        one_line(e.confidence),
         one_line(&e.lesson.confidence),
     );
+    for m in e.measured {
+        s.push_str(&format!("- {}\n", one_line(m)));
+    }
+    s.push_str("\n## What each edit did\n");
     for r in e.rows {
         s.push_str(&format!(
             "\ncomponent: {}\ncandidates: {}\nchange: {}\nobserved: {}\nverdict: {}\n",
@@ -529,14 +566,21 @@ mod tests {
     fn only_a_contrast_backed_lesson_is_admitted() {
         let (rows, lesson) = parse_reflection(REFLECTION);
         let backed = &rows[..1];
-        assert!(admit(lesson.as_ref(), true, &rows, backed).is_ok());
-        assert!(admit(None, true, &rows, backed).unwrap_err().contains("NO_ENTRY"));
-        assert!(admit(lesson.as_ref(), false, &rows, backed).unwrap_err().contains("changed the harness"));
-        assert!(admit(lesson.as_ref(), true, &rows, &[]).unwrap_err().contains("slag's measurements"));
+        let labels = ["base-1", "dom-1", "comp-1"];
+        assert!(admit(lesson.as_ref(), true, &rows, backed, &labels).is_ok());
+        assert!(admit(None, true, &rows, backed, &labels).unwrap_err().contains("NO_ENTRY"));
+        assert!(admit(lesson.as_ref(), false, &rows, backed, &labels).unwrap_err().contains("changed the harness"));
+        assert!(admit(lesson.as_ref(), true, &rows, &[], &labels).unwrap_err().contains("slag's measurements"));
         let confounded: Vec<EditRow> = rows.iter().filter(|r| r.verdict == "confounded").cloned().collect();
-        assert!(admit(lesson.as_ref(), true, &confounded, &[]).unwrap_err().contains("confounded"));
+        assert!(admit(lesson.as_ref(), true, &confounded, &[], &labels).unwrap_err().contains("confounded"));
         let fix_only = Lesson { lesson: "edit split() to hand out the remainder".into(), ..lesson.clone().unwrap() };
-        assert!(admit(Some(&fix_only), true, &rows, backed).unwrap_err().contains("names no harness component"));
+        assert!(admit(Some(&fix_only), true, &rows, backed, &labels).unwrap_err().contains("names no harness component"));
+        // Evidence has to exist and point at a run of this round.
+        let bare = Lesson { evidence: " ".into(), ..lesson.clone().unwrap() };
+        assert!(admit(Some(&bare), true, &rows, backed, &labels).unwrap_err().contains("cites no evidence"));
+        let vague = Lesson { evidence: "the runs went better".into(), ..lesson.clone().unwrap() };
+        assert!(admit(Some(&vague), true, &rows, backed, &labels).unwrap_err().contains("by its label"));
+        assert!(admit(lesson.as_ref(), true, &rows, backed, &["dom-10"]).is_err(), "dom-1 is not dom-10");
     }
 
     #[test]
@@ -568,6 +612,8 @@ mod tests {
             lesson: lesson.as_ref().unwrap(),
             rows: &rows,
             evidence: &evidence,
+            confidence: "low: 1 run carried the edit against 1 reference run, could be noise",
+            measured: &["recipes/dates/RECIPE.md helped: dom-1 verified where base-1 did not".to_string()],
         };
         let stored = lib.add("python", &entry).unwrap();
         assert!(stored.join("harness/recipes/ends/RECIPE.md").exists());
@@ -575,24 +621,31 @@ mod tests {
         let exp = std::fs::read_to_string(stored.join("EXPERIENCE.md")).unwrap();
         assert!(exp.contains("cue: an issue reports a range") && exp.contains("verdict: helped"), "{exp}");
         assert!(exp.contains("candidates/dom-1/"), "{exp}");
+        assert!(exp.contains("\nconfidence: low: 1 run") && exp.contains("reflector's confidence: medium"), "{exp}");
+        assert!(exp.contains("## What slag measured\n\n- recipes/dates/RECIPE.md helped"), "{exp}");
         let index = std::fs::read_to_string(lib.domain_dir("python").join("INDEX.md")).unwrap();
         assert!(index.contains("export-drops-the-last-day") && index.contains("recipe ends"), "{index}");
         assert!(index.contains("candidates: dom-1 (recipe dates)"), "{index}");
         let listed = lib.entries("python");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].repository, "shop");
+        assert!(listed[0].confidence.starts_with("low"), "the index shows slag's figure: {}", listed[0].confidence);
 
-        // Another repository gets the recipes only, the rejected
-        // candidate's included: always-on text was written for its task.
+        // Another repository gets every component, the rejected
+        // candidate's recipe included, minus the lines that state a fact
+        // about the entry's own repository.
         let out = dir.path().join("applied");
         let used = lib.apply("python", "the range report loses its last day", "other", &out);
         assert_eq!(used.len(), 1);
+        assert!(used[0].1.contains(&"memory.md".to_string()) && used[0].1.contains(&"recipes/dates".to_string()), "{used:?}");
         assert!(out.join("recipes/ends/RECIPE.md").exists() && out.join("recipes/dates/RECIPE.md").exists());
-        assert!(!out.join("memory.md").exists());
-        // The same repository also gets its facts, and only those lines.
-        lib.apply("python", "anything", "shop", &out);
         let memory = std::fs::read_to_string(out.join("memory.md")).unwrap();
-        assert!(memory.contains("src/d.py") && !memory.contains("unittest"), "{memory}");
+        assert!(memory.contains("unittest") && !memory.contains("src/d.py"), "{memory}");
+        // The same repository gets its facts too.
+        let same = dir.path().join("same");
+        lib.apply("python", "anything", "shop", &same);
+        let memory = std::fs::read_to_string(same.join("memory.md")).unwrap();
+        assert!(memory.contains("src/d.py") && memory.contains("unittest"), "{memory}");
         // An empty domain applies nothing.
         assert!(lib.apply("rust", "x", "shop", &dir.path().join("none")).is_empty());
 

@@ -341,6 +341,8 @@ pub(super) struct Record {
     notes: Vec<String>,
     library: Option<String>,
     reflection: Option<String>,
+    /// slag's own confidence in the admitted lesson, from run counts.
+    confidence: Option<String>,
     total: Option<Stage>,
     verdict: Option<String>,
 }
@@ -1524,7 +1526,21 @@ impl Evolved {
             .iter()
             .any(|c| c.outcome == "edited" && harness::tree(&c.dir) != base);
         let backed = backed_rows(&rows, &self.record);
-        let line = match (library::admit(lesson.as_ref(), edited, &rows, &backed), &self.sh.settings.library, lesson) {
+        let supports: Vec<Support> = backed.iter().map(|r| support(r, &self.record)).collect();
+        let confidence = measured_confidence(&supports);
+        let measured: Vec<String> = supports.iter().map(Support::line).collect();
+        let labels: Vec<&str> = self
+            .record
+            .runs
+            .iter()
+            .map(|r| r.label.as_str())
+            .chain(self.record.candidates.iter().map(|c| c.label.as_str()))
+            .collect();
+        let admitted = library::admit(lesson.as_ref(), edited, &rows, &backed, &labels);
+        if admitted.is_ok() {
+            self.record.confidence = Some(confidence.clone());
+        }
+        let line = match (admitted, &self.sh.settings.library, lesson) {
             (Ok(()), Some(lib), Some(lesson)) => {
                 let repository = self.sh.top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let adopted = self.adopted();
@@ -1544,9 +1560,15 @@ impl Evolved {
                     lesson: &lesson,
                     rows: &rows,
                     evidence: &evidence,
+                    confidence: &confidence,
+                    measured: &measured,
                 };
+                let level = confidence.split(':').next().unwrap_or("low");
                 match lib.add(&self.sh.settings.domain, &entry) {
-                    Ok(dir) => format!("added {}", dir.strip_prefix(&lib.root).unwrap_or(&dir).display()),
+                    Ok(dir) => format!(
+                        "added {} (confidence {level}, by slag's run counts)",
+                        dir.strip_prefix(&lib.root).unwrap_or(&dir).display()
+                    ),
                     Err(e) => format!("no entry: could not write the library: {e}"),
                 }
             }
@@ -1712,36 +1734,150 @@ enum Contrast {
 /// whether it verified, how strongly it showed the bug, its tool errors
 /// (one fewer or more than the reference mean), its turns (two).
 fn contrast(r: &Rollout, base: &[&Rollout]) -> Contrast {
+    judge(r, base).0
+}
+
+/// A contrast with the measure that decided it and the difference it saw.
+/// `verified` and `reproduction` judge the outcome; `tool errors` and
+/// `turns` only the path to it.
+fn judge(r: &Rollout, base: &[&Rollout]) -> (Contrast, &'static str, String) {
     let all = |f: &dyn Fn(&Rollout) -> bool| base.iter().all(|b| f(b));
     if r.verified && all(&|b| !b.verified) {
-        return Contrast::Better;
+        return (Contrast::Better, "verified", "verified where the reference runs did not".into());
     }
     if !r.verified && all(&|b| b.verified) {
-        return Contrast::Worse;
+        return (Contrast::Worse, "verified", "did not verify where the reference runs did".into());
     }
     if r.verified {
+        let ranks = base.iter().map(|b| b.repro_rank.to_string()).collect::<Vec<_>>().join("/");
+        let shown = format!("showed the bug at rank {} against {ranks} for the reference", r.repro_rank);
         if all(&|b| b.repro_rank < r.repro_rank) {
-            return Contrast::Better;
+            return (Contrast::Better, "reproduction", shown);
         }
         if all(&|b| b.repro_rank > r.repro_rank) {
-            return Contrast::Worse;
+            return (Contrast::Worse, "reproduction", shown);
         }
     }
     let mean = |f: &dyn Fn(&Rollout) -> f64| base.iter().map(|b| f(b)).sum::<f64>() / base.len().max(1) as f64;
     let errors = r.metrics.tool_errors as f64 - mean(&|b| b.metrics.tool_errors as f64);
+    let error_text = format!("{errors:+.1} tool errors against the reference mean");
     if errors <= -1.0 {
-        return Contrast::Better;
+        return (Contrast::Better, "tool errors", error_text);
     }
     if errors >= 1.0 {
-        return Contrast::Worse;
+        return (Contrast::Worse, "tool errors", error_text);
     }
     let turns = r.metrics.turns as f64 - mean(&|b| b.metrics.turns as f64);
+    let turn_text = format!("{turns:+.1} turns against the reference mean");
     if turns <= -2.0 {
-        Contrast::Better
+        (Contrast::Better, "turns", turn_text)
     } else if turns >= 2.0 {
-        Contrast::Worse
+        (Contrast::Worse, "turns", turn_text)
     } else {
-        Contrast::Same
+        (Contrast::Same, "none", "no measure separated it from the reference".into())
+    }
+}
+
+/// What slag's numbers say behind one row: the runs that carried its edit,
+/// how many of them agree with the verdict and how many contradict it,
+/// against how many reference runs, and on which measures.
+#[derive(Debug, Clone, PartialEq)]
+struct Support {
+    row: String,
+    carried: usize,
+    agree: usize,
+    against: usize,
+    base: usize,
+    /// Every agreeing run decided on whether it verified or caught the bug.
+    outcome: bool,
+    detail: Vec<String>,
+}
+
+impl Support {
+    /// `high`, `medium` or `low`, from the counts alone. One run against
+    /// one, or a difference in turns or tool errors only, stays `low`:
+    /// either can come from chance.
+    fn level(&self) -> &'static str {
+        if self.against > 0 || !self.outcome {
+            "low"
+        } else if self.agree >= 3 && self.base >= 2 {
+            "high"
+        } else if self.agree >= 2 {
+            "medium"
+        } else {
+            "low"
+        }
+    }
+
+    fn line(&self) -> String {
+        let runs = |n: usize| if n == 1 { "1 run".to_string() } else { format!("{n} runs") };
+        let mut s = format!(
+            "{}: {} of {} that carried the edit agree, {} against, beside {} of the reference ({})",
+            self.row,
+            self.agree,
+            runs(self.carried),
+            self.against,
+            runs(self.base),
+            self.detail.join("; ")
+        );
+        if self.level() == "low" {
+            let why = if self.against > 0 {
+                "the runs disagree"
+            } else if !self.outcome {
+                "turns or tool errors alone can come from chance"
+            } else {
+                "too few runs to tell it from chance"
+            };
+            s.push_str(&format!(", could be noise: {why}"));
+        }
+        s
+    }
+}
+
+fn support(row: &library::EditRow, record: &Record) -> Support {
+    let base: Vec<&Rollout> = record.runs.iter().filter(|r| r.kind == Kind::Reference).collect();
+    let carriers: Vec<&str> = carriers(row, record).into_iter().map(|c| c.label.as_str()).collect();
+    let (want, opposite) =
+        if row.verdict.starts_with("hurt") { (Contrast::Worse, Contrast::Better) } else { (Contrast::Better, Contrast::Worse) };
+    let mut s = Support {
+        row: format!("{} {}", row.component.trim(), row.verdict.trim()),
+        carried: 0,
+        agree: 0,
+        against: 0,
+        base: base.len(),
+        outcome: true,
+        detail: Vec::new(),
+    };
+    for r in record
+        .runs
+        .iter()
+        .filter(|r| r.reused.is_none() && r.kind != Kind::Reference && carriers.contains(&r.harness.as_str()))
+    {
+        let (c, measure, effect) = judge(r, &base);
+        s.carried += 1;
+        if c == want {
+            s.agree += 1;
+            s.outcome &= matches!(measure, "verified" | "reproduction");
+        } else if c == opposite {
+            s.against += 1;
+        }
+        s.detail.push(format!("{} {}", r.label, effect));
+    }
+    s.outcome &= s.agree > 0;
+    s
+}
+
+/// slag's confidence in a lesson: the best level among its backed rows,
+/// with the run counts that set it.
+fn measured_confidence(backed: &[Support]) -> String {
+    let rank = |l: &str| match l {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    };
+    match backed.iter().max_by_key(|s| rank(s.level())) {
+        Some(best) => format!("{}: {}", best.level(), best.line()),
+        None => "low: no row is backed".into(),
     }
 }
 
@@ -2378,6 +2514,64 @@ mod tests {
         ];
         let backed: Vec<String> = backed_rows(&rows, &record).into_iter().map(|r| format!("{} {}", r.component, r.verdict)).collect();
         assert_eq!(backed, ["harness/systemprompt.md helped", "recipes/x/RECIPE.md hurt"]);
+
+        // One run against one is low however clear it looks, and a turn
+        // count alone is low too: both can come from chance.
+        let one = support(&rows[0], &record);
+        assert_eq!((one.carried, one.agree, one.against, one.base, one.level()), (1, 1, 0, 1, "low"));
+        assert!(one.line().contains("inv-1 showed the bug at rank 2") && one.line().contains("too few runs"), "{}", one.line());
+        let turns = support(&rows[2], &record);
+        assert_eq!(turns.level(), "low");
+        assert!(turns.line().contains("turns or tool errors alone"), "{}", turns.line());
+        assert!(measured_confidence(&[one, turns]).starts_with("low: "));
+    }
+
+    #[test]
+    fn confidence_rises_only_with_agreeing_outcome_runs() {
+        let cand = |label: &str| Candidate {
+            label: label.into(),
+            kind: Kind::Invariant,
+            round: 1,
+            outcome: "edited".into(),
+            retried: false,
+            fallback: None,
+            dropped: Vec::new(),
+            components: vec!["memory.md".into()],
+            applied: Vec::new(),
+            dir: PathBuf::new(),
+            start: PathBuf::new(),
+            notes: String::new(),
+        };
+        let carried = |label: &str, harness: &str, verified: bool| {
+            let mut r = run(label, Kind::Invariant, verified, &["value.txt"], 6, 0);
+            r.harness = harness.into();
+            r
+        };
+        let row = library::EditRow { component: "memory.md".into(), verdict: "helped".into(), ..Default::default() };
+        let mut record = Record {
+            runs: vec![
+                run("base-1", Kind::Reference, false, &[], 6, 0),
+                carried("inv-1", "inv-1", true),
+                carried("comp-1", "comp-1", true),
+            ],
+            candidates: vec![cand("inv-1"), cand("comp-1")],
+            ..Default::default()
+        };
+        assert_eq!(support(&row, &record).level(), "medium", "two agreeing runs");
+        record.runs.push(run("base-2", Kind::Reference, false, &[], 6, 0));
+        record.runs.push(carried("inv-2", "inv-1", true));
+        let three = support(&row, &record);
+        assert_eq!((three.agree, three.base, three.level()), (3, 2, "high"));
+        assert!(measured_confidence(&[three]).starts_with("high: memory.md helped: 3 of 3 runs"));
+        record.runs.push(carried("inv-3", "inv-1", false));
+        let split = support(&row, &record);
+        assert_eq!((split.against, split.level()), (0, "high"), "an unverified run beside unverified references is no contrast");
+        let mut worse = run("comp-2", Kind::Composed, false, &[], 14, 3);
+        worse.harness = "comp-1".into();
+        record.runs[0].verified = true;
+        record.runs.push(worse);
+        let mixed = support(&row, &record);
+        assert!(mixed.against > 0 && mixed.level() == "low" && mixed.line().contains("the runs disagree"), "{}", mixed.line());
     }
 
     #[test]
