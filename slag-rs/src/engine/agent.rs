@@ -1218,6 +1218,8 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                         lines: outcome.output.lines().count(),
                         bytes: outcome.output.len(),
                         ms: dispatched.elapsed().as_millis() as u64,
+                        unchanged: !outcome.is_error
+                            && super::tools::left_unchanged(&calls[i].name, &outcome.output),
                     },
                 );
                 // Item 89: failed tool calls tally per tool with a coarse

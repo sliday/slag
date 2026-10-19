@@ -358,6 +358,7 @@ pub fn decode_event(v: &Value) -> Option<EngineEvent> {
             lines: n("lines") as usize,
             bytes: n("bytes") as usize,
             ms: n("ms"),
+            unchanged: b("unchanged"),
         },
         "tokens" => EngineEvent::Tokens {
             usage: v
@@ -948,6 +949,7 @@ mod tests {
                 lines: 3,
                 bytes: 40,
                 ms: 12,
+                unchanged: false,
             },
             EngineEvent::Tokens {
                 usage: Usage { total_tokens: 900, cost: Some(0.01), ..Default::default() },

@@ -72,6 +72,18 @@ fn the_warden_verdict_reaches_both_views() {
 }
 
 #[test]
+fn a_wide_frame_keeps_each_line_count_near_its_file() {
+    let scratch = tempfile::tempdir().unwrap();
+    // The cards go to stderr, beside the skeleton on stdout.
+    let out = slag(&scratch).args(["replay", &fixture(FORGE), "--at", "plan", "--size", "160x48"]).output().unwrap();
+    assert!(out.status.success());
+    let frame = String::from_utf8_lossy(&out.stderr);
+    let row = frame.lines().find(|l| l.contains("✓ read") && l.ends_with(" lines"));
+    let row = row.unwrap_or_else(|| panic!("no read row with a count:\n{frame}"));
+    assert!(row.chars().count() <= 80, "the count drifted to the far edge: {row:?}");
+}
+
+#[test]
 fn points_lists_the_moments_a_tape_has() {
     let scratch = tempfile::tempdir().unwrap();
     let out = stdout(slag(&scratch).args(["replay", &fixture(FORGE), "--points"]));
