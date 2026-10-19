@@ -443,6 +443,53 @@ pub fn test_marks(text: &str) -> (usize, usize) {
     (def.find_iter(text).count(), skip.find_iter(text).count())
 }
 
+/// The lines `new` no longer has from `old`: deleted or rewritten. Blank
+/// lines do not count, and neither does a line that reappears elsewhere
+/// with only its indentation changed, so moving a block or reindenting it
+/// is not an edit of what it asserts.
+pub fn removed_lines(old: &str, new: &str) -> Vec<String> {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_lines(old, new);
+    let inserted: std::collections::HashSet<&str> = diff
+        .iter_all_changes()
+        .filter(|c| c.tag() == ChangeTag::Insert)
+        .map(|c| c.value().trim())
+        .collect();
+    diff.iter_all_changes()
+        .filter(|c| c.tag() == ChangeTag::Delete)
+        .map(|c| c.value().trim())
+        .filter(|l| !l.is_empty() && !inserted.contains(l))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Split a source file at its inline test module (`#[cfg(test)]`, the
+/// Rust convention): the code above it, and the tests from it on. `None`
+/// when the file has no such module.
+pub fn split_inline_tests(text: &str) -> Option<(&str, &str)> {
+    let at = text.find("#[cfg(test)]")?;
+    Some(text.split_at(at))
+}
+
+/// A new test file beside `existing`, named so the runner still finds it:
+/// `tests/test_x.py` gives `tests/test_x_regression.py`,
+/// `test/store.test.js` gives `test/store_regression.test.js`,
+/// `pkg/thing_test.go` gives `pkg/thing_regression_test.go`.
+pub fn regression_sibling(existing: &str) -> String {
+    let (dir, file) = existing.rsplit_once('/').map_or(("", existing), |(d, f)| (d, f));
+    let (stem, rest) = file.split_once('.').unwrap_or((file, ""));
+    let stem = match stem.strip_suffix("_test") {
+        Some(base) => format!("{base}_regression_test"),
+        None => format!("{stem}_regression"),
+    };
+    let name = if rest.is_empty() { stem } else { format!("{stem}.{rest}") };
+    if dir.is_empty() {
+        name
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
 /// A file's content before the session: `None` when it did not exist.
 pub type Content = Option<Vec<u8>>;
 
@@ -974,6 +1021,33 @@ mod tests {
         )
         .await;
         assert!(run.output.contains("True"), "{}", run.output);
+    }
+
+    #[test]
+    fn removed_lines_are_the_rewritten_ones_not_the_moved_ones() {
+        let old = "test('a', () => {\n  expect(f(1)).toBe('hello worl…');\n});\n\nconst x = 1;\n";
+        let new = "test('a', () => {\n  expect(f(1)).toBe('hello wor…');\n});\nconst x = 1;\n  // new\n";
+        assert_eq!(removed_lines(old, new), ["expect(f(1)).toBe('hello worl…');"]);
+        let reindented = "test('a', () => {\n    expect(f(1)).toBe('hello worl…');\n});\n\nconst x = 1;\n";
+        assert!(removed_lines(old, reindented).is_empty(), "indentation is not an edit");
+        assert!(removed_lines(old, &format!("{old}test('b', () => {{}});\n")).is_empty(), "additions only");
+        assert_eq!(removed_lines("a\nb\n", "").len(), 2, "a deleted file loses every line");
+    }
+
+    #[test]
+    fn a_regression_sibling_keeps_the_runners_naming() {
+        assert_eq!(regression_sibling("tests/test_x.py"), "tests/test_x_regression.py");
+        assert_eq!(regression_sibling("test/store.test.js"), "test/store_regression.test.js");
+        assert_eq!(regression_sibling("pkg/thing_test.go"), "pkg/thing_regression_test.go");
+        assert_eq!(regression_sibling("tests/basic.rs"), "tests/basic_regression.rs");
+        assert_eq!(regression_sibling("conftest.py"), "conftest_regression.py");
+    }
+
+    #[test]
+    fn inline_rust_tests_split_from_the_code_above_them() {
+        let lib = "pub fn f() {}\n#[cfg(test)]\nmod tests {}\n";
+        assert_eq!(split_inline_tests(lib), Some(("pub fn f() {}\n", "#[cfg(test)]\nmod tests {}\n")));
+        assert_eq!(split_inline_tests("pub fn f() {}\n"), None);
     }
 
     #[test]
