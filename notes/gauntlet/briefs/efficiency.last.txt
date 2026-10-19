@@ -1,22 +1,27 @@
-Committed `f997117` on `gauntlet/efficiency`.
+Committed `c07730c`. Six prompts FORGED. Wc remained CRACKED across three attempts.
 
-The Linux write failed with EROFS. The test failed because it expected `PermissionError`. Bubblewrap now also drops all capabilities.
+| Run | Seconds | Tokens | Spend | Verdict |
+|---|---:|---:|---:|---|
+| wc, first | 199.4 | 196,390 | $0.2193 | CRACKED |
+| wc, second | 190.5 | 174,027 | $0.2482 | CRACKED |
+| wc, third | 140.6 | 232,381 | $0.2570 | CRACKED |
+| CSV | 148.7 | 135,407 | $0.1608 | FORGED |
+| Node words | 115.9 | 115,275 | $0.1333 | FORGED |
+| Tail | 156.8 | 145,114 | $0.1650 | FORGED |
+| Durations | 96.4 | 101,555 | $0.1165 | FORGED |
+| Slugifier | 55.1 | 37,452 | $0.0442 | FORGED |
+| Retry | 101.1 | 108,348 | $0.1249 | FORGED |
 
-Landlock permits metadata writes. Strict checks now refuse that backend, warn once, and produce no read-only evidence.
+Total estimated spend: **$1.4692**.
 
-Install checks now try venv, virtualenv, then isolated pip target. Missing tools produce a recorded skip. Package failures remain errors.
+Independent boundary checks passed for the six delivered artifacts. Wc’s remaining files passed 75 checks and four tests, but no warden verdict exists.
 
-| Verification | Passed | Cargo exit |
-|---|---:|---:|
-| Linux root, full suite | 1,260 | 0 |
-| Linux UID 1000, full suite | 1,260 | 0 |
-| macOS, full suite | 1,258 | 0 |
-| Clippy, all targets, warnings denied | Clean | 0 |
+The wc contracts exposed false arithmetic and invalid reference arguments. I added general oracle guidance. The final portability guidance lacks live verification because the budget ended.
 
-Both Linux runs also passed Landlock refusal tests. Non-root pip fallback checks passed without python3-venv.
+Cargo: **1,266 passed**, exit 0. Clippy passed with warnings denied. Both checkouts are clean.
 
-Both checkouts are clean. [Report, changed files, tests, and exact commands](notes/gauntlet/efficiency-round10.md).
+[Full report: tail BAR, edge checks, changed files, and commands](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/efficiency-round11.md).
 
-ASK: Fix Linux portability of fresh-checkout verification and verify root, non-root, and macOS.
-🟩Got 🟩Had 🟩Did
-🧠 —
+ASK: Narrow commission contracts, verify mundane boundaries, and measure seven live prompts.
+🟩Got 🟩Had 🟨Did — wc delivery remains unresolved.
+🧠 High

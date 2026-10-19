@@ -430,6 +430,37 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Votes (order-stable): codex 4, split 3, slag 0. Vote trend: 0-6, 0-6, 0-2-1, 0-3-1, 1-3-1, 0-4-3: oscillating between breadth and depth.
 - BIGGEST_GAP: the BAR inflates scope (stdin twice via surveyor + `direct.rs:239`) and skips mundane edge cases. Queued as efficiency r11, declared the LAST commission round; one final critic after it, then the lane closes.
 
+### efficiency r10 merged (Linux portability)
+- Root cause: the Linux write WAS blocked (EROFS); the test expected Python's PermissionError. bwrap now also drops all capabilities. Landlock allows metadata writes, so strict read-only checks refuse that backend, warn once, and claim no read-only evidence. Install checks try venv, then virtualenv, then isolated pip target; missing tools record a skip.
+- Builder verification: Linux root 1260 pass, Linux UID 1000 1260 pass, macOS 1258 pass, clippy clean. Integration after merge: 1194 unit tests green, clippy clean.
+- Efficiency r11 (final commission round) launched.
+
+### efficiency r11 merged (last commission round)
+- One source of conventional interface expectations; each named behavior's mundane edges are must-pass probes the warden checks first.
+- Builder live (gpt-6.1-sol): 6/7 FORGED (csv 149 s, node 116 s, tail 157 s, durations 96 s, slug 55 s, retry 101 s; $0.04-0.17 each). wc CRACKED 3/3 (the contract's own oracle had arithmetic errors); builder added "use the reference tool, not arithmetic" guidance but ran out of budget to verify it.
+- Lead check of that guidance: one wc run FORGED in 2:17, $0.15; output matches system wc on trailing newline, no newline, empty and stdin; differs on a lone Latin-1 0xA0 byte (2 words vs wc's 3). Tracked files: product only.
+- Integration: 1194 unit tests green, clippy clean. Critic commission-r9 (final) running, wc twice.
+
+### commission critic r9 (FINAL for this lane): WINNER bar 0-4-3. Lane closed.
+- 8 runs, $0.98: wc x2 FORGED (matches system wc on newline, no newline, empty, utf8, bad bytes, CRLF, stdin, `-`; 2/2 reliable); csv FORGED (BOM, quoted newline, ragged rejected, json.dumps); node FORGED (DEFECT: case-sensitive word counts, no tie-break); tail FORGED at heat 2 (unterminated line, non-UTF-8, follow OK; heat 1 a harness false negative: proof referenced `.slag/checks/follow.py` before it existed); durations FORGED (strict, rejects " 90s "); slug FORGED (punctuation separates); retry FORGED (cap hard-coded at 30 s, no knobs).
+- Instruments: product + .gitignore + README only, except one README line naming `.slag/`.
+- Votes (both orders): a split, b codex, c codex, d codex, e split (fx flipped), f split, g codex → 0-4-3 (same as r8).
+- Open gap, reported to the owner: on the same model codex supplies the obvious expectations of each tool kind (case-insensitive words, configurable caps, lenient whitespace); slag's fixes landed as rules per prompt, not as a general instinct.
+- Vote history: 0-6, 0-6, 0-2-1, 0-3-1, 1-3-1, 0-4-3, 0-4-3.
+
+### fix critic r4 (Fable, fresh, MODEL FOR MODEL gpt-6.1-sol): WINNER bar (votes only)
+- slag gpt-6.1-sol: **16/16, median 32 s, p90 54 s, $0.60** vs codex 8/8, 80 s, 155 s. mistral-small: 14/16 by hidden tests (slag's own 12/16), median 24.5 s, p90 324 s (466 HTTP 429 retries), $0.44.
+- Tests: existing-test deletions 0/16; new tests reached by the repo's runner 16/16; reported cases covered 14/14 (codex 14/14).
+- Votes (both orders): fx codex 3 / split 5 / slag 0 (fx picked Y in 12 of 16 asks: position bias, splits = no preference); critic slag 2 / codex 3 / tie 3.
+- BIGGEST_GAP: tests 2-3x longer than codex's and missing the issue's literal invocation (js-leaderboard default limit). Sent as fix r7 (literal call first, concise tests, minimal fix).
+- Instrument note: bench counts PASS from a leftover tree even when slag exits 1 (NOT FIXED); report slag's own verdict beside hidden-test results.
+
+### docs truth pass
+- Sonnet audit (briefs/docs-audit.md): "eleven fields" wrong in 3 docs (13), "four phases" omits temper, chat-completions-only claims vs Responses, root PRD/PLAN paths vs `.slag/`, missing subcommands/flags/env vars, site silent on sandbox, spend, replay, `.slag/`, `--evolve`.
+- Lead verified: hooks read from `config.toml` (config.rs:1133); `hooks.rs:5` and the `slag hooks list` hint (`hooks.rs:967`) wrongly say `slag.toml`. `slag-rs/.github/workflows/*.yml` sit outside the repo root, so GitHub never runs them.
+- Incident: the auditor ran the installed v2.9.0 (`slag fix --help` → paid commission under the old trailing var-arg parser) from the integration worktree; lead reverted PRD.md/.gitignore/BLUEPRINT.md (diff saved). The new build prints `fix` help correctly.
+- builder-docs (Claude) running in lane-docs.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
