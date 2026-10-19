@@ -646,15 +646,22 @@ impl Git {
         self.dirty_paths().into_iter().map(|p| (p.clone(), std::fs::read(self.top.join(&p)).ok())).collect()
     }
 
-    /// Paths the session changed: dirty now, and not as they were in
-    /// `before`.
+    /// Paths the session changed: dirty now, and clean before it. A path
+    /// that was already modified or untracked belongs to the user, even
+    /// when its content moves during the run (a log the user's shell
+    /// redirects into, notes, a secret): it is never the fix's to verify,
+    /// swap, or commit.
     pub fn changed_since(&self, before: &BTreeMap<String, Content>) -> Vec<String> {
-        self.dirty_paths()
-            .into_iter()
-            .filter(|p| match before.get(p) {
-                Some(old) => *old != std::fs::read(self.top.join(p)).ok(),
-                None => true,
-            })
+        self.dirty_paths().into_iter().filter(|p| !before.contains_key(p)).collect()
+    }
+
+    /// The user's own uncommitted paths whose content moved during the
+    /// run. They stay out of the fix; the report names them.
+    pub fn yours_changed(&self, before: &BTreeMap<String, Content>) -> Vec<String> {
+        before
+            .iter()
+            .filter(|(p, old)| **old != std::fs::read(self.top.join(p)).ok())
+            .map(|(p, _)| p.clone())
             .collect()
     }
 
@@ -739,7 +746,9 @@ impl Git {
         }
         self.git_checked(&["switch", "-c", branch])
             .or_else(|_| self.git_checked(&["checkout", "-b", branch]))?;
-        let mut add = vec!["add", "-A", "--"];
+        // An explicit list, never `-A` or `.`: only these paths may land.
+        // Git stages a listed deletion as a deletion.
+        let mut add = vec!["add", "--"];
         add.extend(paths.iter().map(String::as_str));
         self.git_checked(&add)?;
         let mut commit = vec!["commit", "--quiet", "--only", "-m", message, "--"];
@@ -1228,11 +1237,15 @@ mod tests {
     fn only_the_sessions_changes_reach_the_commit() {
         let (dir, git) = repo();
         git.hide_scratch();
-        // The user's own work in progress, before the session starts.
+        // The user's own work in progress, before the session starts, and
+        // a file their shell redirects output into.
         write(dir.path(), "notes.txt", "mine, edited\n");
+        write(dir.path(), "out.txt", "");
         let before = git.snapshot();
 
-        // The session: a fix, a new test, and engine scratch.
+        // The session: a fix, a new test, and engine scratch. The user's
+        // output file grows meanwhile.
+        write(dir.path(), "out.txt", "slag says hello\n");
         write(dir.path(), "src/a.py", "x = 2\n");
         write(dir.path(), "tests/test_a.py", "assert True\n");
         write(dir.path(), "logs/engine-1.jsonl", "{}\n");
@@ -1240,6 +1253,7 @@ mod tests {
 
         let changed = git.changed_since(&before);
         assert_eq!(changed, ["src/a.py", "tests/test_a.py"], "scratch and WIP stay out");
+        assert_eq!(git.yours_changed(&before), ["out.txt"], "named, never claimed");
         assert_eq!(git.original(&before, "src/a.py").as_deref(), Some(&b"x = 1\n"[..]));
         assert_eq!(git.original(&before, "tests/test_a.py"), None);
         assert!(git.stat(&changed).iter().any(|l| l == "src/a.py +1 -1"), "{:?}", git.stat(&changed));
@@ -1250,9 +1264,10 @@ mod tests {
         let committed = git.git(&["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert!(committed.contains("src/a.py") && committed.contains("tests/test_a.py"));
         assert!(!committed.contains("notes.txt"), "the user's WIP is not swept in");
+        assert!(!committed.contains("out.txt"), "nor their output file");
         assert_eq!(
             git.git(&["status", "--porcelain"]).unwrap().trim(),
-            "M notes.txt\n?? target/",
+            "M notes.txt\n?? out.txt\n?? target/",
             "the WIP stays dirty, build output stays out, the scratch stays hidden"
         );
         assert_eq!(git.free_branch("slag/fix-a"), "slag/fix-a-2");

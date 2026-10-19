@@ -437,3 +437,41 @@ async fn a_change_no_test_can_see_is_not_called_fixed() {
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("no test shows the change fixes anything"), "{stdout}");
 }
+
+/// The user's own files never ride along: an untracked note, a tracked
+/// file with uncommitted edits, and an output file their shell redirects
+/// into that grows during the run. All three stay out of the commit and
+/// keep exactly what they hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_users_own_uncommitted_files_never_reach_the_commit() {
+    let repo = buggy_repo();
+    let root = repo.path();
+    std::fs::write(root.join("README.md"), "# app\n").unwrap();
+    sh(root, "git add README.md && git commit -qm readme");
+    std::fs::write(root.join("README.md"), "# app\n\nmy unfinished notes\n").unwrap();
+    std::fs::write(root.join("notes.txt"), "api key: do-not-commit\n").unwrap();
+    std::fs::write(root.join("out.txt"), "").unwrap();
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/value_test.sh", "content": "grep -qx 2 value.txt\n"})),
+        tool("bash", json!({"command": "echo progress >> out.txt"})),
+        tool("finish", json!({"summary": "value.txt:1 now holds 2.", "cmd": SUITE})),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+    ])
+    .await;
+
+    let out = slag_fix(root, &server, &["value is wrong", "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let files = sh(root, "git show --name-only --format= HEAD");
+    assert_eq!(files.trim(), "tests/value_test.sh\nvalue.txt", "{files}");
+    assert_eq!(std::fs::read_to_string(root.join("README.md")).unwrap(), "# app\n\nmy unfinished notes\n");
+    assert_eq!(std::fs::read_to_string(root.join("notes.txt")).unwrap(), "api key: do-not-commit\n");
+    assert_eq!(std::fs::read_to_string(root.join("out.txt")).unwrap(), "progress\n");
+    let status = sh(root, "git status --porcelain");
+    for path in ["README.md", "notes.txt", "out.txt"] {
+        assert!(status.contains(path), "{path} stays uncommitted: {status}");
+    }
+    assert!(stdout.contains("left untouched: 3 files you had before"), "{stdout}");
+}

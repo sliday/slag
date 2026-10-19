@@ -264,6 +264,9 @@ struct Outcome {
     commit: Option<String>,
     pr: Option<String>,
     notes: Vec<String>,
+    /// Exactly the paths the fix commits: what the session created or
+    /// changed, never a file the user had dirty before the run.
+    files: Vec<String>,
     /// Where the wall time went, phase by phase, so waste is visible.
     phases: Phases,
     /// Run time and spend, taken when the fix ends rather than when the
@@ -418,6 +421,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         commit: None,
         pr: None,
         notes: Vec::new(),
+        files: Vec::new(),
         phases,
         time: None,
         spend: None,
@@ -612,7 +616,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: true });
 
     let clock = std::time::Instant::now();
-    land(job, &mut out, &changed);
+    land(job, &mut out, &changed, &before);
     out.phases.land = clock.elapsed().as_secs_f64();
     stamp(&mut out);
     Ok(out)
@@ -724,14 +728,21 @@ impl Ctx<'_> {
 
         if let Some(git) = &job.git {
             if changed.is_empty() {
+                // Edits to the user's own uncommitted files never count:
+                // slag will not commit them, so they cannot be the fix.
+                let yours = git.yours_changed(self.before);
+                let detail = if yours.is_empty() {
+                    "The session finished without changing any file.".to_string()
+                } else {
+                    format!(
+                        "The session changed only files that already had uncommitted \
+                         changes before the run ({}). Those belong to the user and slag \
+                         never commits them. Fix the bug in files that were clean.",
+                        yours.join(", ")
+                    )
+                };
                 note(hooks, &format!("{label}: no file changed"), false);
-                return fail(
-                    Failure::new(
-                        "the session changed no file",
-                        "The session finished without changing any file.",
-                    ),
-                    summary,
-                );
+                return fail(Failure::new("the session changed no file", detail), summary);
             }
             // A suite goes green easily when tests disappear. The rule is
             // in the prompt; this is the check that it held.
@@ -1517,7 +1528,21 @@ fn swap_mtime(path: &std::path::Path) -> std::time::SystemTime {
 
 /// Commit the verified fix on a new branch, and open a draft PR when asked.
 /// A failure here is reported, never fatal: the fix itself is on disk.
-fn land(job: &Job, out: &mut Outcome, changed: &[String]) {
+fn land(job: &Job, out: &mut Outcome, changed: &[String], before: &BTreeMap<String, repo::Content>) {
+    out.files = changed.to_vec();
+    // The user's own uncommitted files stay where they were, out of the
+    // commit, and the report says so.
+    if !before.is_empty() {
+        let moved = job.git.as_ref().map(|g| g.yours_changed(before)).unwrap_or_default();
+        let mut line = format!("left untouched: {} files you had before", before.len());
+        if !moved.is_empty() {
+            line.push_str(&format!(
+                " ({} changed during the run and stay uncommitted)",
+                moved.join(", ")
+            ));
+        }
+        out.notes.push(line);
+    }
     let Some(git) = job.git.as_ref().filter(|g| !g.is_shadow()) else {
         out.notes.push("not a git repository: the fix is in the working tree".into());
         return;
@@ -1605,6 +1630,12 @@ fn pr_body(out: &Outcome) -> String {
     body.push_str(&repro_line(&out.repro, out.checks.first().map(|c| c.cmd.as_str())));
     body.push_str("\n\n## Fix\n\n");
     body.push_str(out.summary.trim());
+    if !out.files.is_empty() {
+        body.push_str("\n\nFiles in this change:\n");
+        for f in &out.files {
+            body.push_str(&format!("- `{f}`\n"));
+        }
+    }
     body.push_str("\n\n## Verification\n");
     for check in &out.checks {
         body.push_str(&format!(
@@ -2519,6 +2550,7 @@ mod tests {
             commit: None,
             pr: None,
             notes: vec![],
+            files: vec!["src/a.js".into(), "tests/a.test.js".into()],
             phases: Phases::default(),
             time: None,
             spend: None,
@@ -2529,5 +2561,6 @@ mod tests {
         let body = pr_body(&out);
         assert!(body.contains("## Reproduction") && body.contains("new test catches the bug"), "{body}");
         assert!(body.contains("## Verification") && body.contains("`npm test`: exit 0"), "{body}");
+        assert!(body.contains("- `src/a.js`\n- `tests/a.test.js`"), "the PR lists the committed paths: {body}");
     }
 }
