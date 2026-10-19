@@ -331,6 +331,11 @@ pub enum EngineEvent {
         bytes: usize,
         #[serde(default)]
         ms: u64,
+        /// The call succeeded and changed nothing: an edit whose result
+        /// was already in the file. Views show it without a check mark.
+        /// Written only when true, so other results keep their shape.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unchanged: bool,
     },
     Tokens { usage: Usage },
     Steer { text: String },

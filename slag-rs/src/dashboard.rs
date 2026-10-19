@@ -410,7 +410,7 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
         EngineEvent::Finish { .. } | EngineEvent::Error { .. } => {
             state.turn_started = None;
         }
-        EngineEvent::ToolResult { name, ok, preview: p, lines, bytes, ms } => {
+        EngineEvent::ToolResult { name, ok, preview: p, lines, ms, unchanged, .. } => {
             state.mark_activity();
             let (color, text) = feed_entry(&event);
             let detail = (!p.is_empty()).then(|| p.clone());
@@ -428,12 +428,12 @@ pub(crate) fn apply_event(state: &mut DashState, event: EngineEvent) {
                 // The call row carries the argument, which the result
                 // event does not; keep it and swap the verdict in.
                 Some(id) => {
-                    let (ok, lines, bytes, ms) = (*ok, *lines, *bytes, *ms);
+                    let (ok, lines, unchanged, ms) = (*ok, *lines, *unchanged, *ms);
                     let p = p.clone();
                     state.amend(id, |row| {
                         let arg = row.text.split_once("  ").map(|(_, a)| a.trim().to_string());
                         row.color = color;
-                        row.text = complete_row(name, arg.as_deref(), ok, &p, lines, bytes, ms);
+                        row.text = complete_row(name, arg.as_deref(), ok, &p, lines, unchanged, ms);
                         row.detail = detail.clone();
                     })
                 }
@@ -516,7 +516,7 @@ fn complete_row(
     ok: bool,
     err: &str,
     lines: usize,
-    _bytes: usize,
+    unchanged: bool,
     ms: u64,
 ) -> String {
     let (verb, _) = crate::engine::events::tool_label(name, "");
@@ -524,6 +524,11 @@ fn complete_row(
         Some(a) if !a.is_empty() => format!("  {a}"),
         _ => String::new(),
     };
+    if ok && unchanged {
+        // An edit whose result was already in the file: no check mark,
+        // since nothing changed.
+        return format!("– {verb:<6}{arg}  · no change");
+    }
     if ok {
         let mut meta = Vec::new();
         if lines > 1 {
@@ -558,9 +563,9 @@ fn feed_entry(event: &EngineEvent) -> (Color, String) {
             let (verb, arg) = crate::engine::events::tool_label(name, p);
             (palette(tui::BRIGHT), format!("→ {verb:<6}  {}", preview(arg.as_deref().unwrap_or(""), 120)))
         }
-        EngineEvent::ToolResult { name, ok, preview: p, lines, bytes, ms } => {
+        EngineEvent::ToolResult { name, ok, preview: p, lines, ms, unchanged, .. } => {
             let color = if *ok { palette(tui::COLD) } else { palette(tui::WARM) };
-            (color, complete_row(name, None, *ok, p, *lines, *bytes, *ms))
+            (color, complete_row(name, None, *ok, p, *lines, *unchanged, *ms))
         }
         EngineEvent::Tokens { .. } => (palette(tui::COLD), String::new()),
         EngineEvent::Steer { text } => {
@@ -1289,10 +1294,11 @@ fn draw_crucible(f: &mut Frame, area: Rect, state: &DashState) {
                 lines.push(Line::from(""));
             }
             lines.push(Line::from(""));
-            // Once the run is over the bar gives way to the verdict: a full
-            // bar under a failed goal reads as success at a glance.
-            let failed = counts.cracked > 0 || state.goal == Some(false);
-            if state.finished && failed {
+            // Once the run is over the bar gives way to the verdict when the
+            // goal failed: a full bar under it reads as success at a glance.
+            // Cracked ingots keep the bar: it ends in their warm cells, the
+            // title counts them, and the status row gives the verdict.
+            if state.finished && counts.cracked == 0 && state.goal == Some(false) {
                 let (verdict, color, _) = final_verdict(state);
                 let lead = verdict.split(" · ").next().unwrap_or(&verdict).to_string();
                 lines.push(Line::from(Span::styled(preview(&lead, inner_w), Style::default().fg(color))));
@@ -1816,12 +1822,10 @@ impl PlanWatch {
 /// closed) and a replay (tape ran out), so both end on the same frame.
 pub(crate) fn mark_finished(state: &mut DashState) {
     state.finished = true;
-    let (verdict, color, next) = final_verdict(state);
-    let mut row = format!("■ finished · {}", verdict.trim_start_matches(['✗', '█', '!', ' ']));
-    if let Some(next) = next {
-        row.push_str(&format!(" — next: {next}"));
-    }
-    state.push_feed(color, row);
+    // The verdict and the next command live in the status row below the
+    // feed; the feed only marks where the run ended.
+    let (_, color, _) = final_verdict(state);
+    state.push_feed(color, "■ finished".to_string());
 }
 
 /// The run's one truthful verdict, its colour, and the command that comes
@@ -2247,6 +2251,13 @@ mod tests {
         apply_event(&mut state, EngineEvent::TurnStart { turn: 4 });
         let head = &state.feed.back().unwrap().text;
         assert!(head.contains("i1 · turn 4"), "{head}");
+    }
+
+    #[test]
+    fn a_no_op_edit_row_carries_no_check_mark() {
+        let row = complete_row("edit_file", Some("tests/test_calc.py"), true, "", 1, true, 3);
+        assert!(row.starts_with('–') && row.contains("no change"), "{row}");
+        assert!(!row.contains('✓'), "{row}");
     }
 
     #[test]
@@ -2774,6 +2785,7 @@ mod tests {
             lines: preview.lines().count(),
             bytes: preview.len(),
             ms: 300,
+            unchanged: false,
         }
     }
 

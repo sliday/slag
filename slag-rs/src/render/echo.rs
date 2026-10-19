@@ -483,7 +483,7 @@ impl Echo {
             Some(c) if ok && room > 10 => format!("  {}", dim(&tui::clip(c, room))),
             _ => String::new(),
         };
-        tui::spread(&format!("{head}{cmd}"), &dim(&tail), self.width)
+        tui::beside(&format!("{head}{cmd}"), &dim(&tail), self.width)
     }
 
     /// `  ⚒ 3 anvils  i1 · i2 · i3`, once per parallel batch: the batch is
@@ -541,7 +541,7 @@ impl Echo {
             paint(PURE, id),
             tui::clip(&title(&ingot.work), room)
         );
-        out.push(tui::spread(&left, &dim(&tags), self.width));
+        out.push(tui::beside(&left, &dim(&tags), self.width));
         if !ingot.proof.is_empty() {
             let room = self.width.saturating_sub(12);
             out.push(format!("    {}  {}", dim("proof"), dim(&tui::clip(&unescape(&ingot.proof), room))));
@@ -763,7 +763,7 @@ impl Echo {
                     let indent = tui::visible_len(&head);
                     let mut rows = tui::wrap(&head, &cmd, w.saturating_sub(8), indent, 3);
                     if let Some(first) = rows.first_mut() {
-                        *first = tui::spread(first, &dim("exit 0"), w);
+                        *first = tui::beside(first, &dim("exit 0"), w);
                     }
                     ran.extend(rows);
                     continue;

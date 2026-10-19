@@ -72,3 +72,15 @@ fn the_reproduction_reads_as_a_failure_without_the_fix() {
     assert!(text.contains("✗ without the fix: exit 1"), "{text}");
     assert!(!text.contains('['), "plain output carries no escape body: {text}");
 }
+
+#[test]
+fn the_card_drops_instant_phases_and_does_not_repeat_the_review() {
+    let mut out = outcome(Verdict::Fixed);
+    out.phases = Phases { gather: 0.1, session: 9.6, verify: 0.1, repro: 0.1, review: 0.0, land: 0.1 };
+    out.notes = vec!["revised once after review: no regression test was added: add one".into()];
+    let text = crate::tui::with_color(false, || report_lines(&out, 79)).join("\n");
+    assert!(text.contains("session 9.6s"), "{text}");
+    assert!(!text.contains("review 0.0s"), "{text}");
+    assert!(text.contains("revised once after review; the revision closed the gap"), "{text}");
+    assert!(!text.contains("no regression test was added"), "{text}");
+}

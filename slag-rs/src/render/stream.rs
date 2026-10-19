@@ -420,6 +420,7 @@ mod tests {
                     lines: 1,
                     bytes: 2,
                     ms: 5,
+                    unchanged: false,
                 }),
                 t0,
             ));

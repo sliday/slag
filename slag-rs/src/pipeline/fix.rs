@@ -284,12 +284,23 @@ struct Phases {
 }
 
 impl Phases {
+    /// The phases that took measurable time. A step done in microseconds
+    /// (a review slag settles from the diff, a cached verify) printed as
+    /// "0.0s" beside its own verdict reads as a step that never ran.
     fn line(&self) -> String {
-        format!(
-            "gather {:.1}s · session {:.1}s · verify {:.1}s · reproduce {:.1}s · review {:.1}s · \
-             commit {:.1}s",
-            self.gather, self.session, self.verify, self.repro, self.review, self.land
-        )
+        [
+            ("gather", self.gather),
+            ("session", self.session),
+            ("verify", self.verify),
+            ("reproduce", self.repro),
+            ("review", self.review),
+            ("commit", self.land),
+        ]
+        .iter()
+        .filter(|(_, secs)| *secs >= 0.05)
+        .map(|(name, secs)| format!("{name} {secs:.1}s"))
+        .collect::<Vec<_>>()
+        .join(" · ")
     }
 }
 
@@ -1893,7 +1904,7 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
         if meta.is_empty() {
             left
         } else {
-            tui::spread(&left, &tui::paint(if ok { tui::COLD } else { tui::WARM }, meta), w)
+            tui::beside(&left, &tui::paint(if ok { tui::COLD } else { tui::WARM }, meta), w)
         }
     };
     for (i, check) in out.checks.iter().enumerate() {
@@ -1938,6 +1949,9 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
         lines.extend(wrapped("work", &work.join(" · "), 2));
     }
     for n in &out.notes {
+        // The live review line already gave the gap in full; once the
+        // revision closed it, the card says only that.
+        let n = if n.starts_with("revised once after review: ") { "revised once after review; the revision closed the gap" } else { n };
         lines.extend(wrapped("note", n, 3));
     }
 
@@ -1952,7 +1966,10 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
     if !took.is_empty() {
         lines.extend(wrapped("run", &took.join(" · "), 2));
     }
-    lines.extend(wrapped("", &out.phases.line(), 2));
+    let phases = out.phases.line();
+    if !phases.is_empty() {
+        lines.extend(wrapped("", &phases, 2));
+    }
     lines.push(String::new());
     lines
 }

@@ -321,6 +321,19 @@ pub fn spread(left: &str, right: &str, width: usize) -> String {
     format!("{left}{}{right}", " ".repeat(width - l - r))
 }
 
+/// The column an entry's meta lines up on, terminal width permitting.
+/// Flush to a 160-column edge, a line count sat 120 cells from its file
+/// name and no longer read as that file's.
+pub const META_EDGE: usize = 80;
+
+/// `spread` for an entry and its meta (`5 lines`, `exit 0`): the meta lines
+/// up at `META_EDGE` on a wide terminal, or sits two spaces after an entry
+/// that runs past it. Bars that span the screen (the footer) use `spread`.
+pub fn beside(left: &str, right: &str, width: usize) -> String {
+    let edge = (visible_len(left) + 2 + visible_len(right)).max(META_EDGE).min(width);
+    spread(left, right, edge)
+}
+
 /// The wordmark: the site's fire gradient on either side of the name.
 pub fn banner_lines() -> Vec<String> {
     let ramp = [COLD, WARM, HOT, BRIGHT];

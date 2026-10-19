@@ -377,6 +377,7 @@ mod tests {
             lines: 3,
             bytes: 90,
             ms,
+            unchanged: false,
         }
     }
 

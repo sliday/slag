@@ -960,7 +960,7 @@ impl ToolBox {
             .map_err(|e| SlagError::Tool(format!("cannot read {raw}: {e}")))?;
 
         if old == new {
-            return Ok("already applied (old_string equals new_string)".into());
+            return Ok(already_applied("old_string equals new_string"));
         }
 
         let matches = find_all(&content, old);
@@ -969,7 +969,7 @@ impl ToolBox {
             if matches.is_empty() {
                 // contains("") is always true — never a signal of a prior edit.
                 if !new.is_empty() && content.contains(new) {
-                    return Ok("already applied (new_string present, old_string absent)".into());
+                    return Ok(already_applied("new_string present, old_string absent"));
                 }
                 return Err(SlagError::Tool(format!(
                     "no exact match for old_string in {raw}; fuzzy matching is refused with replace_all=true.\n{}",
@@ -1021,7 +1021,7 @@ impl ToolBox {
             // still-applicable edit is never dropped as a false success.
             let Some(m) = fuzzy_find(&file_lines, &needle_lines) else {
                 if !new.is_empty() && content.contains(new) {
-                    return Ok("already applied (new_string present, old_string absent)".into());
+                    return Ok(already_applied("new_string present, old_string absent"));
                 }
                 return Err(SlagError::Tool(format!(
                     "no match for old_string in {raw}.\n{}",
@@ -1061,7 +1061,7 @@ impl ToolBox {
         };
 
         if new_content == content {
-            return Ok("already applied (edit produces no change)".into());
+            return Ok(already_applied("edit produces no change"));
         }
 
         tokio::fs::write(&path, &new_content)
@@ -1683,6 +1683,21 @@ pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// What an edit returns when the file already holds its result. The
+/// model reads the words; `left_unchanged` is how the views learn it.
+const ALREADY_APPLIED: &str = "already applied (";
+
+fn already_applied(why: &str) -> String {
+    format!("{ALREADY_APPLIED}{why})")
+}
+
+/// A successful call that changed nothing: an `edit_file` whose result was
+/// already in the file. This module wrote that output, so the check reads
+/// its own words in full, never a display preview.
+pub fn left_unchanged(name: &str, output: &str) -> bool {
+    name == "edit_file" && output.starts_with(ALREADY_APPLIED)
 }
 
 fn checksum_hex(bytes: &[u8]) -> String {
@@ -2975,6 +2990,31 @@ mod tests {
             .await;
         assert!(!out.is_error, "{}", out.output);
         assert!(out.output.contains("already applied"));
+        assert!(left_unchanged("edit_file", &out.output), "a no-op edit is flagged");
+    }
+
+    #[tokio::test]
+    async fn only_a_no_op_edit_is_flagged_unchanged() {
+        let (dir, tb) = setup();
+        write(&dir, "f.rs", "let x = 1;\n");
+        prime(&tb, "f.rs").await;
+        let same = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "f.rs", "old_string": "let x = 1;", "new_string": "let x = 1;"}),
+            ))
+            .await;
+        assert!(left_unchanged("edit_file", &same.output), "{}", same.output);
+        let real = tb
+            .dispatch(&call(
+                "edit_file",
+                json!({"path": "f.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"}),
+            ))
+            .await;
+        assert!(!real.is_error, "{}", real.output);
+        assert!(!left_unchanged("edit_file", &real.output), "{}", real.output);
+        // The words alone mean nothing outside an edit.
+        assert!(!left_unchanged("bash", "already applied (by hand)"));
     }
 
     #[tokio::test]

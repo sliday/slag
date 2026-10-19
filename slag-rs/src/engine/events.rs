@@ -599,13 +599,13 @@ impl RenderState {
                     started: now,
                 });
             }
-            EngineEvent::ToolResult { name, ok, preview: p, lines, ms, .. } => {
+            EngineEvent::ToolResult { name, ok, preview: p, lines, ms, unchanged, .. } => {
                 // `finish` says nothing a card could add: its summary
                 // arrives as its own line right after.
                 if name == "finish" && *ok {
                     self.take_pending(name);
                 } else {
-                    let card = self.build_card(name, *ok, p, *lines, *ms);
+                    let card = self.build_card(name, *ok, *unchanged, p, *lines, *ms);
                     self.push_card(card, &mut prints);
                 }
                 self.narrate = None;
@@ -798,7 +798,7 @@ impl RenderState {
     /// One line per call: `  ✓ read   src/x.rs            42 lines`. A
     /// success is quiet (dim glyph, dim meta); a failure is the one card
     /// worth reading, so its error rides the same line in WARM.
-    fn build_card(&mut self, name: &str, ok: bool, result_preview: &str, lines: usize, ms: u64) -> Card {
+    fn build_card(&mut self, name: &str, ok: bool, unchanged: bool, result_preview: &str, lines: usize, ms: u64) -> Card {
         let (verb, arg) = match self.take_pending(name) {
             Some(call) => (call.verb.clone(), call.arg.clone()),
             // Unmatched result (start line lost): render from the name.
@@ -808,9 +808,14 @@ impl RenderState {
         let col = verb.chars().count().max(6);
         let lead = 4 + col + 1;
         let mut meta = String::new();
+        // An edit whose result was already in the file succeeded and
+        // changed nothing: it reads as a dim dash, never as a check mark.
+        let unchanged = ok && unchanged;
         if ok {
             let mut parts = Vec::new();
-            if matches!(verb.as_str(), "read" | "run" | "search") && lines > 1 {
+            if unchanged {
+                parts.push("no change".to_string());
+            } else if matches!(verb.as_str(), "read" | "run" | "search") && lines > 1 {
                 parts.push(format!("{lines} lines"));
             }
             if ms >= 1000 {
@@ -830,15 +835,15 @@ impl RenderState {
         };
         let key = arg.clone().unwrap_or_default();
         let subject = arg.map(|a| preview(&a, subject_room.max(8))).unwrap_or_default();
-        let (glyph, gcolor) = if ok { ("✓", COLD) } else { ("✗", WARM) };
+        let (glyph, gcolor) = if unchanged { ("–", COLD) } else if ok { ("✓", COLD) } else { ("✗", WARM) };
         let mut text = format!(
             "  {} {} {}",
             paint(gcolor, glyph),
             if ok { dim(&format!("{verb:<col$}")) } else { paint(WARM, &format!("{verb:<col$}")) },
-            subject
+            if unchanged { dim(&subject) } else { subject.clone() }
         );
         if ok {
-            text = crate::tui::spread(&text, &dim(&meta), width);
+            text = crate::tui::beside(&text, &dim(&meta), width);
         } else {
             let used = lead + subject.chars().count();
             let gist = error_gist(name, result_preview);
@@ -847,7 +852,9 @@ impl RenderState {
                 text.push_str(&format!(" {} {}", dim("—"), paint(WARM, &preview(&gist, room))));
             }
         }
-        Card { verb, ok, line: text, key }
+        // A no-op stands alone: folded into a streak of edits it would
+        // count as one more change.
+        Card { verb, ok: ok && !unchanged, line: text, key }
     }
 
     /// Streak-aware card emission. First card of a verb prints at once;
@@ -1123,10 +1130,12 @@ mod tests {
             lines: 1,
             bytes: 8,
             ms: 12,
+            unchanged: false,
         })
         .unwrap();
         assert_eq!(v["event"], "tool_result");
         assert_eq!(v["ok"], false);
+        assert!(v.get("unchanged").is_none(), "a changing result keeps its old shape");
 
         let v = serde_json::to_value(EngineEvent::Finish { summary: "done".into() }).unwrap();
         assert_eq!(v["event"], "finish");
@@ -1253,6 +1262,7 @@ mod tests {
             lines: p.lines().count(),
             bytes: p.len(),
             ms: 0,
+            unchanged: false,
         }
     }
 
@@ -1282,6 +1292,29 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains('✓') && lines[0].contains("run"), "{}", lines[0]);
         assert!(lines[0].contains("cargo test --all"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_no_op_edit_reads_as_no_change_not_a_check() {
+        let mut state = RenderState::new(false);
+        let mut lines = Vec::new();
+        for path in ["a.py", "b.py", "c.py"] {
+            state.feed(&start("edit_file", &format!(r#"{{"path": "{path}"}}"#)));
+            let mut ev = result("edit_file", true, "already applied (old_string equals new_string)");
+            if path == "b.py" {
+                if let EngineEvent::ToolResult { unchanged, .. } = &mut ev {
+                    *unchanged = true;
+                }
+            }
+            lines.extend(printed(&state.feed(&ev)));
+        }
+        lines.extend(printed(&state.finish()));
+        let noop = lines.iter().find(|l| l.contains("b.py")).expect("the no-op prints its own row");
+        assert!(noop.contains('–') && noop.contains("no change"), "{noop}");
+        assert!(!noop.contains('✓'), "{noop}");
+        // It stays out of the edits around it: no streak counts it.
+        assert!(lines.iter().all(|l| !l.contains("edited")), "{lines:?}");
+        assert_eq!(lines.iter().filter(|l| l.contains('✓')).count(), 2, "{lines:?}");
     }
 
     #[test]
