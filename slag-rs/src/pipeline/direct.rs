@@ -3,7 +3,7 @@ use serde::Deserialize;
 mod reference;
 
 const PACKAGE_CRITERION: &str = "Include installation metadata and importable modules for the requested package. Document its intended installation and launch or import commands.";
-const CLI_CRITERION: &str = "Judge named behavior and boundary cases before interface conveniences. Use subprocess checks with exact expected results for the named behavior and flags. Run the stated CLI launch and --help.";
+const CLI_CRITERION: &str = "Judge named behavior and boundary cases before interface conveniences. Use subprocess checks with exact expected results for the named behavior and flags. Run the stated CLI launch.";
 const TEST_CRITERION: &str = "Run a nonempty full test suite that exercises the commission's named behavior. Its documented command must pass in a fresh clone without prior installation.";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,22 +48,24 @@ pub fn scope_prompt(commission: &str) -> String {
          Routing only: direct=true suits small local utilities with a clear local interface, without external services, UI, deployment, or architectural research.\n\
          Return only {example} or {{\"direct\":false}}.\n\
          List primary behavior criteria first, then a few secondary interface criteria. Target six short criteria. Keep routing and harness limits out of criteria.\n\
-         Derive observable inputs/results from the standard meaning of the named operations and formats. Give each primary behavior an edge-case assertion in the suite.\n\
-         Examples apply only to named operations. Tail selects the last N lines (default 10); test -n 0, -n +N, appends, and partial records.\n\
-         A regex filter searches each complete line; invalid patterns fail with a useful error. A wc-like tool includes -l/-w/-c and combined flags.\n\
+         Derive observable inputs/results from the standard meaning of the named operations and formats. Give EACH named behavior must-pass probes with exact expected results for its mundane edge cases. Put these probes in the suite or commands, not prose alone. Keep these primary checks before interface checks.\n\
+         Examples apply only to named operations. Tail selects the final lines (default 10); test empty input, fewer lines, -n 0, an unterminated final line, appends, and partial records.\n\
+         A regex filter searches each line, including an unterminated final line at EOF; invalid patterns fail with a useful error. A wc-like tool includes -l/-w/-c and combined flags.\n\
          CSV conversion handles UTF-8 BOM and quoted newlines; reject ragged rows with a useful error instead of silent data loss. Unicode word frequency treats canonically equivalent words alike through NFC.\n\
-         Process potentially unbounded file/text streams incrementally. Do not replace tail or follow with whole-file reads. Test follow with appended data and partial lines.\n\
-         Include those behaviors only when the sentence names that operation or format. Do not add log rotation, network services, or unrelated features.\n\
+         Process potentially unbounded file/text streams incrementally. Do not replace tail or follow with whole-file reads. A finite tail snapshot emits its unterminated final line. Follow buffers partial appends until a newline; test both cases separately. Probe an invalid UTF-8 byte in file/text tools. Tail/count readers process bytes or use a documented decoding fallback that preserves readable records. Structured formats may reject invalid encoding with a clear error.\n\
+         For text transforms, probe empty text, punctuation between words, repeated separators, and Unicode. A separator transform keeps punctuation-separated words apart. For backoff/retry, probe attempt limits, delay growth, jitter bounds, and a finite maximum delay; document limits without adding a new API option unless needed. Include those behaviors only when the sentence names that operation or format. Do not add log rotation, network services, or unrelated features.\n\
          Match a named reference only for requested behavior, including input boundaries and byte versus character counts.\n\
-         Keep conventional interfaces secondary. Do not invent --file, --input, or --regex aliases when positional arguments suffice. Add no unrelated features, dependency bans, test quotas, or output-order rules.\n\
+         Derive numeric expectations from executable reference tools or builtin computations, such as len(encoded_input), rather than mental arithmetic. Share the oracle between suite and probes instead of duplicating numeric constants.\n\
+         Validate each reference invocation on the host before using it as an oracle. Compare equivalent semantics and input modes. Product and reference argv may differ. Do not assume the reference supports product conveniences; use its documented stdin invocation.\n\
+         Use standard library formatters and parsers when they implement the requested semantics. Keep conventional interfaces secondary. The criteria you return are the single source of interface expectations; list each expectation once. Do not invent --file, --input, or --regex aliases when positional arguments suffice. Add no unrelated features, dependency bans, test quotas, or output-order rules.\n\
          proof must run the full declared test suite from a fresh clone without prior installation or environment activation. Use the system interpreter, not .venv. Do not select, skip, or filter tests.\n\
          CLI/scripts need a normal launch probe; exercise each named flag. Keep harness fixtures and probe scripts under .slag/checks/.\n\
          CLI probes must write no workspace output files. Print results to stdout. Use private TMPDIR for scratch. Put probe scripts under .slag/checks/, outside product tests.\n\
          For long-running flags such as --follow, pass the flag to a probe script under .slag/checks/. It must assert child results, enforce a timeout, and terminate the child.\n\
          Prefer probes that assert primary semantics and a named flag in the same run. Derive secondary interfaces from this tool's kind. Allow up to six direct probes. Non-CLI libraries may use commands=[].\n\
-         A Python package CLI needs installation metadata with a console-script entry point and __main__.py. Probe python3 -m PACKAGE from source. The coordinator verifies installation and the console script in an isolated copy. Never install into the product workspace. The suite uses source or module launches.\n\
+         Only an explicitly requested Python package with a CLI needs installation metadata with a console-script entry point and __main__.py. A standalone Python CLI does not imply a package. Probe python3 -m PACKAGE from source. The coordinator verifies installation and the console script in an isolated copy. Never install into the product workspace. The suite uses source or module launches.\n\
          A Node CLI needs package.json with a bin entry. Probe that bin target.\n\
-         A Unix stream filter, such as wc, tail, CSV conversion, or word frequency, reads stdin without a file or with literal -. A scalar parser, such as duration parsing, takes its value positionally; do not add file or stdin interfaces. CLIs support --help. A top-N CLI has a documented default N. Test FILE N and the default; do not require an extra flag unless the sentence names it.\n\
+         Infer interfaces from the requested input. A Unix filter over arbitrary input, such as a wc-like tool, accepts stdin and literal -. A tool that tails or follows a named log file does not imply stdin, literal -, -n +N, or packaging. A scalar parser takes its value positionally; do not add file or stdin interfaces. Keep --help as a small CLI convention. A top-N CLI has a documented default N. Test FILE N and the default; do not require an extra flag unless the sentence names it.\n\
          Test these conventional interfaces with subprocess assertions. Match any explicit interface restrictions in the commission.\n\
          Launch standalone scripts with their interpreter. Keep each verification command within the declared environment.\n\
          The workspace stays read-only during tests/probes. Use in-memory data, .slag/checks/ fixtures, or private TMPDIR scratch. Product tests must not depend on .slag/. Do not install dependencies or write workspace fixtures or caches.\n\
@@ -211,48 +213,10 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
             criteria.push(criterion.to_string());
         }
     }
-    let conventions = conventional_criteria(commission, needs_cli, package);
-    for criterion in conventions {
-        if !criteria.iter().any(|existing| existing == criterion) { criteria.push(criterion.into()); }
-    }
     let reference = reference::checks(commission, choice.reference).ok()?;
     if let Some(criterion) = reference.criterion { criteria.push(criterion); }
     commands.extend(reference.commands);
     Some(DirectPlan { proof: proof.to_string(), criteria, commands, fixtures: reference.fixtures })
-}
-
-fn python_commission(commission: &str) -> bool {
-    let lower = commission.to_ascii_lowercase();
-    ["python", "unittest", ".py"].iter().any(|word| lower.contains(word))
-}
-
-fn stream_filter(commission: &str) -> bool {
-    let lower = commission.to_ascii_lowercase();
-    let operation = regex::Regex::new(r"\b(wc|tail|tails|tailing)\b").unwrap();
-    let converts = regex::Regex::new(r"\b(convert|converts|converter|conversion)\b").unwrap();
-    let words = regex::Regex::new(r"\bwords?\b").unwrap();
-    operation.is_match(&lower)
-        || lower.contains("csv") && converts.is_match(&lower)
-        || words.is_match(&lower) && ["frequent", "frequency", "top n", "top-n"].iter().any(|term| lower.contains(term))
-}
-
-fn conventional_criteria(commission: &str, cli: bool, package: bool) -> Vec<&'static str> {
-    if !cli { return Vec::new(); }
-    let lower = commission.to_ascii_lowercase();
-    let mut criteria = Vec::new();
-    if package && python_commission(commission) {
-        criteria.push("Provide a console-script entry point and __main__.py for python3 -m PACKAGE. Run the module from source; verify installation and the console script in an isolated copy. The suite must pass from a fresh clone without installation.");
-    }
-    if lower.contains("node") {
-        criteria.push("Provide package.json with a bin entry that points to the runnable CLI. Document and verify that entry.");
-    }
-    if stream_filter(commission) {
-        criteria.push("Read stdin when no input file is given or the input file is literal -. Document both interfaces and --help. Run stdin, dash, and help probes. Test their results through the real CLI.");
-    }
-    if lower.contains("top n") || lower.contains("top-n") {
-        criteria.push("Choose and document a sensible default N. Accept FILE N positionally. Verify the default and positional forms through CLI tests; require a flag only when the commission names it.");
-    }
-    criteria
 }
 
 fn write_redirection(command: &str) -> bool {
@@ -299,40 +263,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conventional_interfaces_follow_the_requested_deliverable() {
-        let python = conventional_criteria("a Python package CLI that converts CSV files to JSON", true, true);
-        assert!(python.iter().any(|item| item.contains("console-script")));
-        assert!(python.iter().any(|item| item.contains("stdin")));
-        let node = conventional_criteria("a tiny Node CLI for top N words of a text file", true, false);
-        assert!(node.iter().any(|item| item.contains("bin entry")));
-        assert!(node.iter().any(|item| item.contains("default N")));
-        assert!(!node.iter().any(|item| item.contains("console-script")));
-        assert!(conventional_criteria("a Python package library", false, true).is_empty());
-        assert!(conventional_criteria("a CLI that shows the date", true, false).is_empty());
+    fn conventional_interfaces_have_one_source_without_tail_scope_expansion() {
+        let commission = "a Python CLI that tails a log file with --follow and tests";
+        let raw = answer_with_commands(serde_json::json!([
+            "Tail selects final log lines and --follow prints appended records."
+        ]), &["python3 .slag/checks/tail.py --follow"]);
+        let plan = parse_scope(&raw, commission).unwrap();
+        assert!(!plan.criteria.iter().any(|item| item.contains("stdin") || item.contains("console-script")
+            || item.contains("-n +N") || item.contains("__main__.py")));
+        let prompt = scope_prompt(commission);
+        assert!(prompt.contains("single source of interface expectations"));
+        assert!(prompt.contains("list each expectation once"));
+        assert!(prompt.contains("does not imply stdin, literal -, -n +N, or packaging"));
+        assert!(prompt.contains("A standalone Python CLI does not imply a package"));
+        assert!(prompt.contains("takes its value positionally"));
+        assert!(prompt.contains("do not add file or stdin interfaces"));
     }
 
     #[test]
-    fn scalar_and_file_tools_do_not_inherit_stream_filter_interfaces() {
-        for commission in [
-            "a small Python library and CLI that parses durations like 1h30m or 90s into seconds, with tests",
-            "a CLI that inspects a file and prints its metadata",
-            "a CLI that renders text like a typewriter",
-            "a CLI that validates a CSV schema file",
-        ] {
-            let criteria = conventional_criteria(commission, true, false);
-            assert!(!criteria.iter().any(|item| item.contains("stdin")), "{commission}");
-        }
-        for commission in [
-            "write wc.py that counts lines, words and bytes of a file like wc",
-            "a Python CLI that tails a log file and prints only lines matching a regex",
-            "a small Python CLI that converts CSV to JSON",
-            "a tiny Node CLI that prints the top N most frequent words of a text file",
-        ] {
-            assert!(stream_filter(commission), "{commission}");
-        }
-        let prompt = scope_prompt("a Python CLI that parses durations");
-        assert!(prompt.contains("takes its value positionally"));
-        assert!(prompt.contains("do not add file or stdin interfaces"));
+    fn numeric_probe_expectations_use_executable_oracles() {
+        let prompt = scope_prompt("A CLI that measures encoded text with tests");
+        assert!(prompt.contains("Derive numeric expectations from executable reference tools or builtin computations"));
+        assert!(prompt.contains("rather than mental arithmetic"));
+        assert!(prompt.contains("Share the oracle between suite and probes"));
+        assert!(prompt.contains("Validate each reference invocation on the host"));
+        assert!(prompt.contains("Product and reference argv may differ"));
+        assert!(prompt.contains("use its documented stdin invocation"));
     }
 
     #[test]
@@ -349,8 +305,9 @@ mod tests {
         let semantics = prompt.find("List primary behavior criteria first").unwrap();
         let interfaces = prompt.find("Keep conventional interfaces secondary").unwrap();
         assert!(semantics < interfaces);
-        for requirement in ["last N lines", "partial records", "-n 0", "-n +N", "-l/-w/-c", "UTF-8 BOM",
-            "quoted newlines", "ragged rows", "NFC", "incrementally", "edge-case assertion"]
+        for requirement in ["final lines", "partial records", "-n 0", "unterminated final line", "invalid UTF-8 byte", "-l/-w/-c", "UTF-8 BOM",
+            "quoted newlines", "ragged rows", "NFC", "incrementally", "EACH named behavior must-pass probes", "punctuation between words",
+            "repeated separators", "attempt limits", "jitter bounds", "finite maximum delay"]
         {
             assert!(prompt.contains(requirement), "missing {requirement}");
         }
@@ -379,7 +336,7 @@ mod tests {
         ]), &["python3 -m tally tests/fixtures/input.txt --lines -q"]);
         let plan = parse_scope(&raw, commission).unwrap();
         assert_eq!(plan.proof, "python3 -m unittest");
-        assert_eq!(plan.criteria.len(), 8);
+        assert_eq!(plan.criteria.len(), 7);
         assert!(plan.criteria[2].contains("--lines"));
         assert_eq!(plan.commands, ["python3 -m tally tests/fixtures/input.txt --lines -q"]);
     }
@@ -391,7 +348,7 @@ mod tests {
         let plan = parse_scope(&raw, "A Python package CLI for CSV with --pretty and tests.").unwrap();
         assert_eq!(plan.proof, "python3 -m unittest");
         assert_eq!(plan.commands, ["python3 -m csvjson --pretty tests/fixtures/input.csv"]);
-        assert!(plan.criteria.iter().any(|item| item.contains("isolated copy")));
+        assert!(scope_prompt("A Python package CLI").contains("isolated copy"));
         assert!(!scope_prompt("A Python package CLI").contains("builder installs into .venv"));
     }
 
@@ -408,15 +365,16 @@ mod tests {
     }
 
     #[test]
-    fn first_review_conventions_cover_module_dash_and_positional_launches() {
-        let python = conventional_criteria("A Python package CLI that converts CSV files to JSON", true, true);
-        assert!(python.iter().any(|item| item.contains("__main__.py") && item.contains("python3 -m PACKAGE")));
-        assert!(python.iter().any(|item| item.contains("literal -")));
-        let node = conventional_criteria("A Node CLI for top N words of a text file", true, false);
-        assert!(node.iter().any(|item| item.contains("FILE N positionally") && item.contains("only when the commission names it")));
+    fn surveyor_owns_conventional_interfaces_without_coordinator_duplicates() {
+        let criterion = "Read stdin when the file is literal -.";
+        let raw = answer_with_commands(serde_json::json!([criterion]), &["python3 words.py -"]);
+        let plan = parse_scope(&raw, "A Python CLI for top N words of a text file").unwrap();
+        assert_eq!(plan.criteria.iter().filter(|item| item.contains("stdin")).count(), 1);
+        assert!(!plan.criteria.iter().any(|item| item.contains("default N")));
         let prompt = scope_prompt("A Python package CLI that converts CSV files to JSON");
         assert!(prompt.contains("fresh clone without prior installation"));
         assert!(prompt.contains("suite uses source or module launches"));
+        assert!(prompt.contains("Only an explicitly requested Python package"));
     }
 
     #[test]
@@ -513,12 +471,12 @@ mod tests {
         let commission = "Create a package with a CLI and unittest for CSV totals.";
         let commands = ["python3 -m totals tests/fixtures/input.csv"];
         let plan = parse_scope(&answer_with_commands(serde_json::json!(["CSV totals print the requested result."]), &commands), commission).unwrap();
-        assert_eq!(plan.criteria.len(), 5);
+        assert_eq!(plan.criteria.len(), 4);
         assert!(plan.criteria.iter().any(|item| item.contains("installation metadata") && item.contains("importable modules")));
         assert!(plan.criteria.iter().any(|item| item.contains("subprocess checks") && item.contains("exact expected results")));
         assert!(plan.criteria.iter().any(|item| item.contains("nonempty full test suite") && item.contains("named behavior")));
         let repeated = parse_scope(&answer_with_commands(serde_json::json!(plan.criteria), &commands), commission).unwrap();
-        assert_eq!(repeated.criteria.len(), 5);
+        assert_eq!(repeated.criteria.len(), 4);
     }
 
     #[tokio::test]

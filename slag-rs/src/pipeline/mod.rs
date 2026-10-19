@@ -777,7 +777,7 @@ fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagE
          ## HOW TO INSPECT\n\
          Read the product and test source, then run the declared suite and CLI probes.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful run IDs in EVIDENCE.\n\
-         Check each named behavior and flag through the actual CLI tests. Source inspection alone cannot pass this bar.\n\
+         Check each named behavior and its listed mundane boundary probes first. Confirm their assertions in test source and successful runs. Missing assertions or failed probes cannot pass. Check secondary interfaces afterward. Source inspection alone cannot pass this bar.\n\
          Keep verification instruments and reference fixtures under .slag/checks/. Product tests must work without .slag/.\n\
          The reviewer can read and run instruments. Use private TMPDIR for scratch; keep the workspace read-only.\n\
          Judge the commission without extra naming, style, or test-count rules.\n"
@@ -930,22 +930,22 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     // Create logs dir
     std::fs::create_dir_all(crate::config::project_path(crate::config::LOG_DIR))?;
 
-    // Initial commit, scoped to the files slag just wrote. `git add -A`
-    // here swept whatever the user had lying around — including .env —
-    // into a commit they never asked for.
-    let mut initial_files = vec!["add", "--"];
-    if std::path::Path::new(".gitignore").is_file() {
-        initial_files.push(".gitignore");
+    if review_head().is_none() {
+        // Commit only the files slag created.
+        let mut initial_files = vec!["add", "--"];
+        if std::path::Path::new(".gitignore").is_file() {
+            initial_files.push(".gitignore");
+        }
+        if crate::config::project_path(crate::config::ORE_FILE) == crate::config::ORE_FILE {
+            initial_files.extend([crate::config::ORE_FILE, crate::config::ALLOY_FILE, crate::config::LEDGER]);
+        }
+        if initial_files.len() > 2 {
+            let _ = crate::engine::sandbox::git().args(initial_files).output();
+        }
+        let _ = crate::engine::sandbox::git()
+            .args(["commit", "--allow-empty", "-m", "chore: initialize project", "--quiet"])
+            .output();
     }
-    if crate::config::project_path(crate::config::ORE_FILE) == crate::config::ORE_FILE {
-        initial_files.extend([crate::config::ORE_FILE, crate::config::ALLOY_FILE, crate::config::LEDGER]);
-    }
-    if initial_files.len() > 2 {
-        let _ = crate::engine::sandbox::git().args(initial_files).output();
-    }
-    let _ = crate::engine::sandbox::git()
-        .args(["commit", "--allow-empty", "-m", "chore: initialize project", "--quiet"])
-        .output();
 
     tui::status_line("█", tui::HOT, "Furnace hot");
     Ok(Ore::Fired)
