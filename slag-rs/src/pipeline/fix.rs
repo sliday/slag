@@ -61,6 +61,8 @@ const OUTPUT_TAIL_BYTES: usize = 4_000;
 const RETRY_DIFF_BYTES: usize = 8_000;
 /// How much of the diff the reviewer reads.
 const REVIEW_DIFF_BYTES: usize = 16_000;
+/// How long the issue's own command may run before slag stops waiting.
+const ISSUE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest a review may take before the verified fix lands without it.
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -371,8 +373,26 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     let before = job.git.as_ref().map(Git::snapshot).unwrap_or_default();
     let files = repo::file_list(&job.cwd, job.git.as_ref());
     let test_files: Vec<String> = files.iter().filter(|f| repo::is_test_path(f)).cloned().collect();
-    let context =
+    // The issue's own command, run as the user ran it, so the first test can
+    // reproduce exactly that and not a call the session imagined.
+    let mut reported = String::new();
+    for cmd in repo::issue_commands(&issue.render(), &job.cwd) {
+        let run = repo::run(&cmd, &job.cwd, ISSUE_COMMAND_TIMEOUT).await;
+        note(hooks, &format!("issue command: `{cmd}` {} before any edit", run.status()), true);
+        reported.push_str(&format!(
+            "`{cmd}` gave {}. The end of its output:\n{}\n",
+            run.status(),
+            repo::tail(&run.output, 20, 2_000)
+        ));
+    }
+    let mut context =
         context_block(job, &issue, &files, &test_files, test.as_ref(), baseline.as_ref());
+    if !reported.is_empty() {
+        context.push_str(&format!(
+            "\n=== THE ISSUE'S COMMAND, RUN BEFORE ANY EDIT ===\n{reported}Your first test \
+             reproduces what this command does: the same call, input, and defaults.\n"
+        ));
+    }
     let rescuer = Rescuer { register: &register_shutdown, stop: repo::kill_running };
     let mut ctx = Ctx {
         job,
@@ -963,12 +983,26 @@ impl Ctx<'_> {
             // in the prompt; this is the check that it held.
             if let Some(lost) = lost_tests(git, self.before, &changed) {
                 note(hooks, &format!("{label}: {lost}"), false);
+                // Told to restore, a weak model removes the same test again.
+                // Put the old tests back here, and show exactly what was lost.
+                let edited = edited_old_tests(git, self.before, &changed);
+                let olds: Vec<Saved> = edited
+                    .iter()
+                    .map(|e| (git.top.join(&e.path), e.original_tests.clone(), None))
+                    .collect();
+                restore(&olds);
+                let names: Vec<&str> = edited.iter().map(|e| e.path.as_str()).collect();
                 return fail(
                     Failure::new(
                         lost.clone(),
                         format!(
-                            "The session {lost}. Restore every existing test exactly as it \
-                             was, unskipped, and add new tests beside them."
+                            "The session {lost}. slag put {} back as it was, with every \
+                             existing test whole and unskipped; any new tests you had put \
+                             there are gone with the edit. Add them again after the last \
+                             existing test, or in a new test file, and change none of these \
+                             lines:\n{}",
+                            names.join(", "),
+                            removed_text(&edited)
                         ),
                     ),
                     summary,
@@ -2499,6 +2533,8 @@ mod tests {
         assert!(prompt.contains("Export drops a day"));
         assert!(prompt.contains("regression test"));
         assert!(prompt.contains("PLAN.md"), "the prompt forbids plan files by name");
+        assert!(prompt.contains("the FIRST test is the issue exactly as reported"), "{prompt}");
+        assert!(prompt.contains("no new guards"), "a minimal fix is asked for: {prompt}");
         assert!(!prompt.contains("PREVIOUS ATTEMPT"));
         let retry = crate::flux::fix_prompt("x", "", Some(&retry_block("`npm test` gave exit 1", "")));
         assert!(retry.contains("PREVIOUS ATTEMPT FAILED") && retry.contains("exit 1"));

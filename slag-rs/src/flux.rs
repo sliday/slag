@@ -602,13 +602,17 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         1. Locate the code the issue is about. Read it and its tests in ONE turn. \
         Trace the wrong result back to where it is produced: that is the root cause, \
         and it is often not the file where the symptom shows.\n\
-        2. Write the regression test a reader of the issue would recognize:\n\
-        - the issue's own scenario: the inputs, values, and calls it names, asserting \
-        the result it says is expected. One test per case the issue lists, plus the \
-        boundary next to each case (empty input, exactly at a limit, one past it), each \
-        named after the behavior it checks.\n\
-        - in the existing tests' idiom: imports at the top of the file, their helpers \
-        and fixtures, their assertion style.\n\
+        2. Write short regression tests a reader of the issue would recognize:\n\
+        - the FIRST test is the issue exactly as reported: the same call or command, \
+        the same input, the same defaults (where the user passed no argument, pass \
+        none), asserting the result the issue says is expected. When the issue reports \
+        a command (a script, a demo, a CLI), test the call that command makes.\n\
+        - then one test for each other case the issue lists, and one boundary next to \
+        the reported case only when the issue implies a limit. Nothing the issue does \
+        not ask about.\n\
+        - concise, in the existing tests' idiom: one assertion per behavior, no \
+        repeated setup, no new helper unless the existing tests have one, imports at \
+        the top of the file. About the length of the existing tests.\n\
         - where the test command already looks (TESTS above says how the runner finds \
         tests): extend an existing test file, or wire a new file in the way the existing \
         ones are. slag makes each new test file unable to run and reruns the tests; a \
@@ -627,7 +631,9 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         edit and the fix edit in ONE turn: two edit calls in the same message. When \
         it is not, run the test first and watch it fail.\n\
         3. Fix the root cause with the smallest change that resolves the WHOLE issue, \
-        every case it names. Keep public names and signatures.\n\
+        every case it names. Change only what the cause needs: no new guards or \
+        validation, and no change to messages, flags, redirections, or behavior the \
+        issue does not ask about. Keep public names and signatures.\n\
         4. Run the full test command. Your test and the existing ones must pass.\n\
         5. Finish. summary: the root cause as path:line, the fix, the reproduction. \
         cmd: the full test command, which now runs your regression test.\n\n\
@@ -686,11 +692,13 @@ pub fn fix_review_prompt(
          {existing_check}\
          1. ROOT CAUSE: the source change fixes the cause the issue describes where it \
          is produced, not a special case for the reported input, and not a patch where \
-         the symptom shows.\n\
-         2. THE ISSUE'S CASES: the new tests use the issue's own scenario, with the \
-         inputs it names and the result it says is expected, for every case it lists. \
-         A test that only restates the new code, or checks something the issue never \
-         mentions, misses.\n\
+         the symptom shows. It changes nothing else: a new guard, a dropped redirect, \
+         or any behavior the issue never mentions misses.\n\
+         2. THE ISSUE'S CASES: the first new test is the issue's literal invocation, \
+         the same call or command with the same input and defaults (no explicit \
+         argument where the user passed none), asserting the result the issue expects; \
+         every other case the issue lists has a test. A test that only restates the new \
+         code, or checks something the issue never mentions, misses.\n\
          3. PLACE: each new test sits in the test file for the module it tests, or in \
          a new file named after that module beside the existing tests. A test added to \
          a file for a different module misses.\n\
