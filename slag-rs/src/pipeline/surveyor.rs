@@ -9,6 +9,11 @@ pub async fn direct_proof(smith: &dyn Smith, commission: &str) -> Result<Option<
     if let Some(plan) = super::direct::parse_scope(&raw, commission) {
         return Ok(Some(plan));
     }
+    if let Some(prompt) = super::direct::reference_mapping_prompt(commission, &raw) {
+        let reference = smith.invoke(&prompt).await?;
+        return super::direct::complete_reference(commission, &raw, &reference).map(Some)
+            .ok_or_else(|| SlagError::SurveyFailed("the named reference has no valid comparison contract".into()));
+    }
     let Some(prompt) = super::direct::scope_repair_prompt(commission, &raw) else { return Ok(None) };
     let repaired = smith.invoke(&prompt).await?;
     Ok(super::direct::parse_scope(&repaired, commission))
@@ -137,6 +142,27 @@ mod tests {
 
         let smith = crate::smith::mock::MockSmith::fixed(invalid);
         assert!(direct_proof(&smith, "Create a word counting CLI.").await.unwrap().is_none());
+        assert_eq!(smith.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_omitted_reference_gets_a_bounded_mapping_request() {
+        let scope = serde_json::json!({
+            "direct": true, "proof": "python3 -m unittest", "criteria": ["Copy file contents like cat."],
+            "commands": ["python3 copy.py fixtures/sample.txt"]
+        }).to_string();
+        let reference = serde_json::json!({"actual": ["python3", "copy.py", "{input}"], "command": ["cat", "{input}"], "comparison": "bytes"}).to_string();
+        let mut wrapped: serde_json::Value = serde_json::from_str(&scope).unwrap();
+        wrapped["reference"] = serde_json::from_str(&reference).unwrap();
+        for reply in [reference, wrapped.to_string()] {
+            let smith = crate::smith::mock::MockSmith::new(vec![scope.clone(), reply]);
+            let plan = direct_proof(&smith, "A file CLI like cat with tests.").await.unwrap().unwrap();
+            assert_eq!(plan.fixtures.len(), 2);
+            assert_eq!(plan.commands.len(), 3);
+            assert_eq!(smith.call_count(), 2);
+        }
+        let smith = crate::smith::mock::MockSmith::fixed(&scope);
+        assert!(direct_proof(&smith, "A file CLI like cat with tests.").await.is_err());
         assert_eq!(smith.call_count(), 2);
     }
 

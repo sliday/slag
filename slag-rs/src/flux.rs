@@ -406,6 +406,8 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          Derive a short, reachable checklist from the commission's stated requirements.\n\
          Use the blueprint for context. Do not promote its design choices into requirements.\n\
          Name observable behavior and a direct way to inspect it.\n\
+         If the commission says like TOOL, compare the requested behavior with that tool's documented semantics.\n\
+         Use asserted comparisons on classic edge cases, including empty input and an unterminated final record for text-file utilities.\n\
          {DELIVERY_RULES}\n\
          Add no test counts, formatting rules, dependency bans, or features unless the commission requires them.\n\
          Permit normal imports between project modules.\n\
@@ -474,7 +476,7 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          ITS BAR:\n{bar}\n\n\
          Inspect the source and tests on disk.\n\
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
-         Copy each REQUIRED RUN COMMANDS entry verbatim into its own bash call. Cite those successful runs in EVIDENCE.\n\
+         Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
          Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
          Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
          The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\
@@ -509,7 +511,7 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          THE BAR:\n{bar}\n\n\
          Inspect the source and tests on disk.\n\
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
-         Copy each REQUIRED RUN COMMANDS entry verbatim into its own bash call. Cite those successful runs in EVIDENCE.\n\
+         Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
          Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
          Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
          The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\

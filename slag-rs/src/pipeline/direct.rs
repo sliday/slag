@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+mod reference;
+
 const PACKAGE_CRITERION: &str = "Include installation metadata and importable modules for the requested package. Document its intended installation and launch or import commands.";
 const CLI_CRITERION: &str = "Run the stated CLI launch. Use subprocess checks that assert actual results for the named behavior and flags.";
 const TEST_CRITERION: &str = "Run a nonempty full test suite that exercises the commission's named behavior.";
@@ -9,6 +11,7 @@ pub struct DirectPlan {
     pub proof: String,
     pub criteria: Vec<String>,
     pub commands: Vec<String>,
+    pub fixtures: Vec<(String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -21,14 +24,29 @@ struct ScopeChoice {
     criteria: Vec<String>,
     #[serde(default)]
     commands: Vec<String>,
+    #[serde(default)]
+    reference: Option<reference::Reference>,
 }
 
 pub fn scope_prompt(commission: &str) -> String {
+    let tool = reference::named_tool(commission);
+    let mut example = serde_json::json!({"direct": true, "proof": "test command", "criteria": ["checkable requirement"], "commands": ["CLI probe"]});
+    if let Some(tool) = &tool {
+        example["reference"] = serde_json::json!({"actual": ["python3", "app.py", "{input}"], "command": [tool, "{input}"], "comparison": "words"});
+    }
+    let reference = tool.map(|tool| format!(
+        "\nNamed reference tool: {tool}. Also return a reference object: \
+         {{\"actual\":[\"python3\",\"app.py\",\"{{input}}\"],\"command\":[\"{tool}\",\"{{input}}\"],\"comparison\":\"words\"}}.\n\
+         actual must use your chosen CLI launch. Substitute {{input}} for the input file in both argv arrays.\n\
+         Choose comparison=bytes for exact output or words when only whitespace differs in the requested output.\n\
+         The coordinator supplies immutable-content fixtures for empty input and an unterminated final text record.\n\
+         Compare only the requested behavior using the reference tool's documented semantics. Include other classic cases in the suite."
+    )).unwrap_or_default();
     format!(
         "Choose the work scope for a fresh, empty project.\n\
          COMMISSION: {commission}\n\
          Routing only: direct=true suits small local utilities, about four files, without external services, UI, deployment, or architectural research.\n\
-         Return only {{\"direct\":true,\"proof\":\"test command\",\"criteria\":[\"checkable requirement\"],\"commands\":[\"CLI probe\"]}} or {{\"direct\":false}}.\n\
+         Return only {example} or {{\"direct\":false}}.\n\
          Write one short criterion per named requirement, targeting at most six. Keep routing and harness limits out of criteria.\n\
          State observable inputs/results, requested flags, package metadata/import shape, and intended launch method where relevant.\n\
          Match a named reference only for requested behavior, including input boundaries and byte versus character counts.\n\
@@ -41,7 +59,7 @@ pub fn scope_prompt(commission: &str) -> String {
          Tests/probes must support filesystem-read-only execution through in-memory data or committed fixtures, without installs, fixture writes, or cache writes.\n\
          Return direct=false if this verification contract conflicts with the commission.\n\
          Criteria must be single lines of at most 320 characters; proof and each probe must fit 1024 characters.\n\
-         Output the JSON itself without tools, prose, or document descriptions."
+         Output the JSON itself without tools, prose, or document descriptions.{reference}"
     )
 }
 
@@ -64,9 +82,33 @@ pub fn scope_repair_prompt(commission: &str, previous: &str) -> Option<String> {
          proof must run the full declared test suite.\n\
          Concrete CLI probes must print to stdout. Do not use redirection, shell operators, installs, or no-op commands.\n\
          Include each named flag as an actual command argument.\n\
-         Return only corrected JSON with direct, proof, criteria, and commands.",
+         Return only corrected JSON with direct, proof, criteria, commands, and any required reference object.",
         scope_prompt(commission),
     ))
+}
+
+pub fn reference_mapping_prompt(commission: &str, raw: &str) -> Option<String> {
+    let scope: serde_json::Value = serde_json::from_str(scope_json(raw)?).ok()?;
+    if scope["direct"] != true { return None }
+    let tool = reference::named_tool(commission)?;
+    Some(format!(
+        "Map the requested behavior to the named reference tool.\nCOMMISSION: {commission}\n\
+         PLANNED CLI PROBES: {}\n\
+         Return ONLY this JSON object, with no scope fields: \
+         {{\"actual\":[\"python3\",\"app.py\",\"{{input}}\"],\"command\":[\"{tool}\",\"{{input}}\"],\"comparison\":\"words\"}}.\n\
+         actual must use the planned product CLI. command must invoke {tool} with the options for the requested behavior only.\n\
+         Use {{input}} as a file argument in both arrays. Use documented reference semantics.\n\
+         Choose comparison=bytes for exact text or comparison=words for whitespace-separated output fields.\n\
+         These commands will compare empty input and an unterminated final text record. Do not use tools.",
+        scope["commands"],
+    ))
+}
+
+pub fn complete_reference(commission: &str, scope: &str, reply: &str) -> Option<DirectPlan> {
+    let mut scope: serde_json::Value = serde_json::from_str(scope_json(scope)?).ok()?;
+    let reply: serde_json::Value = serde_json::from_str(scope_json(reply)?).ok()?;
+    scope["reference"] = reply.get("reference").filter(|value| !value.is_null()).unwrap_or(&reply).clone();
+    parse_scope(&scope.to_string(), commission)
 }
 
 pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
@@ -138,7 +180,10 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
             criteria.push(criterion.to_string());
         }
     }
-    Some(DirectPlan { proof: proof.to_string(), criteria, commands })
+    let reference = reference::checks(commission, choice.reference, &commands)?;
+    if let Some(criterion) = reference.criterion { criteria.push(criterion); }
+    commands.extend(reference.commands);
+    Some(DirectPlan { proof: proof.to_string(), criteria, commands, fixtures: reference.fixtures })
 }
 
 fn write_redirection(command: &str) -> bool {
@@ -310,13 +355,96 @@ mod tests {
         assert_eq!(repeated.criteria.len(), 4);
     }
 
+    #[tokio::test]
+    async fn reference_probes_detect_unterminated_record_errors_without_tool_specific_rules() {
+        let raw = serde_json::json!({
+            "direct": true, "proof": "python3 -m unittest", "criteria": ["Copy file contents like cat."],
+            "commands": ["python3 copy.py tests/fixtures/sample.txt"],
+            "reference": {"actual": ["python3", "copy.py", "{input}"], "command": ["cat", "{input}"], "comparison": "bytes"}
+        }).to_string();
+        let plan = parse_scope(&raw, "A file CLI like cat with tests.").unwrap();
+        assert_eq!(plan.commands.len(), 3);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("tests/fixtures")).unwrap();
+        std::fs::write(root.path().join("tests/fixtures/reference-empty.txt"), "").unwrap();
+        std::fs::write(root.path().join("tests/fixtures/reference-no-final-newline.txt"), "alpha beta\nalpha").unwrap();
+        let script = root.path().join("copy.py");
+        let sandbox = crate::engine::sandbox::Sandbox::read_only().unwrap();
+        for (source, expected) in [
+            ("import pathlib,sys\nsys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n", [true, true]),
+            ("import pathlib,sys\nb=pathlib.Path(sys.argv[1]).read_bytes()\nsys.stdout.buffer.write(b + (b'\\n' if b and not b.endswith(b'\\n') else b''))\n", [true, false]),
+            ("import pathlib,sys\nsys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\nsys.exit(2)\n", [false, false]),
+        ] {
+            std::fs::write(&script, source).unwrap();
+            for (command, expected) in plan.commands[1..].iter().zip(expected) {
+                let result = sandbox.wrap("bash").args(["-c", command]).current_dir(root.path()).output().await.unwrap();
+                assert_eq!(result.status.success(), expected, "{}", String::from_utf8_lossy(&result.stderr));
+            }
+        }
+        std::fs::write(&script, "import pathlib,sys\nsys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n").unwrap();
+        std::fs::write(root.path().join("tests/fixtures/reference-no-final-newline.txt"), "alpha beta\nalpha\n").unwrap();
+        let result = sandbox.wrap("bash").args(["-c", &plan.commands[2]]).current_dir(root.path()).output().await.unwrap();
+        assert!(!result.status.success(), "changed boundary input must not pass");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("reference fixture changed"));
+    }
+
+    #[tokio::test]
+    async fn reference_count_fields_reject_an_unterminated_line_mismatch() {
+        let raw = serde_json::json!({
+            "direct": true, "proof": "python3 -m unittest", "criteria": ["Count lines, words and bytes like wc."],
+            "commands": ["python3 wc.py fixtures/empty.txt", "python3 wc.py fixtures/normal.txt", "python3 wc.py fixtures/unterminated.txt"],
+            "reference": {"actual": ["python3", "wc.py", "{input}"], "command": ["wc", "{input}"], "comparison": "words"}
+        }).to_string();
+        let plan = parse_scope(&raw, "Write wc.py that counts lines, words and bytes like wc, with unittest.").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        for (path, content) in &plan.fixtures {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let sandbox = crate::engine::sandbox::Sandbox::read_only().unwrap();
+        for (lines, expected) in [("len(b.splitlines())", [true, false]), ("b.count(bytes([10]))", [true, true])] {
+            let source = format!("import pathlib,sys\nb=pathlib.Path(sys.argv[1]).read_bytes()\nprint({lines},len(b.split()),len(b),sys.argv[1])\n");
+            std::fs::write(root.path().join("wc.py"), source).unwrap();
+            for (command, expected) in plan.commands[3..].iter().zip(expected) {
+                let result = sandbox.wrap("bash").args(["-c", command]).current_dir(root.path()).output().await.unwrap();
+                assert_eq!(result.status.success(), expected, "{}", String::from_utf8_lossy(&result.stderr));
+            }
+        }
+    }
+
+    #[test]
+    fn a_named_reference_requires_the_actual_reference_and_artifact_launch() {
+        let mut raw = serde_json::json!({
+            "direct": true, "proof": "python3 -m unittest", "criteria": ["Copy file contents like cat."],
+            "commands": ["python3 copy.py tests/fixtures/sample.txt"]
+        });
+        assert!(parse_scope(&raw.to_string(), "A file CLI like cat with tests.").is_none());
+        let mut complex = raw.clone();
+        complex["commands"] = serde_json::json!(["python3 copy.py --mode raw tests/fixtures/sample.txt"]);
+        assert!(parse_scope(&complex.to_string(), "A file CLI like cat with tests.").is_none());
+        raw["reference"] = serde_json::json!({"actual": ["python3", "copy.py", "{input}"], "command": ["cat", "{input}"], "comparison": "bytes"});
+        assert!(parse_scope(&raw.to_string(), "A file CLI like cat with tests.").is_some());
+        assert!(parse_scope(&raw.to_string(), "A file CLI with tests.").is_none());
+        for (key, value) in [
+            ("command", serde_json::json!(["echo", "{input}"])),
+            ("actual", serde_json::json!(["cat", "{input}"])),
+            ("actual", serde_json::json!(["python3", "other.py", "{input}"])),
+            ("actual", serde_json::json!(["python3", "copy.py", "unrelated.txt"])),
+            ("comparison", serde_json::json!("ignore errors")),
+        ] {
+            let mut invalid = raw.clone(); invalid["reference"][key] = value;
+            assert!(parse_scope(&invalid.to_string(), "A file CLI like cat with tests.").is_none(), "{invalid}");
+        }
+    }
+
     #[test]
     fn an_exact_outer_json_fence_preserves_the_scope_contract() {
         let json = answer(serde_json::json!(["Counts words."]));
         let expected = parse_scope(&json, "Count words.").unwrap();
         for fenced in [format!("```json\n{json}\n```"), format!(" \n```json\r\n{json}\r\n```\n ")] {
             assert_eq!(parse_scope(&fenced, "Count words."), Some(DirectPlan {
-                proof: expected.proof.clone(), criteria: expected.criteria.clone(), commands: expected.commands.clone(),
+                proof: expected.proof.clone(), criteria: expected.criteria.clone(), commands: expected.commands.clone(), fixtures: expected.fixtures.clone(),
             }));
         }
         for malformed in [
