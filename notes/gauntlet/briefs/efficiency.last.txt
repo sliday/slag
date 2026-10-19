@@ -1,21 +1,20 @@
-Committed `ba34c50` on `gauntlet/efficiency`.
+Committed `8a5105b` on `gauntlet/efficiency`.
 
-| Commission | Tokens | Seconds | Est. cost | Verdict |
+| Commission | Seconds | Tokens | Estimated spend | Verdict |
 |---|---:|---:|---:|---|
-| wc | 76,300 | 109.5 | $0.1108 | FORGED |
-| CSV | 75,274 | 112.4 | $0.1021 | FORGED |
-| Node | 104,647 | 109.8 | $0.1297 | FORGED |
+| wc | 139.4 | 118,874 | $0.1590 | FORGED |
+| CSV | 141.4 | 125,529 | $0.1500 | FORGED |
+| Node | 113.7 | 105,544 | $0.1294 | FORGED |
+| Tail rerun | 148.5 | 121,301 | $0.1713 | FORGED |
 
-Total estimated spend: **$0.3427**.
+Independent checks passed for fresh-clone suites, wc flags and streaming, CSV boundaries, NFC counts, and tail follow behavior.
 
-Fresh-clone suites passed without installation: **7, 7, and 11 tests**. Module launches, `-` stdin, and positional arguments passed.
+Total spend: **$0.8005**, including the initial UNVERIFIED tail run. The fix preserves source evidence throughout the bounded review.
 
-Slag-specific ignores now stay in local Git excludes. Bootstrap commits use `chore: initialize project`.
+Cargo passed **1,233 tests**, with one ignored. Clippy passed with warnings denied. Both checkouts are clean.
 
-Cargo passed **1,218 tests**, with one ignored. Clippy passed with warnings denied. Both worktrees are clean.
+[Report: changed files, test names, phase totals, and exact commands](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/efficiency-round8.md).
 
-[Report: files, commands, phase tokens, history, and ignore output](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/efficiency-round7.md)
-
-ASK: Verify first-run behavior, remove repository marks, and rerun three commissions.
+ASK: Complete Round 8 semantics, sandbox reliability, residue cleanup, live checks, and commit.
 🟩Got 🟩Had 🟩Did
 🧠 —

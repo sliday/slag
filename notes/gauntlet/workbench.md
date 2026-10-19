@@ -363,6 +363,25 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Integrity pass; no UNVERIFIED.
 - BIGGEST_GAP: idiomatic first-check failures (fresh-clone suite, `python -m`, positional args). Sent as efficiency r7 with slag's marks in the repo (bootstrap commit name, committed `.slag/` ignore lines).
 
+### efficiency r7 merged
+- Warden verifies delivery from a fresh clone (no install); Python CLIs run as `python -m <pkg>`; `-` means stdin; named arguments accepted positionally and by flag; slag's ignore lines in `.git/info/exclude`; bootstrap commit `chore: initialize project`.
+- Live gpt-6.1-sol: wc 76.3k / 110 s / $0.11 FORGED; csv 75.3k / 112 s / $0.10 FORGED; node 104.6k / 110 s / $0.13 FORGED. Fresh-clone suites pass without install (7, 7, 11 tests).
+- Integration: 1150 unit tests green, clippy clean. Critic commission-r6 running, with a fourth new prompt (log tail --follow) and one fresh codex run.
+
+### Harness² critic r1 (Fable, fresh, paper's comparison on streams): WINNER bar
+- Editor gpt-4.1 (gpt-5.5 blew the $2 cap in propose alone). Instrument proven (noop 0/8, reference 8/8 both streams). Spend ≈ $7.9.
+- py-data: A base 3/16 (median 84 s, ~$0.01/task); B evolve 2/8 (median ~117 s, $0.17-0.61/task, capped on 4/8 tasks, library EMPTY after 8 tasks); C (5-8) 1/8 vs A 1/8.
+- js-web: A 4/16 (median 54 s); B tasks 1-4 with corrected price 4/4 (median 166 s, $0.70/task) vs A on 1-4 2/8; C (5-8) 3/8 vs A 2/8 (inside noise: A flips 5/16 tasks between its own runs). Evolve is best-of-4 attempts; no matched-compute (`--tries 4`) control yet.
+- Safety PASS: no leaks, harness edits only in harness files, empty library reproduces base.
+- BIGGEST_GAP: unpriced models charged $5/M toward the evolve cap (`agent.rs:1827`), so evolve dies on the README's own weak executor; stage spend "unknown". Sent as Harness² r3 with full-component library transfer (`library.rs:196` applies recipes only) and evidence-based confidence.
+- Held: improver validation failures with gpt-4.1 (compose mostly no-op); wall 3-10x base.
+
+### commission critic r6 (Fable, fresh, gpt-6.1-sol, 4 prompts incl. new log-tail): WINNER bar
+- slag: wc 100 s / $0.106 FORGED (no -l/-w/-c); csv 143 s / $0.157 FORGED (1 retry; left .venv + egg-info); node 99 s / $0.130 FORGED (18 tests, bin, stdin); tail 334 s / $0.447 UNVERIFIED after 3 heats + re-smelt (prints whole file, not a tail; partial-line bug). Codex: 113 / 124 / 79 / 101 s.
+- Votes (both orders): a codex, b codex, c split (critic slag), d codex → 0-3-1.
+- Integrity pass; the tail UNVERIFIED is true but caused by slag's proof tooling (read-only sandbox: "No usable temporary directory"; nested-quote SyntaxError).
+- BIGGEST_GAP: r7 overcorrected toward interface breadth; codex wins on the behavior the sentence names. Sent as efficiency r8: core semantics first, private TMPDIR for read-only sessions, proof residue in temp copies, user-facing commit messages.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
