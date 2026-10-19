@@ -621,7 +621,8 @@ async fn base_harness(
             Ok((!loaded.is_empty()).then_some(dir))
         }
         Err(why) => {
-            note(hooks, &format!("harness dropped: {}", why.lines().next().unwrap_or_default()), false);
+            let first = why.lines().find_map(|l| l.trim().strip_prefix("- ")).unwrap_or(why.as_str());
+            note(hooks, &format!("harness dropped, it failed validation: {first}"), false);
             Ok(None)
         }
     }

@@ -363,6 +363,39 @@ async fn sequential_evolution_chains_checkpoints() {
     assert!(history.exists(), "{}", history.display());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_harness_directory_changes_the_smith_and_stays_untouched() {
+    let repo = buggy_repo();
+    let home = tempfile::tempdir().unwrap();
+    let (server, roles) = model().await;
+    let harness = tempfile::tempdir().unwrap();
+    std::fs::write(harness.path().join("systemprompt.md"), format!("{RULE}\n")).unwrap();
+    std::fs::write(harness.path().join("notes.txt"), "the user's own scratch\n").unwrap();
+    let dir = harness.path().display().to_string();
+    let args = ["fix", "value is wrong", "--test", "bash tests/check.sh", "--harness", dir.as_str()];
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("harness: systemprompt.md"), "{stdout}");
+    let systems = roles.systems.lock().unwrap().clone();
+    let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
+    assert!(smith.contains("## Procedure") && smith.contains(RULE), "{smith}");
+    assert!(sh(repo.path(), "git show --name-only --format= HEAD").contains("tests/value_test.sh"));
+    assert!(harness.path().join("notes.txt").exists(), "validation prunes a copy, never the user's tree");
+
+    // A tree that fails validation runs nothing of itself.
+    std::fs::create_dir_all(harness.path().join("recipes/x")).unwrap();
+    std::fs::write(harness.path().join("recipes/x/RECIPE.md"), "---\nname: x\n---\nbody\n").unwrap();
+    sh(repo.path(), "git checkout -q main");
+    roles.systems.lock().unwrap().clear();
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("harness dropped") && stdout.contains("has no trigger"), "{stdout}");
+    let systems = roles.systems.lock().unwrap().clone();
+    let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
+    assert!(!smith.contains("# Harness"), "{smith}");
+}
+
 #[test]
 fn sequential_without_evolve_is_refused() {
     let dir = tempfile::tempdir().unwrap();
