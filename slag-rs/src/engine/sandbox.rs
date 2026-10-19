@@ -195,11 +195,26 @@ impl Sandbox {
 
     /// Allow writes only beneath `root`, without configured writable paths.
     pub fn for_scratch(root: &Path) -> std::io::Result<Self> {
-        let backend = backend();
+        Self::scratch_with_backend(root, backend()).inspect_err(|error| {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| crate::tui::status_line("!", crate::tui::WARM,
+                    &format!("read-only checks unavailable: {error}; checks will not run")));
+            }
+        })
+    }
+
+    fn scratch_with_backend(root: &Path, backend: Backend) -> std::io::Result<Self> {
         if backend == Backend::None {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "read-only review requires a working OS sandbox; no unconfined fallback",
+            ));
+        }
+        if backend == Backend::Landlock {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "read-only review requires bubblewrap: Landlock cannot block chmod, timestamps, or extended attribute writes",
             ));
         }
         let path = root.canonicalize()?;
@@ -207,17 +222,6 @@ impl Sandbox {
         sandbox.read_only = true;
         for name in ["TMPDIR", "TMP", "TEMP"] {
             sandbox.env.push((name.to_string(), path.clone()));
-        }
-        #[cfg(target_os = "linux")]
-        if backend == Backend::Landlock {
-            sandbox.ruleset = landlock::read_only_ruleset(&sandbox.writable);
-            if sandbox.ruleset.is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "read-only review requires Landlock ABI 3 or a working bubblewrap",
-                ));
-            }
-            sandbox.backend = Backend::Landlock;
         }
         if sandbox.backend == Backend::None {
             return Err(std::io::Error::new(
@@ -408,6 +412,9 @@ impl Sandbox {
         }
         for tree in self.locked.trees.iter().filter(|t| t.exists()) {
             args.extend(["--ro-bind".into(), tree.into(), tree.into()]);
+        }
+        if self.read_only {
+            args.extend(["--cap-drop".into(), "ALL".into()]);
         }
         args.push("--die-with-parent".into());
         args
@@ -898,16 +905,6 @@ mod landlock {
         ruleset_with_devices(writable, &[PathBuf::from("/dev")])
     }
 
-    pub fn read_only_ruleset(writable: &[PathBuf]) -> Option<OwnedFd> {
-        if abi()? < 3 {
-            return None;
-        }
-        ruleset_with_devices(
-            writable,
-            &[PathBuf::from("/dev/null"), PathBuf::from("/dev/zero")],
-        )
-    }
-
     fn ruleset_with_devices(writable: &[PathBuf], devices: &[PathBuf]) -> Option<OwnedFd> {
         let abi = abi()?;
         let mut handled = WRITE_FILE
@@ -1145,6 +1142,81 @@ mod tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "--bind" || arg == "--dev-bind"));
+        assert!(args.windows(2).any(|args| args == ["--cap-drop", "ALL"]));
+    }
+
+    #[test]
+    fn readonly_scratch_refuses_unconfined_backend() {
+        let scratch = tempfile::tempdir().unwrap();
+        let error = Sandbox::scratch_with_backend(scratch.path(), Backend::None)
+            .err()
+            .expect("read-only review must not run unconfined");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("no unconfined fallback"));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn readonly_backend_blocks_checkout_writes(backend: Backend) {
+        if backend == Backend::Bwrap
+            && !runs("bwrap", &["--ro-bind", "/", "/", "true"])
+        {
+            eprintln!("skipped: bubblewrap cannot create a sandbox here");
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("existing"), "unchanged").unwrap();
+        std::os::unix::fs::symlink(workspace.path(), scratch.path().join("workspace")).unwrap();
+        let sb = Sandbox::scratch_with_backend(scratch.path(), backend).unwrap();
+        let code = r#"import errno, os, pathlib, sys, tempfile
+root = pathlib.Path(sys.argv[1])
+with tempfile.TemporaryDirectory() as directory:
+    pathlib.Path(directory, 'allowed').write_text('scratch')
+for path in (pathlib.Path('written'), root / 'absolute', root / 'existing', pathlib.Path(os.environ['TMPDIR']) / 'workspace' / 'escape'):
+    try:
+        path.write_text('blocked')
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), error
+    else:
+        raise AssertionError(f'workspace write succeeded: {path}')
+for operation in (lambda: (root / 'existing').chmod(0o600), lambda: os.utime(root / 'existing', ns=(1, 1)), lambda: os.setxattr(root / 'existing', 'user.slag_probe', b'blocked')):
+    try:
+        operation()
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), error
+    else:
+        raise AssertionError('workspace metadata write succeeded')
+if sys.argv[2] == 'bwrap':
+    caps = next(line for line in pathlib.Path('/proc/self/status').read_text().splitlines() if line.startswith('CapEff:'))
+    assert int(caps.split()[1], 16) == 0, caps
+print('checkout read-only; private temporary files allowed')
+"#;
+        let program = shell_words::join([
+            "python3", "-B", "-c", code, workspace.path().to_str().unwrap(),
+            if backend == Backend::Bwrap { "bwrap" } else { "landlock" },
+        ]);
+        let command = format!("cd {} && {program}", shell_words::quote(workspace.path().to_str().unwrap()));
+        let output = sb.command(&command).output().await.unwrap();
+        assert!(output.status.success(), "{backend:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read_to_string(workspace.path().join("existing")).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bwrap_readonly_blocks_checkout_writes_and_allows_private_temp() {
+        readonly_backend_blocks_checkout_writes(Backend::Bwrap).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_readonly_refuses_unprotected_metadata_writes() {
+        let scratch = tempfile::tempdir().unwrap();
+        let error = Sandbox::scratch_with_backend(scratch.path(), Backend::Landlock)
+            .err()
+            .expect("Landlock cannot enforce a read-only workspace");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("Landlock cannot block chmod, timestamps, or extended attribute writes"));
     }
 
     #[tokio::test]

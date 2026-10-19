@@ -2320,7 +2320,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_review_keeps_grounded_pass_after_optional_pytest_traceback() {
         use std::os::unix::fs::PermissionsExt;
-        if super::super::sandbox::backend() == super::super::sandbox::Backend::None { return; }
+        if super::super::sandbox::Sandbox::read_only().is_err() { return; }
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("test_cli.py"),
             "import unittest\nclass Tests(unittest.TestCase):\n def test_plain(self): pass\n def test_pretty(self): pass\n").unwrap();
@@ -2377,7 +2377,7 @@ mod tests {
             "command": "python3 -c 'import artifact, os; assert artifact.VALUE == 42; assert os.environ[\"NODE_DISABLE_COMPILE_CACHE\"] == \"1\"; print(artifact.VALUE)'",
         }));
         let result = review_shell(&call, Some(dir.path())).await;
-        if super::super::sandbox::backend() == super::super::sandbox::Backend::None {
+        if super::super::sandbox::Sandbox::read_only().is_err() {
             assert!(result.is_error);
             assert!(!result.output.starts_with(REVIEW_VIOLATION));
         } else {
@@ -2396,7 +2396,7 @@ mod tests {
             "command": "python3 -m unittest -v",
         }));
         let result = review_shell(&call, Some(dir.path())).await;
-        if super::super::sandbox::backend() == super::super::sandbox::Backend::None {
+        if super::super::sandbox::Sandbox::read_only().is_err() {
             assert!(result.is_error);
         } else {
             assert!(!result.is_error, "{}", result.output);
