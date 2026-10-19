@@ -42,6 +42,53 @@ pub(super) async fn prepare(root: &Path, suite: &str) -> Result<FreshCheckout, S
     Ok(FreshCheckout { _temp: temp, command })
 }
 
+pub(super) async fn prepare_install(root: &Path) -> Result<FreshCheckout, SlagError> {
+    let mut prepared = prepare(root, "true").await?;
+    let root = prepared._temp.path();
+    let checkout = root.join("checkout");
+    let runtime = root.join("installed-runtime");
+    let temp = root.join("scratch");
+    std::fs::create_dir(&temp)?;
+    let sandbox = crate::engine::sandbox::Sandbox::for_scratch(root)?;
+    let mut create = sandbox.wrap("python3");
+    create.args(["-I", "-m", "venv"]).arg(&runtime).current_dir(root)
+        .env_remove("PYTHONPATH").env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV")
+        .env("TMPDIR", &temp).kill_on_drop(true);
+    checked(&mut create, "isolated installation runtime").await?;
+    let python = runtime.join("bin/python");
+    let mut install = sandbox.wrap(python.to_str().ok_or_else(|| SlagError::Config("non-UTF-8 installation path".into()))?);
+    install.args(["-I", "-m", "pip", "--isolated", "--timeout", "10", "--retries", "0", "install", "--disable-pip-version-check", "--no-input", "--no-deps", "--no-cache-dir", "--progress-bar", "off", "."])
+        .current_dir(&checkout).env_remove("PYTHONPATH").env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV")
+        .env("TMPDIR", &temp).kill_on_drop(true);
+    checked(&mut install, "package installation in a temporary clone").await?;
+    let probe = root.join("installed-console-check.py");
+    std::fs::write(&probe, INSTALL_CHECK)?;
+    prepared.command = shell_words::join([
+        python.to_string_lossy().as_ref(), "-I", probe.to_string_lossy().as_ref(), checkout.to_string_lossy().as_ref(),
+    ]);
+    Ok(prepared)
+}
+
+const INSTALL_CHECK: &str = r#"import importlib.metadata, json, os, pathlib, subprocess, sys
+source = pathlib.Path(sys.argv[1]).resolve().as_uri()
+entries = []
+environment = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV')}
+environment['PYTHONDONTWRITEBYTECODE'] = '1'
+for distribution in importlib.metadata.distributions():
+    direct = distribution.read_text('direct_url.json')
+    if direct and json.loads(direct).get('url', '').rstrip('/') == source.rstrip('/'):
+        entries.extend(entry for entry in distribution.entry_points if entry.group == 'console_scripts')
+assert entries, 'the installed package has no console-script entry point'
+for entry in entries:
+    assert pathlib.Path(entry.name).name == entry.name and entry.name not in ('.', '..'), entry.name
+    command = pathlib.Path(sys.executable).parent / entry.name
+    result = subprocess.run([str(command), '--help'], cwd=pathlib.Path(sys.executable).parent.parent, env=environment, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, (entry.name, result.returncode, result.stdout, result.stderr)
+    assert result.stdout.strip() or result.stderr.strip(), 'console --help produced no output'
+    print('Installed console script:', entry.name)
+    print(result.stdout, end='')
+"#;
+
 fn clean_paths(root: &Path) -> Vec<PathBuf> {
     let active = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from)
         .map(|path| path.canonicalize().unwrap_or(path));
@@ -87,7 +134,8 @@ mod tests {
     }
 
     async fn run(checkout: &FreshCheckout) -> std::process::Output {
-        Sandbox::read_only().unwrap().command(&checkout.command).output().await.unwrap()
+        let sandbox = Sandbox::read_only().unwrap();
+        sandbox.command(&checkout.command).output().await.unwrap()
     }
 
     #[tokio::test]
@@ -118,6 +166,58 @@ mod tests {
         let output = run(&checkout).await;
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stderr).contains("Ran 1 test"));
+    }
+
+    #[tokio::test]
+    async fn isolated_install_checks_console_without_workspace_residue() {
+        let repo = repository("import unittest\nclass Clean(unittest.TestCase):\n def test_source(self):\n  import example_cli\n  self.assertTrue(callable(example_cli.main))\n");
+        std::fs::write(repo.path().join("example_cli.py"), "def main():\n print('usage: example-cli [--help]')\n").unwrap();
+        std::fs::write(repo.path().join("pyproject.toml"), "[build-system]\nrequires = []\nbuild-backend = 'backend'\nbackend-path = ['.']\n").unwrap();
+        std::fs::write(repo.path().join("backend.py"), r#"import pathlib, zipfile
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    pathlib.Path('example_cli.egg-info').mkdir(exist_ok=True)
+    pathlib.Path('.venv').mkdir(exist_ok=True)
+    filename = 'example_cli-1.0-py3-none-any.whl'
+    prefix = 'example_cli-1.0.dist-info/'
+    with zipfile.ZipFile(pathlib.Path(wheel_directory) / filename, 'w') as wheel:
+        wheel.write('example_cli.py')
+        wheel.writestr(prefix + 'METADATA', 'Metadata-Version: 2.1\nName: example-cli\nVersion: 1.0\n')
+        wheel.writestr(prefix + 'WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+        wheel.writestr(prefix + 'entry_points.txt', '[console_scripts]\nexample-cli = example_cli:main\n')
+        wheel.writestr(prefix + 'RECORD', '')
+    return filename
+"#).unwrap();
+        let backend = repo.path().join("backend.py");
+        let source = std::fs::read_to_string(&backend).unwrap();
+        let original = serde_json::to_string(&repo.path().join("install-escaped").to_string_lossy()).unwrap();
+        let guarded = source.replace("    filename =", &format!(
+            "    try:\n        pathlib.Path({original}).write_text('escape')\n    except PermissionError:\n        pass\n    else:\n        raise AssertionError('installation wrote into the original repository')\n    filename ="));
+        std::fs::write(backend, guarded).unwrap();
+        assert!(git().args(["add", "."]).current_dir(repo.path()).status().unwrap().success());
+        assert!(git().args(["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "Add package"])
+            .current_dir(repo.path()).status().unwrap().success());
+        let fresh = prepare(repo.path(), "python3 -m unittest").await.unwrap();
+        let suite = run(&fresh).await;
+        assert!(suite.status.success(), "{}", String::from_utf8_lossy(&suite.stderr));
+        let installed = prepare_install(repo.path()).await.unwrap();
+        let installed_root = installed._temp.path().to_path_buf();
+        let result = run(&installed).await;
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("Installed console script: example-cli"));
+        assert!(!repo.path().join(".venv").exists());
+        assert!(!repo.path().join("example_cli.egg-info").exists());
+        assert!(!repo.path().join("install-escaped").exists());
+        assert!(!fresh._temp.path().join("checkout/.venv").exists());
+        drop(installed);
+        assert!(!installed_root.exists());
+    }
+
+    #[tokio::test]
+    async fn fresh_checkout_suite_can_use_private_tempfile() {
+        let repo = repository("import unittest, tempfile, pathlib\nclass Clean(unittest.TestCase):\n def test_temp(self):\n  with tempfile.TemporaryDirectory() as temp:\n   pathlib.Path(temp, 'log').write_text('new line')\n");
+        let checkout = prepare(repo.path(), "python3 -m unittest").await.unwrap();
+        let output = run(&checkout).await;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 
     #[tokio::test]

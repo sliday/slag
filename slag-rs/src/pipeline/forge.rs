@@ -297,7 +297,7 @@ async fn run_inner(
                         if matches!(kind, Forged::Strike) {
                             append_ledger(ingot, heat);
                         }
-                        proof::git_commit(&id, &ingot.work).await;
+                        proof::git_commit(&id, &commit_work(ingot)).await;
                         run_log.append(&RunEntry::IngotDone { id: id.clone(), ok: true, heat });
                         fire_ingot_hook(&id, true, &hooks.events).await;
                         emit(&hooks.events, EngineEvent::IngotDone { id, ok: true });
@@ -449,7 +449,7 @@ async fn run_inner(
             run_log.append(&RunEntry::IngotDone { id: ingot.id.clone(), ok: true, heat });
             fire_ingot_hook(&ingot.id, true, &hooks.events).await;
             emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
-            proof::git_commit(&ingot.id, &ingot.work).await;
+            proof::git_commit(&ingot.id, &commit_work(&ingot)).await;
         } else {
             let base_smith = crate::smith::make_base_smith(config, hooks);
             let result = resmelt_unlocked(&ingot, base_smith.as_ref()).await;
@@ -835,7 +835,7 @@ async fn resume_crashed_ingot(
                 crucible.set_status(&ingot.id, Status::Forged);
                 crucible.save()?;
                 append_ledger(ingot, ingot.heat);
-                proof::git_commit(&ingot.id, &ingot.work).await;
+                proof::git_commit(&ingot.id, &commit_work(ingot)).await;
                 fire_ingot_hook(&ingot.id, true, &hooks.events).await;
             emit(&hooks.events, EngineEvent::IngotDone { id: ingot.id.clone(), ok: true });
                 run_log.append(&RunEntry::IngotDone {
@@ -1041,7 +1041,14 @@ async fn check_read_only(cmd: &str) -> proof::ShellCheck {
         Ok(sandbox) => sandbox,
         Err(e) => return failed(format!("cannot run read-only verification: {e}")),
     };
-    let output = match sandbox.wrap("/bin/bash").args(["-c", cmd]).current_dir(".")
+    let Some(temp) = sandbox.temp_dir() else {
+        return failed("read-only verification has no private temporary directory".to_string());
+    };
+    let command = match crate::engine::probe::materialize(cmd, temp) {
+        Ok(command) => command,
+        Err(error) => return failed(format!("cannot prepare verification probe: {error}")),
+    };
+    let output = match sandbox.wrap("/bin/bash").args(["-c", &command]).current_dir(".")
         .env("PYTHONDONTWRITEBYTECODE", "1").env("NODE_DISABLE_COMPILE_CACHE", "1")
         .output().await
     {
@@ -1406,6 +1413,22 @@ fn append_ledger(ingot: &Ingot, heat: u8) {
         });
 }
 
+fn commit_work(ingot: &Ingot) -> String {
+    let ore = std::fs::read_to_string(crate::config::project_path(crate::config::ORE_FILE)).unwrap_or_default();
+    commission_subject(&ore).unwrap_or_else(|| {
+        if ingot.heat > 1 || ingot.smelt > 0 {
+            "complete project requirements".to_string()
+        } else {
+            ingot.work.lines().find(|line| !line.trim().is_empty()).unwrap_or("complete project requirements").trim().chars().take(160).collect()
+        }
+    })
+}
+
+fn commission_subject(ore: &str) -> Option<String> {
+    ore.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.chars().take(160).collect())
+}
+
 fn log_to_file(label: &str, content: &str) {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let path = format!("{}/{ts}_{label}.log", crate::config::project_path(crate::config::LOG_DIR));
@@ -1420,6 +1443,13 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn commit_subject_uses_commission_before_retry_notes() {
+        assert_eq!(commission_subject("# Commission\n\nBuild a log viewer.\n\n## Repair\nInternal fix notes"), Some("Build a log viewer.".to_string()));
+        assert_eq!(commission_subject("# Commission\n\n"), None);
+        assert_eq!(commission_subject(&"x".repeat(200)).unwrap().len(), 160);
+    }
 
     fn forge_test_config(duel: DuelMode) -> EngineConfig {
         EngineConfig {

@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod policy;
 pub mod pricing;
 pub mod prompt;
+pub(crate) mod probe;
 pub mod provider;
 pub mod sandbox;
 pub mod tools;

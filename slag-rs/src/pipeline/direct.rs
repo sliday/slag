@@ -3,7 +3,7 @@ use serde::Deserialize;
 mod reference;
 
 const PACKAGE_CRITERION: &str = "Include installation metadata and importable modules for the requested package. Document its intended installation and launch or import commands.";
-const CLI_CRITERION: &str = "Run the stated CLI launch and --help. Use subprocess checks that assert actual results for the named behavior and flags.";
+const CLI_CRITERION: &str = "Judge named behavior and boundary cases before interface conveniences. Use subprocess checks with exact expected results for the named behavior and flags. Run the stated CLI launch and --help.";
 const TEST_CRITERION: &str = "Run a nonempty full test suite that exercises the commission's named behavior. Its documented command must pass in a fresh clone without prior installation.";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,20 +47,26 @@ pub fn scope_prompt(commission: &str) -> String {
          COMMISSION: {commission}\n\
          Routing only: direct=true suits small local utilities with a clear local interface, without external services, UI, deployment, or architectural research.\n\
          Return only {example} or {{\"direct\":false}}.\n\
-         Write one short criterion per named requirement, targeting at most six. Keep routing and harness limits out of criteria.\n\
-         State observable inputs/results, requested flags, package metadata/import shape, and intended launch method where relevant.\n\
+         List primary behavior criteria first, then a few secondary interface criteria. Target six short criteria. Keep routing and harness limits out of criteria.\n\
+         Derive observable inputs/results from the standard meaning of the named operations and formats. Give each primary behavior an edge-case assertion in the suite.\n\
+         Examples apply only to named operations. Tail selects the last N lines (default 10); test -n 0, -n +N, appends, and partial records.\n\
+         A regex filter searches each complete line; invalid patterns fail with a useful error. A wc-like tool includes -l/-w/-c and combined flags.\n\
+         CSV conversion handles UTF-8 BOM and quoted newlines; reject ragged rows with a useful error instead of silent data loss. Unicode word frequency treats canonically equivalent words alike through NFC.\n\
+         Process potentially unbounded file/text streams incrementally. Do not replace tail or follow with whole-file reads. Test follow with appended data and partial lines.\n\
+         Include those behaviors only when the sentence names that operation or format. Do not add log rotation, network services, or unrelated features.\n\
          Match a named reference only for requested behavior, including input boundaries and byte versus character counts.\n\
-         Include conventional interfaces implied by the request. Add no unrelated features, dependency bans, test quotas, or ordering rules.\n\
+         Keep conventional interfaces secondary. Do not invent --file, --input, or --regex aliases when positional arguments suffice. Add no unrelated features, dependency bans, test quotas, or output-order rules.\n\
          proof must run the full declared test suite from a fresh clone without prior installation or environment activation. Use the system interpreter, not .venv. Do not select, skip, or filter tests.\n\
          CLI/scripts need a normal launch probe with concrete fixture paths the builder will commit; exercise each named flag.\n\
-         CLI probes must write no output files. Print results to stdout. Use /dev/stdout for a required output-path argument.\n\
-         Include --help and stdin probes for file/text CLIs. Use python3 -c with subprocess.run(input=...) for stdin. Also probe literal - as stdin. Allow up to six probes. Non-CLI libraries may use commands=[].\n\
-         A Python package CLI needs installation metadata with a console-script entry point. Probe its installed console command and python3 -m PACKAGE. Include __main__.py. The builder installs into .venv before review. Use .venv/bin for installed console probes only. The suite must pass without that installation; subprocess tests use source or module launches.\n\
+         CLI probes must write no workspace output files. Print results to stdout. Use private TMPDIR for scratch. Prefer committed Python probe scripts over nested python -c quoting.\n\
+         For long-running flags such as --follow, pass the flag to a committed probe script. It must assert child results, enforce a timeout, and terminate the child.\n\
+         Prefer probes that assert primary semantics and a named flag in the same run. Cover --help, stdin, and literal - in the CLI suite. Allow up to six direct probes. Non-CLI libraries may use commands=[].\n\
+         A Python package CLI needs installation metadata with a console-script entry point and __main__.py. Probe python3 -m PACKAGE from source. The coordinator verifies installation and the console script in an isolated copy. Never install into the product workspace. The suite uses source or module launches.\n\
          A Node CLI needs package.json with a bin entry. Probe that bin target.\n\
-         A file/text CLI reads stdin without a file or with literal - and supports --help. Named file and value arguments support a positional form as well as a flag. A top-N CLI has a documented default N. Probe both FILE N and FILE --top N, unless the commission names another flag.\n\
+         A file/text CLI reads stdin without a file or with literal - and supports --help. Named file and value arguments support a positional form. A top-N CLI has a documented default N. Test FILE N and the default; do not require an extra flag unless the sentence names it.\n\
          Test these conventional interfaces with subprocess assertions. Match any explicit interface restrictions in the commission.\n\
          Launch standalone scripts with their interpreter. Keep each verification command within the declared environment.\n\
-         Tests/probes must support filesystem-read-only execution through in-memory data or committed fixtures, without installs, fixture writes, or cache writes.\n\
+         The workspace stays read-only during tests/probes. Use in-memory data, committed fixtures, or private TMPDIR scratch. Do not install dependencies or write workspace fixtures or caches.\n\
          Return direct=false if this verification contract conflicts with the commission.\n\
          Criteria must be single lines of at most 320 characters; proof and each probe must fit 1024 characters.\n\
          Output the JSON itself without tools, prose, or document descriptions.{reference}"
@@ -143,7 +149,7 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
     for command in choice.commands {
         let command = command.trim();
         if command.is_empty() || command.len() > 1_024 || command.chars().any(char::is_control)
-            || matches!(command, "true" | "false" | ":" | "exit 0") || write_redirection(command)
+            || matches!(command, "true" | "false" | ":" | "exit 0") || write_redirection(command) || command.contains(".venv/")
             || crate::engine::agent::review_command_error(command).is_some()
         {
             return None;
@@ -191,10 +197,6 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
     let reference = reference::checks(commission, choice.reference, &commands)?;
     if let Some(criterion) = reference.criterion { criteria.push(criterion); }
     commands.extend(reference.commands);
-    if package && needs_cli && python_commission(commission) {
-        let environment = |command: &str| format!("PATH=\"$PWD/.venv/bin:$PATH\" {command}");
-        commands = commands.iter().map(|command| environment(command)).collect();
-    }
     Some(DirectPlan { proof: proof.to_string(), criteria, commands, fixtures: reference.fixtures })
 }
 
@@ -208,7 +210,7 @@ fn conventional_criteria(commission: &str, cli: bool, package: bool) -> Vec<&'st
     let lower = commission.to_ascii_lowercase();
     let mut criteria = Vec::new();
     if package && python_commission(commission) {
-        criteria.push("Provide a console-script entry point and __main__.py for python3 -m PACKAGE. Install in a local virtual environment before review. Document and run both launch methods. The suite must pass from a fresh clone without installation.");
+        criteria.push("Provide a console-script entry point and __main__.py for python3 -m PACKAGE. Run the module from source; verify installation and the console script in an isolated copy. The suite must pass from a fresh clone without installation.");
     }
     if lower.contains("node") {
         criteria.push("Provide package.json with a bin entry that points to the runnable CLI. Document and verify that entry.");
@@ -217,7 +219,7 @@ fn conventional_criteria(commission: &str, cli: bool, package: bool) -> Vec<&'st
         criteria.push("Read stdin when no input file is given or the input file is literal -. Document both interfaces and --help. Run stdin, dash, and help probes. Test their results through the real CLI.");
     }
     if lower.contains("top n") || lower.contains("top-n") {
-        criteria.push("Choose and document a sensible default N. Accept FILE N positionally and N through a flag. Verify the default, positional, and flag forms through CLI tests.");
+        criteria.push("Choose and document a sensible default N. Accept FILE N positionally. Verify the default and positional forms through CLI tests; require a flag only when the commission names it.");
     }
     criteria
 }
@@ -278,6 +280,23 @@ mod tests {
         assert!(conventional_criteria("a CLI that shows the date", true, false).is_empty());
     }
 
+    #[test]
+    fn scope_prioritizes_semantics_and_limits_convenience_interfaces() {
+        let prompt = scope_prompt("a Python CLI that tails a log file with --follow and tests");
+        let semantics = prompt.find("List primary behavior criteria first").unwrap();
+        let interfaces = prompt.find("Keep conventional interfaces secondary").unwrap();
+        assert!(semantics < interfaces);
+        for requirement in ["last N lines", "partial records", "-n 0", "-n +N", "-l/-w/-c", "UTF-8 BOM",
+            "quoted newlines", "ragged rows", "NFC", "incrementally", "edge-case assertion"]
+        {
+            assert!(prompt.contains(requirement), "missing {requirement}");
+        }
+        assert!(prompt.contains("only when the sentence names"));
+        assert!(prompt.contains("Do not invent --file, --input, or --regex aliases"));
+        assert!(!prompt.contains("Probe both FILE N and FILE --top N"));
+        assert!(!prompt.contains("python3 -c with subprocess.run"));
+    }
+
     fn answer(criteria: serde_json::Value) -> String {
         answer_with_commands(criteria, &[])
     }
@@ -299,19 +318,18 @@ mod tests {
         assert_eq!(plan.proof, "python3 -m unittest");
         assert_eq!(plan.criteria.len(), 9);
         assert!(plan.criteria[2].contains("--lines"));
-        assert_eq!(plan.commands, ["PATH=\"$PWD/.venv/bin:$PATH\" python3 -m tally tests/fixtures/input.txt --lines -q"]);
+        assert_eq!(plan.commands, ["python3 -m tally tests/fixtures/input.txt --lines -q"]);
     }
 
     #[test]
-    fn package_probes_use_the_local_environment_without_shell_activation() {
+    fn package_probes_use_source_without_a_workspace_install() {
         let raw = answer_with_commands(serde_json::json!(["CSV conversion supports --pretty."]),
-            &["csv-to-json --pretty tests/fixtures/input.csv", "python3 -c 'import subprocess; subprocess.run([\"csv-to-json\"], check=True)'"]);
+            &["python3 -m csvjson --pretty tests/fixtures/input.csv"]);
         let plan = parse_scope(&raw, "A Python package CLI for CSV with --pretty and tests.").unwrap();
         assert_eq!(plan.proof, "python3 -m unittest");
-        for command in &plan.commands {
-            assert!(command.starts_with("PATH=\"$PWD/.venv/bin:$PATH\" "), "{command}");
-            assert!(crate::engine::agent::review_command_error(command).is_none());
-        }
+        assert_eq!(plan.commands, ["python3 -m csvjson --pretty tests/fixtures/input.csv"]);
+        assert!(plan.criteria.iter().any(|item| item.contains("isolated copy")));
+        assert!(!scope_prompt("A Python package CLI").contains("builder installs into .venv"));
     }
 
     #[test]
@@ -332,10 +350,10 @@ mod tests {
         assert!(python.iter().any(|item| item.contains("__main__.py") && item.contains("python3 -m PACKAGE")));
         assert!(python.iter().any(|item| item.contains("literal -")));
         let node = conventional_criteria("A Node CLI for top N words of a text file", true, false);
-        assert!(node.iter().any(|item| item.contains("FILE N positionally") && item.contains("through a flag")));
+        assert!(node.iter().any(|item| item.contains("FILE N positionally") && item.contains("only when the commission names it")));
         let prompt = scope_prompt("A Python package CLI for CSV files");
         assert!(prompt.contains("fresh clone without prior installation"));
-        assert!(prompt.contains("subprocess tests use source or module launches"));
+        assert!(prompt.contains("suite uses source or module launches"));
     }
 
     #[test]
@@ -366,7 +384,7 @@ mod tests {
         for commands in [
             vec!["true"], vec!["echo done"], vec!["printf done"],
             vec!["python3 tally.py fixtures/input.txt > output.txt"],
-            vec!["touch fixture.txt"], vec!["python3 -m pip install tally"],
+            vec!["touch fixture.txt"], vec!["python3 -m pip install tally"], vec![".venv/bin/tally fixture.txt"],
             vec!["python3 tally.py '"],
             vec!["python3 tally.py fixtures/input.txt"; 7],
         ] {
@@ -434,7 +452,7 @@ mod tests {
         let plan = parse_scope(&answer_with_commands(serde_json::json!(["CSV totals print the requested result."]), &commands), commission).unwrap();
         assert_eq!(plan.criteria.len(), 6);
         assert!(plan.criteria.iter().any(|item| item.contains("installation metadata") && item.contains("importable modules")));
-        assert!(plan.criteria.iter().any(|item| item.contains("subprocess checks") && item.contains("assert actual results")));
+        assert!(plan.criteria.iter().any(|item| item.contains("subprocess checks") && item.contains("exact expected results")));
         assert!(plan.criteria.iter().any(|item| item.contains("nonempty full test suite") && item.contains("named behavior")));
         let repeated = parse_scope(&answer_with_commands(serde_json::json!(plan.criteria), &commands), commission).unwrap();
         assert_eq!(repeated.criteria.len(), 6);

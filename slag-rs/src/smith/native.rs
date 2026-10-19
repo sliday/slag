@@ -205,12 +205,12 @@ impl NativeSmith {
             prompt::build_with(&self.root, &model, self.mode, self.harness.as_deref()).join()
         };
         if self.role == Role::Warden {
-            system.push_str("\n\nREAD-ONLY REVIEW: You cannot write anywhere, including temporary directories. \
+            system.push_str("\n\nREAD-ONLY REVIEW: The workspace stays read-only. Tests may write scratch data in private TMPDIR. \
                 Read the relevant source, tests, or document first. \
-                Use read-only-compatible checks, existing fixtures, or in-memory test inputs. \
+                Use existing fixtures, in-memory inputs, or private TMPDIR scratch. \
                 Disable optional test caches. Python bytecode and Node compile caches are disabled by the harness. \
-                Return unverified if a required check needs writes or unavailable dependencies. \
-                A denied write ends this review as unverified. Return your verdict as text after inspection. \
+                Return unverified if a required check needs workspace writes or unavailable dependencies. \
+                An explicit mutation command ends this review. Other command errors do not erase successful evidence. Return your verdict as text after inspection. \
                 EVIDENCE must be a JSON array of successful tool-call IDs from this session, for example [\"read-source\"]. \
                 Each successful tool result names its inspection ID. Do not put paths, commands, or prose in EVIDENCE. \
                 The coordinator resolves those IDs to the actual successful reads and commands.");
@@ -297,7 +297,7 @@ impl NativeSmith {
             agent = agent.with_read_only_tools().with_max_turns(2);
         }
         if self.mode == PromptMode::Review {
-            agent = agent.with_read_only_tools().with_required_inspection().with_required_runs().with_max_turns(6);
+            agent = agent.with_read_only_tools().with_required_inspection().with_required_runs().with_max_turns(6).with_recent_rounds(6);
         }
         if self.scope_only {
             agent = agent.with_no_tools().with_max_turns(1);
@@ -477,6 +477,9 @@ mod tests {
             let tools: Vec<_> = body["tools"].as_array().unwrap().iter()
                 .map(|tool| tool["function"]["name"].as_str().unwrap())
                 .collect();
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("Tests may write scratch data in private TMPDIR"));
+            assert!(!system.contains("including temporary directories"));
             assert!(tools.contains(&"bash"));
             assert!(tools.contains(&"read_file"));
             assert!(!tools.iter().any(|name| ["write_file", "edit_file", "finish"].contains(name)));
