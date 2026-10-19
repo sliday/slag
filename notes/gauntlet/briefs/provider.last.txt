@@ -1,54 +1,40 @@
-Committed `a8f8efb` on `gauntlet/provider`. Worktree clean.
+Committed:
 
-Added 33 dated price entries, configuration overrides, cached-input discounts, and shared spend formatting. Unknown prices show token counts. Pricing makes no catalog request outside OpenRouter.
+- `151d61a provider: share throttled retries with capped full jitter`
+- `28bb5bb agent: repair missing finish commands before burning a heat`
 
-**991 tests passed; 1 ignored. Cargo exited 0.** Clippy exited 0 with warnings.
+Retries share a limiter by provider and host. Full jitter uses exponential ceilings from 1 to 30 seconds. Each wait prints a status line.
 
-Both live fixes passed in one attempt:
+The finish schema required only `summary`. Forge calls now require `cmd` and receive one repair nudge before the heat fails.
 
-| Provider | Input / output tokens | Spend line | Wall time |
-|---|---:|---|---:|
-| Cerebras | 14,639 / 519 | `spend ≈ $0.0153 est.` | 2.81 s |
-| OpenAI | 13,916 / 267 | `spend ≈ $0.0028 est.` | 6.27 s |
+Live Mistral results:
 
-Prices checked **2026-10-15**, USD per million tokens:
+| Test | Before | After |
+|---|---|---|
+| Natural control | FORGED, 2.94 s, heat 1 | FORGED, 4.07 s, heat 1 |
+| Proxy removes first finish `cmd` | FORGED, 7.90 s, heat 2 | FORGED, 3.70 s, heat 1 |
 
-- [Cerebras Qwen 3.8 27B](https://www.cerebras.ai/pricing): **$0.99 input / $1.49 output**. Calculation: **$0.01526592**.
-- [OpenAI GPT-4.1 mini](https://developers.openai.com/api/docs/models/gpt-4.1-mini): **$0.40 input / $1.60 output / $0.10 cached input**. The uncached calculation is $0.0059936; cache discounts reduce the estimate to **$0.002768**.
+The natural control did not reproduce the omission. The proxy test used real Mistral replies and confirmed one bounded repair. Total estimated spend: **$0.00664**.
 
-Combined estimate: **$0.0180**. `slag cost` and JSON status preserved both estimates.
+Verification passed:
 
-The full table includes sources and dates in [pricing.rs](/Users/stas/Playground/slag/.claude/worktrees/lane-provider/slag-rs/src/engine/pricing.rs).
+```sh
+cargo test --offline --manifest-path slag-rs/Cargo.toml
+cargo clippy --offline --manifest-path slag-rs/Cargo.toml --all-targets -- -D warnings
+git diff --check
+```
+
+Cargo reported **1,081 passed, 0 failed, 1 ignored**. Clippy reported zero warnings. Both working trees are clean.
 
 Files changed:
 
-```text
-CLAUDE.md
-README.md
-slag-rs/src/cli.rs
-slag-rs/src/config.rs
-slag-rs/src/dashboard.rs
-slag-rs/src/engine/events.rs
-slag-rs/src/engine/mod.rs
-slag-rs/src/engine/pricing.rs
-slag-rs/src/engine/provider.rs
-slag-rs/src/pipeline/assay.rs
-slag-rs/src/pipeline/fix.rs
-slag-rs/src/render/echo.rs
-slag-rs/src/render/stream.rs
-```
+- `slag-rs/src/engine/provider.rs`
+- `slag-rs/src/engine/agent.rs`
+- `slag-rs/src/pipeline/forge.rs`
+- `slag-rs/src/smith/mod.rs`
+- `slag-rs/src/smith/native.rs`
+- `slag-rs/tests/forge_loop.rs`
 
-Verification commands:
-
-```sh
-CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test --manifest-path slag-rs/Cargo.toml
-CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --manifest-path slag-rs/Cargo.toml --all-targets
-git diff --check
-python3 /private/tmp/slag-round5-live.py
-```
-
-Existing assertions changed for estimate labels, unknown-token fallback, and four-decimal formatting.
-
-ASK: Add honest provider pricing across spend displays, verify live, and commit.
+ASK: Fix shared retry backoff and missing-command recovery, verify live, and commit.
 🟩Got 🟩Had 🟩Did
 🧠 —
