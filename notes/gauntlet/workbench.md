@@ -461,6 +461,35 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Incident: the auditor ran the installed v2.9.0 (`slag fix --help` → paid commission under the old trailing var-arg parser) from the integration worktree; lead reverted PRD.md/.gitignore/BLUEPRINT.md (diff saved). The new build prints `fix` help correctly.
 - builder-docs (Claude) running in lane-docs.
 
+### fix r7 merged (last fix round)
+- First test reproduces the issue as reported (same call, input, defaults); a named script command runs first through the sandboxed `repo::run` (lead verified); one assertion per behavior, no new helpers; minimal fix (no new guards, flags or redirects), checked by the review; lost-test retry lists exact lines; trial-run logs stay out of commits.
+- Builder: gpt-6.1-sol test lines/fix 32.8 → 15.5, median 28.6 → 26.0 s, hidden 4/4; mistral-small 20.7 → 18.3 lines, 18.9 → 17.2 s, hidden 3/4.
+- Integration: 1195 unit tests green, clippy clean. Critic fix-r5 (FINAL for the lane) running model for model.
+
+### docs merged
+- README, CLAUDE.md, slag.dev: 13 fields (`:bar`, `:casts`), temper stage, Responses API, `.slag/` paths, editor role, six subcommands, four flags, nine env vars, hooks section, release-target note; Harness² marked experimental with `<!-- harness2-result -->` placeholder; site cards for spend estimates, sandbox, replay. Builder caught `SLAG_CHAR_BUDGET` default documented as 600000 (code: 48000).
+- Lead fixed the two remaining `slag.toml` comments (bbe0632). 1195 unit tests green, clippy clean, `npm ci && npm run build` passes.
+
+### fix critic r5 (FINAL, model for model gpt-6.1-sol): WINNER ours. Lane closed.
+- **16/16 hidden (slag's own FIXED 16/16, one attempt each), median 32 s, p90 40 s, max 46 s, $0.52** vs codex 8/8, 80 s, 155 s.
+- Existing test lines changed 0/16; new tests reached by the runner 8/8 best runs; literal call first 16/16; test lines slag 153 vs codex 240 (shorter on 6/8); unrelated changes 0/16.
+- Votes (both orders): fx **slag 6 / codex 1 / split 1**; critic slag 5 / codex 3.
+- Remaining gap: js-notify-preview splits by code points (Array.from); compound emoji (family, skin tone, flags) can still be cut; codex used Intl.Segmenter. Hidden suite lacks that case. Second tier: js-user-pager duplicated fixtures; run-to-run variance on sh-backup-rotate; a less obvious rust fix shape.
+- Fix lane history: r1 bar (test quality), r2 bar (test rewrites), r3 bar (thin tests, model mismatch), r4 bar (votes 0-3-5, model for model), r5 OURS.
+
+### final site critic (Fable, fresh): WINNER bar narrowly → fixed by the lead
+- TRUTH PASS: every command, flag, env var, path and number on slag.dev matches the CLI help, README and source. Only unverifiable line: "the next release ships four targets" (a promise).
+- Craft vs Zed, Copilot CLI, Warp, Charm: slag 3rd at the desktop fold; value clear in ~2 s; no `<h1>`; longest page (10,248 px). Budgets pass: 1.6 MB load with video (113 KB without), webm 1.5 MB, mp4 3.1 MB, CLS 0.006/0, no external hosts, reduced motion shows the poster.
+- BIGGEST_GAP: ASCII diagrams wrapped into garbage on phones (webtui `pre-wrap`). Lead fixed: `.diagram pre { white-space: pre }`; hero line is now an `<h1>` (clamp 1.4-2 rem); body copy and footer links use `--text-dim` #8a93a6 (≈6.4:1); `html, body { overflow-x: clip }` stops header sparks from widening the page (mobile scrollWidth 393 → 390, three measurements). Lead screenshots: diagram intact and scrollable, h1 present at 390 and 1440.
+- Not done: page length (tables could fold into `<details>`).
+
+### Harness² critic r2: interim (lead read of the critic's raw results, 19:58)
+- Executor ministral-3b, editor gpt-5.5, streams py-data and js-web, 8 tasks each.
+- B (`--evolve 1`, growing library): py-data 3/8, js-web 3/8 → 6/16; median wall 216-313 s.
+- A1 (base, 1 try, 2 runs): py-data 6/16, js-web 7/16 → 13/32 (41%); median 44-58 s.
+- A4 (base, `--tries 4`, matched compute): py-data 4/4 on tasks 1-4 so far.
+- Lead check of a suspected fault: the composer's KEEP_BASE does not block delivery. `select()` (evolve.rs:1271) pools every verified run (composed, candidates, reference), so a passing candidate ships. KEEP_BASE only decides which harness enters the library.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
