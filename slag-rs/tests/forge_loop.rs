@@ -41,6 +41,7 @@ fn command(root: &Path, config: &Path, base: &str, duel: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_slag"));
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("TMPDIR", std::env::temp_dir())
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("OPENROUTER_API_KEY", "sk-or-test")
@@ -63,6 +64,7 @@ async fn founder_writes_and_forged_status_never_replace_forge_proof() {
     use std::sync::Arc;
 
     let root = project("");
+    std::fs::write(root.path().join("proof-runs"), "").unwrap();
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     let founders = Arc::new(AtomicUsize::new(0));
@@ -506,6 +508,7 @@ async fn quoted_proof_runs_after_plan_load_and_save() {
     let root = project(
         r#"(ingot :id "i1" :solo nil :max 5 :proof "printf '%s\n' \"a.b|c\" | grep 'a\.b\|c' > proof-ran")"#,
     );
+    std::fs::write(root.path().join("proof-ran"), "").unwrap();
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("POST"))

@@ -10,7 +10,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const COMMISSION: &str = "write wc.py that counts words in a file, with a unittest";
 const PROOF: &str = "python3 -m unittest";
 const SOURCE: &str = "import sys\n\ndef count_words(path):\n    with open(path, encoding='utf-8') as source:\n        return len(source.read().split())\n\nif __name__ == '__main__':\n    print(count_words(sys.argv[1]))\n";
-const TEST: &str = "import tempfile\nimport unittest\nimport wc\n\nclass WordCountTest(unittest.TestCase):\n    def test_counts_words(self):\n        with tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8') as source:\n            source.write('one two\\nthree')\n            source.flush()\n            self.assertEqual(wc.count_words(source.name), 3)\n";
+const TEST: &str = "import unittest\nfrom unittest.mock import mock_open, patch\nimport wc\n\nclass WordCountTest(unittest.TestCase):\n    def test_counts_words(self):\n        with patch('builtins.open', mock_open(read_data='one two\\nthree')):\n            self.assertEqual(wc.count_words('sample.txt'), 3)\n";
 
 fn command(root: &Path, config: &Path, server: &MockServer) -> Command {
     let mut cmd = base_command(root, config, server);
@@ -101,7 +101,7 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
             let results = tool_results(&body);
             if messages.contains("Choose the work scope") {
                 assert!(results.is_empty());
-                return response(json!({"content": json!({"direct": true, "proof": PROOF}).to_string()}));
+                return response(json!({"content": direct_scope().to_string()}));
             }
             if body["model"] == "test/work" {
                 if results.is_empty() {
@@ -137,15 +137,16 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
                 assert!(git(&review_root, &["status", "--porcelain"]).is_empty());
                 assert!(git(&review_root, &["show", "HEAD:PLAN.md"]).contains(":status forged"));
                 assert!(git(&review_root, &["show", "HEAD:PROGRESS.md"]).contains("heats:1"));
-                return response(json!({"content": null, "tool_calls": [
+                return response(json!({"content": null, "tool_calls": ([
                     tool("inspect", "read_file", json!({"path": "wc.py"})),
                     tool("inspect-tests", "read_file", json!({"path": "test_wc.py"})),
-                ]}));
+                ].into_iter().chain(required_runs(&body)).collect::<Vec<_>>())}));
             }
-            assert_eq!(results.len(), 2, "{results:?}");
+            assert!(results.len() >= 3, "{results:?}");
             assert!(results[0].contains("def count_words(path)"), "{results:?}");
             assert!(results[1].contains("assertEqual(wc.count_words"), "{results:?}");
-            response(json!({"content": "VERDICT: pass\nEVIDENCE: [\"inspect\",\"inspect-tests\"]"}))
+            assert!(results.iter().all(|output| !output.starts_with("ERROR:")), "{results:?}");
+            grounded_pass(&body)
         })
         .expect(5)
         .mount(&server).await;
@@ -184,7 +185,7 @@ async fn direct_commission_keeps_the_final_warden_failure() {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let results = tool_results(&body);
             if body["messages"].to_string().contains("Choose the work scope") {
-                response(json!({"content": json!({"direct": true, "proof": PROOF}).to_string()}))
+                response(json!({"content": direct_scope().to_string()}))
             } else if body["model"] == "test/work" {
                 if results.is_empty() {
                     response(json!({"content": null, "tool_calls": [
@@ -382,12 +383,12 @@ async fn assert_resume_repairs_gap(args: &[&str]) {
             if artifact_review(&body) {
                 if results.is_empty() {
                     seen.lock().unwrap().push("warden-inspect");
-                    response(json!({"content": null, "tool_calls": [
+                    response(json!({"content": null, "tool_calls": ([
                         tool("inspect", "read_file", json!({"path": "README.md"})),
-                    ]}))
+                    ].into_iter().chain(required_runs(&body)).collect::<Vec<_>>())}))
                 } else if results[0].contains("python3 -m venv") {
                     seen.lock().unwrap().push("warden-pass");
-                    response(json!({"content": "VERDICT: pass\nEVIDENCE: [\"inspect\"]"}))
+                    grounded_pass(&body)
                 } else {
                     seen.lock().unwrap().push("warden-fail-before-repair");
                     response(json!({"content": format!("VERDICT: fail\nGAP: {INSTALL_GAP}\nEVIDENCE: [\"inspect\"]")}))
@@ -402,7 +403,9 @@ async fn assert_resume_repairs_gap(args: &[&str]) {
                     response(json!({"content": null, "tool_calls": [
                         tool("read-install", "read_file", json!({"path": "README.md"})),
                     ]}))
-                } else if results.len() == 1 {
+                } else if body["messages"].as_array().unwrap().iter().rev()
+                    .find(|message| message["role"] == "tool")
+                    .is_some_and(|message| message["tool_call_id"] == "read-install") {
                     seen.lock().unwrap().push("smith-write");
                     response(json!({"content": null, "tool_calls": [
                         tool("fix-install", "write_file", json!({"path": "README.md", "content": INSTALL_AFTER})),
@@ -695,7 +698,7 @@ async fn successful_read_cannot_ground_failed_unknown_or_prose_evidence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn successful_read_grounds_a_pass_with_the_actual_inspected_path() {
+async fn successful_checks_ground_a_pass_with_the_actual_inspected_path() {
     let root = evidence_project();
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
@@ -708,12 +711,12 @@ async fn successful_read_grounds_a_pass_with_the_actual_inspected_path() {
             }
             let results = tool_results(&body);
             if results.is_empty() {
-                response(json!({"content": null, "tool_calls": [
+                response(json!({"content": null, "tool_calls": ([
                     tool("read-ok", "read_file", json!({"path": "README.md"})),
-                ]}))
+                ].into_iter().chain(required_runs(&body)).collect::<Vec<_>>())}))
             } else {
                 assert!(results[0].contains("python3 -m venv"), "{results:?}");
-                response(json!({"content": "VERDICT: pass\nGAP:\nEVIDENCE: [\"read-ok\"]"}))
+                grounded_pass(&body)
             }
         })
         .mount(&server)
@@ -748,15 +751,15 @@ async fn resume_rejudges_unverified_work_and_requires_current_grounded_evidence(
                 }
                 let results = tool_results(&body);
                 if results.is_empty() {
-                    response(json!({"content": null, "tool_calls": [
+                    response(json!({"content": null, "tool_calls": ([
                         tool(&format!("read-{attempt}"), "read_file", json!({"path": "README.md"})),
-                    ]}))
+                    ].into_iter().chain(if attempt == 2 { required_runs(&body) } else { Vec::new() }).collect::<Vec<_>>())}))
                 } else {
                     assert!(results[0].contains("python3 -m venv"), "{results:?}");
                     let verdict = match attempt {
                         0 => "VERDICT: unverified\nGAP: inspection stopped before a verdict\nEVIDENCE: [\"read-0\"]".to_string(),
                         1 => "VERDICT: pass\nGAP:\nEVIDENCE: [\"read-0\"]".to_string(),
-                        _ => "VERDICT: pass\nGAP:\nEVIDENCE: [\"read-2\"]".to_string(),
+                        _ => format!("VERDICT: pass\nGAP:\nEVIDENCE: {}", inspection_ids(&body)),
                     };
                     response(json!({"content": verdict}))
                 }
@@ -764,7 +767,11 @@ async fn resume_rejudges_unverified_work_and_requires_current_grounded_evidence(
             .mount(&server).await;
 
         let output = base_command(root.path(), config.path(), &server)
-            .args(if attempt == 0 { &["--temper", "1", "resume"][..] } else { &["resume"][..] })
+            .args(if attempt == 0 {
+                &["--temper", "1", "resume"][..]
+            } else {
+                &["resume"][..]
+            })
             .assert()
             .get_output()
             .clone();
@@ -809,4 +816,85 @@ async fn resume_rejudges_unverified_work_and_requires_current_grounded_evidence(
     );
     assert!(latest.contains("README.md"), "{ledger}");
     assert!(git(root.path(), &["status", "--porcelain"]).is_empty());
+}
+
+fn direct_scope() -> Value {
+    json!({
+        "direct": true,
+        "proof": PROOF,
+        "criteria": [
+            "wc.py counts words in the supplied file.",
+            "python3 wc.py FILE prints the word count.",
+            "unittest checks word counts with in-memory inputs."
+        ],
+        "commands": ["python3 wc.py test_wc.py"]
+    })
+}
+
+fn required_runs(body: &Value) -> Vec<Value> {
+    let commands: Vec<String> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .flat_map(str::lines)
+        .find_map(|line| line.strip_prefix("REQUIRED RUN COMMANDS: "))
+        .map(|commands| serde_json::from_str(commands).unwrap())
+        .expect("artifact review must declare its required commands");
+    assert!(!commands.is_empty(), "{body}");
+    commands
+        .into_iter()
+        .enumerate()
+        .map(|(n, command)| tool(&format!("check-{n}"), "bash", json!({"command": command})))
+        .collect()
+}
+
+fn inspection_ids(body: &Value) -> Value {
+    let ids: Vec<_> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter(|message| !message["content"].as_str().unwrap().starts_with("ERROR:"))
+        .map(|message| message["tool_call_id"].as_str().unwrap())
+        .collect();
+    json!(ids)
+}
+
+fn grounded_pass(body: &Value) -> ResponseTemplate {
+    response(json!({"content": format!("VERDICT: pass\nGAP:\nEVIDENCE: {}", inspection_ids(body))}))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_inspection_without_the_declared_run_cannot_pass() {
+    let root = evidence_project();
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if !artifact_review(&body) {
+                return plan_review_response(&body);
+            }
+            if tool_results(&body).is_empty() {
+                response(json!({"content": null, "tool_calls": [
+                    tool("read-only", "read_file", json!({"path": "README.md"})),
+                ]}))
+            } else {
+                grounded_pass(&body)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let output = base_command(root.path(), config.path(), &server)
+        .args(["--temper", "1", "resume"])
+        .assert()
+        .get_output()
+        .clone();
+    assert_unverified_review(&output);
+    let ledger = git(root.path(), &["show", "HEAD:PROGRESS.md"]);
+    assert!(ledger.contains("goal unverified"), "{ledger}");
 }

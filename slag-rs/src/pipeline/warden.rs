@@ -202,8 +202,9 @@ pub async fn judge_artifact(
 
     tui::header(&format!("WARDEN · round {round}"));
     let smith = crate::smith::make_warden(cfg, hooks);
-    let prompt = format!("{}\n\n{}\n\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
-        workspace_context(), crate::flux::warden_prompt(&ore, &bar), proof_output());
+    let commands = artifact_commands(&bar);
+    let prompt = format!("REQUIRED RUN COMMANDS: {}\n\n{}\n\n{}",
+        serde_json::to_string(&commands).unwrap(), workspace_context(), crate::flux::warden_prompt(&ore, &bar));
     let raw = match smith
         .invoke(&prompt)
         .await
@@ -219,8 +220,28 @@ pub async fn judge_artifact(
         }
     };
     let verdict = parse_verdict(&raw);
+    if verdict.is_unverified() { log_raw(&raw); }
     record(round, &verdict);
     Ok(verdict)
+}
+
+fn artifact_commands(bar: &str) -> Vec<String> {
+    if let Some(commands) = bar.lines().find_map(|line| line.strip_prefix("REQUIRED RUN COMMANDS: ")
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok()))
+    {
+        return commands;
+    }
+    crate::crucible::Crucible::load(std::path::Path::new(crate::config::CRUCIBLE))
+        .map(|plan| plan.ingots.into_iter().filter(|ingot| ingot.status == crate::sexp::Status::Forged)
+            .map(|ingot| ingot.proof).filter(|proof| !proof.is_empty() && proof != "true").collect())
+        .unwrap_or_default()
+}
+
+fn log_raw(raw: &str) {
+    let path = std::path::Path::new(crate::config::LOG_DIR).join(format!(
+        "warden-raw-{}-{}.log", chrono::Local::now().format("%Y%m%d%H%M%S%f"), std::process::id()
+    ));
+    let _ = std::fs::write(path, raw);
 }
 
 fn workspace_context() -> String {
@@ -292,20 +313,6 @@ fn workspace_context_in(root: &std::path::Path, base: Option<&str>) -> String {
     )
 }
 
-fn proof_output() -> String {
-    let mut paths: Vec<_> = std::fs::read_dir(crate::config::LOG_DIR).into_iter().flatten()
-        .filter_map(Result::ok).map(|entry| entry.path())
-        .filter(|path| path.file_name().and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains("_ASSAY_") && name.ends_with(".log")))
-        .collect();
-    paths.sort();
-    paths.into_iter().rev().take(8).rev().filter_map(|path| {
-        let text = std::fs::read_to_string(&path).ok()?;
-        let tail: String = text.chars().rev().take(4_000).collect::<String>().chars().rev().collect();
-        Some(format!("{}:\n{tail}", path.display()))
-    }).collect::<Vec<_>>().join("\n\n")
-}
-
 /// Judge a plan document -- the blueprint, or the crucible -- against the
 /// bar before the forge runs.
 ///
@@ -349,8 +356,9 @@ pub async fn judge_ingot(
     ingot: &crate::sexp::Ingot,
 ) -> Verdict {
     let smith = crate::smith::make_warden(cfg, hooks);
-    let prompt = format!("{}\n\n{}\n\nPROOF COMMAND: {}\nCOORDINATOR PROOF OUTPUT (already executed before review):\n{}",
-        workspace_context(), crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar), ingot.proof, proof_output());
+    let commands: Vec<_> = [&ingot.proof].into_iter().filter(|proof| !proof.is_empty() && proof.as_str() != "true").collect();
+    let prompt = format!("REQUIRED RUN COMMANDS: {}\n\n{}\n\n{}",
+        serde_json::to_string(&commands).unwrap(), workspace_context(), crate::flux::ingot_warden_prompt(&ingot.work, &ingot.bar));
     match smith.invoke(&prompt).await {
         Ok(raw) => parse_verdict(&raw),
         Err(e) => Verdict::unverified(format!("the warden could not inspect the ingot: {e}")),

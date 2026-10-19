@@ -144,7 +144,12 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
     );
 
     flux.push_str(DELIVERY_RULES);
-    flux.push_str("\n\n");
+    flux.push_str("\n\nVERIFICATION CONTRACT: The independent reviewer runs the suite and CLI with a read-only filesystem. \
+        Use in-memory data or committed fixtures under tests/fixtures. Create fixture files during construction, before verification. Tests must not create or delete workspace fixtures. \
+        Use subprocess CLI tests to exercise each named flag and behavior. Assert exact expected results, not only exit codes or output shapes. Keep scratch files in TMPDIR, not the product tree. \
+        For package installation, prepare a project virtual environment before review; never use global pip or bypass PEP 668. \
+        For named reference tools, check the requested behavior against the reference instead of guessing fixture expectations. \
+        Inspect a failing assertion and its input before changing code or tests. Never change expectations just to fit the implementation.\n\n");
 
     if let Some(slag_msg) = slag {
         flux.push_str(&format!(
@@ -288,7 +293,10 @@ pub fn surveyor_prompt(ore: &str) -> String {
         ## 4. DEPENDENCY GRAPH\n```\n[A] ──▶ [B] ──▶ [C]\n         │\n         └────▶ [D]\n```\n\n\
         ## 5. RISKS\n- High complexity areas\n- Integration points\n- External dependencies\n\n\
         ## 6. FORGING SEQUENCE\n1. Foundation (parallel, :solo t)\n2. Core logic\n3. Integration\n4. Polish/deploy\n\n\
-        ## 7. ACCEPTANCE CRITERIA\n- Specific tests\n- Features to verify\n- Quality checks\n\n\
+        ## 7. ACCEPTANCE CRITERIA\n- Trace each named behavior, flag, CLI and package requirement to an observable check.\n\
+        - Include actual CLI subprocess tests for requested flags and behavior.\n\
+        - Choose a read-only-compatible suite and CLI probes using in-memory data or committed fixtures.\n\
+        - Add no unstated features, fixed test counts or packaging formats.\n\n\
         RULES:\n\
         - You are the EXPERT. Make ALL decisions yourself.\n\
         - NO QUESTIONS. If uncertain, choose the best option.\n\
@@ -337,7 +345,9 @@ fn founder_format_rules() -> String {
         - :heat = 0\n\
         - :max = attempts (5 simple, 8+ complex)\n\
         - :smelt = 0 (re-smelt count; system manages this)\n\
-        - :proof = shell verification command\n\
+        - :proof = the declared read-only-compatible test command\n\
+        - Carry every acceptance item from the blueprint or bar into task work and proof.\n\
+        - CLI tests must call the actual CLI and requested flags. Use in-memory data or committed fixtures.\n\
         - :bar = what DONE means for this ingot, stated so a reviewer can \
         inspect it. The proof shows something appeared; the bar says whether \
         the ingot's goal was met. Name the observable behaviour, not the file: \
@@ -373,6 +383,7 @@ fn founder_format_rules() -> String {
 const DELIVERY_RULES: &str = "\
     Judge the commission as a usable deliverable.\n\
     A requested CLI must run through its intended entry command in the delivered project.\n\
+    Document the intended launch and test commands.\n\
     Include the local modules, dependency declarations, and configuration needed for that command.\n\
     For a package deliverable, include the metadata needed for its intended installation or distribution.\n\
     Check one suitable launch method, such as a console entry point or python -m.\n\
@@ -462,10 +473,11 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          THE SUB-GOAL:\n{work}\n\n\
          ITS BAR:\n{bar}\n\n\
          Inspect the source and tests on disk.\n\
-         Read PROGRESS.md for the proof command and logs/*_ASSAY_*.log for its recorded output.\n\
-         Run independent checks that do not write files.\n\
-         The review filesystem is read-only, including temporary directories.\n\
-         Do not run tests that create fixtures or build files.\n\
+         Run the declared test suite and CLI probes under the read-only sandbox.\n\
+         Copy each REQUIRED RUN COMMANDS entry verbatim into its own bash call. Cite those successful runs in EVIDENCE.\n\
+         Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
+         Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
+         The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
          Do not edit files. Do not install packages. Do not run git commands.\n\
@@ -496,10 +508,11 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          THE GOAL:\n{ore}\n\n\
          THE BAR:\n{bar}\n\n\
          Inspect the source and tests on disk.\n\
-         Read PROGRESS.md for the proof command and logs/*_ASSAY_*.log for its recorded output.\n\
-         Run independent checks that do not write files.\n\
-         The review filesystem is read-only, including temporary directories.\n\
-         Do not run tests that create fixtures or build files.\n\
+         Run the declared test suite and CLI probes under the read-only sandbox.\n\
+         Copy each REQUIRED RUN COMMANDS entry verbatim into its own bash call. Cite those successful runs in EVIDENCE.\n\
+         Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
+         Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
+         The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          For visual or interactive work, inspect the interface.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
