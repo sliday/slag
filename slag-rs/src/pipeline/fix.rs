@@ -551,7 +551,15 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     // file, a test that cannot run here. One gap, one chance to close it.
     let clock = std::time::Instant::now();
     let found = ctx
-        .quality_gap(&changed, &test_files, &repro, without.as_ref(), &edited, declared.as_deref())
+        .quality_gap(
+            &changed,
+            &test_files,
+            &repro,
+            without.as_ref(),
+            &edited,
+            declared.as_deref(),
+            &proof_cmd,
+        )
         .await?;
     let mut gap_open = found.as_ref().map(|g| g.text.clone());
     let gap_kind = found.as_ref().map(|g| g.kind);
@@ -605,6 +613,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                 let closes = match found.kind {
                     GapKind::NoTest => added_test(git, &before, &ch, &ed),
                     GapKind::PassesWithoutFix => !w.as_ref().is_some_and(|run| run.ok()),
+                    GapKind::Orphan => ctx.orphans(&ch, &proof_cmd).await.is_empty(),
                     GapKind::Review => true,
                 };
                 if !closes {
@@ -649,26 +658,39 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         }
         out.stat = git.stat(&changed);
     }
-    drop(without);
-    out.repro = repro;
     // A change to what existing tests pin stands only when the issue asks
-    // for it. Declared, judged against the issue, and still disputed after
-    // the one revision: that is not a fix to hand over.
-    if let (Some(said), Some(gap)) = (&declared, &gap_open) {
-        emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: false });
-        out.verdict = Verdict::Failed(format!(
-            "changes existing tests the issue does not ask to change ({said}): {gap}"
-        ));
-        out.notes.push("the changes are left in the working tree".into());
-        stamp(&mut out);
-        return Ok(out);
+    // for it and a review of the final change explicitly agrees. A gap left
+    // open, a skipped review, or a garbled one: not a fix to hand over.
+    if let Some(said) = &declared {
+        let agreed = match &gap_open {
+            Some(gap) => Err(gap.clone()),
+            None => {
+                let edited = edited_now(&changed);
+                ctx.declared_agreed(&changed, &test_files, &repro, without.as_ref(), &edited, said)
+                    .await?
+            }
+        };
+        if let Err(why) = agreed {
+            emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: false });
+            out.verdict = Verdict::Failed(format!(
+                "changes existing tests without the review agreeing the issue asks for it \
+                 ({said}): {why}"
+            ));
+            out.notes.push("the changes are left in the working tree".into());
+            out.repro = repro;
+            stamp(&mut out);
+            return Ok(out);
+        }
     }
     // Tests that pass with and without the source change, after the one
     // chance to fix them, are no evidence the change does anything; with no
     // failing test before the edit either, nothing says the bug is gone.
     let unproven = gap_open.is_some()
-        && gap_kind == Some(GapKind::PassesWithoutFix)
-        && !matches!(out.repro, Repro::Baseline { .. });
+        && matches!(gap_kind, Some(GapKind::PassesWithoutFix | GapKind::Orphan))
+        && without.as_ref().is_some_and(|run| run.ok())
+        && !matches!(repro, Repro::Baseline { .. });
+    drop(without);
+    out.repro = repro;
     if unproven {
         emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: false });
         out.verdict = Verdict::Failed(
@@ -1088,6 +1110,25 @@ impl Ctx<'_> {
                         summary,
                     );
                 }
+                // The issue has to name what the old expectation pinned: a
+                // declaration whose removed lines share nothing with the
+                // issue is a rewrite dressed as a request.
+                if !ties_to_issue(&edited, &self.issue.render()) {
+                    note(hooks, &format!("{label}: declared test change the issue never names"), false);
+                    put_back();
+                    return fail(
+                        Failure::new(
+                            format!("changed existing tests the issue never mentions: {names}"),
+                            format!(
+                                "You changed existing tests and declared it, but nothing in the \
+                                 lines you changed appears in the issue, so the issue does not \
+                                 ask for that behavior. slag put {names} back. Fix the source so \
+                                 they pass as written. The lines you had changed:\n{removed}"
+                            ),
+                        ),
+                        summary,
+                    );
+                }
                 note(hooks, &format!("{label}: changed existing tests, declared"), false);
             }
         }
@@ -1123,6 +1164,7 @@ impl Ctx<'_> {
     /// model call: no test was added, or the new test passes without the
     /// fix. Past those, one tool-free review call on a fresh context reads
     /// the issue, the diff, and what the tests did with the fix reverted.
+    #[allow(clippy::too_many_arguments)]
     async fn quality_gap(
         &self,
         changed: &[String],
@@ -1131,6 +1173,7 @@ impl Ctx<'_> {
         without: Option<&Run>,
         edited: &[EditedTest],
         declared: Option<&str>,
+        cmd: &str,
     ) -> Result<Option<Gap>, SlagError> {
         let Some(git) = &self.job.git else { return Ok(None) };
         let has_tests = !test_files.is_empty() || self.usable_test.is_some();
@@ -1140,6 +1183,23 @@ impl Ctx<'_> {
                 "no regression test was added: add one that asserts the issue's reported \
                  cases, in the test file for the module you fixed, or in a new file named \
                  after it",
+            )));
+        }
+        // A test file the runner never executes passes with or without the
+        // fix, and proves nothing either way. Say why before saying that.
+        let orphans = self.orphans(changed, cmd).await;
+        if !orphans.is_empty() {
+            let wiring = repo::runner_wiring(&self.job.cwd, cmd)
+                .map(|w| format!(" How the runner finds tests: {w}"))
+                .unwrap_or_default();
+            return Ok(Some(Gap::new(
+                GapKind::Orphan,
+                &format!(
+                    "{} never runs: `{cmd}` still passes when it cannot run.{wiring}\nPut the \
+                     new tests where the runner already looks: extend an existing test file, \
+                     or wire the new file into the runner the way the existing tests are.",
+                    orphans.join(", ")
+                ),
             )));
         }
         // Checked on the run itself, not the verdict: a failing baseline
@@ -1152,6 +1212,73 @@ impl Ctx<'_> {
             )));
         }
 
+        let prompt = self.review_prompt(changed, test_files, repro, without, edited, declared);
+        match review(self.config, self.hooks, &prompt).await {
+            Ok(Review::Gap(gap)) => Ok(Some(Gap { text: gap, kind: GapKind::Review })),
+            Ok(_) => {
+                note(self.hooks, "review: pass", true);
+                Ok(None)
+            }
+            Err(e) if e.is_deterministic_provider() => Err(e),
+            // An advisory call that cannot run must not sink a verified fix.
+            Err(e) => {
+                note(self.hooks, &format!("review skipped: {e}"), false);
+                Ok(None)
+            }
+        }
+    }
+
+    /// New test files the repository's own test command never executes:
+    /// with each made unable to run, the command still passes. One run per
+    /// file, for the first three; data files a test reads are skipped.
+    async fn orphans(&self, changed: &[String], cmd: &str) -> Vec<String> {
+        let Some(git) = &self.job.git else { return Vec::new() };
+        let mut found = Vec::new();
+        let fresh = changed.iter().filter(|p| {
+            repo::is_test_path(p) && repo::is_code(p) && git.original(self.before, p).is_none()
+        });
+        for p in fresh.take(3) {
+            let Ok(text) = std::fs::read_to_string(git.top.join(p)) else { continue };
+            let swap = vec![(git.top.join(p), Some(repo::unrunnable(p, &text).into_bytes()))];
+            if swap_and_run(self.job, swap, cmd, self.rescuer).await.is_some_and(|run| run.ok()) {
+                found.push(p.clone());
+            }
+        }
+        found
+    }
+
+    /// A change to existing tests stands only on an explicit pass from a
+    /// review of the final change. Anything else, a skipped or garbled
+    /// review included, is no agreement.
+    #[allow(clippy::too_many_arguments)]
+    async fn declared_agreed(
+        &self,
+        changed: &[String],
+        test_files: &[String],
+        repro: &Repro,
+        without: Option<&Run>,
+        edited: &[EditedTest],
+        declared: &str,
+    ) -> Result<Result<(), String>, SlagError> {
+        let prompt = self.review_prompt(changed, test_files, repro, without, edited, Some(declared));
+        match review(self.config, self.hooks, &prompt).await {
+            Ok(Review::Pass) => Ok(Ok(())),
+            Ok(Review::Gap(gap)) => Ok(Err(gap)),
+            Ok(Review::Unclear) => Ok(Err("the review gave no clear verdict".into())),
+            Err(e) if e.is_deterministic_provider() => Err(e),
+            Err(e) => Ok(Err(format!("the review could not run: {e}"))),
+        }
+    }
+
+    fn review_prompt(
+        &self,
+        changed: &[String],
+        test_files: &[String],
+        repro: &Repro,
+        without: Option<&Run>,
+        edited: &[EditedTest],
+        declared: Option<&str>,
+    ) -> String {
         let without_fix = match (repro, without) {
             (Repro::Regression { .. }, Some(run)) => format!(
                 "`{}` gave {}. The end of its output:\n{}",
@@ -1178,27 +1305,14 @@ impl Ctx<'_> {
             ),
             _ => "untouched: every line of every pre-existing test is as it was".to_string(),
         };
-        let prompt = crate::flux::fix_review_prompt(
+        crate::flux::fix_review_prompt(
             &self.issue.render(),
             &clip(&self.diff(changed), REVIEW_DIFF_BYTES),
             &listed,
             &without_fix,
             &existing,
             repo::platform(),
-        );
-        match review(self.config, self.hooks, &prompt).await {
-            Ok(Some(gap)) => Ok(Some(Gap { text: gap, kind: GapKind::Review })),
-            Ok(None) => {
-                note(self.hooks, "review: pass", true);
-                Ok(None)
-            }
-            Err(e) if e.is_deterministic_provider() => Err(e),
-            // An advisory call that cannot run must not sink a verified fix.
-            Err(e) => {
-                note(self.hooks, &format!("review skipped: {e}"), false);
-                Ok(None)
-            }
-        }
+        )
     }
 }
 
@@ -1215,6 +1329,8 @@ enum GapKind {
     NoTest,
     /// slag measured it: the new tests pass with the fix reverted.
     PassesWithoutFix,
+    /// slag measured it: a new test file the runner never executes.
+    Orphan,
     /// A model's opinion. A revision that follows it must keep passing the
     /// first fix's own tests.
     Review,
@@ -1246,11 +1362,19 @@ fn added_test(
 
 /// One tool-free call to the judge model. `Some(gap)` on a clear fail with
 /// a gap to act on; `None` on a pass, and on a reply too garbled to act on.
+/// What one review said.
+enum Review {
+    Pass,
+    Gap(String),
+    /// A reply with no readable verdict, or a fail with no gap to act on.
+    Unclear,
+}
+
 async fn review(
     config: &EngineConfig,
     hooks: &EngineHooks,
     prompt: &str,
-) -> Result<Option<String>, SlagError> {
+) -> Result<Review, SlagError> {
     use crate::engine::Provider;
     let provider = crate::engine::agent::SpendTracked::new(
         crate::engine::provider::OpenRouter::with_base_url(
@@ -1278,7 +1402,20 @@ async fn review(
     let resp = tokio::time::timeout(REVIEW_TIMEOUT, call).await.map_err(|_| {
         SlagError::Provider(format!("the review took over {}s", REVIEW_TIMEOUT.as_secs()))
     })??;
-    Ok(review_gap(&resp.content))
+    Ok(read_review(&resp.content))
+}
+
+fn read_review(raw: &str) -> Review {
+    if let Some(gap) = review_gap(raw) {
+        return Review::Gap(gap);
+    }
+    // A tool-free review has no inspection evidence to give; the warden's
+    // rule that a pass needs evidence does not apply to it.
+    let v = super::warden::parse_verdict(raw);
+    if raw.contains("VERDICT") && (v.fulfilled || v.gap.contains("without inspection evidence")) {
+        return Review::Pass;
+    }
+    Review::Unclear
 }
 
 /// Read the reviewer's reply: a gap only on an explicit fail that names
@@ -1578,6 +1715,27 @@ fn edited_old_tests(
             })
         })
         .collect()
+}
+
+/// Does any line an edited test lost name something the issue names: a
+/// code name, a quoted value, or a number? Words every test uses (assert,
+/// expect, equal, test) do not count.
+fn ties_to_issue(edited: &[EditedTest], issue: &str) -> bool {
+    const COMMON: &[&str] = &[
+        "assert", "assertEqual", "assert_eq", "expect", "equal", "toBe", "toEqual", "test",
+        "self", "true", "false", "None", "null", "return", "should", "const", "let",
+    ];
+    let token = regex::Regex::new(r#"[A-Za-z_][A-Za-z0-9_]{2,}|\d+(?:\.\d+)?|"[^"]+"|'[^']+'"#).unwrap();
+    let issue_lower = issue.to_lowercase();
+    edited.iter().flat_map(|e| &e.removed).any(|line| {
+        token.find_iter(line).any(|m| {
+            let t = m.as_str().trim_matches(|c| c == '"' || c == '\'');
+            !t.is_empty()
+                && !COMMON.contains(&t)
+                && t.len() >= 2
+                && issue_lower.contains(&t.to_lowercase())
+        })
+    })
 }
 
 /// The lines each edited test lost, for a prompt or a report.
@@ -1948,15 +2106,20 @@ fn context_block(
             b.status(),
             repo::tail(&b.output, 10, 1_000)
         )),
-        (Some(t), Some(b)) => s.push_str(&format!(
-            "Test command (from {}): {}\nslag ran it before any edit: {} in {:.1}s. The end of \
-             its output:\n{}\n",
-            t.source,
-            t.cmd,
-            b.status(),
-            b.secs,
-            repo::tail(&b.output, OUTPUT_TAIL_LINES, OUTPUT_TAIL_BYTES)
-        )),
+        (Some(t), Some(b)) => {
+            s.push_str(&format!(
+                "Test command (from {}): {}\nslag ran it before any edit: {} in {:.1}s. The end \
+                 of its output:\n{}\n",
+                t.source,
+                t.cmd,
+                b.status(),
+                b.secs,
+                repo::tail(&b.output, OUTPUT_TAIL_LINES, OUTPUT_TAIL_BYTES)
+            ));
+            if let Some(wiring) = repo::runner_wiring(&job.cwd, &t.cmd) {
+                s.push_str(&format!("How the runner finds tests: {wiring}\n"));
+            }
+        }
         _ => s.push_str(
             "No test command was detected. Find how this repository runs its tests \
              (README, CI config, manifests) and put that command in the finish `cmd`.\n",
@@ -2645,6 +2808,27 @@ mod tests {
         let decl = declaration(&all, &both).expect("both named");
         assert!(decl.contains("preview.test.js") && decl.contains("limits.test.js"), "{decl}");
         assert!(declaration("Fixed it.", &both[..1]).is_none());
+    }
+
+    #[test]
+    fn a_review_pass_needs_the_word_and_nothing_else_counts() {
+        assert!(matches!(read_review("VERDICT: pass\nGAP:"), Review::Pass));
+        assert!(matches!(read_review("VERDICT: fail\nGAP: add the boundary"), Review::Gap(g) if g == "add the boundary"));
+        assert!(matches!(read_review("Looks plausible, I think."), Review::Unclear));
+        assert!(matches!(read_review("VERDICT: fail\nGAP:"), Review::Unclear));
+    }
+
+    #[test]
+    fn a_declared_test_change_must_share_a_name_with_the_issue() {
+        let edited = |line: &str| vec![EditedTest {
+            path: "tests/preview.test.js".into(),
+            removed: vec![line.into()],
+            original_tests: None,
+        }];
+        let issue = "makePreview(\"🎉\".repeat(25), 20) splits an emoji";
+        assert!(ties_to_issue(&edited("assert.equal(makePreview(s, 20), x);"), issue));
+        assert!(!ties_to_issue(&edited("assert.equal(f('hello worl…'), 1);"), issue), "nothing the issue names");
+        assert!(!ties_to_issue(&edited("expect(x).toBe(1);"), "use 1 thing"), "single digits and test words do not tie");
     }
 
     #[test]

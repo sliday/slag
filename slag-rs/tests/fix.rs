@@ -353,11 +353,13 @@ async fn a_declared_change_the_issue_asks_for_lands_in_plain_sight() {
             "summary": "a.txt now holds 2.\nchanged existing tests: tests/a.sh: the issue asks a to be 2",
             "cmd": SUITE,
         })),
+        // The usual review, then the one a declared change must pass.
+        json!({"text": "VERDICT: pass\nGAP:"}),
         json!({"text": "VERDICT: pass\nGAP:"}),
     ])
     .await;
 
-    let issue = "a must be 2, not 1; tests/a.sh pins the old value and must change";
+    let issue = "a.txt must hold 2, not 1; tests/a.sh pins the old value and must change";
     let out = slag_fix(repo.path(), &server, &[issue, "--test", SUITE]).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
@@ -474,4 +476,94 @@ async fn the_users_own_uncommitted_files_never_reach_the_commit() {
         assert!(status.contains(path), "{path} stays uncommitted: {status}");
     }
     assert!(stdout.contains("left untouched: 3 files you had before"), "{stdout}");
+}
+
+/// A declared change to an existing test whose changed lines share nothing
+/// with the issue: the issue does not ask for it, so it is not a fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_change_the_issue_never_mentions_is_not_a_fix() {
+    let repo = two_value_repo();
+    let server = model(vec![
+        tool("read_file", json!({"path": "a.txt"})),
+        tool("edit_file", json!({"path": "a.txt", "old_string": "1", "new_string": "2"})),
+        tool("read_file", json!({"path": "tests/a.sh"})),
+        tool("edit_file", json!({"path": "tests/a.sh", "old_string": "-qx 1", "new_string": "-qx 2"})),
+        tool("write_file", json!({"path": "tests/b.sh", "content": "grep -qx 2 a.txt\n"})),
+        tool("finish", json!({
+            "summary": "Done.\nchanged existing tests: tests/a.sh: the new value is right",
+            "cmd": SUITE,
+        })),
+    ])
+    .await;
+
+    let out = slag_fix(repo.path(), &server, &["b should be 2", "--test", SUITE, "--tries", "1"]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("the issue never mentions"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(repo.path().join("tests/a.sh")).unwrap(), "grep -qx 1 a.txt\n");
+}
+
+/// A declared change the issue does name still needs a review that says
+/// pass in so many words. A reply with no verdict is no agreement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_change_without_a_clear_review_pass_is_not_a_fix() {
+    let repo = two_value_repo();
+    let server = model(vec![
+        tool("read_file", json!({"path": "a.txt"})),
+        tool("edit_file", json!({"path": "a.txt", "old_string": "1", "new_string": "2"})),
+        tool("read_file", json!({"path": "tests/a.sh"})),
+        tool("edit_file", json!({"path": "tests/a.sh", "old_string": "-qx 1", "new_string": "-qx 2"})),
+        tool("write_file", json!({"path": "tests/a_is_two.sh", "content": "grep -qx 2 a.txt\n"})),
+        tool("finish", json!({
+            "summary": "a.txt now holds 2.\nchanged existing tests: tests/a.sh: the issue asks a.txt to hold 2",
+            "cmd": SUITE,
+        })),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+        json!({"text": "Looks plausible, I think."}),
+    ])
+    .await;
+
+    let issue = "a.txt must hold 2, not 1; tests/a.sh pins the old value and must change";
+    let out = slag_fix(repo.path(), &server, &[issue, "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("without the review agreeing"), "{stdout}");
+}
+
+/// The runner only runs tests/test_*.sh. The sh-backup-rotate shape: a
+/// new test file it never reaches passes with or without the fix. slag
+/// makes it unable to run, sees the suite still pass, and sends it back
+/// with how the runner finds tests; wired in, the fix lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_the_runner_never_reaches_goes_back_until_it_is_wired_in() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+    std::fs::write(root.join("b.txt"), "1\n").unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("tests/run_tests.sh"),
+        "for t in tests/test_*.sh; do bash \"$t\" || exit 1; done\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("tests/test_exists.sh"), "test -f b.txt\n").unwrap();
+    sh(root, "git add -A && git commit -qm init");
+    let runner = "bash tests/run_tests.sh";
+    let server = model(vec![
+        tool("read_file", json!({"path": "b.txt"})),
+        tool("edit_file", json!({"path": "b.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/b_check.sh", "content": "grep -qx 2 b.txt\n"})),
+        tool("finish", json!({"summary": "b.txt now holds 2.", "cmd": runner})),
+        // The revision wires the test in by the runner's own pattern.
+        tool("bash", json!({"command": "mv tests/b_check.sh tests/test_b_is_two.sh"})),
+        tool("finish", json!({"summary": "Renamed so the runner runs it.", "cmd": runner})),
+    ])
+    .await;
+
+    let out = slag_fix(root, &server, &["b should be 2", "--test", runner]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("tests/b_check.sh never runs"), "{stdout}");
+    let files = sh(root, "git show --name-only --format= HEAD");
+    assert_eq!(files.trim(), "b.txt\ntests/test_b_is_two.sh", "{files}");
 }
