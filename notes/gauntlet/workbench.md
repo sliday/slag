@@ -409,6 +409,15 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - BIGGEST_GAP: thin or orphaned regression tests (sh-backup-rotate test outside the runner; 1 test vs 2-5). Sent as fix r6: mechanical "runner executes the new test" check, issue cases + boundary, declared-change loophole closed, edit-miss hints.
 - Next fix critic runs model for model (gpt-6.1-sol both sides) from a copied bench.
 
+### efficiency r9 merged
+- Probes and reference fixtures run from `.slag/` and never enter the repo; interface derived from the kind of tool (no keyword forcing); reference-contract mismatch gets one repair round with a precise message; converters validate before output.
+- Live gpt-6.1-sol: 7/7 FORGED (wc x3 115-128 s, csv 149 s, node 160 s, tail 143 s, durations 97 s), $0.10-0.17 each; fresh-clone checks pass; no probes/fixtures tracked.
+- Integration: 1182 unit tests green, clippy clean. Critic commission-r8 (final) running on 7 prompts, 2 new.
+
+### final wave: Linux check (lead)
+- Docker `rust:1-bookworm --privileged`, as root, bubblewrap installed: 1180 passed, 2 FAILED, both in efficiency's fresh-checkout warden code: `fresh_checkout_tests_cannot_write` (a test could write inside the "read-only" checkout) and `isolated_install_checks_console_without_workspace_residue` (`prepare_install` Err; likely no `python3-venv` on Debian). Landlock-only sandbox tests: 32/32 pass.
+- Sent as efficiency r10 (Linux portability, root and non-root). Script: tmp/linux-final/run.sh.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
