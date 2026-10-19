@@ -35,7 +35,7 @@ slag "Build a CLI tool that converts CSV to JSON"
 
 Run `slag` without an argument to forge an existing commission.
 
-New commissions keep coordination files in gitignored `.slag/`. Existing projects with root `PLAN.md` or `PRD.md` keep their root layout.
+New commissions keep coordination files in gitignored `.slag/`. Slag stores its ignore patterns in `.git/info/exclude`. Language cache rules stay in `.gitignore`. Existing projects with root `PLAN.md` or `PRD.md` keep their root layout.
 
 ## Providers and keys
 
@@ -178,7 +178,7 @@ PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGR
 
 ### Phase 1: SURVEYOR
 
-Small local commissions share a short contract between the builder and reviewer. The contract covers named behavior and conventional CLI interfaces: help, stdin, package entry points, and stated defaults. The reviewer runs the suite and CLI probes in a read-only sandbox.
+Small local commissions share a short contract between the builder and reviewer. The contract covers named behavior and conventional CLI interfaces: help, stdin, package entry points, and stated defaults. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation.
 
 The surveyor reads `.slag/PRD.md` (the ore). It writes `.slag/BLUEPRINT.md` with architecture decisions, dependencies, risks, and the forging sequence. It uses the plan model.
 

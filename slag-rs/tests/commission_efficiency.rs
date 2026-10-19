@@ -161,6 +161,11 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
     assert!(plan.contains(":heat 1"), "{plan}");
     let tracked = git(root.path(), &["ls-files"]);
     assert!(!tracked.lines().any(|path| path.starts_with(".slag/") || matches!(path, "PLAN.md" | "PROGRESS.md" | "PRD.md" | "BLUEPRINT.md" | "BAR.md" | "AGENTS.md")), "{tracked}");
+    let ignore = git(root.path(), &["show", "HEAD:.gitignore"]);
+    assert!(!ignore.lines().any(|line| matches!(line, "/.slag/" | "/logs/")), "{ignore}");
+    let history = git(root.path(), &["log", "--oneline"]);
+    assert!(history.contains("chore: initialize project"), "{history}");
+    assert!(!history.contains("fire: furnace lit"), "{history}");
     let ledger = std::fs::read_to_string(root.path().join(".slag/PROGRESS.md")).unwrap();
     assert_eq!(ledger.matches("heats:1").count(), 1, "{ledger}");
     assert!(ledger.contains("Warden round 1"), "{ledger}");
@@ -822,6 +827,41 @@ async fn resume_rejudges_unverified_work_and_requires_current_grounded_evidence(
     );
     assert!(latest.contains("README.md"), "{ledger}");
     assert!(git(root.path(), &["status", "--porcelain"]).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_only_suite_cannot_ground_a_fresh_clone_pass() {
+    let root = forged_project(None);
+    std::fs::write(root.path().join(".gitignore"), "logs/\ninstalled_only.py\n").unwrap();
+    std::fs::write(root.path().join("test_clean.py"),
+        "import unittest, installed_only\nclass Clean(unittest.TestCase):\n def test_value(self): self.assertEqual(installed_only.VALUE, 1)\n").unwrap();
+    std::fs::write(root.path().join("installed_only.py"), "VALUE = 1\n").unwrap();
+    std::fs::write(root.path().join("BAR.md"),
+        "## THE BAR\n- Tests pass without local setup.\nREQUIRED RUN COMMANDS: [\"python3 -m unittest\"]\n").unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-m", "Add source tests"]);
+    let before = std::process::Command::new("python3").args(["-m", "unittest"])
+        .env("PYTHONDONTWRITEBYTECODE", "1").current_dir(root.path()).output().unwrap();
+    assert!(before.status.success(), "{before:?}");
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if !artifact_review(&body) { return plan_review_response(&body); }
+            let results = tool_results(&body);
+            if results.is_empty() {
+                return response(json!({"content": null, "tool_calls": required_runs(&body)}));
+            }
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert!(!results[0].starts_with("ERROR:"), "{results:?}");
+            assert!(results[1].contains("No module named 'installed_only'"), "{results:?}");
+            grounded_pass(&body)
+        }).mount(&server).await;
+    let output = base_command(root.path(), config.path(), &server)
+        .args(["--temper", "1", "resume"]).assert().failure().get_output().clone();
+    assert_unverified_review(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("successful required run"));
 }
 
 fn direct_scope() -> Value {

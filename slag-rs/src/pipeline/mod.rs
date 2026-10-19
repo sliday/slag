@@ -738,7 +738,7 @@ fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagE
     let checklist = plan.criteria.iter().map(|item| format!("- [ ] {item}")).collect::<Vec<_>>().join("\n");
     let commands: Vec<_> = std::iter::once(&plan.proof).chain(&plan.commands).cloned().collect();
     let checks = format!("REQUIRED RUN COMMANDS: {}", serde_json::to_string(&commands).unwrap());
-    let contract = format!("## CHECKLIST\n{checklist}\n\n{checks}\n");
+    let contract = format!("## CHECKLIST\n{checklist}\n\n{checks}\nFRESH CLONE TEST COMMAND: {}\n", serde_json::to_string(&plan.proof).unwrap());
     std::fs::write(crate::config::project_path(crate::config::BLUEPRINT), format!(
         "# Local utility\n\n{commission}\n\n{contract}"
     ))?;
@@ -835,6 +835,7 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     let ore_path = std::path::Path::new(crate::config::project_path(crate::config::ORE_FILE));
 
     if ore_path.exists() {
+        hygiene::install_ignores(std::path::Path::new("."), commission)?;
         // A commission for a project that already has ore used to be
         // dropped on the floor: no error, no warning, and a run that
         // looked like it did nothing. Append it instead, and let the
@@ -901,13 +902,18 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
     // Initial commit, scoped to the files slag just wrote. `git add -A`
     // here swept whatever the user had lying around — including .env —
     // into a commit they never asked for.
-    let mut initial_files = vec!["add", "--", ".gitignore"];
+    let mut initial_files = vec!["add", "--"];
+    if std::path::Path::new(".gitignore").is_file() {
+        initial_files.push(".gitignore");
+    }
     if crate::config::project_path(crate::config::ORE_FILE) == crate::config::ORE_FILE {
         initial_files.extend([crate::config::ORE_FILE, crate::config::ALLOY_FILE, crate::config::LEDGER]);
     }
-    let _ = crate::engine::sandbox::git().args(initial_files).output();
+    if initial_files.len() > 2 {
+        let _ = crate::engine::sandbox::git().args(initial_files).output();
+    }
     let _ = crate::engine::sandbox::git()
-        .args(["commit", "-m", "fire: furnace lit", "--quiet"])
+        .args(["commit", "--allow-empty", "-m", "chore: initialize project", "--quiet"])
         .output();
 
     tui::status_line("█", tui::HOT, "Furnace hot");
@@ -1131,7 +1137,7 @@ mod ore_tests {
             }
             assert!(std::path::Path::new(".slag/logs").is_dir());
             let files = crate::engine::sandbox::git().args(["ls-files"]).output().unwrap();
-            assert_eq!(String::from_utf8_lossy(&files.stdout), ".gitignore\n");
+            assert!(files.stdout.is_empty(), "language-neutral bootstrap must not track internal ignores");
             assert_eq!(fire_furnace(None).unwrap(), Ore::Unchanged);
             assert!(!prd.contains("Addendum"), "a first commission is the ore, not an addendum");
         });

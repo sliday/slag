@@ -16,6 +16,7 @@ use crate::error::SlagError;
 use crate::tui;
 
 mod grounding;
+mod checkout;
 pub(crate) use grounding::{InspectionLog, parse_grounded_verdict};
 
 /// How many warden rounds this run was armed with. Ambient like
@@ -202,8 +203,22 @@ pub async fn judge_artifact(
 
     tui::header(&format!("WARDEN · round {round}"));
     let smith = crate::smith::make_warden(cfg, hooks);
-    let commands = artifact_commands(&bar);
-    let prompt = format!("REQUIRED RUN COMMANDS: {}\n\n{}\n\n{}",
+    let mut commands = artifact_commands(&bar);
+    let fresh = if let Some(suite) = fresh_suite(&bar, &commands) {
+        match checkout::prepare(std::path::Path::new("."), &suite).await {
+            Ok(checkout) => { commands.push(checkout.command.clone()); Some(checkout) }
+            Err(error) => {
+                let verdict = Verdict::unverified(format!("cannot prepare the fresh-clone test check: {error}"));
+                record(round, &verdict);
+                return Ok(verdict);
+            }
+        }
+    } else { None };
+    let fresh_context = fresh.as_ref().map(|checkout| format!(
+        "FRESH CLONE CHECK: {}\nThe coordinator cloned committed HEAD without ignored files or prior package installs. Run this exact command in its own bash call. Cite its successful ID. A failure is a delivery gap.\n",
+        checkout.command,
+    )).unwrap_or_default();
+    let prompt = format!("REQUIRED RUN COMMANDS: {}\n\n{fresh_context}\n{}\n\n{}",
         serde_json::to_string(&commands).unwrap(), workspace_context(), crate::flux::warden_prompt(&ore, &bar));
     let raw = match smith
         .invoke(&prompt)
@@ -223,6 +238,26 @@ pub async fn judge_artifact(
     if verdict.is_unverified() { log_raw(&raw); }
     record(round, &verdict);
     Ok(verdict)
+}
+
+fn fresh_suite(bar: &str, commands: &[String]) -> Option<String> {
+    if let Some(suite) = bar.lines().find_map(|line| line.strip_prefix("FRESH CLONE TEST COMMAND: ")
+        .and_then(|json| serde_json::from_str::<String>(json).ok()))
+    {
+        return Some(suite);
+    }
+    commands.iter().find(|command| {
+        let Ok(words) = shell_words::split(command) else { return false };
+        let words = words.iter().skip_while(|word| word.split_once('=').is_some_and(|(key, _)|
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))).collect::<Vec<_>>();
+        let Some(program) = words.first().and_then(|word| std::path::Path::new(word).file_name())
+            .and_then(|name| name.to_str()) else { return false };
+        let args = words.iter().skip(1).map(|word| word.as_str()).collect::<Vec<_>>();
+        program.starts_with("python") && args.windows(2).any(|args| args[0] == "-m" && matches!(args[1], "unittest" | "pytest"))
+            || program == "pytest"
+            || program == "node" && args.contains(&"--test")
+            || matches!(program, "cargo" | "go" | "npm" | "pnpm" | "yarn" | "bun") && args.contains(&"test")
+    }).cloned()
 }
 
 fn artifact_commands(bar: &str) -> Vec<String> {
