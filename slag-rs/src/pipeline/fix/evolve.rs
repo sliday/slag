@@ -203,7 +203,7 @@ pub(super) struct Rollout {
     #[serde(skip)]
     detail: Option<String>,
     #[serde(skip)]
-    contents: Vec<(String, Option<Vec<u8>>, Option<u32>)>,
+    contents: Vec<(String, Delivered)>,
     #[serde(skip)]
     diff: String,
     #[serde(skip)]
@@ -238,6 +238,14 @@ impl Rollout {
             repro_rank: 0,
         }
     }
+}
+
+/// What a run left at one changed path, as delivery writes it back.
+#[derive(Debug, Clone)]
+enum Delivered {
+    File { bytes: Vec<u8>, mode: Option<u32> },
+    Link(PathBuf),
+    Gone,
 }
 
 /// One harness the improver produced, and how.
@@ -656,6 +664,10 @@ impl Evolver<'_, '_> {
     /// `runs/<label>/`.
     async fn rollout(&self, label: &str, kind: Kind, harness_label: &str, dir: &Path) -> Result<Rollout, SlagError> {
         let started = Instant::now();
+        // A run waiting for its slot does not start once a cap is spent.
+        if let Some(why) = self.sh.budget.over() {
+            return Ok(Rollout::undelivered(label, kind, harness_label, format!("not started: {why}")));
+        }
         let (top, cwd) = match self.copy_repo(label) {
             Ok(paths) => paths,
             Err(e) => return Ok(Rollout::undelivered(label, kind, harness_label, format!("could not copy the repository: {e}"))),
@@ -734,7 +746,15 @@ impl Evolver<'_, '_> {
             .iter()
             .map(|p| {
                 let path = git.top.join(p);
-                (p.clone(), std::fs::read(&path).ok(), mode_of(&path))
+                let what = match std::fs::symlink_metadata(&path) {
+                    Ok(m) if m.file_type().is_symlink() => std::fs::read_link(&path).map_or(Delivered::Gone, Delivered::Link),
+                    Ok(_) => match std::fs::read(&path) {
+                        Ok(bytes) => Delivered::File { bytes, mode: mode_of(&path) },
+                        Err(_) => Delivered::Gone,
+                    },
+                    Err(_) => Delivered::Gone,
+                };
+                (p.clone(), what)
             })
             .collect();
         let repro_rank = match repro {
@@ -1061,6 +1081,9 @@ impl Evolver<'_, '_> {
         max_turns: usize,
     ) -> Result<String, SlagError> {
         guard(ws).map_err(SlagError::SmithFailed)?;
+        if let Some(why) = self.sh.budget.over() {
+            return Err(SlagError::SmithFailed(format!("not started: {why}")));
+        }
         let config = self.ctx.config;
         let model = self.sh.settings.editor_model.clone();
         let (tx, rx) = crate::engine::events::channel();
@@ -1330,21 +1353,34 @@ impl Evolved {
     }
 
     /// Put the chosen run's change into the user's repository. Returns the
-    /// finish text slag's checks read (summary and `CMD:` line), or `None`
-    /// when no run delivered.
-    pub fn deliver(&self, job: &Job) -> Option<String> {
-        let run = self.chosen()?;
+    /// finish text slag's checks read (summary and `CMD:` line), `Ok(None)`
+    /// when no run delivered, and `Err` when a path is not one to write:
+    /// outside the tree, slag's own scratch, git's, or under a link. A
+    /// link at the path itself is replaced, never written through.
+    pub fn deliver(&self, job: &Job) -> Result<Option<String>, String> {
+        let Some(run) = self.chosen() else { return Ok(None) };
         let top = job.git.as_ref().map(|g| g.top.clone()).unwrap_or_else(|| job.cwd.clone());
-        for (rel, content, mode) in &run.contents {
-            let safe = !rel.is_empty()
-                && !Path::new(rel).is_absolute()
-                && Path::new(rel).components().all(|c| matches!(c, std::path::Component::Normal(_)));
-            if !safe || scratch(rel) {
-                continue;
+        for (rel, _) in &run.contents {
+            let parts: Vec<std::path::Component> = Path::new(rel).components().collect();
+            let plain = !rel.is_empty() && parts.iter().all(|c| matches!(c, std::path::Component::Normal(_)));
+            let git_path = parts.iter().any(|c| c.as_os_str() == ".git");
+            let mut under_link = false;
+            let mut at = top.clone();
+            for c in parts.iter().take(parts.len().saturating_sub(1)) {
+                at.push(c.as_os_str());
+                under_link |= std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink());
             }
+            if !plain || git_path || scratch(rel) || under_link {
+                return Err(format!("the chosen run changed `{rel}`, which slag will not write into your repository"));
+            }
+        }
+        for (rel, what) in &run.contents {
             let path = top.join(rel);
-            match content {
-                Some(bytes) => {
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                let _ = std::fs::remove_file(&path);
+            }
+            match what {
+                Delivered::File { bytes, mode } => {
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -1355,13 +1391,20 @@ impl Evolved {
                         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(*mode));
                     }
                 }
-                None => {
+                Delivered::Link(target) => {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    #[cfg(unix)]
+                    let _ = std::os::unix::fs::symlink(target, &path);
+                }
+                Delivered::Gone => {
                     let _ = std::fs::remove_file(&path);
                 }
             }
         }
         let cmd = run.cmd.as_deref().map(|c| format!("\nCMD: {c}")).unwrap_or_default();
-        Some(format!("{}{cmd}", run.summary))
+        Ok(Some(format!("{}{cmd}", run.summary)))
     }
 
     pub fn chosen_label(&self) -> Option<String> {
@@ -1718,7 +1761,7 @@ pub(super) fn guard(dir: &Path) -> Result<(), String> {
                         continue;
                     }
                     let text = std::fs::read(&path).map(|b| String::from_utf8_lossy(&b).to_ascii_lowercase()).unwrap_or_default();
-                    for needle in ["bench/issues/", "bench/streams/", "reference.patch"] {
+                    for needle in ["bench/issues/", "bench/streams/", "reference.patch", "/hidden/"] {
                         if text.contains(needle) {
                             return Err(format!(
                                 "refusing to hand over {}: {} mentions `{needle}`",
@@ -2056,6 +2099,7 @@ mod tests {
             ("context/score.json", "{}"),
             ("context/runs/base-1/trajectory.md", "cat /x/bench/streams/s1/hidden/t.py"),
             ("context/notes.md", "apply reference.patch"),
+            ("context/runs/base-1/diff.patch", "+++ b/../hidden/test_x.py"),
         ] {
             let path = dir.path().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2079,6 +2123,86 @@ mod tests {
         assert!(check_tree(&edited, &start, "<notes>KEEP_BASE</notes>").await.is_ok());
         std::fs::write(edited.join("memory.md"), "In this repository, tests use unittest.\n").unwrap();
         assert!(check_tree(&edited, &start, reply).await.is_ok(), "a changed tree is the validator's to judge");
+    }
+
+    /// An evolve result whose chosen run left `contents`, for `deliver`.
+    fn chosen(contents: Vec<(String, Delivered)>, top: &Path) -> (Evolved, Job) {
+        use clap::Parser;
+        let Some(crate::cli::Command::Fix(args)) = crate::cli::Cli::parse_from(["slag", "fix", "x"]).command else {
+            panic!("fix parses")
+        };
+        let mut r = run("comp-1-run", Kind::Composed, true, &[], 1, 0);
+        r.contents = contents;
+        let record = Record {
+            runs: vec![r],
+            selection: Some(Selection {
+                pool: vec!["comp-1-run".into()],
+                ids: BTreeMap::new(),
+                chosen: "comp-1-run".into(),
+                by: "composed".into(),
+                why: String::new(),
+            }),
+            ..Default::default()
+        };
+        let sh = Shared {
+            settings: Settings {
+                k: 1,
+                sequential: false,
+                editor_model: "m".into(),
+                usd: 1.0,
+                tokens: 1,
+                domain: "general".into(),
+                library: None,
+                base: None,
+            },
+            run_id: "t".into(),
+            run_dir: top.join(".slag/evolve/t"),
+            budget: Budget { usd: 1.0, tokens: 1, start: Usage::default(), spend: Default::default() },
+            top: top.to_path_buf(),
+            prefix: String::new(),
+            base: top.join(".slag/evolve/t/harness/base"),
+            started: Instant::now(),
+        };
+        let job = Job { args, temper: false, cwd: top.to_path_buf(), git: None };
+        (Evolved { sh, record }, job)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_writes_files_and_never_writes_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (top, outside) = (dir.path().join("repo"), dir.path().join("outside"));
+        std::fs::create_dir_all(top.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("target.txt"), "keep me\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("target.txt"), top.join("linked.txt")).unwrap();
+        std::fs::write(top.join("old.txt"), "old\n").unwrap();
+        let contents = vec![
+            ("src/fix.sh".to_string(), Delivered::File { bytes: b"echo 2\n".to_vec(), mode: Some(0o100755) }),
+            ("linked.txt".to_string(), Delivered::File { bytes: b"new\n".to_vec(), mode: None }),
+            ("old.txt".to_string(), Delivered::Gone),
+        ];
+        let (ev, job) = chosen(contents, &top);
+        assert!(ev.deliver(&job).unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(top.join("src/fix.sh")).unwrap(), "echo 2\n");
+        assert_eq!(std::fs::metadata(top.join("src/fix.sh")).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read_to_string(outside.join("target.txt")).unwrap(), "keep me\n", "the link's target is untouched");
+        assert!(!std::fs::symlink_metadata(top.join("linked.txt")).unwrap().file_type().is_symlink());
+        assert!(!top.join("old.txt").exists());
+
+        // A path under a linked directory, or slag's own scratch, is refused whole.
+        std::os::unix::fs::symlink(&outside, top.join("out")).unwrap();
+        for rel in ["out/planted.txt", ".slag/x", ".git/hooks/pre-commit", "../escape.txt"] {
+            let contents = vec![
+                ("ok.txt".to_string(), Delivered::File { bytes: b"x\n".to_vec(), mode: None }),
+                (rel.to_string(), Delivered::File { bytes: b"x\n".to_vec(), mode: None }),
+            ];
+            let (ev, job) = chosen(contents, &top);
+            assert!(ev.deliver(&job).is_err(), "{rel} must be refused");
+            assert!(!top.join("ok.txt").exists(), "nothing lands when one path is refused");
+        }
+        assert!(!outside.join("planted.txt").exists());
     }
 
     #[test]

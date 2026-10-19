@@ -411,7 +411,11 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         phases.evolve += clock.elapsed().as_secs_f64();
         ctx.smith.harness = Some(Arc::new(crate::harness::Harness::load(&ev.adopted())));
         match ev.deliver(job) {
-            Some(response) => {
+            Err(why) => {
+                note(hooks, &format!("evolve: {why}"), false);
+                failure = Some(Failure::new(why.clone(), why));
+            }
+            Ok(Some(response)) => {
                 let label = format!("evolved fix ({})", ev.chosen_label().unwrap_or_default());
                 match ctx.check(&label, &response, &mut phases).await? {
                     Attempted::Passed { checks: c, summary: s, changed: ch } => {
@@ -423,7 +427,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                     }
                 }
             }
-            None => failure = ev.failure().map(|(line, detail)| Failure::new(line, detail)),
+            Ok(None) => failure = ev.failure().map(|(line, detail)| Failure::new(line, detail)),
         }
         evolved = Some(ev);
     }

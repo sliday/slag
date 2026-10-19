@@ -212,7 +212,10 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut BTreeMap<String, Vec<u8
             walk(root, &path, depth + 1, out);
         } else if kind.is_file() {
             let small = entry.metadata().is_ok_and(|m| m.len() > 0 && m.len() <= TREE_MAX_BYTES);
-            if let (true, Ok(rel), Ok(bytes)) = (small, path.strip_prefix(root), std::fs::read(&path)) {
+            if !small {
+                continue;
+            }
+            if let (Ok(rel), Ok(bytes)) = (path.strip_prefix(root), std::fs::read(&path)) {
                 let rel = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>();
                 out.insert(rel.join("/"), bytes);
             }

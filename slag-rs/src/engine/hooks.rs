@@ -557,6 +557,17 @@ pub async fn run_command_in(def: &HookDef, payload: &HookPayload, scope: &Comman
     if let Some(dir) = &scope.cwd {
         command.current_dir(dir);
     }
+    if scope.read_only {
+        // A model-written hook reads freely, but gets no credential to
+        // read, and dies with its timeout.
+        for (name, _) in std::env::vars_os() {
+            let upper = name.to_string_lossy().to_ascii_uppercase();
+            if ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"].iter().any(|s| upper.ends_with(s)) {
+                command.env_remove(&name);
+            }
+        }
+        command.kill_on_drop(true);
+    }
     command.envs(scope.env.iter().map(|(k, v)| (k, v)));
     let spawned = command
         .arg("-c")
@@ -571,14 +582,20 @@ pub async fn run_command_in(def: &HookDef, payload: &HookPayload, scope: &Comman
         Err(e) => return failed(def, started, format!("hook `{}` failed to spawn: {e}", def.name)),
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        // A hook that ignores stdin closes the pipe early; that EPIPE is
-        // the hook's business, not an error worth failing the run over.
-        let _ = stdin.write_all(payload.to_stdin().as_bytes()).await;
-        drop(stdin);
-    }
+    // Feed stdin while the output drains, all under the timeout: a hook
+    // that never reads a large payload cannot hang the call that fired it.
+    // A hook that ignores stdin closes the pipe early; that EPIPE is the
+    // hook's business, not an error worth failing the run over.
+    let stdin = child.stdin.take();
+    let body = payload.to_stdin();
+    let feed = async move {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(body.as_bytes()).await;
+        }
+    };
+    let finished = async move { tokio::join!(feed, child.wait_with_output()).1 };
 
-    match tokio::time::timeout(def.timeout, child.wait_with_output()).await {
+    match tokio::time::timeout(def.timeout, finished).await {
         Ok(Ok(out)) => classify(
             &def.name,
             out.status.code().unwrap_or(CODE_FAILED),
@@ -1312,6 +1329,20 @@ mod tests {
         } else {
             assert_eq!(o.code, CODE_FAILED, "fails closed: {o:?}");
         }
+        // No credential reaches it.
+        std::env::set_var("HARNESS_PROBE_API_KEY", "sk-not-for-hooks");
+        let leak = run_command_in(&cmd_hook("echo \"key=${HARNESS_PROBE_API_KEY:-none}\""), &HookPayload::new(HookEvent::PostTool), &scope).await;
+        if crate::engine::sandbox::Sandbox::read_only().is_ok() {
+            assert_eq!(leak.context.as_deref(), Some("key=none"), "{leak:?}");
+        }
+        // One that never reads a large payload ends at its timeout.
+        let mut stuck = cmd_hook("sleep 30");
+        stuck.timeout = Duration::from_millis(800);
+        let big = HookPayload::new(HookEvent::PostTool).with_output(&"x".repeat(1 << 20));
+        let clock = Instant::now();
+        let o = run_command_in(&stuck, &big, &scope).await;
+        assert_eq!(o.code, CODE_FAILED, "{o:?}");
+        assert!(clock.elapsed() < Duration::from_secs(10), "{:?}", clock.elapsed());
         // The operator's own snapshot still runs a hook plainly.
         let plain = run_command(&cmd_hook(&format!("echo hi > '{}'", planted.display())), &HookPayload::new(HookEvent::Stop)).await;
         assert_eq!(plain.code, 0);
