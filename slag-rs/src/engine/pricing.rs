@@ -37,7 +37,7 @@ impl Pricing {
     }
 }
 
-/// Published list rates in USD per million tokens. Snapshot date: 2026-10-15.
+/// Published list rates in USD per million tokens. Each entry records its snapshot date.
 #[derive(Debug, Clone, Copy)]
 pub struct ListPrice {
     pub provider: &'static str,
@@ -60,6 +60,14 @@ impl ListPrice {
             output *= 2.0;
             cached_input *= 2.0;
         }
+        // OpenAI standard long-context rates apply above 272K input tokens (2026-10-19).
+        if self.provider == "openai" && usage.prompt_tokens > 272_000
+            && (self.model.starts_with("gpt-6") || self.model.starts_with("gpt-5.6-")
+                || matches!(self.model, "gpt-5.4" | "gpt-5.4-2026-03-05" | "gpt-5.5" | "gpt-5.5-2026-04-23")) {
+            input *= 2.0;
+            cached_input *= 2.0;
+            output *= 1.5;
+        }
         ((usage.prompt_tokens - cached) as f64 * input
             + cached as f64 * cached_input
             + usage.completion_tokens as f64 * output) / 1_000_000.0
@@ -69,6 +77,27 @@ impl ListPrice {
 // Official list prices, checked 2026-10-15. Estimates exclude taxes and discounts.
 // DeepSeek uses peak rates. Gemini latest uses the current promotional rate.
 pub const LIST_PRICES: &[ListPrice] = &[
+    // OpenAI standard rates, checked 2026-10-19 against the official pricing table.
+    ListPrice { provider: "openai", model: "gpt-5.2", input: 1.75, output: 14.0, cached_input: Some(0.175), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.2-2025-12-11", input: 1.75, output: 14.0, cached_input: Some(0.175), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.4", input: 2.5, output: 15.0, cached_input: Some(0.25), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.4-2026-03-05", input: 2.5, output: 15.0, cached_input: Some(0.25), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.5", input: 5.0, output: 30.0, cached_input: Some(0.5), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.5-2026-04-23", input: 5.0, output: 30.0, cached_input: Some(0.5), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-6.1-sol", input: 2.0, output: 10.0, cached_input: Some(0.1), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-6-sol", input: 2.0, output: 10.0, cached_input: Some(0.2), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-6-luna", input: 0.1, output: 0.5, cached_input: Some(0.01), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.6-sol", input: 4.0, output: 20.0, cached_input: Some(0.4), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.6-terra", input: 2.0, output: 12.0, cached_input: Some(0.2), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.6-luna", input: 0.2, output: 1.2, cached_input: Some(0.02), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.4-mini", input: 0.75, output: 4.5, cached_input: Some(0.075), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.4-mini-2026-03-17", input: 0.75, output: 4.5, cached_input: Some(0.075), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.4-nano", input: 0.2, output: 1.25, cached_input: Some(0.02), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5.4-nano-2026-03-17", input: 0.2, output: 1.25, cached_input: Some(0.02), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5-nano", input: 0.05, output: 0.4, cached_input: Some(0.005), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-5-nano-2025-08-07", input: 0.05, output: 0.4, cached_input: Some(0.005), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-4.1-nano", input: 0.1, output: 0.4, cached_input: Some(0.025), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
+    ListPrice { provider: "openai", model: "gpt-4.1-nano-2025-04-14", input: 0.1, output: 0.4, cached_input: Some(0.025), date: "2026-10-19", source: "https://developers.openai.com/api/docs/pricing.md" },
     ListPrice { provider: "openai", model: "gpt-4.1-mini", input: 0.4, output: 1.6, cached_input: Some(0.1), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
     ListPrice { provider: "openai", model: "gpt-4.1-mini-2025-04-14", input: 0.4, output: 1.6, cached_input: Some(0.1), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
     ListPrice { provider: "openai", model: "gpt-4.1", input: 2.0, output: 8.0, cached_input: Some(0.5), date: "2026-10-15", source: "https://developers.openai.com/api/docs/pricing" },
@@ -487,6 +516,59 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_models_have_published_standard_rates() {
+        use crate::config::ProviderPreset;
+        for (model, input, output, cached) in [
+            ("gpt-5.2", 1.75, 14.0, 0.175),
+            ("gpt-5.4", 2.5, 15.0, 0.25),
+            ("gpt-5.5", 5.0, 30.0, 0.5),
+            ("gpt-6.1-sol", 2.0, 10.0, 0.1),
+            ("gpt-6-luna", 0.1, 0.5, 0.01),
+            ("gpt-5.4-mini", 0.75, 4.5, 0.075),
+            ("gpt-5.4-nano", 0.2, 1.25, 0.02),
+            ("gpt-5-nano", 0.05, 0.4, 0.005),
+            ("gpt-4.1-nano", 0.1, 0.4, 0.025),
+        ] {
+            let price = builtin_price(ProviderPreset::OpenAI, model).unwrap();
+            assert_eq!((price.input, price.output, price.cached_input), (input, output, Some(cached)));
+            assert_eq!(price.date, "2026-10-19");
+            assert_eq!(price.source, "https://developers.openai.com/api/docs/pricing.md");
+            let expected = (750.0 * input + 250.0 * cached + 100.0 * output) / 1_000_000.0;
+            assert!((price.cost_of(&usage(1_000, 100), 250) - expected).abs() < 1e-12);
+        }
+        for (alias, snapshot) in [
+            ("gpt-5.2", "gpt-5.2-2025-12-11"),
+            ("gpt-5.4", "gpt-5.4-2026-03-05"),
+            ("gpt-5.5", "gpt-5.5-2026-04-23"),
+            ("gpt-5.4-mini", "gpt-5.4-mini-2026-03-17"),
+            ("gpt-5.4-nano", "gpt-5.4-nano-2026-03-17"),
+        ] {
+            let alias = builtin_price(ProviderPreset::OpenAI, alias).unwrap();
+            let snapshot = builtin_price(ProviderPreset::OpenAI, snapshot).unwrap();
+            assert_eq!((alias.input, alias.output, alias.cached_input),
+                (snapshot.input, snapshot.output, snapshot.cached_input));
+        }
+    }
+
+    #[test]
+    fn openai_long_context_rates_apply_only_above_the_published_boundary() {
+        use crate::config::ProviderPreset;
+        for model in ["gpt-6.1-sol", "gpt-6-luna", "gpt-5.4", "gpt-5.5-2026-04-23"] {
+            let price = builtin_price(ProviderPreset::OpenAI, model).unwrap();
+            let short = price.cost_of(&usage(272_000, 100), 1_000);
+            let expected = (271_000.0 * price.input + 1_000.0 * price.cached_input.unwrap()
+                + 100.0 * price.output) / 1_000_000.0;
+            assert!((short - expected).abs() < 1e-12, "{model}");
+            let long = price.cost_of(&usage(272_001, 100), 1_000);
+            let expected = (271_001.0 * price.input * 2.0 + 1_000.0 * price.cached_input.unwrap() * 2.0
+                + 100.0 * price.output * 1.5) / 1_000_000.0;
+            assert!((long - expected).abs() < 1e-12, "{model}");
+        }
+        let mini = builtin_price(ProviderPreset::OpenAI, "gpt-5.4-mini").unwrap();
+        assert!((mini.cost_of(&usage(300_000, 1_000), 0) - 0.2295).abs() < 1e-12);
+    }
+
+    #[test]
     fn configured_prices_override_list_prices_and_accept_zero() {
         use crate::config::ProviderPreset;
         let overrides = HashMap::from([("openai::gpt-4.1-mini".into(), (0.0, 0.0, Some(0.0)))]);
@@ -531,6 +613,7 @@ mod tests {
             estimated: false,
             model: Some(model.to_string()),
             role: Some(role),
+            ..Default::default()
         }
     }
 

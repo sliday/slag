@@ -20,6 +20,8 @@ use super::{
 use crate::config::ProviderPreset;
 use crate::error::{ProviderApiError, ProviderErrorCategory, SlagError};
 
+static RESPONSES_MODELS: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_ATTEMPTS: usize = 8;
 const BACKOFF_BASE_MS: u64 = 500;
@@ -626,9 +628,11 @@ impl OpenRouter {
                 }));
             }
         }
-        let mut body = self.build_body(&req);
+        let mut responses = self.provider == ProviderPreset::OpenAI
+            && (openai_responses_model(&req.model) || responses_cached(&self.base_url, &req.model));
+        let mut body = if responses { build_responses_body(&req) } else { self.build_body(&req) };
         let mut shape_retries = 0usize;
-        let url = format!("{}/chat/completions", self.base_url);
+        let mut url = format!("{}/{}", self.base_url, if responses { "responses" } else { "chat/completions" });
         // Definite-assignment checked: every `break` below writes it first.
         let mut last_err;
         let mut last_category;
@@ -697,8 +701,8 @@ impl OpenRouter {
             let status = resp.status();
             let retry_hint = should_retry_override(resp.headers());
             if status.is_success() {
-                let api: ApiResponse = match resp.json().await {
-                    Ok(api) => api,
+                let payload: Value = match resp.json().await {
+                    Ok(payload) => payload,
                     Err(e) => {
                         return Err(SlagError::ProviderApi(ProviderApiError {
                             status: Some(200),
@@ -708,8 +712,32 @@ impl OpenRouter {
                         }))
                     }
                 };
-                let cached_tokens = api.usage.as_ref().map(ApiUsage::cached_tokens).unwrap_or(0);
-                match normalize_for_provider(api, self.provider) {
+                if responses && payload.get("error").is_some_and(|error| !error.is_null()) {
+                    let mut text = payload["error"].to_string();
+                    if !self.api_key.is_empty() {
+                        text = text.replace(&self.api_key, "[redacted]");
+                    }
+                    let category = classify_response(400, &text, false);
+                    return Err(SlagError::ProviderApi(ProviderApiError {
+                        status: Some(200), category, retryable: false,
+                        excerpt: self.error_context(&req, category, &excerpt(&text)),
+                    }));
+                }
+                let normalized = if responses {
+                    normalize_responses(payload)
+                } else {
+                    serde_json::from_value::<ApiResponse>(payload)
+                        .map_err(|e| SlagError::ProviderApi(ProviderApiError {
+                            status: Some(200), category: ProviderErrorCategory::BadResponse,
+                            retryable: false,
+                            excerpt: self.error_context(&req, ProviderErrorCategory::BadResponse, &format!("malformed response: {e}")),
+                        }))
+                        .and_then(|api| {
+                            let cached = api.usage.as_ref().map(ApiUsage::cached_tokens).unwrap_or(0);
+                            normalize_for_provider(api, self.provider).map(|response| (response, cached))
+                        })
+                };
+                match normalized {
                     // Empty 200s (no choices, no message, no finish_reason)
                     // are upstream hiccups; burn a retry instead of handing
                     // the agent an empty turn.
@@ -724,14 +752,14 @@ impl OpenRouter {
                             None => break,
                         }
                     }
-                    Ok(mut resp) => {
+                    Ok((mut resp, cached_tokens)) => {
                         if rate_limit_permit.is_some() {
                             self.rate_limiter.reset();
                         }
                         self.attribute(&mut resp, &req, cached_tokens).await;
                         return Ok(resp);
                     }
-                    other => return other,
+                    Err(error) => return Err(error),
                 }
             }
 
@@ -745,9 +773,19 @@ impl OpenRouter {
                 text = text.replace(&self.api_key, "[redacted]");
             }
             let excerpt = excerpt(&text);
+            if code == 400 && self.provider == ProviderPreset::OpenAI && !responses
+                && responses_required_error(&text) {
+                RESPONSES_MODELS.get_or_init(Default::default).lock().unwrap()
+                    .insert(responses_cache_key(&self.base_url, &req.model));
+                responses = true;
+                body = build_responses_body(&req);
+                url = format!("{}/responses", self.base_url);
+                budget_used = budget_used.saturating_sub(1);
+                continue;
+            }
             if matches!(code, 400 | 422) && shape_retries < 3
                 && budget_used < req.retry.attempts.unwrap_or(self.max_attempts) {
-                if let Some(quirk) = rejected_tool_shape(&body, &text) {
+                if let Some(quirk) = (!responses).then(|| rejected_tool_shape(&body, &text)).flatten() {
                     self.quirks.fetch_or(quirk, std::sync::atomic::Ordering::Relaxed);
                     apply_quirks(&mut body, quirk);
                     shape_retries += 1;
@@ -817,11 +855,167 @@ impl OpenRouter {
     }
 }
 
+fn responses_cache_key(base_url: &str, model: &str) -> String {
+    format!("{base_url}::{model}")
+}
+
+fn responses_cached(base_url: &str, model: &str) -> bool {
+    RESPONSES_MODELS.get_or_init(Default::default).lock().unwrap()
+        .contains(&responses_cache_key(base_url, model))
+}
+
+fn openai_responses_model(model: &str) -> bool {
+    let Some(version) = model.strip_prefix("gpt-") else { return false; };
+    let mut numbers = version.split(['.', '-']);
+    let major = numbers.next().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    let minor = numbers.next().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    major > 5 || (major == 5 && minor >= 4)
+}
+
+fn responses_required_error(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("chat/completions") && text.contains("not supported")
+        && (text.contains("reasoning_effort") || text.contains("responses"))
+}
+
+fn responses_function_call(call: &ToolCall) -> Value {
+    json!({ "type": "function_call", "call_id": call.id,
+        "name": call.name, "arguments": call.arguments })
+}
+
+fn build_responses_body(req: &ChatRequest) -> Value {
+    let mut input = Vec::new();
+    for message in &req.messages {
+        if message.role == "assistant" {
+            if let Some(output) = message.reasoning_details.as_ref()
+                .filter(|metadata| metadata["_slag_provider"] == "openai"
+                    && metadata["_slag_transport"] == "responses")
+                .and_then(|metadata| metadata["output"].as_array()) {
+                input.extend(output.iter().cloned());
+                if let Some(calls) = &message.tool_calls {
+                    input.extend(calls.iter().filter(|call| !output.iter()
+                        .any(|item| item["type"] == "function_call" && item["call_id"] == call.id))
+                        .map(responses_function_call));
+                }
+                continue;
+            }
+        }
+        if message.role == "tool" {
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": message.tool_call_id,
+                "output": message.content,
+            }));
+            continue;
+        }
+        if !message.content.is_empty() || message.images.as_ref().is_some_and(|images| !images.is_empty()) {
+            let content = match message.images.as_deref().filter(|images| !images.is_empty()) {
+                Some(images) => {
+                    let mut content = vec![json!({ "type": "input_text", "text": message.content })];
+                    content.extend(images.iter().map(|url| json!({ "type": "input_image", "image_url": url })));
+                    Value::Array(content)
+                }
+                None => json!(message.content),
+            };
+            input.push(json!({ "role": message.role, "content": content }));
+        }
+        if let Some(calls) = &message.tool_calls {
+            input.extend(calls.iter().map(responses_function_call));
+        }
+    }
+    // Stateless replay keeps encrypted reasoning with its associated calls.
+    let mut body = json!({
+        "model": req.model, "input": input, "store": false,
+        "include": ["reasoning.encrypted_content"],
+    });
+    if !req.tools.is_empty() {
+        body["tools"] = json!(req.tools.iter().map(|tool| json!({
+            "type": "function", "name": tool.name, "description": tool.description,
+            "parameters": tool.parameters, "strict": false,
+        })).collect::<Vec<_>>());
+        body["tool_choice"] = json!("auto");
+    }
+    if let Some(effort) = req.effort {
+        body["reasoning"] = json!({ "effort": effort.as_str() });
+    }
+    if let Some(max) = req.max_tokens {
+        body["max_output_tokens"] = json!(max);
+    }
+    body
+}
+
+fn normalize_responses(api: Value) -> Result<(NormalizedResponse, u64), SlagError> {
+    let output = api["output"].as_array()
+        .ok_or_else(|| SlagError::ProviderTransient("Responses reply missing output".into()))?;
+    let mut text = String::new();
+    let mut reasoning = Vec::new();
+    let mut tool_calls = Vec::new();
+    for item in output {
+        match item["type"].as_str() {
+            Some("message") => {
+                for part in item["content"].as_array().into_iter().flatten() {
+                    if let Some(content) = part["text"].as_str().or_else(|| part["refusal"].as_str()) {
+                        text.push_str(content);
+                    }
+                }
+            }
+            Some("function_call") => {
+                let call = item["call_id"].as_str().zip(item["name"].as_str())
+                    .zip(item["arguments"].as_str())
+                    .filter(|((id, name), _)| !id.is_empty() && !name.is_empty());
+                let Some(((id, name), arguments)) = call else {
+                    return Err(SlagError::ProviderTransient("Responses reply has an invalid function call".into()));
+                };
+                tool_calls.push(ToolCall { id: id.into(), name: name.into(), arguments: arguments.into() });
+            }
+            Some("reasoning") => {
+                for part in item["summary"].as_array().into_iter().flatten() {
+                    if let Some(text) = part["text"].as_str() {
+                        reasoning.push(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let finish_reason = if api["status"] == "incomplete" {
+        if api["incomplete_details"]["reason"] == "max_output_tokens" { FinishReason::Length } else { FinishReason::Other }
+    } else if !tool_calls.is_empty() {
+        FinishReason::ToolCalls
+    } else if output.is_empty() {
+        return Err(SlagError::ProviderTransient("Responses reply has empty output".into()));
+    } else {
+        FinishReason::Stop
+    };
+    let tokens = |name: &str| api["usage"][name].as_u64().unwrap_or(0);
+    let prompt_tokens = tokens("input_tokens");
+    let completion_tokens = tokens("output_tokens");
+    let cached_tokens = api["usage"]["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+    let reasoning_tokens = api["usage"]["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0);
+    Ok((NormalizedResponse {
+        model: api["model"].as_str().filter(|model| !model.is_empty()).map(str::to_owned),
+        content: text,
+        tool_calls,
+        finish_reason,
+        reasoning: (!reasoning.is_empty()).then(|| reasoning.join("\n")),
+        reasoning_details: Some(json!({
+            "_slag_provider": "openai", "_slag_transport": "responses", "output": output,
+        })),
+        usage: Usage {
+            prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens,
+            total_tokens: if tokens("total_tokens") == 0 {
+                prompt_tokens.saturating_add(completion_tokens)
+            } else { tokens("total_tokens") },
+            ..Default::default()
+        },
+    }, cached_tokens))
+}
+
 fn openai_reasoning_model(model: &str) -> bool {
     model == "o1" || model.starts_with("o1-")
         || model == "o3" || model.starts_with("o3-")
         || model == "o4" || model.starts_with("o4-")
-        || model.starts_with("gpt-5")
+        || model.starts_with("gpt-5") || model.starts_with("gpt-6")
 }
 
 fn reasoning_effort(provider: ProviderPreset, model: &str, effort: super::Effort) -> Option<&'static str> {
@@ -1538,7 +1732,12 @@ fn normalize_for_provider(api: ApiResponse, provider: ProviderPreset) -> Result<
         .or(msg.reasoning_content.filter(|s| !s.is_empty()))
         .or_else(|| reasoning_from_details(msg.reasoning_details.as_ref()));
 
-    let mut usage = api.usage.map(|usage| usage.usage).unwrap_or_default();
+    let mut usage = api.usage.map(|mut api| {
+        api.usage.cached_tokens = api.cached_tokens();
+        api.usage.reasoning_tokens = api.completion_tokens_details.as_ref()
+            .map(|details| details.reasoning_tokens).unwrap_or(0);
+        api.usage
+    }).unwrap_or_default();
     if usage.total_tokens == 0 {
         usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     }
@@ -1632,6 +1831,8 @@ struct ApiUsage {
     #[serde(default)]
     prompt_tokens_details: Option<CachedUsage>,
     #[serde(default)]
+    completion_tokens_details: Option<ReasoningUsage>,
+    #[serde(default)]
     prompt_cache_hit_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
@@ -1642,6 +1843,12 @@ impl ApiUsage {
         self.prompt_tokens_details.as_ref().map(|details| details.cached_tokens).unwrap_or(0)
             .max(self.prompt_cache_hit_tokens).max(self.cache_read_input_tokens)
     }
+}
+
+#[derive(Deserialize)]
+struct ReasoningUsage {
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -1734,6 +1941,226 @@ mod tests {
             max_tokens: None,
             role: crate::engine::Role::Smith,
             retry: RetryPolicy::full(),
+        }
+    }
+
+    fn responses_reply(output: Value) -> Value {
+        json!({
+            "id": "resp_1", "model": "gpt-6.1-sol", "status": "completed", "output": output,
+            "usage": { "input_tokens": 100, "output_tokens": 30, "total_tokens": 130,
+                "input_tokens_details": { "cached_tokens": 40 },
+                "output_tokens_details": { "reasoning_tokens": 20 } },
+        })
+    }
+
+    #[test]
+    fn responses_model_rule_preserves_existing_chat_models() {
+        for model in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5-2026-10-01", "gpt-6.1-sol", "gpt-7"] {
+            assert!(openai_responses_model(model), "{model}");
+        }
+        for model in ["gpt-5.2", "gpt-5", "gpt-4.1", "o3", "openai/gpt-6.1-sol", "gpt-5.3"] {
+            assert!(!openai_responses_model(model), "{model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_maps_tools_messages_images_and_usage() {
+        let server = MockServer::start().await;
+        let reply = responses_reply(json!([
+            { "type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "Inspect file"}], "encrypted_content": "opaque" },
+            { "type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "Checking."}] },
+            { "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file", "arguments": "{\"path\":\"hello.py\"}" }
+        ]));
+        Mock::given(method("POST")).and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply)).expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri());
+        let mut req = request(vec![spec()], Some(Effort::Low));
+        req.model = "gpt-6.1-sol".into();
+        req.max_tokens = Some(200);
+        req.messages[1].images = Some(vec!["data:image/png;base64,eA==".into()]);
+        let response = provider.chat(req).await.unwrap();
+        assert_eq!(response.content, "Checking.");
+        assert_eq!(response.reasoning.as_deref(), Some("Inspect file"));
+        assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].arguments, "{\"path\":\"hello.py\"}");
+        assert_eq!(response.usage.prompt_tokens, 100);
+        assert_eq!(response.usage.completion_tokens, 30);
+        assert_eq!(response.usage.total_tokens, 130);
+        assert_eq!(response.usage.cached_tokens, 40);
+        assert_eq!(response.usage.reasoning_tokens, 20);
+        let calls = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&calls[0].body).unwrap();
+        assert_eq!(body["input"][0], json!({"role":"system","content":"you are slag"}));
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][1]["content"][1]["type"], "input_image");
+        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][0]["parameters"], spec().parameters);
+        assert_eq!(body["tools"][0]["strict"], false);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["max_output_tokens"], 200);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        for field in ["messages", "reasoning_effort", "max_tokens", "max_completion_tokens"] {
+            assert!(body.get(field).is_none(), "{field}");
+        }
+        assert!(calls[0].headers.get("http-referer").is_none());
+        assert!(calls[0].headers.get("x-title").is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_tool_round_trip_replays_complete_reasoning_items() {
+        let server = MockServer::start().await;
+        let output = json!([
+            { "type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "encrypted-state" },
+            { "type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "read_file", "arguments": "{}", "status": "completed" }
+        ]);
+        Mock::given(method("POST")).and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_reply(output.clone())))
+            .up_to_n_times(1).expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri());
+        let mut req = request(vec![spec()], Some(Effort::Low));
+        req.model = "gpt-5.5".into();
+        let first = provider.chat(req.clone()).await.unwrap();
+        req.messages.push(ChatMessage::assistant(first.content, Some(first.tool_calls))
+            .with_reasoning_details(first.reasoning_details));
+        req.messages.push(ChatMessage::tool_result("call_2", "file content"));
+        Mock::given(method("POST")).and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_reply(json!([
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}
+            ])))).expect(1).mount(&server).await;
+        let final_response = provider.chat(req).await.unwrap();
+        assert_eq!(final_response.content, "Done.");
+        let calls = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&calls[1].body).unwrap();
+        assert_eq!(body["input"][2], output[0]);
+        assert_eq!(body["input"][3], output[1]);
+        assert_eq!(body["input"][4], json!({"type":"function_call_output","call_id":"call_2","output":"file content"}));
+        assert_eq!(body["input"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn responses_maps_legacy_calls_and_keeps_metadata_provider_scoped() {
+        let mut req = request(vec![], None);
+        req.messages.push(ChatMessage::assistant("old text", Some(vec![ToolCall {
+            id: "legacy_call".into(), name: "read_file".into(), arguments: "{}".into(),
+        }])).with_reasoning_details(Some(json!({"_slag_provider":"gemini","output":[{"type":"reasoning","id":"wrong"}]}))));
+        req.messages.push(ChatMessage::tool_result("legacy_call", "result"));
+        let body = build_responses_body(&req);
+        assert_eq!(body["input"][2], json!({"role":"assistant","content":"old text"}));
+        assert_eq!(body["input"][3], json!({"type":"function_call","call_id":"legacy_call","name":"read_file","arguments":"{}"}));
+        assert_eq!(body["input"][4]["type"], "function_call_output");
+        let provider = OpenRouter::with_provider(ProviderPreset::Mistral, "", "http://localhost:0");
+        req.messages[2].reasoning_details = Some(json!({"_slag_provider":"openai","_slag_transport":"responses","output":[{"type":"reasoning","id":"rs_secret"}]}));
+        assert!(!provider.build_body(&req).to_string().contains("rs_secret"));
+    }
+
+    #[test]
+    fn responses_replays_recovered_json_calls_beside_original_text() {
+        let output = json!([{"type":"message","id":"msg_recovered","role":"assistant","content":[{"type":"output_text","text":"{\"cmd\":\"true\",\"summary\":\"done\"}"}]}]);
+        let mut req = request(vec![], Some(Effort::Low));
+        req.messages.push(ChatMessage::assistant("", Some(vec![ToolCall {
+            id: "recovered_call".into(), name: "finish".into(), arguments: "{\"cmd\":\"true\",\"summary\":\"done\"}".into(),
+        }])).with_reasoning_details(Some(json!({"_slag_provider":"openai","_slag_transport":"responses","output":output}))));
+        req.messages.push(ChatMessage::tool_result("recovered_call", "done"));
+        let body = build_responses_body(&req);
+        assert_eq!(body["input"][2], output[0]);
+        assert_eq!(body["input"][3]["type"], "function_call");
+        assert_eq!(body["input"][3]["call_id"], "recovered_call");
+        assert_eq!(body["input"][4]["type"], "function_call_output");
+        assert_eq!(body["input"][4]["call_id"], "recovered_call");
+    }
+
+    #[tokio::test]
+    async fn responses_fallback_is_once_and_cached_across_clients() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"Function tools with reasoning_effort are not supported for this model in /v1/chat/completions"}})))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(responses_reply(json!([
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}
+            ])))).expect(2).mount(&server).await;
+        let mut req = request(vec![spec()], Some(Effort::Low));
+        req.model = "gpt-5.2".into();
+        req.retry = RetryPolicy::side();
+        for _ in 0..2 {
+            let provider = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri());
+            assert_eq!(provider.chat(req.clone()).await.unwrap().content, "ok");
+        }
+        assert!(responses_cached(&server.uri(), "gpt-5.2"));
+        assert!(!responses_cached("https://other-host.invalid/v1", "gpt-5.2"));
+    }
+
+    #[tokio::test]
+    async fn responses_fallback_does_not_loop_on_another_400() {
+        let server = MockServer::start().await;
+        let error = json!({"error":{"message":"Function tools with reasoning_effort are not supported in /v1/chat/completions"}});
+        for endpoint in ["/chat/completions", "/responses"] {
+            Mock::given(method("POST")).and(path(endpoint))
+                .respond_with(ResponseTemplate::new(400).set_body_json(error.clone()))
+                .expect(1).mount(&server).await;
+        }
+        let mut req = request(vec![spec()], Some(Effort::Low));
+        req.model = "unknown-future-model".into();
+        let provider = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri());
+        assert!(provider.chat(req).await.unwrap_err().is_deterministic_provider());
+    }
+
+    #[tokio::test]
+    async fn responses_errors_use_existing_categories() {
+        for (status, text, category) in [
+            (401, "invalid API key", ProviderErrorCategory::Auth),
+            (403, "Your team has exhausted its credits", ProviderErrorCategory::Billing),
+            (400, "unknown model", ProviderErrorCategory::InvalidRequest),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/responses"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(text))
+                .expect(1).mount(&server).await;
+            let mut req = request(vec![], Some(Effort::Low));
+            req.model = "gpt-6.1-sol".into();
+            let provider = OpenRouter::with_provider(ProviderPreset::OpenAI, "test-key", server.uri());
+            let SlagError::ProviderApi(error) = provider.chat(req).await.unwrap_err() else { panic!("wrong error") };
+            assert_eq!(error.category, category);
+            assert!(error.excerpt.contains("openai, role smith, model gpt-6.1-sol"));
+        }
+    }
+
+    #[test]
+    fn responses_incomplete_maps_reasoning_tokens_without_double_counting() {
+        let mut api = responses_reply(json!([{ "type":"reasoning", "id":"rs_limit", "summary":[] }]));
+        api["status"] = json!("incomplete");
+        api["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        let (response, cached) = normalize_responses(api).unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Length);
+        assert_eq!(response.usage.completion_tokens, 30);
+        assert_eq!(response.usage.reasoning_tokens, 20);
+        assert_eq!(cached, 40);
+        let mut filtered = responses_reply(json!([]));
+        filtered["status"] = json!("incomplete");
+        filtered["incomplete_details"] = json!({"reason":"content_filter"});
+        assert_eq!(normalize_responses(filtered).unwrap().0.finish_reason, FinishReason::Other);
+    }
+
+    #[tokio::test]
+    async fn responses_fallback_ignores_other_errors_and_providers() {
+        for (preset, status, text) in [
+            (ProviderPreset::OpenAI, 400, "Invalid tool parameters"),
+            (ProviderPreset::OpenAI, 401, "Function tools with reasoning_effort are not supported in /v1/chat/completions"),
+            (ProviderPreset::Mistral, 400, "Function tools with reasoning_effort are not supported in /v1/chat/completions"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(text))
+                .expect(1).mount(&server).await;
+            Mock::given(method("POST")).and(path("/responses"))
+                .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+            let provider = OpenRouter::with_provider(preset, "test-key", server.uri());
+            let mut req = request(vec![], None);
+            req.model = "gpt-5.2".into();
+            assert!(provider.chat(req).await.is_err());
+            assert!(!responses_cached(&server.uri(), "gpt-5.2"));
         }
     }
 

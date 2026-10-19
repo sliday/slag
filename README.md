@@ -83,9 +83,13 @@ Override a preset's endpoint with `SLAG_BASE_URL` or `base_url` in the file. Sup
 
 For separate endpoints in a mixed run, use `SLAG_<PROVIDER>_BASE_URL` or `<provider>_base_url`. Endpoint precedence is provider environment, generic environment, OpenRouter alias, provider file, generic file, then preset. slag rejects foreign preset hosts before authentication and does not follow HTTP redirects.
 
+OpenAI models from GPT-5.4 onward use the Responses API. Older models keep chat completions, with one cached switch after a tools/reasoning rejection. slag replays encrypted reasoning across tool calls without server-side storage.
+
 `slag cost` shows session spend. For OpenRouter, it also checks the account balance. Other providers get session spend and a note about the absent balance endpoint.
 
-Local list prices cover cloud defaults and common models, dated 2026-10-15. Sources and rates live in `slag-rs/src/engine/pricing.rs`. These estimates appear as `≈ $0.0031 est.` across spend displays. Unknown prices show input and output tokens. Mixed totals stay unknown if any call has an unknown price. Local and custom models stay unknown unless you set a price. No pricing lookup contacts another provider.
+Local list prices cover cloud defaults and common models. Each entry records its date. OpenAI rates include GPT-6.1 Sol and GPT-5.5, checked 2026-10-19.
+
+Sources and rates live in `slag-rs/src/engine/pricing.rs`. These estimates appear as `≈ $0.0031 est.` across spend displays. Unknown prices show input and output tokens. Mixed totals stay unknown if any call has an unknown price. Local and custom models stay unknown unless you set a price. No pricing lookup contacts another provider.
 
 Override list prices in USD per million tokens:
 
