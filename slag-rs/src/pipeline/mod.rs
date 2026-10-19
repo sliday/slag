@@ -362,13 +362,20 @@ pub async fn run(
 ) -> Result<(), SlagError> {
     tui::show_banner();
 
-    warden::set_rounds(temper_rounds);
-
-    let resumed_gap = if commission.is_none() && temper_rounds > 0 {
+    let resumed_unverified = if commission.is_none() {
+        unverified_goal_round(std::path::Path::new(crate::config::LEDGER))
+    } else { None };
+    let resumed_gap = if commission.is_none() {
         pending_goal_gap(std::path::Path::new(crate::config::LEDGER))
     } else {
         None
     };
+    let temper_rounds = if resumed_unverified.is_some() {
+        temper_rounds.max(1)
+    } else if temper_rounds == 0 {
+        resumed_gap.as_ref().map_or(0, |(round, _)| round.saturating_add(1))
+    } else { temper_rounds };
+    warden::set_rounds(temper_rounds);
     if let Some((round, gap)) = &resumed_gap {
         if *round >= temper_rounds {
             return Err(SlagError::GoalNotMet(format!(
@@ -381,8 +388,17 @@ pub async fn run(
         && empty_project(std::path::Path::new("."))
         && temper_rounds > 0;
 
+    let prior_head = commission.and_then(|_| review_head());
     // Fire furnace if needed
     let ore = fire_furnace(commission)?;
+    let base_path = std::path::Path::new(crate::config::LOG_DIR).join("commission-base");
+    if commission.is_some() {
+        if let Some(base) = prior_head.or_else(review_head) {
+            std::fs::create_dir_all(crate::config::LOG_DIR)?;
+            std::fs::write(&base_path, base)?;
+        }
+    }
+    warden::set_review_base(std::fs::read_to_string(base_path).ok());
 
     let direct = if direct_candidate && ore == Ore::Fired {
         let smith = crate::smith::make_scope_smith(config, &hooks);
@@ -437,7 +453,7 @@ pub async fn run(
     // wrote this" made it unreachable in the common case. One corrective
     // pass, not a loop -- a surveyor that cannot cover the gap when told
     // exactly what it is will not cover it on an identical third try.
-    if !direct && resumed_gap.is_none() {
+    if !direct && resumed_gap.is_none() && resumed_unverified.is_none() {
         if let Some(gap) = checkpoint(config, &hooks, "BLUEPRINT", crate::config::BLUEPRINT).await {
             let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
             surveyor::run_with_guidance(smith.as_ref(), Some(&gap)).await?;
@@ -501,7 +517,10 @@ pub async fn run(
     // casts ingots, and the forge runs again -- both halves of that loop
     // already existed.
     let mut forged;
-    let mut round = resumed_gap.as_ref().map_or(0, |(round, _)| *round);
+    let mut round = resumed_gap.as_ref().map_or_else(
+        || resumed_unverified.map_or(0, |round| round.min(temper_rounds.saturating_sub(1))),
+        |(round, _)| *round,
+    );
     // The warden's last word, carried past the assay. A run that prints
     // FORGED over an unmet goal launders the doubt it was asked to remove.
     let mut goal_gap: Option<String> = None;
@@ -659,6 +678,19 @@ pub async fn run(
         return Err(SlagError::GoalNotMet(gap));
     }
     forged
+}
+
+fn review_head() -> Option<String> {
+    let output = crate::engine::sandbox::git().args(["rev-parse", "HEAD"]).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn unverified_goal_round(path: &std::path::Path) -> Option<usize> {
+    let ledger = std::fs::read_to_string(path).ok()?;
+    let section = ledger.rsplit("## Warden round ").next()?;
+    let header = section.lines().next()?;
+    if !header.trim_end().ends_with("goal unverified") { return None; }
+    header.split_whitespace().next()?.trim_end_matches(':').parse().ok()
 }
 
 fn pending_goal_gap(path: &std::path::Path) -> Option<(usize, String)> {

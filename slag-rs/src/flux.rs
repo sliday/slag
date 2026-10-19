@@ -143,6 +143,9 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         bar = ingot.bar,
     );
 
+    flux.push_str(DELIVERY_RULES);
+    flux.push_str("\n\n");
+
     if let Some(slag_msg) = slag {
         flux.push_str(&format!(
             "!!! CRACKED - PREVIOUS ATTEMPT FAILED !!!\n{slag_msg}\n!!! ANALYZE AND FIX !!!\n\n\
@@ -367,6 +370,16 @@ fn founder_format_rules() -> String {
         .to_string()
 }
 
+const DELIVERY_RULES: &str = "\
+    Judge the commission as a usable deliverable.\n\
+    A requested CLI must run through its intended entry command in the delivered project.\n\
+    Include the local modules, dependency declarations, and configuration needed for that command.\n\
+    For a package deliverable, include the metadata needed for its intended installation or distribution.\n\
+    Check one suitable launch method, such as a console entry point or python -m.\n\
+    Do not require multiple launch methods unless the commission asks for them.\n\
+    Require installation only when the commission or its stated invocation requires it.\n\
+    Do not require a packaging format, a publish step, or a fixed test count without that requirement.";
+
 /// Ask for the acceptance bar: the concrete, inspectable statement a warden
 /// will judge the finished work against.
 ///
@@ -382,6 +395,7 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          Derive a short, reachable checklist from the commission's stated requirements.\n\
          Use the blueprint for context. Do not promote its design choices into requirements.\n\
          Name observable behavior and a direct way to inspect it.\n\
+         {DELIVERY_RULES}\n\
          Add no test counts, formatting rules, dependency bans, or features unless the commission requires them.\n\
          Permit normal imports between project modules.\n\
          Check test execution through the test runner, never by regex over test names or output.\n\
@@ -396,7 +410,7 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          ## HOW TO INSPECT\n\
          The commands a reviewer runs to check the list, in order.\n\n\
          RULES:\n\
-         - Trace each checklist item to a stated requirement.\n\
+         - Trace each checklist item to the commission or a runtime prerequisite for its requested behavior.\n\
          - NO QUESTIONS, NO PREAMBLE.\n\n\
          {}",
         DOCUMENT_OUTPUT_RULE
@@ -420,15 +434,18 @@ pub fn plan_warden_prompt(kind: &str, ore: &str, bar: &str, doc: &str) -> String
          Question: if this {kind} were carried out exactly as written, would \
          the result clear the bar?\n\n\
          Judge coverage of stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
+         {DELIVERY_RULES}\n\
          Do not require extra features, test counts, naming rules, or bans on normal project imports.\n\n\
          Do not ask for more detail for its own sake. A terse {kind} that \
          covers the bar passes.\n\n\
          Name ONE gap: the biggest thing the bar needs and this {kind} \
          does not deliver.\n\n\
+         Tool results include their tool-call IDs. Cite only IDs from successful inspection results.\n\
+         Put a JSON array of these IDs in EVIDENCE. Do not put paths, commands, or prose in EVIDENCE.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
          VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
-         EVIDENCE: the bar item that goes uncovered"
+         EVIDENCE: [\"tool-call-id\"]"
     )
 }
 
@@ -453,14 +470,17 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
          Do not edit files. Do not install packages. Do not run git commands.\n\
          Judge the stated sub-goal. Add no features, test counts, naming rules, or bans on normal project imports.\n\
+         {DELIVERY_RULES}\n\
          Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\n\
          Judge only this sub-goal. Work outside it is not your concern, and \
          a gap you name that belongs to another ingot wastes a heat here.\n\n\
          Name ONE gap: the biggest that still matters for THIS sub-goal.\n\n\
+         Tool results include their tool-call IDs. Cite only IDs from successful inspection results.\n\
+         Put a JSON array of these IDs in EVIDENCE. Do not put paths, commands, or prose in EVIDENCE.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
          VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
-         EVIDENCE: what you actually inspected"
+         EVIDENCE: [\"tool-call-id\"]"
     )
 }
 
@@ -485,14 +505,17 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
          Do not edit files. Do not install packages. Do not run git commands.\n\
          Judge the commission's stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
+         {DELIVERY_RULES}\n\
          Add no features, test counts, naming rules, or bans on normal project imports.\n\
          Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\
          Name one unmet requirement if the artifact fails. Cite the command output or source that proves your verdict.\n\
          Return unverified if you cannot inspect the artifact or verify a required behavior.\n\n\
+         Tool results include their tool-call IDs. Cite only IDs from successful inspection results.\n\
+         Put a JSON array of these IDs in EVIDENCE. Do not put paths, commands, or prose in EVIDENCE.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
          VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
-         EVIDENCE: the paths you inspected and commands you ran, with their results"
+         EVIDENCE: [\"tool-call-id\"]"
     )
 }
 
