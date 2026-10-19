@@ -271,7 +271,17 @@ Every run is one fix attempt in a copy of the working tree, uncommitted work inc
 
 ### Harnessing level: the library
 
-After the fix, a reflector reads the whole record. It writes one row per edited component, with a verdict of `helped`, `hurt`, `no observed effect` or `confounded`, and at most one lesson: a cue for the kind of situation and an operation on a named component. The library gains an entry only when slag's own measurements back a `helped` or `hurt` row: the runs under the harnesses that carried the edit beat the reference runs (or fell behind them) on the first measure that separates them, in this order: whether the fix verified, whether its new test catches the bug, tool errors, turns. The lesson must also name a harness component. A verdict the numbers contradict stays the reflector's opinion. Each entry holds the adopted harness, any rejected candidate whose edit backed the lesson, and an EXPERIENCE.md. An INDEX.md lists the entries per domain:
+After the fix, a reflector reads the whole record. It writes one row per edited component, with a verdict of `helped`, `hurt`, `no observed effect` or `confounded`, and at most one lesson: a cue for the kind of situation and an operation on a named component. The library gains an entry only when slag's own measurements back a `helped` or `hurt` row: the runs under the harnesses that carried the edit beat the reference runs (or fell behind them) on the first measure that separates them, in this order: whether the fix verified, whether its new test catches the bug, tool errors, turns. The lesson must also name a harness component, and its evidence must cite at least one run of the round by its label (`base-1`, `inv-1`). A verdict the numbers contradict stays the reflector's opinion.
+
+slag sets the entry's confidence from its own counts, and keeps the reflector's figure beside it:
+
+| Confidence | When |
+|------------|------|
+| high | 3 or more runs that carried the edit agree on whether the fix verified or its test caught the bug, against 2 or more reference runs, and no carrying run disagrees |
+| medium | 2 or more carrying runs agree on that outcome measure, and none disagrees |
+| low | anything less: one run against one, a difference in turns or tool errors alone, or runs that disagree. The entry says "could be noise" and why |
+
+Each entry holds the adopted harness, any rejected candidate whose edit backed the lesson, and an EXPERIENCE.md. An INDEX.md lists the entries per domain:
 
 ```text
 ~/.config/slag/library/<domain>/INDEX.md
@@ -280,7 +290,11 @@ After the fix, a reflector reads the whole record. It writes one row per edited 
 ~/.config/slag/library/<domain>/<entry>/candidates/<label>/
 ```
 
-The domain is the repository's stack (`python`, `node`, `rust`, `go`, `shell`, or `general`), read from the test command and the manifests; `--domain` overrides it. A repository can keep its own library at `.slag/library`. Later `--evolve` runs start from the base harness, and their editors and composers read the library as examples. `--harness library` applies what transfers without a probe, from the domain's most relevant entries and with no model call. An adopted harness's procedure, guardrails, tool guidance and hooks were written for the task that adopted them, and only `--evolve` adapts them, so they stay behind. Recipes come from every relevant entry, including a rejected candidate whose edit backed the lesson: a recipe costs nothing until its trigger loads it. From the same repository, the `memory.md` lines that state a fact "in this repository" come too.
+The domain is the repository's stack (`python`, `node`, `rust`, `go`, `shell`, or `general`), read from the test command and the manifests; `--domain` overrides it. A repository can keep its own library at `.slag/library`. Later `--evolve` runs start from the base harness, and their editors and composers read the library as examples. `--harness library` applies the domain's most relevant entries without a probe and with no model call. Entries rank by the words their title, cue and lesson share with the issue, with a bonus for the same repository. The best entry always applies, and up to two more when they share a word with the issue or come from the same repository. Every component of an applied entry comes over: its adopted harness, then each rejected candidate whose edit backed the lesson. Always-on files from several entries stack, best entry first, up to the 8000-byte cap; a recipe or script name keeps the first entry's copy; hook lines join. From another repository, the lines that state a fact "in this repository" stay behind. The run prints, and the done screen keeps, which entries applied and what each gave:
+
+```text
+note    harness from the python library: 20261019-170212-export-drops-the-last-day (memory.md, recipes/ends, systemprompt.md)
+```
 
 ### Safety and cost
 
@@ -288,8 +302,9 @@ The domain is the repository's stack (`python`, `node`, `rust`, `go`, `shell`, o
 - A guard refuses any working directory that holds a grader verdict, a rubric, a score file, a `hidden/` directory, or a bench path. Absolute paths of your repository read as `<repo>`.
 - A harness lives outside your repository, so no harness edit can touch your code or tests. Harness scripts run through the smith's sandboxed shell. Harness hooks run in the read-only sandbox without credential variables (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`), die at their timeout, and do not run at all where no OS sandbox exists.
 - The chosen fix lands in your repository only when every path it changed is a plain path inside the tree, outside `.git`, `.slag` and `logs`, and under no symbolic link. A link at a changed path is replaced, never written through.
-- The validator rejects a recipe without a trigger (`description:` of four words or more), a named script the harness does not ship, a script that does not parse, always-on text over 8000 bytes, a hook that is not a plain command, and notes that describe edits, or spell out file writes as text, over a tree that did not change (an unchanged tree needs KEEP_BASE in the notes). A rejected tree gets one retry with the validator's message, then falls back to the tree it started from, and the record says so.
-- `--evolve 1` costs up to four fix attempts and four improver sessions, plus one for each validation retry. The done screen and `slag status --json` (under `evolve`) show each stage's sessions, time, tokens and spend. `--evolve-budget USD` (default $2) and `--evolve-tokens N` (default 4,000,000) cap everything the recursion spends. Once either is reached, no further session starts, and the dollar cap also stops a session in flight at its next turn. A capped run says so and delivers the best verified fix found so far.
+- The validator rejects a recipe without a trigger (`description:` of four words or more), a named script the harness does not ship, a script that does not parse, always-on text over 8000 bytes, a hook that is not a plain command, and notes that describe edits, or spell out file writes as text, over a tree that did not change (an unchanged tree needs KEEP_BASE in the notes). A rejected tree gets one retry with the validator's message, then falls back to the tree it started from, and the record says so. A composer whose notes keep edits (`kept -> inv-1 recipes/tests -> ...`) but who wrote none gets those components copied from the named candidates before any retry; the record lists them under `applied`.
+- `--evolve 1` costs up to four fix attempts and four improver sessions, plus one for each validation retry. The done screen and `slag status --json` (under `evolve`) show each stage's sessions, time, tokens and spend, as `≈ $0.0123 est.` from the dated price list (or OpenRouter's reported cost). `--evolve-budget USD` (default $2) and `--evolve-tokens N` (default 4,000,000) cap everything the recursion spends. Once either is reached, no further session starts, and both caps stop a session in flight at its next turn. The reference runs are the plain fix, so they always finish; their spend still counts. A capped run says so and delivers the best verified fix found so far.
+- slag never invents a price. A call to a model with no list price, no `[pricing]` override and no OpenRouter cost adds nothing to the dollar figure and counts toward the token cap alone. The run names such models up front, and each spend line shows their tokens apart: `≈ $0.0041 est. + 12.3k unpriced tokens`.
 - `.slag/evolve/<run>/record.json` keeps the whole record: every run with what slag measured, every candidate with its outcome, the composer's and editors' notes, the selection, and the library outcome.
 
 | Setting | Env | `config.toml` key | Flag |
