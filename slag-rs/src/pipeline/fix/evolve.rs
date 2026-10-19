@@ -453,8 +453,17 @@ pub(super) async fn run(ctx: &Ctx<'_>, baseline: Option<&Run>, settings: Setting
         evolver.parallel(&mut ev.record).await
     };
     if let Err(e) = outcome {
-        persist(&ev.sh, &ev.record);
-        return Err(e);
+        // A verified fix in hand outlives a later stage's error: the
+        // recursion stops and delivers it, as at a cap. A cancel, or an
+        // error before anything verified, still ends the fix.
+        if matches!(e, SlagError::Cancelled) || !ev.record.runs.iter().any(|r| r.verified) {
+            persist(&ev.sh, &ev.record);
+            return Err(e);
+        }
+        let why = format!("a stage failed: {e}");
+        crate::error::clear_provider_failure();
+        note(ctx.hooks, &format!("evolve stopped: {why}; keeping the best verified fix so far"), false);
+        ev.record.capped = Some(why);
     }
     evolver.select(&mut ev.record).await?;
     persist(&ev.sh, &ev.record);
@@ -1294,10 +1303,12 @@ impl Evolver<'_, '_> {
             (first.label.clone(), "composed", "k = 1: the composed harness's run verified".to_string(), BTreeMap::new())
         } else if pool.len() == 1 {
             (first.label.clone(), "only", "the only verified run".to_string(), BTreeMap::new())
-        } else if record.capped.is_some() {
-            let why = "a cap stopped the run, so slag kept the best verified run by its own order: composed, \
-                       then candidates, then reference";
-            (first.label.clone(), "capped", why.to_string(), BTreeMap::new())
+        } else if let Some(stop) = &record.capped {
+            let why = format!(
+                "the run stopped early ({stop}), so slag kept the best verified run by its own order: \
+                 composed, then candidates, then reference"
+            );
+            (first.label.clone(), "capped", why, BTreeMap::new())
         } else {
             let mark = self.mark();
             let picked = self.selector(&pool).await;

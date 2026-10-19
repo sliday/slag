@@ -90,8 +90,14 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self { role: "user".into(), content: content.into(), tool_calls: None, tool_call_id: None, reasoning_details: None, images: None }
     }
+    /// A turn with neither text nor tool calls gets a placeholder: Mistral
+    /// and Anthropic reject an empty assistant message when slag re-sends it.
     pub fn assistant(content: impl Into<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
-        Self { role: "assistant".into(), content: content.into(), tool_calls, tool_call_id: None, reasoning_details: None, images: None }
+        let mut content = content.into();
+        if content.trim().is_empty() && tool_calls.as_ref().is_none_or(|calls| calls.is_empty()) {
+            content = "(no reply)".into();
+        }
+        Self { role: "assistant".into(), content, tool_calls, tool_call_id: None, reasoning_details: None, images: None }
     }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -216,6 +222,20 @@ impl Usage {
         // One estimated leg makes the whole sum an estimate. The key fields
         // stay put: a fold across models has no single model or role.
         self.estimated |= other.estimated;
+    }
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::{ChatMessage, ToolCall};
+
+    #[test]
+    fn an_empty_assistant_turn_never_goes_out_empty() {
+        assert_eq!(ChatMessage::assistant("", None).content, "(no reply)");
+        assert_eq!(ChatMessage::assistant(" \n", Some(Vec::new())).content, "(no reply)");
+        assert_eq!(ChatMessage::assistant("done", None).content, "done");
+        let call = ToolCall { id: "c0".into(), name: "read_file".into(), arguments: "{}".into() };
+        assert_eq!(ChatMessage::assistant("", Some(vec![call])).content, "", "tool calls carry the turn");
     }
 }
 

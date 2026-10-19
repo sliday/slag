@@ -176,6 +176,7 @@ impl SlagError {
 }
 
 static PROVIDER_RUN: std::sync::Mutex<Option<Option<ProviderApiError>>> = std::sync::Mutex::new(None);
+static QUIET_BEFORE_FAILURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct ProviderRunGuard {
     quiet: bool,
@@ -205,10 +206,23 @@ pub fn record_provider_failure(error: &SlagError) {
             if let Some(first) = PROVIDER_RUN.lock().unwrap().as_mut() {
                 if first.is_none() {
                     *first = Some(api.clone());
+                    QUIET_BEFORE_FAILURE.store(crate::tui::is_quiet(), std::sync::atomic::Ordering::Relaxed);
                     // Suppress the success assay when a critic catches this failure.
                     crate::tui::set_quiet(true);
                 }
             }
+        }
+    }
+}
+
+/// Forget the run's recorded provider failure and restore the output it
+/// silenced. Only for a caller that stops on the error with a verified
+/// result in hand: the error is then its to report. A later call that
+/// fails the same way records it again.
+pub fn clear_provider_failure() {
+    if let Some(first) = PROVIDER_RUN.lock().unwrap().as_mut() {
+        if first.take().is_some() {
+            crate::tui::set_quiet(QUIET_BEFORE_FAILURE.load(std::sync::atomic::Ordering::Relaxed));
         }
     }
 }

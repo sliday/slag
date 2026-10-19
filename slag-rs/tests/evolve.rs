@@ -39,6 +39,8 @@ struct Roles {
     nudges: Arc<Mutex<Vec<String>>>,
     /// A composer that names the edits it keeps and writes none.
     lazy_composer: Arc<std::sync::atomic::AtomicBool>,
+    /// A provider that rejects every smith call under the test recipe.
+    reject_recipe_smith: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn tool_call(calls: Vec<(&str, Value)>) -> ResponseTemplate {
@@ -127,6 +129,11 @@ impl Respond for Roles {
             return text(REFLECTION);
         }
         if first.contains("# slag smith") {
+            if self.reject_recipe_smith.load(std::sync::atomic::Ordering::Relaxed) && first.contains("ALWAYS ADD A TEST") {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"message": "Assistant message must have either content or tool_calls, but not none."}
+                }));
+            }
             if task.contains("REVIEW: ONE GAP LEFT") {
                 return tool_call(vec![("finish", json!({"summary": "Nothing to change.", "cmd": "bash tests/check.sh"}))]);
             }
@@ -400,6 +407,26 @@ async fn a_cap_stops_the_recursion_and_keeps_the_verified_fix() {
     assert!(rec["library"].as_str().unwrap().contains("reflection skipped"));
     let systems = roles.systems.lock().unwrap().clone();
     assert!(!systems.iter().any(|s| s.contains("YOUR DIMENSION")), "no editor ran past the cap");
+    assert_eq!(sh(repo.path(), "cat value.txt").trim(), "2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_probe_keeps_the_verified_fix_it_already_has() {
+    let repo = buggy_repo();
+    let home = tempfile::tempdir().unwrap();
+    let (server, roles) = model().await;
+    roles.reject_recipe_smith.store(true, std::sync::atomic::Ordering::Relaxed);
+    let args = ["fix", "value is wrong", "--test", "bash tests/check.sh", "--evolve", "1"];
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("FIXED") && stdout.contains("evolve stopped: a stage failed"), "{stdout}");
+    let rec = record(repo.path());
+    assert!(rec["capped"].as_str().unwrap().starts_with("a stage failed: "), "{rec:#}");
+    let stages: Vec<&str> = rec["stages"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(stages, ["reference", "propose", "probe"], "nothing past the failed stage runs");
+    assert!(rec["selection"]["chosen"].is_string(), "the verified run delivers: {rec:#}");
+    assert!(rec["library"].as_str().unwrap().contains("reflection skipped"));
     assert_eq!(sh(repo.path(), "cat value.txt").trim(), "2");
 }
 
