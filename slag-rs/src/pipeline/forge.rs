@@ -935,6 +935,7 @@ async fn resume_session(
         .with_context_window(window)
         .with_coordinator_root(std::path::PathBuf::from("."))
         .with_resume(true)
+        .with_required_verification()
         .with_effort(config.effort.or(Some(Effort::from_grade(ingot.grade))));
     if let Some(tx) = &hooks.events {
         agent = agent.with_events(tx.clone());
