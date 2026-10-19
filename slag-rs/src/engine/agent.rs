@@ -754,7 +754,8 @@ impl ForgeAgent {
                         // the watermark on purpose — the model needs its own
                         // partial to continue from.
                         nudges += 1;
-                        messages.push(ChatMessage::assistant(resp.content, None));
+                        messages.push(ChatMessage::assistant(resp.content, None)
+                            .with_reasoning_details(resp.reasoning_details.clone()));
                         messages.push(ChatMessage::user(CONTINUE_NUDGE));
                         record_msg(tw, &messages[messages.len() - 2]);
                         record_msg(tw, &messages[messages.len() - 1]);
@@ -777,7 +778,8 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                 if require_verification && !has_verification_command(&resp.content) && !finish_cmd_nudged {
                     finish_cmd_nudged = true;
                     finish_repair_pending = true;
-                    messages.push(ChatMessage::assistant(resp.content, None));
+                    messages.push(ChatMessage::assistant(resp.content, None)
+                        .with_reasoning_details(resp.reasoning_details.clone()));
                     messages.push(ChatMessage::user(FINISH_CMD_NUDGE));
                     record_msg(tw, &messages[messages.len() - 2]);
                     record_msg(tw, &messages[messages.len() - 1]);
@@ -2476,9 +2478,12 @@ mod tests {
     #[tokio::test]
     async fn truncation_at_the_raised_cap_gets_a_continuation_nudge() {
         let dir = tempfile::tempdir().unwrap();
+        let details = serde_json::json!({"responses_output": [{"type": "reasoning", "encrypted_content": "opaque"}]});
+        let mut partial = resp_text("still partial", FinishReason::Length);
+        partial.reasoning_details = Some(details.clone());
         let provider = MockProvider::new(vec![
             resp_text("partial", FinishReason::Length),
-            resp_text("still partial", FinishReason::Length),
+            partial,
             resp_text("complete", FinishReason::Stop),
         ]);
 
@@ -2496,6 +2501,7 @@ mod tests {
         assert_eq!(msgs[msgs.len() - 1].content, CONTINUE_NUDGE);
         assert_eq!(msgs[msgs.len() - 2].content, "still partial");
         assert_eq!(msgs[msgs.len() - 2].role, "assistant");
+        assert_eq!(msgs[msgs.len() - 2].reasoning_details.as_ref(), Some(&details));
     }
 
     #[tokio::test]

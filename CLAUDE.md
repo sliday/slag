@@ -120,9 +120,13 @@ Use `provider::model` to route one role through another provider, such as `model
 
 OpenRouter keeps its reasoning object, `reasoning_details` replay, attribution headers, pricing lookup, and native fallback routing. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. The agent recovers standalone JSON against declared tool schemas and rejects prose or code fences. It returns provider tool-validation errors to the model, with a limit of three consecutive failures.
 
+OpenAI models from GPT-5.4 onward use `/responses`. Older models keep chat completions. A matching tools/reasoning rejection switches once per model and endpoint. slag replays encrypted reasoning and output items without server-side storage.
+
 Other providers receive supported reasoning fields or omit them. `slag cost` shows session spend and a one-line balance note for non-OpenRouter providers.
 
-`engine/pricing.rs` holds cloud list prices and source URLs, dated 2026-10-15. It estimates default and common models without network calls. All spend displays use `pricing::format_cost`: `≈ $0.0031 est.` for estimates, or input/output tokens when the price is unknown. Mixed totals stay unknown if any call lacks a price. Only OpenRouter reads its `pricing.json` catalog cache. Local/custom models need an override for a cost estimate.
+`engine/pricing.rs` holds cloud list prices and source URLs, dated per entry. OpenAI rates include GPT-6.1 Sol and GPT-5.5, checked 2026-10-19. It estimates default and common models without network calls.
+
+All spend displays use `pricing::format_cost`: `≈ $0.0031 est.` for estimates, or input/output tokens when the price is unknown. Mixed totals stay unknown if any call lacks a price. Only OpenRouter reads its `pricing.json` catalog cache. Local/custom models need an override for a cost estimate.
 
 ```toml
 [pricing]

@@ -173,6 +173,10 @@ pub struct Usage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     /// OpenRouter reports spend in credits when `usage: {include: true}`.
     #[serde(default)]
     pub cost: Option<f64>,
@@ -195,6 +199,8 @@ impl Usage {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.total_tokens += other.total_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
         if let Some(c) = other.cost {
             *self.cost.get_or_insert(0.0) += c;
         }
@@ -204,6 +210,23 @@ impl Usage {
         // One estimated leg makes the whole sum an estimate. The key fields
         // stay put: a fold across models has no single model or role.
         self.estimated |= other.estimated;
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::Usage;
+
+    #[test]
+    fn token_details_sum_and_old_logs_default_to_zero() {
+        let mut usage: Usage = serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}"#).unwrap();
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 0);
+        usage.add(&Usage { cached_tokens: 3, reasoning_tokens: 2, ..Default::default() });
+        usage.add(&Usage { cached_tokens: 4, reasoning_tokens: 1, ..Default::default() });
+        assert_eq!(usage.cached_tokens, 7);
+        assert_eq!(usage.reasoning_tokens, 3);
+        assert_eq!(usage.total_tokens, 15);
     }
 }
 
