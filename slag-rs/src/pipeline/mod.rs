@@ -718,6 +718,10 @@ fn empty_project(root: &std::path::Path) -> bool {
 }
 
 fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagError> {
+    for (path, content) in &plan.fixtures {
+        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap())?;
+        std::fs::write(path, content)?;
+    }
     let checklist = plan.criteria.iter().map(|item| format!("- [ ] {item}")).collect::<Vec<_>>().join("\n");
     let commands: Vec<_> = std::iter::once(&plan.proof).chain(&plan.commands).cloned().collect();
     let checks = format!("REQUIRED RUN COMMANDS: {}", serde_json::to_string(&commands).unwrap());
@@ -729,7 +733,7 @@ fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagE
         "## THE BAR\nDeliver the named behavior in the original commission.\n\n{contract}\n\
          ## HOW TO INSPECT\n\
          Read the product and test source, then run the declared suite and CLI probes.\n\
-         Run each required command as its own bash call, copied verbatim. Cite those successful run IDs in EVIDENCE.\n\
+         Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful run IDs in EVIDENCE.\n\
          Check each named behavior and flag through the actual CLI tests. Source inspection alone cannot pass this bar.\n\
          Use in-memory test data or committed fixtures under tests/fixtures. The reviewer cannot create fixtures or caches.\n\
          Judge the commission without extra naming, style, or test-count rules.\n"

@@ -898,3 +898,26 @@ async fn source_inspection_without_the_declared_run_cannot_pass() {
     let ledger = git(root.path(), &["show", "HEAD:PROGRESS.md"]);
     assert!(ledger.contains("goal unverified"), "{ledger}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_reference_contract_stops_before_forging() {
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let invalid = json!({
+        "direct": true, "proof": "python3 -m unittest", "criteria": ["Copy file contents like cat."],
+        "commands": ["python3 copy.py fixtures/sample.txt"]
+    }).to_string();
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": invalid}, "finish_reason": "stop"}]
+        }))).expect(2).mount(&server).await;
+    let output = base_command(root.path(), config.path(), &server)
+        .args(["--temper", "1", "A tiny file-copy CLI like cat with a unittest suite."])
+        .assert().failure().get_output().clone();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("FORGED"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no valid comparison contract"));
+    assert!(!root.path().join("copy.py").exists());
+    assert!(!root.path().join("PLAN.md").exists());
+    server.verify().await;
+}
