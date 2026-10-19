@@ -163,11 +163,16 @@ impl Library {
     }
 
     /// The cheap path (`--harness library`): build a harness in `dst` from
-    /// the domain's most relevant entries, with no model call. The best
-    /// entry's whole tree goes in; the next ones add only recipes, which
-    /// cost nothing until loaded. An entry from another repository brings
-    /// no line that states a fact "in this repository". Returns the ids
-    /// used, best first.
+    /// the domain's most relevant entries, with no model call. Entries
+    /// rank by the words their title, cue and lesson share with `query`,
+    /// with a bonus for the same repository; ties keep the newer entry.
+    ///
+    /// An adopted harness's always-on text is written for the task that
+    /// adopted it, and only a repository's own entries carry it over: the
+    /// best of those comes whole. From every other entry, and from the
+    /// next ones, only recipes come, with their own scripts: they cost
+    /// nothing until a trigger loads them. Returns the ids that gave
+    /// anything, best first.
     pub fn apply(&self, domain: &str, query: &str, repository: &str, dst: &Path) -> Vec<String> {
         let mut scored: Vec<(usize, Entry)> = self
             .entries(domain)
@@ -181,7 +186,6 @@ impl Library {
                 (score, e)
             })
             .collect();
-        // Stable on the newest-first order: ties keep the newer entry.
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
         let mut used = Vec::new();
         let mut files = std::collections::BTreeMap::new();
@@ -189,18 +193,16 @@ impl Library {
             if i > 0 && score == 0 {
                 break;
             }
-            let foreign = e.repository != repository;
+            let whole = i == 0 && e.repository == repository;
             let mut add = tree(&e.dir.join("harness"));
-            if i > 0 {
+            if !whole {
                 let taken: Vec<String> = files.keys().filter_map(|k: &String| recipe_name(k)).collect();
                 add.retain(|p, _| recipe_name(p).is_some_and(|n| !taken.contains(&n)));
             }
-            for (path, bytes) in add {
-                let bytes = if foreign && path.ends_with(".md") { local_facts_out(&bytes) } else { bytes };
-                if !bytes.iter().all(u8::is_ascii_whitespace) {
-                    files.insert(path, bytes);
-                }
+            if add.is_empty() {
+                continue;
             }
+            files.extend(add);
             used.push(e.id);
         }
         let _ = write_tree(&files, dst);
@@ -290,24 +292,47 @@ pub fn parse_reflection(text: &str) -> (Vec<EditRow>, Option<Lesson>) {
 }
 
 /// Does the reflection earn a library entry? Only a lesson backed by an
-/// observed contrast does: a row that says an edit `helped` or `hurt`,
-/// over a round where some candidate changed the harness and slag saw
-/// the runs behave differently. `Err` says why not.
-pub fn admit(rows: &[EditRow], lesson: Option<&Lesson>, edited: bool, contrast: bool) -> Result<(), String> {
+/// observed contrast does: some candidate changed the harness, and at
+/// least one `helped` or `hurt` row is one slag's own measurements back
+/// (`backed`, a subset of `rows`). `Err` says why not.
+pub fn admit(lesson: Option<&Lesson>, edited: bool, rows: &[EditRow], backed: &[EditRow]) -> Result<(), String> {
     if lesson.is_none() {
         return Err("the reflector wrote NO_ENTRY".into());
     }
     if !edited {
         return Err("no candidate changed the harness".into());
     }
-    if !contrast {
-        return Err("no run behaved differently from the reference runs".into());
-    }
     if !rows.iter().any(|r| r.verdict.starts_with("helped") || r.verdict.starts_with("hurt")) {
         return Err("no edit row shows an effect (all confounded or none observed)".into());
     }
+    if backed.is_empty() {
+        return Err("no `helped` or `hurt` row matches slag's measurements: the runs that carried \
+                    the edit did not beat, or fall behind, the reference runs"
+            .into());
+    }
+    let lesson = lesson.map(|l| l.lesson.to_ascii_lowercase()).unwrap_or_default();
+    let names_one = COMPONENT_WORDS.iter().any(|w| lesson.contains(w))
+        || backed.iter().any(|r| lesson.contains(&r.component.to_ascii_lowercase()));
+    if !names_one {
+        return Err("the lesson names no harness component, so it says how to fix one issue, \
+                    not how to change a harness"
+            .into());
+    }
     Ok(())
 }
+
+/// Words that name a harness component in a lesson.
+const COMPONENT_WORDS: [&str; 9] = [
+    "systemprompt",
+    "system prompt",
+    "guardrail",
+    "memory",
+    "tool_guidance",
+    "tool guidance",
+    "recipe",
+    "script",
+    "hook",
+];
 
 fn experience_md(domain: &str, e: &NewEntry) -> String {
     let mut s = format!(
@@ -358,16 +383,6 @@ fn parse_entry(id: &str, dir: &Path, text: &str) -> Entry {
 /// `recipes/<name>/...` names its recipe.
 fn recipe_name(path: &str) -> Option<String> {
     path.strip_prefix("recipes/")?.split('/').next().map(str::to_string)
-}
-
-/// Lines that state a fact about the repository an entry came from.
-fn local_facts_out(bytes: &[u8]) -> Vec<u8> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .filter(|l| !l.to_ascii_lowercase().contains("in this repository"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .into_bytes()
 }
 
 /// How many distinct words of four letters or more two texts share.
@@ -426,12 +441,15 @@ mod tests {
     #[test]
     fn only_a_contrast_backed_lesson_is_admitted() {
         let (rows, lesson) = parse_reflection(REFLECTION);
-        assert!(admit(&rows, lesson.as_ref(), true, true).is_ok());
-        assert!(admit(&rows, None, true, true).unwrap_err().contains("NO_ENTRY"));
-        assert!(admit(&rows, lesson.as_ref(), false, true).unwrap_err().contains("changed the harness"));
-        assert!(admit(&rows, lesson.as_ref(), true, false).unwrap_err().contains("behaved differently"));
-        let confounded: Vec<EditRow> = rows.into_iter().filter(|r| r.verdict == "confounded").collect();
-        assert!(admit(&confounded, lesson.as_ref(), true, true).unwrap_err().contains("confounded"));
+        let backed = &rows[..1];
+        assert!(admit(lesson.as_ref(), true, &rows, backed).is_ok());
+        assert!(admit(None, true, &rows, backed).unwrap_err().contains("NO_ENTRY"));
+        assert!(admit(lesson.as_ref(), false, &rows, backed).unwrap_err().contains("changed the harness"));
+        assert!(admit(lesson.as_ref(), true, &rows, &[]).unwrap_err().contains("slag's measurements"));
+        let confounded: Vec<EditRow> = rows.iter().filter(|r| r.verdict == "confounded").cloned().collect();
+        assert!(admit(lesson.as_ref(), true, &confounded, &[]).unwrap_err().contains("confounded"));
+        let fix_only = Lesson { lesson: "edit split() to hand out the remainder".into(), ..lesson.clone().unwrap() };
+        assert!(admit(Some(&fix_only), true, &rows, backed).unwrap_err().contains("names no harness component"));
     }
 
     #[test]
@@ -465,14 +483,14 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].repository, "shop");
 
-        // Another repository gets the tree without this one's local facts.
+        // Another repository gets only the recipes: always-on text was
+        // written for the task that adopted it.
         let out = dir.path().join("applied");
         let used = lib.apply("python", "the range report loses its last day", "other", &out);
         assert_eq!(used.len(), 1);
-        let memory = std::fs::read_to_string(out.join("memory.md")).unwrap();
-        assert!(memory.contains("unittest") && !memory.contains("src/d.py"), "{memory}");
         assert!(out.join("recipes/ends/RECIPE.md").exists());
-        // The same repository keeps them.
+        assert!(!out.join("memory.md").exists());
+        // The same repository gets the whole tree.
         lib.apply("python", "anything", "shop", &out);
         assert!(std::fs::read_to_string(out.join("memory.md")).unwrap().contains("src/d.py"));
         // An empty domain applies nothing.

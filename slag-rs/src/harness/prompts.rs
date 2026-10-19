@@ -106,7 +106,7 @@ would be wrong for another issue in the same kind of repository is scoped too na
   repository fact  \"in this repository, `format_range` in src/report.py builds every range; \
 tests for it live in tests/test_report.py\"
   procedure        \"find where the wrong value is produced before editing where it shows\"
-  too generic      \"be thorough\" (changes no behaviour)
+  too generic      \"be thorough\" (changes no behavior)
 
 `context/library/` HOLDS FINISHED HARNESSES FROM EARLIER TASKS, with an EXPERIENCE.md each \
 saying why it was adopted. They are examples to read. They are NOT part of the harness you \
@@ -369,7 +369,7 @@ pub fn selector(n: usize) -> String {
          names and the result it expects, through the public function or command the issue \
          describes? Does it fail without the fix (see slag's reversal check)?\n\
          3. CONFORMANCE. Is the change ONLY what the issue asks? Public names and signatures \
-         kept, no unrelated edits, no reformatting, no test weakened. Extra behaviour is a \
+         kept, no unrelated edits, no reformatting, no test weakened. Extra behavior is a \
          deviation, not an improvement.\n\
          4. PLACE. Does each new test sit in the test file for the module it tests, in that \
          file's framework and style?\n\
@@ -407,23 +407,26 @@ domain reads before it makes its own edits. `context/README.md` maps the evidenc
 
 Selection compared FIXES with the harnesses hidden, so the choice says which fix read best, \
 not which edit worked. Treat every candidate as evidence. An edit that appeared only in a \
-rejected candidate may still be the one that changed behaviour for the better, and an edit \
+rejected candidate may still be the one that changed behavior for the better, and an edit \
 inside the adopted candidate may have contributed nothing. Read the trajectories, not the \
 verdict.
 
 # WHAT EACH EDIT DID
 
-Each candidate's `diff.md` diffs its harness against `context/base_harness/`. For each \
-component any candidate changed, write one row: the component, what the edit changed, the \
-observed difference in execution it produced, and a verdict.
+Each candidate's `diff.md` diffs its harness against `context/base_harness/`, and \
+`context/edits.md` lists the components each candidate changed. For each component any \
+candidate changed, write one row: the component, what the edit changed, the observed \
+difference in execution it produced, and a verdict. Rows cover harness components only, by \
+the paths `context/edits.md` uses. The repository's own source and test files are not \
+components: never write a row for them.
 
 Verdicts are `helped`, `hurt`, `no observed effect` and `confounded`. Use `confounded`, and \
 prefer it, whenever a candidate changed several components at once and no run isolates one \
 of them, or when a single run is all that stands behind the difference. A confounded row is a \
 useful record. An invented attribution poisons the library for every later task. Cite the run \
-and the point in its trajectory where behaviour diverges. slag's measurements (tests exit \
+and the point in its trajectory where behavior diverges. slag's measurements (tests exit \
 code, whether the new test fails without the fix, turns, tool errors) count as observed \
-behaviour.
+behavior.
 
 # THE ONE LESSON THAT TRANSFERS
 
@@ -431,8 +434,10 @@ Now write at most one durable entry, and only if the edit rows support it.
 
 The `cue` describes the SHAPE OF SITUATION the lesson applies to, so it can fire on a \
 different issue: not this issue's facts, the pattern. The `lesson` is the operation to perform \
-on a harness, stated so it can be applied and checked, and it must name the component it \
-concerns.
+on a HARNESS component, stated so it can be applied and checked: it names the component \
+(`systemprompt.md`, `guardrails.md`, `memory.md`, `tool_guidance.md`, a recipe, a script, or \
+`hooks.toml`) and says what to put there. A lesson that says how to fix this issue's code is \
+not a lesson about harnesses: write NO_ENTRY instead.
 
 Too generic is useless (\"be thorough\"); too specific never fires again (\"the fee rose to 250 \
 on Jan 1\"). Aim between: \"when an issue reports a range that loses its last element, add a \

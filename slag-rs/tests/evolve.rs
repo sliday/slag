@@ -4,10 +4,10 @@
 //! assistant turns so far says which step of its script comes next. No
 //! network and no real key.
 //!
-//! The scripted model has one behaviour a harness can change: a smith
+//! The scripted model has one behavior a harness can change: a smith
 //! whose system prompt carries `ALWAYS ADD A TEST` writes a regression
 //! test beside the fix, and one without it does not. That is the
-//! behavioural contrast the probes measure and the library records.
+//! behavioral contrast the probes measure and the library records.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -207,7 +207,7 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
     assert_eq!(cand("comp-1")["outcome"], "edited");
 
     // The probe of a fallen-back candidate reuses the reference run; the
-    // composed harness changed behaviour: its run wrote a regression test.
+    // composed harness changed behavior: its run wrote a regression test.
     let run_of = |label: &str| rec["runs"].as_array().unwrap().iter().find(|r| r["label"] == label).unwrap().clone();
     assert_eq!(run_of("dom-1")["reused"], "base-1");
     assert_eq!(run_of("base-1")["files"], json!(["value.txt"]));
@@ -253,16 +253,16 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
 async fn the_library_path_applies_the_lesson_with_no_probing() {
     let home = tempfile::tempdir().unwrap();
     let (server, roles) = model().await;
-    let first = buggy_repo();
+    let repo = buggy_repo();
     let args = ["fix", "value is wrong", "--test", "bash tests/check.sh", "--evolve", "1"];
-    let out = run(slag(first.path(), &server, home.path(), &args)).await;
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
 
-    // A second repository of the same kind, on the cheap path.
-    let second = buggy_repo();
+    // The next issue in the same repository, on the cheap path.
+    sh(repo.path(), "git checkout -q main");
     roles.systems.lock().unwrap().clear();
     let args = ["fix", "value is off", "--test", "bash tests/check.sh", "--harness", "library"];
-    let out = run(slag(second.path(), &server, home.path(), &args)).await;
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("harness: shell library entries"), "{stdout}");
@@ -270,8 +270,20 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     assert!(!systems.iter().any(|s| s.contains("You are composing") || s.contains("YOUR DIMENSION")), "no improver ran");
     let smith = systems.iter().find(|s| s.contains("# slag smith")).expect("a smith ran");
     assert!(smith.contains("# Harness") && smith.contains(RULE), "the lesson reached the smith's prompt");
-    let files = sh(second.path(), "git show --name-only --format= HEAD");
-    assert!(files.contains("tests/value_test.sh"), "the applied harness changed behaviour: {files}");
+    let files = sh(repo.path(), "git show --name-only --format= HEAD");
+    assert!(files.contains("tests/value_test.sh"), "the applied harness changed behavior: {files}");
+
+    // Another repository gets no always-on text from it: that text was
+    // written for the task that adopted it.
+    let other = buggy_repo();
+    roles.systems.lock().unwrap().clear();
+    let out = run(slag(other.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("no shell library entry applies here"), "{stdout}");
+    let systems = roles.systems.lock().unwrap().clone();
+    let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
+    assert!(!smith.contains("# Harness"), "{smith}");
 
     // Without --harness, the fast path's prompt carries no harness at all.
     let third = buggy_repo();

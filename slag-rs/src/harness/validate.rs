@@ -55,8 +55,9 @@ pub async fn validate(dir: &Path) -> Result<Vec<String>, String> {
         }
         if recipe.description.split_whitespace().count() < TRIGGER_MIN_WORDS {
             errors.push(format!(
-                "recipe `{name}` has no trigger: its `description:` must say when to load it, \
-                 in at least {TRIGGER_MIN_WORDS} words"
+                "recipe `{name}` has no trigger: its frontmatter needs a `description:` line (a key, \
+                 not a comment) that says when to load it, in at least {TRIGGER_MIN_WORDS} words, \
+                 such as `description: when <the situation>, load this to <what it does>`"
             ));
         }
     }

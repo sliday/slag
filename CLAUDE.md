@@ -54,7 +54,8 @@ The repo has three layers:
 | `config.rs` | `EngineConfig`, key storage and verification, model resolution |
 | `engine/` | Chat-completions provider, agent loop, tools, shell sandbox, judge, recipes, events, MCP client |
 | `smith/` | `NativeSmith` factories (`make_smith`, `make_plan_smith`, `make_base_smith`) |
-| `pipeline/` | surveyor, founder, forge, duel, resmelt, assay |
+| `pipeline/` | surveyor, founder, forge, duel, resmelt, assay, fix (`fix/evolve.rs` is `--evolve`) |
+| `harness/` | The execution harness (`mod.rs`), its validator, the library, and the improver's stage prompts |
 | `anvil/` | Worktree helpers. The parallel fan-out itself lives in `pipeline/forge.rs` |
 | `crucible.rs`, `sexp/` | Ingot parsing and crucible state |
 | `tui.rs`, `dashboard.rs` | Stream-mode output and the Ratatui dashboard |
@@ -113,6 +114,7 @@ Per-role model overrides resolve flag, then environment, then file, then the pro
 | plan | `SLAG_MODEL_PLAN` | `model_plan` | `--plan-model` |
 | duel cast B | `SLAG_MODEL_ALT` | `model_alt` | |
 | judge | `SLAG_MODEL_JUDGE` | `model_judge` | `--judge-model` |
+| editor (`slag fix --evolve`; default: plan) | `SLAG_MODEL_EDITOR` | `model_editor` | `--editor-model` |
 
 Use `provider::model` to route one role through another provider, such as `model_plan = "openai::gpt-4.1-mini"`. Bare model IDs use the default provider. Existing OpenRouter IDs such as `openai/gpt-5` keep their meaning. Set the key for each provider you name.
 
@@ -154,6 +156,18 @@ github = "gh-mcp --stdio"
 
 Backends: macOS runs `sandbox-exec` with a generated Seatbelt profile. Linux uses `bwrap` when it works, else Landlock (raw syscalls, no crate), else runs unconfined. `main.rs` calls `sandbox::preflight()` before the dashboard starts, which prints one warning per run when nothing can confine writes. A refused write adds `write outside the workspace was blocked by slag's sandbox: <path>` to the tool result, leads a failed proof's output, and rides on a fix test run's `status()`.
 
+### Recursive harnessing (`slag fix --evolve`, `--harness`)
+
+After Harness² (Xu et al., arXiv:2610.14224). `harness/mod.rs` loads a directory of files: `systemprompt.md`, `guardrails.md`, `memory.md` and `tool_guidance.md` close the stable band (`prompt::build_with`); `recipes/<name>/RECIPE.md` join the recipe index (`recipes::index_with`, `ToolBox::with_harness_recipes`); `scripts/` are named in the band and run through the sandboxed `bash`; `hooks.toml` lines become a `HookSnapshot` whose `CommandScope` runs them in the read-only sandbox, fired before the operator's hooks on the way in. Subagents have no slag equivalent. `NativeSmith::with_harness` drops an empty harness, so the fast path's prompt stays byte-identical (tested in `prompt.rs`).
+
+`pipeline/fix/evolve.rs` runs reference, propose, probe, compose, execute and select. Each run is `Ctx::attempt` in a copy of the working tree with a shadow git, under the candidate harness, sharing one `SpendAccum` capped at the evolve budget. Improver sessions are `ForgeAgent`s with `Role::Harness`, a file-tool allowlist rooted at `.slag/evolve/<run>/sessions/<name>`, no finish tool, and `guard()` run first. `harness::validate` retries once, then falls back. `Evolved::reflect` writes a library entry only when `library::admit` passes. `record.json` and `.slag/evolve/latest.json` feed the done screen and `slag status --json`.
+
+| Setting | Env | `config.toml` key | Flag |
+|---------|-----|-------------------|------|
+| library | `SLAG_HARNESS_LIBRARY` | `harness_library` | `--library` (else `.slag/library`, else `<config dir>/library`) |
+| dollar cap | `SLAG_EVOLVE_BUDGET` | `evolve_budget` | `--evolve-budget` (default 2) |
+| token cap | `SLAG_EVOLVE_TOKENS` | | `--evolve-tokens` (default 4000000) |
+
 Other environment knobs include `SLAG_DUEL`, `SLAG_DUEL_ROUNDS`, `SLAG_REASONING_EFFORT`, `SLAG_SCREENSHOT_CMD`, `SLAG_CONFIG_DIR`, and `SLAG_CHAR_BUDGET` (agent compaction budget). `tui.rs` also reads `NO_COLOR` and `COLORTERM`.
 
 Behavior constants in `config.rs`: `MAX_ANVILS = 3` (parallel ingot slots), `HIGH_GRADE = 3` (plan-model threshold), `MAX_ITERATE = 3` (self-iteration rounds).
@@ -168,7 +182,7 @@ cargo test              # keep this green
 cargo build --release
 ```
 
-Binary surface: `slag "commission"`, `slag key [KEY]`, `slag status`, `slag resume`, `slag update`. Flags: `--tui`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--no-sandbox`, `--worktree` (parses, warns, not implemented).
+Binary surface: `slag "commission"`, `slag fix ISSUE` (`--evolve K`, `--sequential`, `--harness DIR|library|none`, `--editor-model`, `--evolve-budget`, `--evolve-tokens`, `--domain`, `--library`), `slag key [KEY]`, `slag status`, `slag resume`, `slag update`. Flags: `--tui`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--no-sandbox`, `--worktree` (parses, warns, not implemented).
 
 ## Website (website/)
 

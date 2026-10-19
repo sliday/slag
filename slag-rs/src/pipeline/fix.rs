@@ -598,7 +598,7 @@ async fn base_harness(
                 .unwrap_or_default();
             let used = lib.apply(domain, &issue.render(), &repository, &dst);
             if used.is_empty() {
-                note(hooks, &format!("harness: the {domain} library has no entry yet; running without one"), false);
+                note(hooks, &format!("harness: no {domain} library entry applies here; running without one"), false);
                 return Ok(None);
             }
             note(hooks, &format!("harness: {domain} library entries {}", used.join(", ")), true);
