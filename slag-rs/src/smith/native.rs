@@ -243,6 +243,9 @@ impl NativeSmith {
         if self.mode == PromptMode::Plan {
             agent = agent.without_finish();
         }
+        if self.mode == PromptMode::Forge {
+            agent = agent.with_required_verification();
+        }
         if self.role == Role::Warden {
             agent = agent.with_read_only_tools().with_max_turns(2);
         }
@@ -508,7 +511,7 @@ mod tests {
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{
-                    "message": { "content": "done" },
+                    "message": { "content": "done\nCMD: true" },
                     "finish_reason": "stop",
                 }],
             })))
@@ -519,7 +522,7 @@ mod tests {
         config.base_url = server.uri();
         let smith =
             NativeSmith::forge(config, "rust", 1, PathBuf::from("."), &EngineHooks::default());
-        assert_eq!(smith.invoke("task").await.unwrap(), "done");
+        assert_eq!(smith.invoke("task").await.unwrap(), "done\nCMD: true");
     }
 
     /// Regression: production never called `set_event_sink`, so the
@@ -578,7 +581,7 @@ mod tests {
                 .expect(0).mount(&router).await;
             for (server, key, model, answer) in [
                 (&plan, "plan-key", "gpt-4.1-mini", "planned"),
-                (&work, "work-key", "gpt-oss-120b", "forged"),
+                (&work, "work-key", "gpt-oss-120b", "forged\nCMD: true"),
             ] {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
@@ -615,7 +618,7 @@ mod tests {
                 }
             }
             assert_eq!(planned.unwrap(), "planned");
-            assert_eq!(forged.unwrap(), "forged");
+            assert_eq!(forged.unwrap(), "forged\nCMD: true");
             assert!(router.received_requests().await.unwrap().is_empty());
             for server in [&plan, &work] {
                 let requests = server.received_requests().await.unwrap();
