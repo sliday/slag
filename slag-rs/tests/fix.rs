@@ -567,3 +567,69 @@ async fn a_test_the_runner_never_reaches_goes_back_until_it_is_wired_in() {
     let files = sh(root, "git show --name-only --format= HEAD");
     assert_eq!(files.trim(), "b.txt\ntests/test_b_is_two.sh", "{files}");
 }
+
+/// The issue names the command the user ran. slag runs it before any edit
+/// and hands the session its output, so the first test reproduces that
+/// exact call rather than one the session imagined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_issues_own_command_runs_first_and_reaches_the_session() {
+    let repo = buggy_repo();
+    std::fs::write(repo.path().join("demo.sh"), "echo \"value is $(cat value.txt)\"\n").unwrap();
+    sh(repo.path(), "git add demo.sh && git commit -qm demo");
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/demo_says_two.sh", "content": "bash demo.sh | grep -qx 'value is 2'\n"})),
+        tool("finish", json!({"summary": "value.txt:1 now holds 2.", "cmd": SUITE})),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+    ])
+    .await;
+
+    let issue = "Running `bash demo.sh` prints value is 1; it should print value is 2";
+    let out = slag_fix(repo.path(), &server, &[issue, "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("issue command: `bash demo.sh` exit 0"), "{stdout}");
+    let first = server.received_requests().await.unwrap();
+    let prompt = first
+        .iter()
+        .find(|r| r.url.path().ends_with("/chat/completions"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .unwrap();
+    assert!(prompt.contains("THE ISSUE'S COMMAND, RUN BEFORE ANY EDIT"), "{prompt}");
+    assert!(prompt.contains("value is 1"), "its real output reaches the session");
+}
+
+/// When an existing test disappears, slag puts it back itself and names
+/// the exact lines, instead of asking a model that just deleted it to
+/// remember what it said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_test_is_put_back_and_its_lines_named() {
+    let repo = two_value_repo();
+    let suite = "def test_a():\n    assert 1\n\ndef test_b_keeps_working():\n    assert 2\n";
+    std::fs::write(repo.path().join("tests/test_x.py"), suite).unwrap();
+    sh(repo.path(), "git add -A && git commit -qm py");
+    let server = model(vec![
+        tool("read_file", json!({"path": "b.txt"})),
+        tool("edit_file", json!({"path": "b.txt", "old_string": "1", "new_string": "2"})),
+        tool("read_file", json!({"path": "tests/test_x.py"})),
+        tool("write_file", json!({"path": "tests/test_x.py", "content": "def test_a():\n    assert 1\n"})),
+        tool("finish", json!({"summary": "b.txt now holds 2.", "cmd": SUITE})),
+    ])
+    .await;
+
+    let out = slag_fix(repo.path(), &server, &["b should be 2", "--test", SUITE, "--tries", "2"]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("removed or skipped existing tests"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(repo.path().join("tests/test_x.py")).unwrap(), suite);
+    // The retry's brief names the very lines that went missing.
+    let retry = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .find(|body| body.contains("PREVIOUS ATTEMPT FAILED"))
+        .expect("a second attempt was briefed");
+    assert!(retry.contains("- def test_b_keeps_working():"), "{retry}");
+}

