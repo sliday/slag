@@ -209,7 +209,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "choices": [{
-                        "message": { "content": "forged" },
+                        "message": { "content": "forged\nCMD: true" },
                         "finish_reason": "stop",
                     }],
                 })),
@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(cfg.model_base, "test/base", "config survives the factories");
 
         for smith in [&forge, &plan, &base] {
-            assert_eq!(smith.invoke("do the thing").await.unwrap(), "forged");
+            assert_eq!(smith.invoke("do the thing").await.unwrap(), "forged\nCMD: true");
         }
 
         // Model per role: forge at grade 1 works on base, both plan-mode
@@ -259,7 +259,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "choices": [{
-                        "message": { "content": "forged" },
+                        "message": { "content": "forged\nCMD: true" },
                         "finish_reason": "stop",
                     }],
                     "usage": {
@@ -279,7 +279,7 @@ mod tests {
         *acc.lock().unwrap() = 0.50;
         let cfg = openrouter_only_config(server.uri());
         let smith = make_smith_with_spend(&cfg, "rust", 1, &EngineHooks::default(), acc.clone());
-        assert_eq!(smith.invoke("do the thing").await.unwrap(), "forged");
+        assert_eq!(smith.invoke("do the thing").await.unwrap(), "forged\nCMD: true");
         assert!(
             (*acc.lock().unwrap() - 0.75).abs() < 1e-9,
             "session cost folds into the shared accumulator"

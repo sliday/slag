@@ -358,6 +358,7 @@ pub fn decode_event(v: &Value) -> Option<EngineEvent> {
             lines: n("lines") as usize,
             bytes: n("bytes") as usize,
             ms: n("ms"),
+            unchanged: b("unchanged"),
         },
         "tokens" => EngineEvent::Tokens {
             usage: v
@@ -434,7 +435,7 @@ pub const POINTS: &[(&str, &str)] = &[
     ("anvils", "two or more ingots forging at once"),
     ("retry", "an ingot back on the anvil for another heat"),
     ("crack", "an ingot that failed for good, or a failed proof"),
-    ("warden", "the warden's verdict on the goal"),
+    ("warden", "the warden judging the goal"),
     ("assay", "the final report"),
 ];
 
@@ -498,6 +499,10 @@ pub fn locate(tape: &Tape, spec: &str) -> Result<u64, String> {
         }
     };
     match found {
+        // A run that ends on the verdict writes the assay in the same
+        // millisecond: stop one short, so the frame shows the warden at
+        // its verdict rather than the final report.
+        Some(i) if spec == "warden" => Ok(tape.cues[i].t.min(end.saturating_sub(1))),
         Some(i) => Ok(tape.cues[i].t),
         None => Err(format!("this tape has no `{spec}` moment")),
     }
@@ -944,6 +949,7 @@ mod tests {
                 lines: 3,
                 bytes: 40,
                 ms: 12,
+                unchanged: false,
             },
             EngineEvent::Tokens {
                 usage: Usage { total_tokens: 900, cost: Some(0.01), ..Default::default() },
@@ -1077,6 +1083,7 @@ mod tests {
         assert!(locate(&tape, "retry").unwrap() >= 200);
         assert!(locate(&tape, "crack").unwrap() >= 300);
         assert!(locate(&tape, "warden").unwrap() >= 400);
+        assert!(locate(&tape, "warden").unwrap() < locate(&tape, "assay").unwrap());
         assert!(locate(&tape, "anvils").unwrap() >= 110);
         let err = locate(&tape, "nope").unwrap_err();
         assert!(err.contains("retry"), "{err}");

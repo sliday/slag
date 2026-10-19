@@ -1,0 +1,270 @@
+{
+  "runs": [
+    {
+      "name": "csv-live",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "a small Python CLI that converts CSV to JSON with a --pretty flag, in a package with tests",
+        "--temper",
+        "1",
+        "--provider",
+        "openai"
+      ],
+      "root": "/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/csv2json",
+      "exit_code": 0,
+      "seconds": 37.4921896669548,
+      "prompt": 67728,
+      "completion": 3065,
+      "tokens": 70793,
+      "cost_estimate": 0.0182864,
+      "sessions": [
+        {
+          "role": "surveyor",
+          "prompt": 165,
+          "completion": 13,
+          "seconds": 2.1919999999999997
+        },
+        {
+          "role": "smith",
+          "prompt": 26170,
+          "completion": 1223,
+          "seconds": 13.41
+        },
+        {
+          "role": "smith",
+          "prompt": 36774,
+          "completion": 1688,
+          "seconds": 17.903
+        },
+        {
+          "role": "warden",
+          "prompt": 4619,
+          "completion": 141,
+          "seconds": 1.8950000000000031
+        }
+      ],
+      "engines": [
+        {
+          "id": "20261019_131639_570242000",
+          "role": "surveyor",
+          "prompt": 165,
+          "completion": 13,
+          "calls": 1,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261019_131641_813571000",
+          "role": "smith",
+          "prompt": 26170,
+          "completion": 1223,
+          "calls": 8,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261019_131655_305565000",
+          "role": "smith",
+          "prompt": 36774,
+          "completion": 1688,
+          "calls": 11,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261019_131713_486583000",
+          "role": "warden",
+          "prompt": 4619,
+          "completion": 141,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "forced": false,
+      "stop_reason": null
+    },
+    {
+      "name": "forced-unverified",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "2",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "root": "/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/csv2json",
+      "exit_code": 1,
+      "seconds": 4.179848375031725,
+      "prompt": 10337,
+      "completion": 233,
+      "tokens": 10570,
+      "cost_estimate": 0.0032788,
+      "sessions": [
+        {
+          "role": "warden",
+          "prompt": 5683,
+          "completion": 139,
+          "seconds": 2.057
+        }
+      ],
+      "engines": [
+        {
+          "id": "20261019_131811_442989000",
+          "role": "warden",
+          "prompt": 5683,
+          "completion": 139,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        },
+        {
+          "id": "20261019_131813_585568000",
+          "role": "warden",
+          "prompt": 4654,
+          "completion": 94,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "forced": false,
+      "stop_reason": null
+    },
+    {
+      "name": "forced-grounding",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "2",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "root": "/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/csv2json",
+      "exit_code": 1,
+      "seconds": 2.374260833952576,
+      "prompt": 4672,
+      "completion": 94,
+      "tokens": 4766,
+      "cost_estimate": 0.0014816,
+      "sessions": [
+        {
+          "role": "warden",
+          "prompt": 4672,
+          "completion": 94,
+          "seconds": 2.122
+        }
+      ],
+      "engines": [
+        {
+          "id": "20261019_131901_714566000",
+          "role": "warden",
+          "prompt": 4672,
+          "completion": 94,
+          "calls": 2,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "forced": true,
+      "stop_reason": null
+    },
+    {
+      "name": "resume-live",
+      "argv": [
+        "/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs/target/debug/slag",
+        "--temper",
+        "2",
+        "resume",
+        "--provider",
+        "openai"
+      ],
+      "root": "/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/csv2json",
+      "exit_code": 0,
+      "seconds": 4.266335832886398,
+      "prompt": 7552,
+      "completion": 181,
+      "tokens": 7733,
+      "cost_estimate": 0.0019664,
+      "sessions": [
+        {
+          "role": "warden",
+          "prompt": 7552,
+          "completion": 181,
+          "seconds": 3.975
+        }
+      ],
+      "engines": [
+        {
+          "id": "20261019_131946_043817000",
+          "role": "warden",
+          "prompt": 7552,
+          "completion": 181,
+          "calls": 3,
+          "models": [
+            "openai::gpt-4.1-mini-2025-04-14"
+          ]
+        }
+      ],
+      "forced": false,
+      "stop_reason": null
+    }
+  ],
+  "total_tokens": 93862,
+  "total_estimated_usd": 0.025013200000000003,
+  "cli_verification": [
+    {
+      "argv": [
+        "python3",
+        "-m",
+        "unittest"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": "...\n----------------------------------------------------------------------\nRan 3 tests in 0.107s\n\nOK\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "-m",
+        "csvtojson.cli",
+        "/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/sample.csv"
+      ],
+      "exit": 0,
+      "stdout": "[{\"name\": \"Alice\", \"city\": \"New York\"}, {\"name\": \"Bob\", \"city\": \"Paris\"}]\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "python3",
+        "-m",
+        "csvtojson.cli",
+        "/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/sample.csv",
+        "--pretty"
+      ],
+      "exit": 0,
+      "stdout": "[\n    {\n        \"name\": \"Alice\",\n        \"city\": \"New York\"\n    },\n    {\n        \"name\": \"Bob\",\n        \"city\": \"Paris\"\n    }\n]\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "python3",
+        "-m",
+        "csvtojson.cli",
+        "/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/missing.csv"
+      ],
+      "exit": 2,
+      "stdout": "",
+      "stderr": "usage: python3.14 -m csvtojson.cli [-h] [--pretty] csvfile\npython3.14 -m csvtojson.cli: error: argument csvfile: can't open '/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/missing.csv': [Errno 2] No such file or directory: '/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/missing.csv'\n"
+    }
+  ]
+}

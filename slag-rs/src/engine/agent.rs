@@ -55,6 +55,7 @@ const STEER_TAG: &str = "[STEER — operator message, follow it]";
 const RAISED_MAX_TOKENS: u32 = 32_768;
 /// Continuation nudges after the silent escalation, before failing.
 const MAX_CONTINUE_NUDGES: usize = 3;
+const FINISH_CMD_NUDGE: &str = "The task needs a verification command. Call finish with a non-empty cmd string and summary. Use the command that checks the completed work.";
 /// CC's proven continuation text: resume directly, no apology, no recap.
 const CONTINUE_NUDGE: &str = "Continue your previous response from exactly where it was cut \
 off — resume directly, no apology, no recap, do not repeat earlier output.";
@@ -369,9 +370,11 @@ pub struct ForgeAgent {
     resume: bool,
     /// Withhold the `finish` tool, forcing the turn to end with text.
     no_finish: bool,
+    require_verification: bool,
     no_tools: bool,
     read_only_tools: bool,
     require_inspection: bool,
+    require_runs: bool,
     coordinator_root: Option<std::path::PathBuf>,
     recent_tool_rounds: usize,
     /// Ledger attribution for every call this session makes. `Smith` by
@@ -407,9 +410,11 @@ impl ForgeAgent {
             transcript_root: std::path::PathBuf::from("."),
             resume: false,
             no_finish: false,
+            require_verification: false,
             no_tools: false,
             read_only_tools: false,
             require_inspection: false,
+            require_runs: false,
             coordinator_root: None,
             recent_tool_rounds: RECENT_TOOL_ROUNDS,
             role: Role::Smith,
@@ -460,6 +465,11 @@ impl ForgeAgent {
         self
     }
 
+    pub fn with_required_verification(mut self) -> Self {
+        self.require_verification = true;
+        self
+    }
+
     pub fn with_read_only_tools(mut self) -> Self {
         self.read_only_tools = true;
         self.no_finish = true;
@@ -473,6 +483,16 @@ impl ForgeAgent {
 
     pub fn with_required_inspection(mut self) -> Self {
         self.require_inspection = true;
+        self
+    }
+
+    pub fn with_required_runs(mut self) -> Self {
+        self.require_runs = true;
+        self
+    }
+
+    pub fn with_recent_tool_rounds(mut self, rounds: usize) -> Self {
+        self.recent_tool_rounds = rounds.max(1);
         self
     }
 
@@ -601,6 +621,12 @@ impl ForgeAgent {
         applied_steers: &mut Vec<String>,
         tw: Option<&TranscriptWriter>,
     ) -> Result<String, SlagError> {
+        let required_runs: Vec<String> = if self.require_runs {
+            task.lines().next().and_then(|line| line.strip_prefix("REQUIRED RUN COMMANDS: "))
+                .map(serde_json::from_str).transpose()
+                .map_err(|e| SlagError::SmithFailed(format!("invalid required run commands: {e}")))?
+                .unwrap_or_default()
+        } else { Vec::new() };
         // Resume-or-begin: on the explicit crash-resume path an open
         // transcript at this same (ingot, heat) replays its recorded
         // conversation and the loop continues where it died; otherwise the
@@ -645,8 +671,16 @@ impl ForgeAgent {
         let mut tool_validation_errors = 0usize;
         let mut inspected = false;
         let mut read: Vec<String> = Vec::new();
+        let require_verification = self.require_verification && !self.no_finish && !self.no_tools;
+        let mut finish_cmd_nudged = false;
+        let mut finish_repair_pending = false;
+        let mut inspections = crate::pipeline::warden::InspectionLog::default();
 
-        for turn in 1..=self.max_turns {
+        for turn in 1..=self.max_turns.saturating_add(1) {
+            if turn > self.max_turns && !finish_repair_pending {
+                break;
+            }
+            finish_repair_pending = false;
             self.check_cancel()?;
             // A parallel anvil or the operator may have rewritten a file
             // this session is tracking; say so before the model reasons
@@ -780,6 +814,18 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     record_msg(tw, messages.last().unwrap());
                     continue;
                 }
+                if require_verification && !has_verification_command(&resp.content) && !finish_cmd_nudged {
+                    finish_cmd_nudged = true;
+                    finish_repair_pending = true;
+                    messages.push(ChatMessage::assistant(resp.content, None));
+                    messages.push(ChatMessage::user(FINISH_CMD_NUDGE));
+                    record_msg(tw, &messages[messages.len() - 2]);
+                    record_msg(tw, &messages[messages.len() - 1]);
+                    emit(&self.events, EngineEvent::Warning {
+                        message: "finish omitted the verification command; requesting one corrected finish call".into(),
+                    });
+                    continue;
+                }
                 let unread: Vec<&str> = self
                     .required_reads
                     .iter()
@@ -797,8 +843,9 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     record_msg(tw, messages.last().unwrap());
                     continue;
                 }
-                emit(&self.events, EngineEvent::Finish { summary: resp.content.clone() });
-                return Ok(resp.content);
+                let report = self.ground_review_report(resp.content, &inspections, &required_runs);
+                emit(&self.events, EngineEvent::Finish { summary: report.clone() });
+                return Ok(report);
             }
 
             // Budget gate sits before the assistant tool_calls message is
@@ -844,7 +891,22 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             );
             record_msg(tw, messages.last().unwrap());
 
-            let outcomes = self.dispatch_batch(&calls).await;
+            let mut outcomes = self.dispatch_batch(&calls).await;
+            if require_verification && !finish_cmd_nudged && !has_verification_command(&resp.content) {
+                for (call, outcome) in calls.iter().zip(&mut outcomes) {
+                    if call.name == "finish" && !outcome.is_error && !has_verification_command(&outcome.output) {
+                        outcome.output = FINISH_CMD_NUDGE.into();
+                        outcome.is_error = true;
+                        finish_repair_pending = true;
+                    }
+                }
+                if finish_repair_pending {
+                    finish_cmd_nudged = true;
+                    emit(&self.events, EngineEvent::Warning {
+                        message: "finish omitted the verification command; requesting one corrected finish call".into(),
+                    });
+                }
+            }
 
             // Every tool_call_id gets a tool result, errors included — the
             // API never sees a dangling id (hermes pattern #7).
@@ -859,11 +921,16 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                         read.push(path);
                     }
                 }
-                let content = if outcome.is_error {
+                let mut content = if outcome.is_error {
                     format!("ERROR: {}", outcome.output)
                 } else {
                     outcome.output.clone()
                 };
+                if self.read_only_tools {
+                    if let Some(reference) = inspections.record(call, outcome) {
+                        content.push_str(&format!("\n\n{reference}"));
+                    }
+                }
                 messages.push(ChatMessage::tool_result(&call.id, content));
                 record_msg(tw, messages.last().unwrap());
                 if call.name == "finish" && !outcome.is_error && finish_summary.is_none() {
@@ -906,9 +973,11 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         if self.require_inspection && !inspected {
             return Err(SlagError::SmithFailed("review ended without a successful artifact inspection".into()));
         }
-        messages.push(ChatMessage::user(
-            "no more tool budget — summarize what was done",
-        ));
+        messages.push(ChatMessage::user(if require_verification {
+            "No more tool budget. Summarize the completed work and include CMD: <verification command> on its own line. Return text without tool calls."
+        } else {
+            "no more tool budget — summarize what was done"
+        }));
         record_msg(tw, messages.last().unwrap());
         if retain_recent_rounds(&mut messages, self.recent_tool_rounds) {
             anchor = None;
@@ -929,8 +998,41 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
         };
         emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
         self.track_spend(&resp.usage);
-        emit(&self.events, EngineEvent::Finish { summary: resp.content.clone() });
-        Ok(resp.content)
+        let content = if require_verification {
+            resp.content.lines().map(|line| match line.trim_start().split_once(':') {
+                Some((key, command)) if key.eq_ignore_ascii_case("cmd") => format!("CMD:{command}"),
+                _ => line.to_string(),
+            }).collect::<Vec<_>>().join("\n")
+        } else { resp.content };
+        let report = self.ground_review_report(content, &inspections, &required_runs);
+        emit(&self.events, EngineEvent::Finish { summary: report.clone() });
+        Ok(report)
+    }
+
+    fn ground_review_report(
+        &self,
+        raw: String,
+        inspections: &crate::pipeline::warden::InspectionLog,
+        required_runs: &[String],
+    ) -> String {
+        let has_verdict = raw.lines().any(|line| line.trim().trim_start_matches(['#', '*', '-', ' '])
+            .split_once(':').is_some_and(|(key, _)| key.trim_matches(['*', '_', '`']).trim().eq_ignore_ascii_case("VERDICT")));
+        if !self.read_only_tools || !self.require_inspection && !has_verdict { return raw; }
+        if crate::pipeline::warden::parse_verdict(&raw).gap.contains("no readable verdict") {
+            if let Some(root) = &self.coordinator_root {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let logs = root.join("logs");
+                if std::fs::create_dir_all(&logs).is_ok() {
+                    let name = format!("warden-raw-{}-{}-{}.log",
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(), std::process::id(),
+                        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    let _ = std::fs::write(logs.join(name), raw.as_bytes());
+                }
+            }
+        }
+        let verdict = crate::pipeline::warden::parse_grounded_verdict(&raw, inspections, self.require_runs, required_runs);
+        let outcome = if verdict.fulfilled { "pass" } else if verdict.is_unverified() { "unverified" } else { "fail" };
+        format!("VERDICT: {outcome}\nGAP: {}\nEVIDENCE: {}", verdict.gap, verdict.evidence)
     }
 
     /// Fold one response's cost into the shared ingot accumulator and the
@@ -1152,6 +1254,12 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                 if self.no_finish {
                     specs.retain(|t| t.name != "finish");
                 }
+                if self.require_verification {
+                    if let Some(finish) = specs.iter_mut().find(|t| t.name == "finish") {
+                        finish.parameters["required"] = serde_json::json!(["summary", "cmd"]);
+                        finish.parameters["properties"]["cmd"]["minLength"] = serde_json::json!(1);
+                    }
+                }
                 if self.read_only_tools {
                     specs.retain(|t| review_tool(&t.name));
                 }
@@ -1221,6 +1329,8 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                         lines: outcome.output.lines().count(),
                         bytes: outcome.output.len(),
                         ms: dispatched.elapsed().as_millis() as u64,
+                        unchanged: !outcome.is_error
+                            && super::tools::left_unchanged(&calls[i].name, &outcome.output),
                     },
                 );
                 // Item 89: failed tool calls tally per tool with a coarse
@@ -1464,6 +1574,11 @@ async fn guarded_dispatch(
             if args.get("run_in_background").and_then(serde_json::Value::as_bool) == Some(true) {
                 return refused("run commands in the foreground so slag can protect coordinator files".into());
             }
+            if args.get("command").and_then(serde_json::Value::as_str)
+                .is_some_and(|command| declared_verification(root, command))
+            {
+                return review_shell(call, Some(root)).await;
+            }
             if let Some(reason) = args.get("command").and_then(serde_json::Value::as_str)
                 .and_then(coordinator_command_error)
             {
@@ -1494,6 +1609,15 @@ async fn guarded_dispatch(
     result
 }
 
+fn declared_verification(root: &std::path::Path, command: &str) -> bool {
+    let Ok(bar) = std::fs::read_to_string(root.join("BAR.md")) else { return false };
+    let Some(required) = bar.lines().find_map(|line| line.strip_prefix("REQUIRED RUN COMMANDS: ")
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())) else { return false };
+    let Ok(actual) = shell_words::split(command) else { return false };
+    required.iter().any(|required| shell_words::split(required).ok()
+        .is_some_and(|words| !words.is_empty() && actual.starts_with(&words)))
+}
+
 async fn review_shell(call: &ToolCall, root: Option<&std::path::Path>) -> ToolOutcome {
     use std::process::Stdio;
     let violation = |message: String| ToolOutcome {
@@ -1519,6 +1643,7 @@ async fn review_shell(call: &ToolCall, root: Option<&std::path::Path>) -> ToolOu
     let mut cmd = sandbox.wrap("/bin/sh");
     cmd.args(["-c", command]).current_dir(root)
         .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("NODE_DISABLE_COMPILE_CACHE", "1")
         .env("PIP_NO_INDEX", "1")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -1557,7 +1682,7 @@ async fn review_shell(call: &ToolCall, root: Option<&std::path::Path>) -> ToolOu
     ToolOutcome { output: text, is_error: !output.status.success() }
 }
 
-fn review_command_error(command: &str) -> Option<&'static str> {
+pub(crate) fn review_command_error(command: &str) -> Option<&'static str> {
     if let Some(reason) = coordinator_command_error(command) { return Some(reason); }
     let words: Vec<_> = command.split(|c: char| c.is_whitespace() || ";|&()".contains(c))
         .map(|word| word.trim_matches(['\'', '"']))
@@ -1571,12 +1696,17 @@ fn review_command_error(command: &str) -> Option<&'static str> {
     }) {
         return Some("filesystem mutation commands are forbidden during review");
     }
-    if words.contains(&"npx") || installer && words.iter().any(|word| {
-        matches!(*word, "install" | "add" | "sync" | "ci" | "update" | "upgrade" | "exec" | "run")
+    if words.contains(&"npx") || words.contains(&"uv") && words.contains(&"run")
+        || installer && words.iter().any(|word| {
+        matches!(*word, "install" | "add" | "sync" | "ci" | "update" | "upgrade" | "exec")
     }) {
         return Some("package installs and package resolution are forbidden during review");
     }
     None
+}
+
+fn has_verification_command(text: &str) -> bool {
+    crate::proof::extract_cmd(text).is_some_and(|cmd| !cmd.is_empty())
 }
 
 /// Journal one appended message (no-op outside a forge attempt).
@@ -1946,7 +2076,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("artifact.py"), "VALUE = 42\n").unwrap();
         let call = tc("b", "bash", serde_json::json!({
-            "command": "python3 -c 'import artifact; assert artifact.VALUE == 42; print(artifact.VALUE)'",
+            "command": "python3 -c 'import artifact, os; assert artifact.VALUE == 42; assert os.environ[\"NODE_DISABLE_COMPILE_CACHE\"] == \"1\"; print(artifact.VALUE)'",
         }));
         let result = review_shell(&call, Some(dir.path())).await;
         if super::super::sandbox::backend() == super::super::sandbox::Backend::None {
@@ -1957,6 +2087,30 @@ mod tests {
             assert!(result.output.contains("42"));
         }
         assert!(!dir.path().join("__pycache__").exists());
+    }
+
+    #[tokio::test]
+    async fn direct_builder_checks_are_readonly_but_construction_stays_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("BAR.md"), "REQUIRED RUN COMMANDS: [\"python3 -m unittest\"]\n").unwrap();
+        std::fs::write(dir.path().join("test_direct.py"),
+            "import pathlib, unittest\nclass TestDirect(unittest.TestCase):\n def test_write(self):\n  pathlib.Path('stray-fixture').write_text('bad')\n").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("suite", "bash", serde_json::json!({"command": "python3 -m unittest -v"}))]),
+            resp_tools(vec![tc("fixture", "write_file", serde_json::json!({"path": "fixture.txt", "content": "intended"}))]),
+            resp_text("construction continues", FinishReason::Stop),
+        ]);
+        let result = agent(provider.clone(), dir.path()).with_coordinator_root(dir.path())
+            .run("system".into(), "task".into()).await.unwrap();
+        assert_eq!(result, "construction continues");
+        let requests = provider.requests();
+        assert!(requests[1].messages.last().unwrap().content.starts_with("ERROR:"));
+        assert!(!requests[2].messages.last().unwrap().content.starts_with("ERROR:"));
+        assert!(!dir.path().join("stray-fixture").exists());
+        assert!(!dir.path().join("__pycache__").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("fixture.txt")).unwrap(), "intended");
+        assert!(!declared_verification(dir.path(), "python3 -c 'print(1)'"));
+        assert!(!declared_verification(dir.path(), "python3 -m unittest_extra"));
     }
 
     #[tokio::test]
@@ -1972,11 +2126,85 @@ mod tests {
         std::fs::write(dir.path().join("artifact.py"), "print('hello')").unwrap();
         let provider = MockProvider::new(vec![
             resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "artifact.py"}))]),
-            resp_text("VERDICT: PASS", FinishReason::Stop),
+            resp_text("VERDICT: PASS\nEVIDENCE: [\"r\"]", FinishReason::Stop),
         ]);
         let result = agent(provider, dir.path()).with_read_only_tools().with_required_inspection()
             .run("review".into(), "inspect artifact".into()).await.unwrap();
-        assert_eq!(result, "VERDICT: PASS");
+        let verdict = crate::pipeline::warden::parse_verdict(&result);
+        assert!(verdict.fulfilled);
+        assert!(verdict.evidence.contains("read_file \"artifact.py\""));
+    }
+
+    #[tokio::test]
+    async fn invalid_required_run_header_stops_before_a_provider_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![]);
+        let error = agent(provider.clone(), dir.path()).with_read_only_tools().with_required_runs()
+            .run("review".into(), "REQUIRED RUN COMMANDS: [1]\nInspect the artifact.".into())
+            .await.unwrap_err();
+        assert!(error.to_string().contains("invalid required run commands"));
+        assert!(provider.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_review_keeps_the_exact_raw_response() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.py"), "VALUE = 42\n").unwrap();
+        let raw = "I cannot choose a verdict.\n  Preserve these spaces.\n";
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "artifact.py"}))]),
+            resp_text(raw, FinishReason::Stop),
+        ]);
+        let result = agent(provider, dir.path()).with_coordinator_root(dir.path())
+            .with_read_only_tools().with_required_inspection().with_required_runs()
+            .run("review".into(), "Inspect artifact.py.".into()).await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&result).is_unverified());
+        let logs: Vec<_> = std::fs::read_dir(dir.path().join("logs")).unwrap()
+            .filter_map(Result::ok).map(|entry| entry.path()).collect();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].file_name().unwrap().to_string_lossy().starts_with("warden-raw-"));
+        assert_eq!(std::fs::read_to_string(&logs[0]).unwrap(), raw);
+    }
+
+    #[test]
+    fn review_allows_package_test_scripts_without_package_installation() {
+        for command in ["npm test", "npm run test", "pnpm run test", "node --test"] {
+            assert!(review_command_error(command).is_none(), "{command}");
+        }
+        for command in ["npm install", "npm ci", "npx vitest", "uv run pytest"] {
+            assert!(review_command_error(command).is_some(), "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn review_grounding_survives_history_trimming_and_the_final_budget_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.py"), "VALUE = 42\n").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("first", "read_file", serde_json::json!({"path": "artifact.py"}))]),
+            resp_tools(vec![tc("second", "read_file", serde_json::json!({"path": "artifact.py"}))]),
+            resp_text("VERDICT: pass\nEVIDENCE: [\"first\"]", FinishReason::Stop),
+        ]);
+        let reviewer = agent(provider.clone(), dir.path()).with_read_only_tools()
+            .with_required_inspection().with_max_turns(2).with_recent_tool_rounds(1);
+        let result = reviewer.run("review".into(), "inspect artifact".into()).await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&result).fulfilled);
+        assert!(result.contains("[\"first\"] read_file \"artifact.py\""));
+        assert_eq!(provider.requests().len(), 3);
+        assert!(provider.requests()[2].messages.iter().all(|message| message.tool_call_id.as_deref() != Some("first")));
+    }
+
+    #[tokio::test]
+    async fn decorated_plan_verdicts_cannot_bypass_grounding() {
+        let dir = tempfile::tempdir().unwrap();
+        for verdict in ["\tVERDICT: pass", "\u{2003}VERDICT: pass", "#\tVERDICT: pass"] {
+            let provider = MockProvider::new(vec![resp_text(
+                &format!("{verdict}\nEVIDENCE: fabricated.py"), FinishReason::Stop,
+            )]);
+            let result = agent(provider, dir.path()).with_read_only_tools()
+                .run("plan review".into(), "judge document".into()).await.unwrap();
+            assert!(crate::pipeline::warden::parse_verdict(&result).is_unverified());
+        }
     }
 
     #[tokio::test]
@@ -2109,6 +2337,114 @@ mod tests {
             .run("system".into(), "task".into()).await.unwrap();
         assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
         assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[test]
+    fn verification_contract_requires_cmd_only_for_forge_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = || agent(MockProvider::new(vec![]), dir.path());
+        let finish = |agent: ForgeAgent| agent.request(Vec::new(), true, None).tools.into_iter()
+            .find(|spec| spec.name == "finish").unwrap();
+        assert_eq!(finish(mk()).parameters["required"], serde_json::json!(["summary"]));
+        let spec = finish(mk().with_required_verification());
+        assert_eq!(spec.parameters["required"], serde_json::json!(["summary", "cmd"]));
+        assert_eq!(spec.parameters["properties"]["cmd"]["minLength"], 1);
+        assert!(content_tool_calls(r#"{"summary":"Done"}"#, &[spec], 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_finish_cmd_gets_one_repair_even_at_the_turn_limit() {
+        for cmd in [None, Some(serde_json::json!("  ")), Some(serde_json::json!(false))] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut args = serde_json::json!({"summary": "Done"});
+            if let Some(cmd) = cmd { args["cmd"] = cmd; }
+            let provider = MockProvider::new(vec![
+                resp_tools(vec![tc("bad", "finish", args)]),
+                resp_tools(vec![tc("good", "finish", serde_json::json!({"summary": "Done", "cmd": "python3 -m unittest"}))]),
+            ]);
+            let result = agent(provider.clone(), dir.path()).with_required_verification().with_max_turns(1)
+                .run("system".into(), "task".into()).await.unwrap();
+            assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
+            let requests = provider.requests();
+            assert_eq!(requests.len(), 2);
+            let feedback = requests[1].messages.last().unwrap();
+            assert_eq!(feedback.role, "tool");
+            assert_eq!(feedback.tool_call_id.as_deref(), Some("bad"));
+            assert!(feedback.content.starts_with("ERROR:"));
+            assert!(feedback.content.contains("non-empty cmd string"));
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_limit_keeps_the_verification_command_in_the_final_text_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("result.txt"), "done").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("read", "read_file", serde_json::json!({"path": "result.txt"}))]),
+            resp_text("Done\ncmd: python3 -m unittest", FinishReason::Stop),
+        ]);
+        let result = agent(provider.clone(), dir.path()).with_required_verification().with_max_turns(1)
+            .run("system".into(), "task".into()).await.unwrap();
+        assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].tools.is_empty());
+        assert!(requests[1].messages.last().unwrap().content.contains("CMD: <verification command>"));
+    }
+
+    #[tokio::test]
+    async fn missing_cmd_repair_stops_after_one_nudge() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![tc("first", "finish", serde_json::json!({"summary": "Done"}))]),
+            resp_tools(vec![tc("second", "finish", serde_json::json!({"summary": "Still no command"}))]),
+        ]);
+        let result = agent(provider.clone(), dir.path()).with_required_verification()
+            .run("system".into(), "task".into()).await.unwrap();
+        assert_eq!(result, "Still no command");
+        assert_eq!(provider.requests().len(), 2);
+        assert!(crate::proof::extract_cmd(&result).is_none());
+    }
+
+    #[tokio::test]
+    async fn text_completion_gets_a_nudge_without_guessing_a_command() {
+        for text in [
+            r#"{"summary":"Done"}"#,
+            r#"{"name":"finish","arguments":{"summary":"Done","cmd":false}}"#,
+            "Done. Run python3 -m unittest to check it.",
+            "```json\n{\"cmd\":\"false\",\"summary\":\"Example\"}\n```",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = MockProvider::new(vec![
+                resp_text(text, FinishReason::Stop),
+                resp_text(r#"{"summary":"Done","cmd":"python3 -m unittest"}"#, FinishReason::Stop),
+            ]);
+            let result = agent(provider.clone(), dir.path()).with_required_verification()
+                .run("system".into(), "task".into()).await.unwrap();
+            assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
+            let requests = provider.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].messages[2].content, text);
+            assert!(requests[1].messages[2].tool_calls.is_none());
+            assert_eq!(requests[1].messages[3].content, FINISH_CMD_NUDGE);
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_repair_preserves_legacy_cmd_and_document_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![resp_text("Done\nCMD: python3 -m unittest", FinishReason::Stop)]);
+        let result = agent(provider.clone(), dir.path()).with_required_verification()
+            .run("system".into(), "task".into()).await.unwrap();
+        assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
+        assert_eq!(provider.requests().len(), 1);
+        for document in [true, false] {
+            let provider = MockProvider::new(vec![resp_text("The document", FinishReason::Stop)]);
+            let agent = agent(provider.clone(), dir.path()).with_required_verification();
+            let agent = if document { agent.without_finish() } else { agent.with_no_tools() };
+            assert_eq!(agent.run("system".into(), "task".into()).await.unwrap(), "The document");
+            assert_eq!(provider.requests().len(), 1);
+        }
     }
 
     #[tokio::test]

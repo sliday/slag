@@ -1,4 +1,6 @@
 pub mod surveyor;
+pub mod direct;
+pub mod hygiene;
 pub mod founder;
 pub mod forge;
 pub mod duel;
@@ -318,6 +320,9 @@ fn runtime_log(path: &std::path::Path) -> bool {
     if path.starts_with("checkpoints/objects") { return hexadecimal(&name); }
     if path.starts_with("tool-results") { return hexadecimal(name.trim_end_matches(".txt")); }
     if path.starts_with("bg") { return name.starts_with("bg-") && name.ends_with(".log"); }
+    if let Some(stamp) = name.strip_prefix("warden-raw-").and_then(|s| s.strip_suffix(".log")) {
+        return !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit() || b == b'-');
+    }
     name.ends_with(".log") && name.len() > 16 && name.as_bytes()[..8].iter().all(u8::is_ascii_digit)
         && ["_FLUX_", "_STRIKE_", "_ASSAY_", "_SURVEY_", "_FOUNDER_", "_RESMELT_"].iter().any(|part| name.contains(part))
 }
@@ -362,13 +367,20 @@ pub async fn run(
 ) -> Result<(), SlagError> {
     tui::show_banner();
 
-    warden::set_rounds(temper_rounds);
-
-    let resumed_gap = if commission.is_none() && temper_rounds > 0 {
+    let resumed_unverified = if commission.is_none() {
+        unverified_goal_round(std::path::Path::new(crate::config::LEDGER))
+    } else { None };
+    let resumed_gap = if commission.is_none() {
         pending_goal_gap(std::path::Path::new(crate::config::LEDGER))
     } else {
         None
     };
+    let temper_rounds = if resumed_unverified.is_some() {
+        temper_rounds.max(1)
+    } else if temper_rounds == 0 {
+        resumed_gap.as_ref().map_or(0, |(round, _)| round.saturating_add(1))
+    } else { temper_rounds };
+    warden::set_rounds(temper_rounds);
     if let Some((round, gap)) = &resumed_gap {
         if *round >= temper_rounds {
             return Err(SlagError::GoalNotMet(format!(
@@ -381,14 +393,23 @@ pub async fn run(
         && empty_project(std::path::Path::new("."))
         && temper_rounds > 0;
 
+    let prior_head = commission.and_then(|_| review_head());
     // Fire furnace if needed
     let ore = fire_furnace(commission)?;
+    let base_path = std::path::Path::new(crate::config::LOG_DIR).join("commission-base");
+    if commission.is_some() {
+        if let Some(base) = prior_head.or_else(review_head) {
+            std::fs::create_dir_all(crate::config::LOG_DIR)?;
+            std::fs::write(&base_path, base)?;
+        }
+    }
+    warden::set_review_base(std::fs::read_to_string(base_path).ok());
 
     let direct = if direct_candidate && ore == Ore::Fired {
         let smith = crate::smith::make_scope_smith(config, &hooks);
         match surveyor::direct_proof(smith.as_ref(), commission.unwrap()).await? {
-            Some(proof) => {
-                found_direct(commission.unwrap(), &proof)?;
+            Some(plan) => {
+                found_direct(commission.unwrap(), &plan)?;
                 tui::status_line("=", tui::COLD, "One local task, one final warden");
                 true
             }
@@ -437,7 +458,7 @@ pub async fn run(
     // wrote this" made it unreachable in the common case. One corrective
     // pass, not a loop -- a surveyor that cannot cover the gap when told
     // exactly what it is will not cover it on an identical third try.
-    if !direct && resumed_gap.is_none() {
+    if !direct && resumed_gap.is_none() && resumed_unverified.is_none() {
         if let Some(gap) = checkpoint(config, &hooks, "BLUEPRINT", crate::config::BLUEPRINT).await {
             let smith = crate::smith::make_plan_smith(config, &hooks, crate::engine::Role::Surveyor);
             surveyor::run_with_guidance(smith.as_ref(), Some(&gap)).await?;
@@ -501,7 +522,10 @@ pub async fn run(
     // casts ingots, and the forge runs again -- both halves of that loop
     // already existed.
     let mut forged;
-    let mut round = resumed_gap.as_ref().map_or(0, |(round, _)| *round);
+    let mut round = resumed_gap.as_ref().map_or_else(
+        || resumed_unverified.map_or(0, |round| round.min(temper_rounds.saturating_sub(1))),
+        |(round, _)| *round,
+    );
     // The warden's last word, carried past the assay. A run that prints
     // FORGED over an unmet goal launders the doubt it was asked to remove.
     let mut goal_gap: Option<String> = None;
@@ -661,6 +685,19 @@ pub async fn run(
     forged
 }
 
+fn review_head() -> Option<String> {
+    let output = crate::engine::sandbox::git().args(["rev-parse", "HEAD"]).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn unverified_goal_round(path: &std::path::Path) -> Option<usize> {
+    let ledger = std::fs::read_to_string(path).ok()?;
+    let section = ledger.rsplit("## Warden round ").next()?;
+    let header = section.lines().next()?;
+    if !header.trim_end().ends_with("goal unverified") { return None; }
+    header.split_whitespace().next()?.trim_end_matches(':').parse().ok()
+}
+
 fn pending_goal_gap(path: &std::path::Path) -> Option<(usize, String)> {
     let ledger = std::fs::read_to_string(path).ok()?;
     let section = ledger.rsplit("## Warden round ").next()?;
@@ -680,15 +717,21 @@ fn empty_project(root: &std::path::Path) -> bool {
     })
 }
 
-fn found_direct(commission: &str, proof: &str) -> Result<(), SlagError> {
+fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagError> {
+    let checklist = plan.criteria.iter().map(|item| format!("- [ ] {item}")).collect::<Vec<_>>().join("\n");
+    let commands: Vec<_> = std::iter::once(&plan.proof).chain(&plan.commands).cloned().collect();
+    let checks = format!("REQUIRED RUN COMMANDS: {}", serde_json::to_string(&commands).unwrap());
+    let contract = format!("## CHECKLIST\n{checklist}\n\n{checks}\n");
     std::fs::write(crate::config::BLUEPRINT, format!(
-        "# Local utility\n\n{commission}\n\nVerification: `{proof}`\n"
+        "# Local utility\n\n{commission}\n\n{contract}"
     ))?;
     std::fs::write(warden::BAR_FILE, format!(
-        "## THE BAR\nMeet the original commission.\n\n## CHECKLIST\n\
-         - [ ] {commission}\n\n## HOW TO INSPECT\n\
-         Read the product files and test source. Read logs/*_ASSAY_*.log for coordinator-run test results.\n\
-         Use read-only behavior probes. Do not run tests that create temporary files or fixtures.\n\
+        "## THE BAR\nDeliver the named behavior in the original commission.\n\n{contract}\n\
+         ## HOW TO INSPECT\n\
+         Read the product and test source, then run the declared suite and CLI probes.\n\
+         Run each required command as its own bash call, copied verbatim. Cite those successful run IDs in EVIDENCE.\n\
+         Check each named behavior and flag through the actual CLI tests. Source inspection alone cannot pass this bar.\n\
+         Use in-memory test data or committed fixtures under tests/fixtures. The reviewer cannot create fixtures or caches.\n\
          Judge the commission without extra naming, style, or test-count rules.\n"
     ))?;
     let mut ingot = crate::sexp::parser::parse_ingot("(ingot :id \"i1\")").unwrap();
@@ -697,7 +740,7 @@ fn found_direct(commission: &str, proof: &str) -> Result<(), SlagError> {
     ingot.max = 3;
     ingot.casts = Some(1);
     ingot.bar.clear();
-    ingot.proof = proof.to_string();
+    ingot.proof = commands.iter().map(|command| format!("( {command} )")).collect::<Vec<_>>().join(" && ");
     ingot.work = commission.to_string();
     Crucible::new(std::path::Path::new(crate::config::CRUCIBLE), vec![ingot]).save()?;
     Ok(())
@@ -808,17 +851,7 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
         .args(["init", "-b", "main"])
         .output();
 
-    // .gitignore
-    let gitignore = std::path::Path::new(".gitignore");
-    let content = std::fs::read_to_string(gitignore).unwrap_or_default();
-    if !content.contains("logs/") {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(gitignore)?;
-        use std::io::Write;
-        writeln!(f, "logs/")?;
-    }
+    hygiene::install_ignores(std::path::Path::new("."), Some(commission))?;
 
     // Create PRD.md
     std::fs::write(

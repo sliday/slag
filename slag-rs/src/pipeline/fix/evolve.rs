@@ -217,6 +217,9 @@ pub(super) struct Rollout {
     /// nothing does.
     #[serde(skip)]
     repro_rank: u8,
+    /// The session's own account of a deliberate change to existing tests,
+    /// which slag's guard accepted.
+    declared: Option<String>,
 }
 
 impl Rollout {
@@ -238,6 +241,7 @@ impl Rollout {
             summary: String::new(),
             cmd: None,
             repro_rank: 0,
+            declared: None,
         }
     }
 }
@@ -703,10 +707,18 @@ impl Evolver<'_, '_> {
             return Ok(Rollout::undelivered(label, kind, harness_label, "could not track the copy's changes".into()));
         };
         let job = Job { args: self.ctx.job.args.clone(), temper: false, cwd: cwd.to_path_buf(), git: Some(git) };
-        let before = job.git.as_ref().map(Git::snapshot).unwrap_or_default();
+        // The copy holds the user's uncommitted work as committed, so its
+        // own snapshot would hand those paths to the session. The real
+        // snapshot keeps them the user's, exactly as on the plain path:
+        // never the fix's to change, verify, or deliver.
+        let before = self.ctx.before.clone();
         let (tx, rx) = crate::engine::events::channel();
         let collector = tokio::spawn(collect(rx, self.ctx.hooks.events.clone()));
         let hooks = EngineHooks { events: Some(tx), steer: None, cancel: self.ctx.hooks.cancel.clone() };
+        // The copy is thrown away, so an interrupted swap in it needs no
+        // rescue, and stopping commands here must not kill other runs'.
+        let no_rescue = |_: Box<dyn FnOnce() + Send>| {};
+        let rescuer = Rescuer { register: &no_rescue, stop: no_stop };
         let attempted = {
             let ctx = Ctx {
                 job: &job,
@@ -716,6 +728,7 @@ impl Evolver<'_, '_> {
                 context: self.ctx.context,
                 before: &before,
                 usable_test: self.ctx.usable_test,
+                rescuer: &rescuer,
                 smith: SmithOpts {
                     harness: Some(Arc::new(Harness::load(dir))),
                     transcripts: Some(self.sh.run_dir.clone()),
@@ -726,23 +739,36 @@ impl Evolver<'_, '_> {
             let id = self.transcript_id(label);
             let attempted = crate::engine::transcript::scope(id, 1, ctx.attempt(1, None, label, &mut phases)).await;
             match attempted {
-                Ok(Attempted::Passed { checks, summary, changed }) => {
-                    let no_rescue = |_: Box<dyn FnOnce() + Send>| {};
-                    let rescuer = Rescuer { register: &no_rescue, stop: no_stop };
-                    let (repro, _) =
-                        super::reproduce(&job, &before, &changed, &checks[0].cmd, self.baseline, &rescuer).await;
-                    Ok((true, None, checks, summary, changed, Some(repro), ctx.diff(&ctx.changed_now())))
+                Ok(Attempted::Passed { checks, summary, changed, declared }) => {
+                    // The reversal check keeps old tests as the session left
+                    // them, as the plain path does.
+                    let edited: Vec<String> = job
+                        .git
+                        .as_ref()
+                        .map(|g| super::edited_old_tests(g, &before, &changed).into_iter().map(|e| e.path).collect())
+                        .unwrap_or_default();
+                    let (repro, _) = super::reproduce(
+                        &job,
+                        &before,
+                        &changed,
+                        &edited,
+                        &checks[0].cmd,
+                        self.baseline,
+                        &rescuer,
+                    )
+                    .await;
+                    Ok((true, None, checks, summary, changed, Some(repro), ctx.diff(&ctx.changed_now()), declared))
                 }
                 Ok(Attempted::Failed { failure, summary, changed }) => {
                     let diff = ctx.diff(&changed);
-                    Ok((false, Some(failure), Vec::new(), summary, changed, None, diff))
+                    Ok((false, Some(failure), Vec::new(), summary, changed, None, diff, None))
                 }
                 Err(e) => Err(e),
             }
         };
         drop(hooks);
         let metrics = collector.await.unwrap_or_default();
-        let (verified, failure, checks, summary, changed, repro, diff) = attempted?;
+        let (verified, failure, checks, summary, changed, repro, diff, declared) = attempted?;
         let git = job.git.as_ref().expect("a shadow repository");
         let contents = changed
             .iter()
@@ -781,6 +807,7 @@ impl Evolver<'_, '_> {
             summary,
             cmd: checks.last().map(|c| c.cmd.clone()),
             repro_rank,
+            declared,
         })
     }
 
@@ -1363,7 +1390,7 @@ impl Evolved {
     /// when no run delivered, and `Err` when a path is not one to write:
     /// outside the tree, slag's own scratch, git's, or under a link. A
     /// link at the path itself is replaced, never written through.
-    pub fn deliver(&self, job: &Job) -> Result<Option<String>, String> {
+    pub fn deliver(&self, job: &Job, before: &BTreeMap<String, super::repo::Content>) -> Result<Option<String>, String> {
         let Some(run) = self.chosen() else { return Ok(None) };
         let top = job.git.as_ref().map(|g| g.top.clone()).unwrap_or_else(|| job.cwd.clone());
         for (rel, _) in &run.contents {
@@ -1376,7 +1403,8 @@ impl Evolved {
                 at.push(c.as_os_str());
                 under_link |= std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink());
             }
-            if !plain || git_path || scratch(rel) || under_link {
+            // The user's own uncommitted files are never the fix's.
+            if !plain || git_path || scratch(rel) || under_link || before.contains_key(rel) {
                 return Err(format!("the chosen run changed `{rel}`, which slag will not write into your repository"));
             }
         }
@@ -1910,6 +1938,9 @@ fn checks_md(r: &Rollout) -> String {
     if let Some(repro) = &r.repro {
         s.push_str(&format!("- reversal check: {repro}\n"));
     }
+    if let Some(said) = &r.declared {
+        s.push_str(&format!("- changed existing tests, declared: {said}\n"));
+    }
     if r.files.is_empty() {
         s.push_str("- files changed: none\n");
     } else {
@@ -2219,7 +2250,7 @@ mod tests {
             ("old.txt".to_string(), Delivered::Gone),
         ];
         let (ev, job) = chosen(contents, &top);
-        assert!(ev.deliver(&job).unwrap().is_some());
+        assert!(ev.deliver(&job, &BTreeMap::new()).unwrap().is_some());
         assert_eq!(std::fs::read_to_string(top.join("src/fix.sh")).unwrap(), "echo 2\n");
         assert_eq!(std::fs::metadata(top.join("src/fix.sh")).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(std::fs::read_to_string(outside.join("target.txt")).unwrap(), "keep me\n", "the link's target is untouched");
@@ -2234,10 +2265,17 @@ mod tests {
                 (rel.to_string(), Delivered::File { bytes: b"x\n".to_vec(), mode: None }),
             ];
             let (ev, job) = chosen(contents, &top);
-            assert!(ev.deliver(&job).is_err(), "{rel} must be refused");
+            assert!(ev.deliver(&job, &BTreeMap::new()).is_err(), "{rel} must be refused");
             assert!(!top.join("ok.txt").exists(), "nothing lands when one path is refused");
         }
         assert!(!outside.join("planted.txt").exists());
+
+        // A file the user had uncommitted work in is theirs, never the fix's.
+        let mut yours = BTreeMap::new();
+        yours.insert("notes.txt".to_string(), Some(b"mine\n".to_vec()));
+        let contents = vec![("notes.txt".to_string(), Delivered::File { bytes: b"fix\n".to_vec(), mode: None })];
+        let (ev, job) = chosen(contents, &top);
+        assert!(ev.deliver(&job, &yours).is_err());
     }
 
     #[test]

@@ -365,12 +365,15 @@ fn extract_str_field(json_ish: &str, key: &str) -> Option<String> {
 /// Collapsed-streak summary: `ran 4 commands`, `read 3 files`. File verbs
 /// count distinct files, not calls: four edits of one file is `edited 1
 /// file (4 calls)`, never `edited 4 files`.
-fn streak_summary(verb: &str, n: usize, files: usize) -> String {
-    let files = match (files, n > files) {
-        (1, true) => format!("1 file ({n} calls)"),
-        (1, false) => "1 file".to_string(),
-        (f, true) => format!("{f} files ({n} calls)"),
-        (f, false) => format!("{f} files"),
+fn streak_summary(verb: &str, n: usize, keys: &std::collections::BTreeSet<String>) -> String {
+    // A count alone reads as the run's total ("edited 1 file" beside a
+    // diff of two). Up to three files, name them: the line then says
+    // plainly which files this streak touched.
+    let calls = if n > keys.len() { format!(" ({n} calls)") } else { String::new() };
+    let files = match keys.len() {
+        0 => format!("{n} files"),
+        1..=3 => format!("{}{calls}", keys.iter().cloned().collect::<Vec<_>>().join(", ")),
+        f => format!("{f} files{calls}"),
     };
     match verb {
         "run" => format!("ran {n} commands"),
@@ -398,46 +401,9 @@ fn error_gist(name: &str, preview_text: &str) -> String {
     t.to_string()
 }
 
-/// `text` broken to `width` under a hanging indent, at most `max` lines,
-/// the last one clipped with an ellipsis when the text runs longer.
+/// `text` broken to `width` under a hanging indent (see `tui::wrap`).
 fn wrap_hanging(head: &str, text: &str, width: usize, indent: usize, max: usize) -> Vec<String> {
-    let head_w = crate::tui::visible_len(head);
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut room = width.saturating_sub(head_w).max(10);
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut i = 0;
-    while i < words.len() {
-        let w = words[i];
-        let need = if cur.is_empty() { w.chars().count() } else { cur.chars().count() + 1 + w.chars().count() };
-        if need > room && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-            room = width.saturating_sub(indent).max(10);
-            if out.len() == max {
-                break;
-            }
-            continue;
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(w);
-        i += 1;
-    }
-    let cut = i < words.len();
-    if out.len() < max && !cur.is_empty() {
-        out.push(cur);
-    }
-    if cut {
-        let budget = if out.len() == 1 { width.saturating_sub(head_w) } else { width.saturating_sub(indent) };
-        if let Some(last) = out.last_mut() {
-            *last = preview(&format!("{last} {}", words[i..].join(" ")), budget.max(4));
-        }
-    }
-    out.into_iter()
-        .enumerate()
-        .map(|(n, l)| if n == 0 { format!("{head}{l}") } else { format!("{}{l}", " ".repeat(indent)) })
-        .collect()
+    crate::tui::wrap(head, text, width, indent, max)
 }
 
 /// An emitted ToolCallStart waiting for its ToolResult.
@@ -633,13 +599,13 @@ impl RenderState {
                     started: now,
                 });
             }
-            EngineEvent::ToolResult { name, ok, preview: p, lines, ms, .. } => {
+            EngineEvent::ToolResult { name, ok, preview: p, lines, ms, unchanged, .. } => {
                 // `finish` says nothing a card could add: its summary
                 // arrives as its own line right after.
                 if name == "finish" && *ok {
                     self.take_pending(name);
                 } else {
-                    let card = self.build_card(name, *ok, p, *lines, *ms);
+                    let card = self.build_card(name, *ok, *unchanged, p, *lines, *ms);
                     self.push_card(card, &mut prints);
                 }
                 self.narrate = None;
@@ -673,7 +639,7 @@ impl RenderState {
                     let (word, color) = if pass { ("pass", PURE) } else if crate::pipeline::warden::is_unverified_report(&why) { ("unverified", WARM) } else { ("fail", WARM) };
                     let head = format!("  {} {}  ", paint(color, "⚖"), paint(color, &format!("judge says {word}")));
                     prints.extend(
-                        wrap_hanging(&head, &format!("“{why}”"), width, 4, 2)
+                        wrap_hanging(&head, &format!("“{why}”"), width, 4, 5)
                             .into_iter()
                             .enumerate()
                             .map(|(i, l)| if i == 0 { l } else { dim(&l) }),
@@ -682,7 +648,7 @@ impl RenderState {
                     prints.push(line(PURE, "■", &dim(&preview(&gist, width.saturating_sub(4)))));
                 } else {
                     let head = format!("  {} ", paint(PURE, "■"));
-                    prints.extend(wrap_hanging(&head, summary, width, 4, 2));
+                    prints.extend(wrap_hanging(&head, summary, width, 4, 4));
                 }
             }
             EngineEvent::Error { message } if is_fatal_provider(message) => {
@@ -692,7 +658,7 @@ impl RenderState {
                 self.flush_streak(&mut prints);
                 let head = format!("  {} ", paint(WARM, "✗"));
                 prints.extend(
-                    wrap_hanging(&head, message, width, 4, 2).into_iter().map(|l| paint(WARM, &l)),
+                    wrap_hanging(&head, message, width, 4, 3).into_iter().map(|l| paint(WARM, &l)),
                 );
             }
             EngineEvent::Warning { message } => {
@@ -832,7 +798,7 @@ impl RenderState {
     /// One line per call: `  ✓ read   src/x.rs            42 lines`. A
     /// success is quiet (dim glyph, dim meta); a failure is the one card
     /// worth reading, so its error rides the same line in WARM.
-    fn build_card(&mut self, name: &str, ok: bool, result_preview: &str, lines: usize, ms: u64) -> Card {
+    fn build_card(&mut self, name: &str, ok: bool, unchanged: bool, result_preview: &str, lines: usize, ms: u64) -> Card {
         let (verb, arg) = match self.take_pending(name) {
             Some(call) => (call.verb.clone(), call.arg.clone()),
             // Unmatched result (start line lost): render from the name.
@@ -842,9 +808,14 @@ impl RenderState {
         let col = verb.chars().count().max(6);
         let lead = 4 + col + 1;
         let mut meta = String::new();
+        // An edit whose result was already in the file succeeded and
+        // changed nothing: it reads as a dim dash, never as a check mark.
+        let unchanged = ok && unchanged;
         if ok {
             let mut parts = Vec::new();
-            if matches!(verb.as_str(), "read" | "run" | "search") && lines > 1 {
+            if unchanged {
+                parts.push("no change".to_string());
+            } else if matches!(verb.as_str(), "read" | "run" | "search") && lines > 1 {
                 parts.push(format!("{lines} lines"));
             }
             if ms >= 1000 {
@@ -864,15 +835,15 @@ impl RenderState {
         };
         let key = arg.clone().unwrap_or_default();
         let subject = arg.map(|a| preview(&a, subject_room.max(8))).unwrap_or_default();
-        let (glyph, gcolor) = if ok { ("✓", COLD) } else { ("✗", WARM) };
+        let (glyph, gcolor) = if unchanged { ("–", COLD) } else if ok { ("✓", COLD) } else { ("✗", WARM) };
         let mut text = format!(
             "  {} {} {}",
             paint(gcolor, glyph),
             if ok { dim(&format!("{verb:<col$}")) } else { paint(WARM, &format!("{verb:<col$}")) },
-            subject
+            if unchanged { dim(&subject) } else { subject.clone() }
         );
         if ok {
-            text = crate::tui::spread(&text, &dim(&meta), width);
+            text = crate::tui::beside(&text, &dim(&meta), width);
         } else {
             let used = lead + subject.chars().count();
             let gist = error_gist(name, result_preview);
@@ -881,7 +852,9 @@ impl RenderState {
                 text.push_str(&format!(" {} {}", dim("—"), paint(WARM, &preview(&gist, room))));
             }
         }
-        Card { verb, ok, line: text, key }
+        // A no-op stands alone: folded into a streak of edits it would
+        // count as one more change.
+        Card { verb, ok: ok && !unchanged, line: text, key }
     }
 
     /// Streak-aware card emission. First card of a verb prints at once;
@@ -918,7 +891,7 @@ impl RenderState {
             prints.push(format!(
                 "  {} {}",
                 paint(COLD, "✓"),
-                dim(&streak_summary(verb, self.streak_count, self.streak_keys.len()))
+                dim(&streak_summary(verb, self.streak_count, &self.streak_keys))
             ));
         } else if let Some(held) = self.held.take() {
             prints.push(held.line);
@@ -943,7 +916,7 @@ fn warning_lines(message: &str, width: usize) -> Vec<String> {
             paint(BRIGHT, "!"),
             paint(BRIGHT, &format!("warden sent back the {}", doc.to_lowercase()))
         );
-        return wrap_hanging(&head, gap, width, 4, 3);
+        return wrap_hanging(&head, gap, width, 4, 5);
     }
     // `[i2] rewound 3 file(s) to attempt start for a clean retry` follows
     // every failed heat. The heat's own ✗ line already says it failed and
@@ -957,7 +930,7 @@ fn warning_lines(message: &str, width: usize) -> Vec<String> {
         }
     }
     let head = format!("  {} ", paint(BRIGHT, "!"));
-    wrap_hanging(&head, message, width, 4, 2).into_iter().map(|l| paint(BRIGHT, &l)).collect()
+    wrap_hanging(&head, message, width, 4, 3).into_iter().map(|l| paint(BRIGHT, &l)).collect()
 }
 
 /// The warden's word on the goal: `✓ warden · round 1  goal met — …` or
@@ -1157,10 +1130,12 @@ mod tests {
             lines: 1,
             bytes: 8,
             ms: 12,
+            unchanged: false,
         })
         .unwrap();
         assert_eq!(v["event"], "tool_result");
         assert_eq!(v["ok"], false);
+        assert!(v.get("unchanged").is_none(), "a changing result keeps its old shape");
 
         let v = serde_json::to_value(EngineEvent::Finish { summary: "done".into() }).unwrap();
         assert_eq!(v["event"], "finish");
@@ -1287,6 +1262,7 @@ mod tests {
             lines: p.lines().count(),
             bytes: p.len(),
             ms: 0,
+            unchanged: false,
         }
     }
 
@@ -1316,6 +1292,29 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains('✓') && lines[0].contains("run"), "{}", lines[0]);
         assert!(lines[0].contains("cargo test --all"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_no_op_edit_reads_as_no_change_not_a_check() {
+        let mut state = RenderState::new(false);
+        let mut lines = Vec::new();
+        for path in ["a.py", "b.py", "c.py"] {
+            state.feed(&start("edit_file", &format!(r#"{{"path": "{path}"}}"#)));
+            let mut ev = result("edit_file", true, "already applied (old_string equals new_string)");
+            if path == "b.py" {
+                if let EngineEvent::ToolResult { unchanged, .. } = &mut ev {
+                    *unchanged = true;
+                }
+            }
+            lines.extend(printed(&state.feed(&ev)));
+        }
+        lines.extend(printed(&state.finish()));
+        let noop = lines.iter().find(|l| l.contains("b.py")).expect("the no-op prints its own row");
+        assert!(noop.contains('–') && noop.contains("no change"), "{noop}");
+        assert!(!noop.contains('✓'), "{noop}");
+        // It stays out of the edits around it: no streak counts it.
+        assert!(lines.iter().all(|l| !l.contains("edited")), "{lines:?}");
+        assert_eq!(lines.iter().filter(|l| l.contains('✓')).count(), 2, "{lines:?}");
     }
 
     #[test]
@@ -1425,10 +1424,16 @@ mod tests {
         events.push(start("bash", r#"{"command": "ls"}"#));
         events.push(result("bash", true, "ok"));
         let joined = printed(&feed_all(&mut state, &events)).join("\n");
-        assert!(joined.contains("read 2 files (4 calls)"), "{joined}");
-        assert!(!joined.contains("read 4 files"), "{joined}");
-        assert_eq!(streak_summary("edit", 3, 3), "edited 3 files");
-        assert_eq!(streak_summary("edit", 4, 1), "edited 1 file (4 calls)");
+        assert!(joined.contains("read a.rs, b.rs (4 calls)"), "{joined}");
+        assert!(!joined.contains("4 files"), "{joined}");
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect();
+        assert_eq!(streak_summary("edit", 3, &keys(&["a", "b", "c"])), "edited a, b, c");
+        assert_eq!(
+            streak_summary("edit", 3, &keys(&["src/preview.js"])),
+            "edited src/preview.js (3 calls)",
+            "names the file, so it never reads as the whole diff"
+        );
+        assert_eq!(streak_summary("edit", 6, &keys(&["a", "b", "c", "d"])), "edited 4 files (6 calls)");
     }
 
     #[test]

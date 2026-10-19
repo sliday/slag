@@ -25,6 +25,81 @@ Tasks: 3 Python (stdlib unittest), 3 JavaScript (node:test), 1 Rust
 (cargo test, no external crates), 1 shell. No network, no package
 installs.
 
+## Streams
+
+`streams/<domain>/` holds an ordered stream of related tasks, built to
+measure recursive harnessing: an agent that keeps a library of lessons
+should do better on later tasks than an agent that starts cold each
+time. A stream task has the same layout as `issues/` tasks, plus an
+`order` field (integer) and a `traps` list in `meta.json`.
+
+Two domains, 8 tasks each, ordered easy to hard (2 easy, 4 medium, 2
+hard per domain):
+
+- `py-data` - Python data-wrangling library bugs. Recurring traps:
+  reproduce with the exact input quoted in the issue, timezone-naive vs
+  aware datetimes, unicode normalization, Decimal ROUND_HALF_UP money
+  math, CSV edge cases (BOM, quoted newlines, chunk boundaries).
+- `js-web` - Node utility bugs. Recurring traps: exact-input
+  reproduction, URL/query semantics, async ordering, 1-based pagination
+  off-by-ones, cache key normalization and stale writes, swallowed
+  errors.
+
+    bench/run.sh --stream py-data --agent bench/agents/slag-fix.sh
+    bench/run.sh --stream js-web --agent bench/agents/noop.sh
+
+`--stream` swaps `bench/issues/` for `bench/streams/<domain>/` and runs
+tasks in `order`. The runner carries nothing between tasks: each task
+still gets a fresh repo copy and a lone ISSUE.md temp dir. An agent that
+wants to carry lessons must do so itself. `--tasks`, `--runs`,
+`--timeout`, `--out`, `--verify-fixtures`, and `--leak-check` all work
+with `--stream`.
+
+### Weak-executor baseline
+
+The stream baseline uses slag with a weak, cheap base model and one
+attempt per task (`SLAG_FIX_TRIES=1`) with the fix left in the working
+tree (`SLAG_FIX_NO_COMMIT=1`), so the number measures the model, not
+retries on the plan model. Both are opt-in; without them the adapter runs
+`slag fix` as a user would:
+
+    SLAG_BIN=slag-rs/target/debug/slag SLAG_PROVIDER=mistral \
+      SLAG_MODEL_BASE=ministral-3b-latest SLAG_FIX_TRIES=1 SLAG_FIX_NO_COMMIT=1 \
+      bench/run.sh --agent bench/agents/slag-fix.sh --stream py-data \
+      --out bench/results/stream-baseline-py-data.json
+
+Chosen executor: `mistral` / `ministral-3b-latest`. Candidates tried:
+`ministral-8b-latest` passed 7/8 on js-web (too strong, no headroom);
+`openai` / `gpt-4.1-nano` passed 5/8 on py-data and 4/8 on js-web
+(slightly strong and uneven); `ministral-3b-latest` passes 2/8 on each
+stream, so lessons from earlier tasks have room to show.
+
+Baseline (slag v2.9.0, `slag fix --no-commit --tries 1`,
+ministral-3b-latest, 2026-10-19):
+
+    stream    task                  result   wall(s)
+    py-data   01-csv-bom            PASS     26
+    py-data   02-money-round        FAIL     100
+    py-data   03-tz-filter          PASS     25
+    py-data   04-unicode-dedupe     FAIL     92
+    py-data   05-csv-quoted-newline FAIL     72
+    py-data   06-float-total        FAIL     37
+    py-data   07-dst-schedule       FAIL     55
+    py-data   08-csv-chunk-boundary FAIL     43
+    js-web    01-query-decode       FAIL     15
+    js-web    02-cache-params-order FAIL     115
+    js-web    03-pager-offbyone     PASS     37
+    js-web    04-async-order        FAIL     28
+    js-web    05-url-join           PASS     17
+    js-web    06-fetch-error-swallow FAIL    139
+    js-web    07-cache-stale-race   FAIL     57
+    js-web    08-cursor-pagination  FAIL     6
+
+    py-data: 2/8   js-web: 2/8   total: 4/16 (25%)
+
+Baseline JSONs: `results/stream-baseline-py-data.json`,
+`results/stream-baseline-js-web.json`.
+
 ## Running
 
     bench/run.sh --agent bench/agents/codex.sh
@@ -54,12 +129,15 @@ exception: when the adapter's basename is `reference.sh`, the runner
 sets `BENCH_REFERENCE_PATCH` to the task's patch. Anything the adapter
 prints goes to the run log. Bundled adapters: `noop.sh` (does nothing),
 `probe.sh` (leak check), `reference.sh` (applies the reference patch),
-`codex.sh`, `fx.sh`, `slag-fix.sh` (placeholder for the future
-`slag fix` command).
+`codex.sh`, `fx.sh`, `slag-fix.sh` (runs `slag fix` as a user would;
+SLAG_BIN picks the binary; opt in with SLAG_FIX_TRIES, SLAG_FIX_NO_COMMIT=1
+and SLAG_FIX_ARGS).
 
 ## Instrument checks
 
     bench/run.sh --verify-fixtures
+    bench/run.sh --verify-fixtures --stream py-data
+    bench/run.sh --verify-fixtures --stream js-web
     bench/run.sh --leak-check
 
 Every task's hidden suite must fail on the untouched repo and pass
@@ -67,10 +145,13 @@ after `reference.patch` is applied. The leak check runs the probe
 adapter through the normal plumbing; it fails if the environment or the
 handed-over paths mention `hidden`, `reference.patch`, or
 `bench/issues` (`--verify-fixtures` runs it too). Additionally, the
-noop adapter must score 0/8 and the reference adapter 8/8:
+noop adapter must score 0/8 and the reference adapter 8/8, on the
+default task set and on each stream:
 
     bench/run.sh --agent bench/agents/noop.sh
     bench/run.sh --agent bench/agents/reference.sh
+    bench/run.sh --stream py-data --agent bench/agents/noop.sh
+    bench/run.sh --stream py-data --agent bench/agents/reference.sh
 
 ## Adding a task
 

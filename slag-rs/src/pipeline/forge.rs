@@ -935,6 +935,7 @@ async fn resume_session(
         .with_context_window(window)
         .with_coordinator_root(std::path::PathBuf::from("."))
         .with_resume(true)
+        .with_required_verification()
         .with_effort(config.effort.or(Some(Effort::from_grade(ingot.grade))));
     if let Some(tx) = &hooks.events {
         agent = agent.with_events(tx.clone());
@@ -1003,8 +1004,20 @@ async fn check_verification(cmd: &str) -> proof::ShellCheck {
         Ok(snapshot) => snapshot,
         Err(e) => return refused(format!("cannot protect coordinator files: {e}")),
     };
-    let check = proof::check_shell(cmd).await;
-    match snapshot.restore() {
+    if let Err(e) = super::hygiene::install_ignores(Path::new("."), None) {
+        return refused(format!("cannot install cache ignores: {e}"));
+    }
+    let files = match super::hygiene::VerificationFiles::capture(Path::new(".")) {
+        Ok(files) => files,
+        Err(e) => return refused(format!("cannot snapshot verification files: {e}")),
+    };
+    let check = if direct_contract() { check_read_only(cmd).await } else { proof::check_shell(cmd).await };
+    let restored = snapshot.restore();
+    let cleaned = files.clean_new(Path::new("."));
+    if let Err(e) = cleaned {
+        return refused(format!("cannot remove verification files: {e}\n{}", check.output));
+    }
+    match restored {
         Ok(changed) if changed.is_empty() => check,
         Ok(changed) => refused(format!(
             "verification changed coordinator files: {}\n{}",
@@ -1012,6 +1025,43 @@ async fn check_verification(cmd: &str) -> proof::ShellCheck {
             check.output
         )),
         Err(e) => refused(format!("cannot restore coordinator files: {e}\n{}", check.output)),
+    }
+}
+
+fn direct_contract() -> bool {
+    std::fs::read_to_string(super::warden::BAR_FILE).ok()
+        .is_some_and(|bar| bar.lines().any(|line| line.starts_with("REQUIRED RUN COMMANDS: ")))
+}
+
+async fn check_read_only(cmd: &str) -> proof::ShellCheck {
+    let failed = |reason: String| proof::ShellCheck {
+        success: false, output: reason.clone(), broken: false, reason,
+    };
+    let sandbox = match crate::engine::sandbox::Sandbox::read_only() {
+        Ok(sandbox) => sandbox,
+        Err(e) => return failed(format!("cannot run read-only verification: {e}")),
+    };
+    let output = match sandbox.wrap("/bin/bash").args(["-c", cmd]).current_dir(".")
+        .env("PYTHONDONTWRITEBYTECODE", "1").env("NODE_DISABLE_COMPILE_CACHE", "1")
+        .output().await
+    {
+        Ok(output) => output,
+        Err(e) => return failed(format!("read-only verification spawn error: {e}")),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let broken = matches!(output.status.code(), Some(126 | 127))
+        || output.status.code() == Some(2) && stderr.lines().any(|line| {
+            (line.starts_with("bash:") || line.contains(": line ") || line.contains(": -c:"))
+                && (line.contains("syntax error") || line.contains("unexpected EOF")
+                    || line.contains("unexpected end of file"))
+        });
+    let reason = stderr.lines().find(|line| !line.trim().is_empty())
+        .or_else(|| stdout.lines().find(|line| !line.trim().is_empty()))
+        .map(str::trim).map(str::to_string)
+        .unwrap_or_else(|| format!("read-only verification exited with {:?}", output.status.code()));
+    proof::ShellCheck {
+        success: output.status.success(), output: format!("{stdout}{stderr}"), broken, reason,
     }
 }
 
@@ -1311,13 +1361,14 @@ async fn reject_broken_proof(
 /// attempt-start snapshot — the retry builds from clean state, not the
 /// wreck of the failed attempt. The final heat never rewinds: a cracked
 /// ingot's debris is what resmelt and the operator inspect.
+/// Keep direct task edits so the next heat can repair the failed proof.
 fn rewind_failed_heat(
     ckpt: &checkpoint::Checkpoint,
     ingot: &Ingot,
     heat: u8,
     hooks: &EngineHooks,
 ) {
-    if heat >= ingot.max {
+    if heat >= ingot.max || ingot.grade == 1 && direct_contract() {
         return;
     }
     let restored = ckpt.rewind();

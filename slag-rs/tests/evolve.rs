@@ -126,6 +126,29 @@ impl Respond for Roles {
                 return tool_call(vec![("finish", json!({"summary": "Nothing to change.", "cmd": "bash tests/check.sh"}))]);
             }
             let rule = first.contains("ALWAYS ADD A TEST");
+            // An issue that says `touch-notes` gets a smith that also
+            // edits the user's uncommitted notes.txt.
+            // `rewrite-test` gets a smith that rewrites the existing test.
+            if task.contains("rewrite-test") {
+                return match turn {
+                    0 => tool_call(vec![("read_file", json!({"path": "value.txt"})), ("read_file", json!({"path": "tests/check.sh"}))]),
+                    1 => tool_call(vec![
+                        ("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+                        ("write_file", json!({"path": "tests/check.sh", "content": "true\n"})),
+                    ]),
+                    _ => tool_call(vec![("finish", json!({"summary": "value.txt now holds 2.", "cmd": "bash tests/check.sh"}))]),
+                };
+            }
+            if task.contains("touch-notes") {
+                return match turn {
+                    0 => tool_call(vec![("read_file", json!({"path": "value.txt"})), ("read_file", json!({"path": "notes.txt"}))]),
+                    1 => tool_call(vec![
+                        ("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+                        ("write_file", json!({"path": "notes.txt", "content": "the smith was here\n"})),
+                    ]),
+                    _ => tool_call(vec![("finish", json!({"summary": "value.txt:1 held 1; it now holds 2.", "cmd": "bash tests/check.sh"}))]),
+                };
+            }
             return match turn {
                 0 => tool_call(vec![("read_file", json!({"path": "value.txt"}))]),
                 1 if rule => tool_call(vec![
@@ -421,6 +444,42 @@ async fn a_harness_directory_changes_the_smith_and_stays_untouched() {
     let systems = roles.systems.lock().unwrap().clone();
     let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
     assert!(!smith.contains("# Harness"), "{smith}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evolved_fix_never_takes_the_users_uncommitted_files() {
+    let repo = buggy_repo();
+    std::fs::write(repo.path().join("notes.txt"), "mine\n").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (server, _) = model().await;
+    let args = ["fix", "value is wrong touch-notes", "--test", "bash tests/check.sh", "--evolve", "1"];
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let rec = record(repo.path());
+    for run in rec["runs"].as_array().unwrap() {
+        assert!(!run["files"].as_array().unwrap().contains(&json!("notes.txt")), "a run's change never holds the user's file: {run}");
+    }
+    assert_eq!(std::fs::read_to_string(repo.path().join("notes.txt")).unwrap(), "mine\n", "delivery left it alone");
+    let files = sh(repo.path(), "git show --name-only --format= HEAD");
+    assert!(!files.contains("notes.txt") && files.contains("value.txt"), "{files}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evolve_run_faces_the_existing_test_guard() {
+    let repo = buggy_repo();
+    let home = tempfile::tempdir().unwrap();
+    let (server, _) = model().await;
+    let args = ["fix", "value is wrong rewrite-test", "--test", "bash tests/check.sh", "--evolve", "1", "--tries", "1"];
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    let rec = record(repo.path());
+    let base = rec["runs"].as_array().unwrap().iter().find(|r| r["label"] == "base-1").unwrap();
+    assert_eq!(base["verified"], false, "{base}");
+    assert!(base["failure"].as_str().unwrap().contains("existing tests"), "{base}");
+    assert!(rec["runs"].as_array().unwrap().iter().all(|r| r["verified"] == false), "{rec:#}");
+    assert_eq!(std::fs::read_to_string(repo.path().join("tests/check.sh")).unwrap(), "grep -qx 2 value.txt\n");
 }
 
 #[test]

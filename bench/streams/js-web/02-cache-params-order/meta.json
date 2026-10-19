@@ -1,0 +1,1 @@
+{"id": "02-cache-params-order", "lang": "javascript", "difficulty": "easy", "summary": "makeKey uses the raw URL string, so query params in a different order miss the cache.", "order": 2, "traps": ["exact-input", "caching", "url-query"]}

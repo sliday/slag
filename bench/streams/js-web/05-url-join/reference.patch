@@ -1,0 +1,13 @@
+diff --git a/src/api.js b/src/api.js
+index 3819ceb..ad6ade5 100644
+--- a/src/api.js
++++ b/src/api.js
+@@ -4,7 +4,7 @@
+  * Join an API base URL and a resource path into one URL string.
+  */
+ function buildUrl(base, path) {
+-  return base + path;
++  return `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+ }
+ 
+ module.exports = { buildUrl };

@@ -1,0 +1,1 @@
+{"id": "04-unicode-dedupe", "lang": "python", "difficulty": "medium", "summary": "unique_names compares raw strings, so NFC and NFD forms of the same name fail to dedupe.", "order": 4, "traps": ["exact-input", "unicode"]}

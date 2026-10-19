@@ -55,6 +55,8 @@ pub struct Stream {
     /// Hold footer redraws until the next tick. A replay jumping straight
     /// to a moment would otherwise redraw it once per cue on the way.
     defer_footer: bool,
+    /// Lines held back instead of printed (see `screenful`).
+    held: Option<Vec<Out>>,
 }
 
 impl Stream {
@@ -75,7 +77,35 @@ impl Stream {
             spin: 0,
             footer: None,
             defer_footer: false,
+            held: None,
         }
+    }
+
+    /// Hold every line until `flush_screen`, which prints only the ones a
+    /// terminal of that height would still show. A replay jumping to a
+    /// moment draws the same frame either way; printing hundreds of lines
+    /// it would scroll past only gives a slow terminal (vhs's xterm.js)
+    /// something to choke on half way through.
+    pub fn screenful(mut self, on: bool) -> Self {
+        self.held = on.then(Vec::new);
+        self
+    }
+
+    /// Print the held lines that fit `rows` terminal rows, oldest first.
+    pub fn flush_screen(&mut self, rows: usize) {
+        let Some(held) = self.held.take() else { return };
+        let mut kept: Vec<Out> = Vec::new();
+        let mut used = 0usize;
+        for line in held.into_iter().rev() {
+            used += line_rows(&line);
+            if used > rows {
+                break;
+            }
+            kept.push(line);
+        }
+        kept.reverse();
+        let footer = self.footer.clone();
+        self.write(&kept, footer);
     }
 
     /// Print a run-stopping provider error itself (a replay; live runs
@@ -216,6 +246,11 @@ impl Stream {
     }
 
     fn write(&mut self, out: &[Out], footer: Option<String>) {
+        if let Some(held) = self.held.as_mut() {
+            // The footer waits too: it is drawn once the screen is printed.
+            held.extend(out.iter().cloned());
+            return;
+        }
         let stdout = std::io::stdout();
         let stderr = std::io::stderr();
         let mut o = stdout.lock();
@@ -250,6 +285,13 @@ impl Viewer for Stream {
 
     fn finish(&mut self, at: Instant) {
         self.finish_at(at);
+    }
+}
+
+/// Terminal rows one ledger entry takes (a wrapped status spans several).
+fn line_rows(line: &Out) -> usize {
+    match line {
+        Out::Std(s) | Out::Err(s) => s.split('\n').count(),
     }
 }
 
@@ -378,6 +420,7 @@ mod tests {
                     lines: 1,
                     bytes: 2,
                     ms: 5,
+                    unchanged: false,
                 }),
                 t0,
             ));

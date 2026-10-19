@@ -4,26 +4,14 @@ use crate::flux;
 use crate::smith::{self, Smith};
 use crate::tui;
 
-pub async fn direct_proof(smith: &dyn Smith, commission: &str) -> Result<Option<String>, SlagError> {
-    let raw = smith.invoke(&format!(
-        "Choose the work scope for a fresh, empty project.\n\
-         COMMISSION:\n{commission}\n\n\
-         Use direct=true only for a local utility with at most four product files, \
-         a deterministic test command, and no external service, UI, deployment, \
-         or architectural research. Otherwise use direct=false.\n\
-         Return only JSON: {{\"direct\":true,\"proof\":\"test command\"}} \
-         or {{\"direct\":false}}. Do not use tools. \
-         The proof must test the requested behavior. Do not invent acceptance rules."
-    )).await?;
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
-        return Ok(None);
-    };
-    let proof = value["proof"].as_str().unwrap_or_default().trim();
-    if value["direct"] == true && !proof.is_empty() && proof != "true" {
-        Ok(Some(proof.to_string()))
-    } else {
-        Ok(None)
+pub async fn direct_proof(smith: &dyn Smith, commission: &str) -> Result<Option<super::direct::DirectPlan>, SlagError> {
+    let raw = smith.invoke(&super::direct::scope_prompt(commission)).await?;
+    if let Some(plan) = super::direct::parse_scope(&raw, commission) {
+        return Ok(Some(plan));
     }
+    let Some(prompt) = super::direct::scope_repair_prompt(commission, &raw) else { return Ok(None) };
+    let repaired = smith.invoke(&prompt).await?;
+    Ok(super::direct::parse_scope(&repaired, commission))
 }
 
 /// Phase 1: Analyze the commission (PRD.md) and produce a BLUEPRINT.md
@@ -124,16 +112,38 @@ mod tests {
 
     #[tokio::test]
     async fn direct_scope_requires_a_test_command_and_explicit_routing() {
-        for (reply, expected) in [
-            (r#"{"direct":true,"proof":"python3 -m unittest"}"#, Some("python3 -m unittest")),
-            (r#"{"direct":false}"#, None),
-            (r#"{"direct":true,"proof":"true"}"#, None),
-            (r#"{"direct":true,"proof":""}"#, None),
-            ("A small project.", None),
+        for (reply, expected, calls) in [
+            (r#"{"direct":true,"proof":"python3 -m unittest","criteria":["The utility passes its requested unittest."]}"#, Some("python3 -m unittest"), 1),
+            (r#"{"direct":false}"#, None, 1),
+            (r#"{"direct":true,"proof":"true"}"#, None, 2),
+            (r#"{"direct":true,"proof":""}"#, None, 2),
+            ("A small project.", None, 1),
         ] {
             let smith = crate::smith::mock::MockSmith::fixed(reply);
-            assert_eq!(direct_proof(&smith, "local utility with tests").await.unwrap().as_deref(), expected);
-            assert_eq!(smith.call_count(), 1);
+            let plan = direct_proof(&smith, "local utility with tests").await.unwrap();
+            assert_eq!(plan.as_ref().map(|plan| plan.proof.as_str()), expected);
+            assert_eq!(smith.call_count(), calls);
         }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_direct_contract_gets_one_repair_attempt() {
+        let invalid = r#"{"direct":true,"proof":"python3 -m unittest","criteria":["The CLI counts words."],"commands":["python3 wc.py fixture.txt > output.json"]}"#;
+        let valid = r#"{"direct":true,"proof":"python3 -m unittest","criteria":["The CLI counts words."],"commands":["python3 wc.py fixture.txt"]}"#;
+        let smith = crate::smith::mock::MockSmith::new(vec![invalid.into(), valid.into()]);
+        let plan = direct_proof(&smith, "Create a word counting CLI.").await.unwrap().unwrap();
+        assert_eq!(plan.commands, ["python3 wc.py fixture.txt"]);
+        assert_eq!(smith.call_count(), 2);
+
+        let smith = crate::smith::mock::MockSmith::fixed(invalid);
+        assert!(direct_proof(&smith, "Create a word counting CLI.").await.unwrap().is_none());
+        assert_eq!(smith.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn scope_provider_errors_do_not_trigger_repair() {
+        let smith = crate::smith::mock::MockSmith::failing();
+        assert!(direct_proof(&smith, "Create a local utility.").await.is_err());
+        assert_eq!(smith.call_count(), 1);
     }
 }

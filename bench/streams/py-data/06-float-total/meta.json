@@ -1,0 +1,1 @@
+{"id": "06-float-total", "lang": "python", "difficulty": "medium", "summary": "reconcile uses float sums, so 0.1+0.2 never equals 0.30 and half-cent totals round wrong.", "order": 6, "traps": ["exact-input", "decimal", "full-suite"]}

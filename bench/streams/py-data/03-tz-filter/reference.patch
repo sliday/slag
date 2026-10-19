@@ -1,0 +1,24 @@
+diff --git a/feedsift/timestamps.py b/feedsift/timestamps.py
+index a15918f..6bc2b68 100644
+--- a/feedsift/timestamps.py
++++ b/feedsift/timestamps.py
+@@ -1,12 +1,16 @@
+ """ISO 8601 timestamp parsing."""
+ 
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ 
+ def parse_iso(text):
+     """Parse an ISO 8601 timestamp into a datetime.
+ 
+     Accepts a trailing 'Z' for UTC and numeric offsets like '+02:00',
+-    as well as plain naive timestamps.
++    as well as plain naive timestamps. The result is aware: offsets are
++    honored and naive timestamps are treated as UTC.
+     """
+-    return datetime.fromisoformat(text).replace(tzinfo=None)
++    dt = datetime.fromisoformat(text)
++    if dt.tzinfo is None:
++        return dt.replace(tzinfo=timezone.utc)
++    return dt.astimezone(timezone.utc)

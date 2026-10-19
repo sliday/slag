@@ -41,6 +41,7 @@ fn command(root: &Path, config: &Path, base: &str, duel: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_slag"));
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("TMPDIR", std::env::temp_dir())
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("OPENROUTER_API_KEY", "sk-or-test")
@@ -63,6 +64,7 @@ async fn founder_writes_and_forged_status_never_replace_forge_proof() {
     use std::sync::Arc;
 
     let root = project("");
+    std::fs::write(root.path().join("proof-runs"), "").unwrap();
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     let founders = Arc::new(AtomicUsize::new(0));
@@ -196,7 +198,7 @@ async fn missing_cmd_after_resmelt_cracks_once_and_resume_spends_nothing() {
                 "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
             }))
         })
-        .expect(13)
+        .expect(25)
         .mount(&server)
         .await;
     forge(root.path(), config.path(), &server.uri(), "on")
@@ -214,6 +216,42 @@ async fn missing_cmd_after_resmelt_cracks_once_and_resume_spends_nothing() {
         std::fs::read_to_string(root.path().join("PLAN.md")).unwrap(),
         plan
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_finish_cmd_is_repaired_before_a_heat_burns() {
+    let root = project("(ingot :id \"i1\" :status ore :solo nil :heat 0 :max 3 :proof \"true\")\n");
+    let config = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"tool_calls": [{"id": "first", "type": "function",
+                "function": {"name": "finish", "arguments": "{\"summary\":\"Done\"}"}}]},
+                "finish_reason": "tool_calls"}]
+        })))
+        .up_to_n_times(1).expect(1).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"tool_calls": [{"id": "second", "type": "function",
+                "function": {"name": "finish", "arguments": "{\"summary\":\"Done\",\"cmd\":\"true\"}"}}]},
+                "finish_reason": "tool_calls"}]
+        })))
+        .expect(1).mount(&server).await;
+    forge(root.path(), config.path(), &server.uri(), "off").assert().success();
+    let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
+    assert!(plan.contains(":status forged"), "{plan}");
+    assert!(plan.contains(":heat 1 :max 3 :smelt 0"), "{plan}");
+    let requests = server.received_requests().await.unwrap();
+    let requests: Vec<_> = requests.iter().filter(|request| request.method == "POST").collect();
+    assert_eq!(requests.len(), 2);
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let finish = first["tools"].as_array().unwrap().iter()
+        .find(|tool| tool["function"]["name"] == "finish").unwrap();
+    assert!(finish["function"]["parameters"]["required"].as_array().unwrap().contains(&serde_json::json!("cmd")));
+    let repair: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(repair["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("non-empty cmd string"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -470,6 +508,7 @@ async fn quoted_proof_runs_after_plan_load_and_save() {
     let root = project(
         r#"(ingot :id "i1" :solo nil :max 5 :proof "printf '%s\n' \"a.b|c\" | grep 'a\.b\|c' > proof-ran")"#,
     );
+    std::fs::write(root.path().join("proof-ran"), "").unwrap();
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("POST"))

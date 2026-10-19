@@ -143,6 +143,14 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         bar = ingot.bar,
     );
 
+    flux.push_str(DELIVERY_RULES);
+    flux.push_str("\n\nVERIFICATION CONTRACT: The independent reviewer runs the suite and CLI with a read-only filesystem. \
+        Use in-memory data or committed fixtures under tests/fixtures. Create fixture files during construction, before verification. Tests must not create or delete workspace fixtures. \
+        Use subprocess CLI tests to exercise each named flag and behavior. Assert exact expected results, not only exit codes or output shapes. Keep scratch files in TMPDIR, not the product tree. \
+        For package installation, prepare a project virtual environment before review; never use global pip or bypass PEP 668. \
+        For named reference tools, check the requested behavior against the reference instead of guessing fixture expectations. \
+        Inspect a failing assertion and its input before changing code or tests. Never change expectations just to fit the implementation.\n\n");
+
     if let Some(slag_msg) = slag {
         flux.push_str(&format!(
             "!!! CRACKED - PREVIOUS ATTEMPT FAILED !!!\n{slag_msg}\n!!! ANALYZE AND FIX !!!\n\n\
@@ -285,7 +293,10 @@ pub fn surveyor_prompt(ore: &str) -> String {
         ## 4. DEPENDENCY GRAPH\n```\n[A] ──▶ [B] ──▶ [C]\n         │\n         └────▶ [D]\n```\n\n\
         ## 5. RISKS\n- High complexity areas\n- Integration points\n- External dependencies\n\n\
         ## 6. FORGING SEQUENCE\n1. Foundation (parallel, :solo t)\n2. Core logic\n3. Integration\n4. Polish/deploy\n\n\
-        ## 7. ACCEPTANCE CRITERIA\n- Specific tests\n- Features to verify\n- Quality checks\n\n\
+        ## 7. ACCEPTANCE CRITERIA\n- Trace each named behavior, flag, CLI and package requirement to an observable check.\n\
+        - Include actual CLI subprocess tests for requested flags and behavior.\n\
+        - Choose a read-only-compatible suite and CLI probes using in-memory data or committed fixtures.\n\
+        - Add no unstated features, fixed test counts or packaging formats.\n\n\
         RULES:\n\
         - You are the EXPERT. Make ALL decisions yourself.\n\
         - NO QUESTIONS. If uncertain, choose the best option.\n\
@@ -334,7 +345,9 @@ fn founder_format_rules() -> String {
         - :heat = 0\n\
         - :max = attempts (5 simple, 8+ complex)\n\
         - :smelt = 0 (re-smelt count; system manages this)\n\
-        - :proof = shell verification command\n\
+        - :proof = the declared read-only-compatible test command\n\
+        - Carry every acceptance item from the blueprint or bar into task work and proof.\n\
+        - CLI tests must call the actual CLI and requested flags. Use in-memory data or committed fixtures.\n\
         - :bar = what DONE means for this ingot, stated so a reviewer can \
         inspect it. The proof shows something appeared; the bar says whether \
         the ingot's goal was met. Name the observable behaviour, not the file: \
@@ -367,6 +380,17 @@ fn founder_format_rules() -> String {
         .to_string()
 }
 
+const DELIVERY_RULES: &str = "\
+    Judge the commission as a usable deliverable.\n\
+    A requested CLI must run through its intended entry command in the delivered project.\n\
+    Document the intended launch and test commands.\n\
+    Include the local modules, dependency declarations, and configuration needed for that command.\n\
+    For a package deliverable, include the metadata needed for its intended installation or distribution.\n\
+    Check one suitable launch method, such as a console entry point or python -m.\n\
+    Do not require multiple launch methods unless the commission asks for them.\n\
+    Require installation only when the commission or its stated invocation requires it.\n\
+    Do not require a packaging format, a publish step, or a fixed test count without that requirement.";
+
 /// Ask for the acceptance bar: the concrete, inspectable statement a warden
 /// will judge the finished work against.
 ///
@@ -382,6 +406,7 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          Derive a short, reachable checklist from the commission's stated requirements.\n\
          Use the blueprint for context. Do not promote its design choices into requirements.\n\
          Name observable behavior and a direct way to inspect it.\n\
+         {DELIVERY_RULES}\n\
          Add no test counts, formatting rules, dependency bans, or features unless the commission requires them.\n\
          Permit normal imports between project modules.\n\
          Check test execution through the test runner, never by regex over test names or output.\n\
@@ -396,7 +421,7 @@ pub fn bar_prompt(ore: &str, blueprint: &str) -> String {
          ## HOW TO INSPECT\n\
          The commands a reviewer runs to check the list, in order.\n\n\
          RULES:\n\
-         - Trace each checklist item to a stated requirement.\n\
+         - Trace each checklist item to the commission or a runtime prerequisite for its requested behavior.\n\
          - NO QUESTIONS, NO PREAMBLE.\n\n\
          {}",
         DOCUMENT_OUTPUT_RULE
@@ -420,15 +445,18 @@ pub fn plan_warden_prompt(kind: &str, ore: &str, bar: &str, doc: &str) -> String
          Question: if this {kind} were carried out exactly as written, would \
          the result clear the bar?\n\n\
          Judge coverage of stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
+         {DELIVERY_RULES}\n\
          Do not require extra features, test counts, naming rules, or bans on normal project imports.\n\n\
          Do not ask for more detail for its own sake. A terse {kind} that \
          covers the bar passes.\n\n\
          Name ONE gap: the biggest thing the bar needs and this {kind} \
          does not deliver.\n\n\
+         Tool results include their tool-call IDs. Cite only IDs from successful inspection results.\n\
+         Put a JSON array of these IDs in EVIDENCE. Do not put paths, commands, or prose in EVIDENCE.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
          VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
-         EVIDENCE: the bar item that goes uncovered"
+         EVIDENCE: [\"tool-call-id\"]"
     )
 }
 
@@ -445,22 +473,26 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          THE SUB-GOAL:\n{work}\n\n\
          ITS BAR:\n{bar}\n\n\
          Inspect the source and tests on disk.\n\
-         Read PROGRESS.md for the proof command and logs/*_ASSAY_*.log for its recorded output.\n\
-         Run independent checks that do not write files.\n\
-         The review filesystem is read-only, including temporary directories.\n\
-         Do not run tests that create fixtures or build files.\n\
+         Run the declared test suite and CLI probes under the read-only sandbox.\n\
+         Copy each REQUIRED RUN COMMANDS entry verbatim into its own bash call. Cite those successful runs in EVIDENCE.\n\
+         Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
+         Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
+         The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
          Do not edit files. Do not install packages. Do not run git commands.\n\
          Judge the stated sub-goal. Add no features, test counts, naming rules, or bans on normal project imports.\n\
+         {DELIVERY_RULES}\n\
          Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\n\
          Judge only this sub-goal. Work outside it is not your concern, and \
          a gap you name that belongs to another ingot wastes a heat here.\n\n\
          Name ONE gap: the biggest that still matters for THIS sub-goal.\n\n\
+         Tool results include their tool-call IDs. Cite only IDs from successful inspection results.\n\
+         Put a JSON array of these IDs in EVIDENCE. Do not put paths, commands, or prose in EVIDENCE.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
          VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
-         EVIDENCE: what you actually inspected"
+         EVIDENCE: [\"tool-call-id\"]"
     )
 }
 
@@ -476,23 +508,27 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          THE GOAL:\n{ore}\n\n\
          THE BAR:\n{bar}\n\n\
          Inspect the source and tests on disk.\n\
-         Read PROGRESS.md for the proof command and logs/*_ASSAY_*.log for its recorded output.\n\
-         Run independent checks that do not write files.\n\
-         The review filesystem is read-only, including temporary directories.\n\
-         Do not run tests that create fixtures or build files.\n\
+         Run the declared test suite and CLI probes under the read-only sandbox.\n\
+         Copy each REQUIRED RUN COMMANDS entry verbatim into its own bash call. Cite those successful runs in EVIDENCE.\n\
+         Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
+         Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
+         The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          For visual or interactive work, inspect the interface.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
          Do not edit files. Do not install packages. Do not run git commands.\n\
          Judge the commission's stated requirements. Treat the commission as authoritative if the bar adds constraints.\n\
+         {DELIVERY_RULES}\n\
          Add no features, test counts, naming rules, or bans on normal project imports.\n\
          Ignore PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, logs/, and generated caches for cleanliness.\n\
          Name one unmet requirement if the artifact fails. Cite the command output or source that proves your verdict.\n\
          Return unverified if you cannot inspect the artifact or verify a required behavior.\n\n\
+         Tool results include their tool-call IDs. Cite only IDs from successful inspection results.\n\
+         Put a JSON array of these IDs in EVIDENCE. Do not put paths, commands, or prose in EVIDENCE.\n\n\
          Report EXACTLY these three lines, last, and nothing after them:\n\
          VERDICT: pass or fail or unverified\n\
          GAP: one sentence, empty when it passes\n\
-         EVIDENCE: the paths you inspected and commands you ran, with their results"
+         EVIDENCE: [\"tool-call-id\"]"
     )
 }
 
@@ -568,7 +604,9 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         the internals of your fix.\n\
         - in the test file for the module you fix (see TESTS above). When that module \
         has none, create one beside the existing tests, named after the module, in \
-        their framework and style. Never put it in a test file for another module.\n\
+        their framework and style. Never put it in a test file for another module. To \
+        add to an existing test file, append after its last test: an edit whose \
+        old_string is an existing test must keep that test whole in new_string.\n\
         - valid on this platform as written, and deterministic: no timing, no file \
         creation order, no network.\n\
         slag reruns your test with the fix reverted: it must then fail on an \
@@ -581,7 +619,11 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         5. Finish. summary: the root cause as path:line, the fix, the reproduction. \
         cmd: the full test command, which now runs your regression test.\n\n\
         RULES:\n\
-        - Never weaken, skip, or delete an existing test.\n\
+        - Never delete, skip, weaken, or rewrite a line of an existing test. slag \
+        reruns the original test files against your fix, and an attempt that fails \
+        them, or edits them, fails. Only when the issue explicitly asks for the \
+        behavior an existing test pins, update that test and say so in the summary, \
+        on its own line: changed existing tests: <file>: <why>.\n\
         - Create no notes, plans, PRD.md, PLAN.md, or BLUEPRINT.md. Put throwaway \
         scripts under /tmp, not in the repository.\n\
         - Run no git commands. slag tracks the changes and commits after it verifies.\n\
@@ -600,8 +642,21 @@ pub fn fix_review_prompt(
     diff: &str,
     test_files: &str,
     without_fix: &str,
+    existing: &str,
     platform: &str,
 ) -> String {
+    // Only a fix that rewrote existing tests gets the existing-behavior
+    // check: offered on every review, weak reviewers misread it as a
+    // request to restore the behavior the issue reports.
+    let existing_check = if existing.starts_with("untouched") {
+        String::new()
+    } else {
+        "0. EXISTING BEHAVIOR: the fix rewrites existing tests, so the issue text must \
+         explicitly ask for the exact behavior the new expectations pin. Without that \
+         ask, the fix breaks what the user relied on: fail, and say which expectation to \
+         restore.\n"
+            .to_string()
+    };
     format!(
         "ROLE: reviewer of a bug fix. You did not write it and you owe its author \
          nothing. You cannot run anything: judge from what is below.\n\n\
@@ -609,8 +664,13 @@ pub fn fix_review_prompt(
          THE CHANGE (unified diff against the code before the fix):\n{diff}\n\n\
          TEST FILES THAT EXISTED BEFORE THE FIX:\n{test_files}\n\n\
          WITH THE SOURCE CHANGE REVERTED, THE TESTS DID THIS:\n{without_fix}\n\n\
+         EXISTING TESTS: {existing}\n\n\
          PLATFORM: {platform}\n\n\
-         Check these four in order. Fail only on a clear miss, never on style:\n\
+         The issue reports a bug. Never ask the author to restore the behavior the \
+         issue reports as wrong, to expect it in a test, or to remove a test that checks \
+         what the issue says should happen. When unsure, pass.\n\n\
+         Check these in order. Fail only on a clear miss, never on style:\n\
+         {existing_check}\
          1. ROOT CAUSE: the source change fixes the cause the issue describes where it \
          is produced, not a special case for the reported input, and not a patch where \
          the symptom shows.\n\

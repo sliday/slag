@@ -6,10 +6,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::collections::HashSet;
-#[cfg(not(test))]
-use std::collections::HashMap;
-#[cfg(not(test))]
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -29,6 +26,8 @@ const BACKOFF_BASE_MS: u64 = 500;
 const BACKOFF_CAP_MS: u64 = 32_000;
 const RETRY_AFTER_CAP_SECS: u64 = 60;
 const BODY_EXCERPT_LEN: usize = 300;
+const RATE_LIMIT_BACKOFF_CAP_MS: u64 = 30_000;
+const RATE_LIMIT_IDLE: Duration = Duration::from_secs(60);
 /// Unattended mode: capacity backoff caps at 5 minutes per wait…
 const UNATTENDED_BACKOFF_CAP_MS: u64 = 300_000;
 /// …a server reset timestamp is honored up to an hour…
@@ -48,6 +47,76 @@ const UNATTENDED_MIN_DELAY: Duration = Duration::from_secs(1);
 
 #[cfg(not(test))]
 static MODEL_INDEX_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, std::sync::Arc<ModelsIndex>>>> = OnceLock::new();
+
+#[derive(Default)]
+struct RateLimitState {
+    failures: usize,
+    deadline: Option<tokio::time::Instant>,
+    // Keep retries serial for one quiet minute after the cooldown.
+    gate_until: Option<tokio::time::Instant>,
+}
+
+#[derive(Default)]
+struct RateLimiter {
+    state: std::sync::Mutex<RateLimitState>,
+    gate: tokio::sync::Mutex<()>,
+}
+
+// Keep throttle state across short-lived smith clients.
+static RATE_LIMITERS: OnceLock<std::sync::Mutex<HashMap<String, std::sync::Arc<RateLimiter>>>> = OnceLock::new();
+
+fn shared_rate_limiter(provider: ProviderPreset, base_url: &str) -> std::sync::Arc<RateLimiter> {
+    let host = reqwest::Url::parse(base_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| base_url.to_string());
+    let key = format!("{}::{host}", provider.name());
+    let mut limiters = RATE_LIMITERS.get_or_init(Default::default).lock().unwrap();
+    limiters.retain(|_, limiter| {
+        std::sync::Arc::strong_count(limiter) > 1
+            || limiter.active()
+    });
+    limiters.entry(key).or_default().clone()
+}
+
+impl RateLimiter {
+    fn delay(&self, hint: Option<Duration>) -> Duration {
+        let mut state = self.state.lock().unwrap();
+        if state.gate_until.is_some_and(|until| until <= tokio::time::Instant::now()) {
+            state.failures = 0;
+        }
+        state.failures = state.failures.saturating_add(1);
+        let delay = hint.unwrap_or_else(|| rate_limit_backoff(state.failures, next_jitter()));
+        let now = tokio::time::Instant::now();
+        let deadline = state.deadline.map_or(now + delay, |previous| previous.max(now + delay));
+        state.deadline = Some(deadline);
+        state.gate_until = Some(deadline + RATE_LIMIT_IDLE);
+        deadline.saturating_duration_since(now)
+    }
+
+    fn defer(&self, delay: Duration) {
+        let mut state = self.state.lock().unwrap();
+        let target = tokio::time::Instant::now() + delay;
+        let deadline = state.deadline.map_or(target, |previous| previous.max(target));
+        state.deadline = Some(deadline);
+        state.gate_until = Some(deadline + RATE_LIMIT_IDLE);
+    }
+
+    fn remaining(&self) -> Duration {
+        self.state.lock().unwrap().deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_default()
+    }
+
+    fn active(&self) -> bool {
+        self.state.lock().unwrap().gate_until.is_some_and(|until| until > tokio::time::Instant::now())
+    }
+
+    fn reset(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.failures = 0;
+        state.deadline = None;
+    }
+}
 
 /// Retry budget: `SLAG_MAX_RETRIES` overrides the default. Three attempts
 /// over ~1.5s proved far too brittle for overnight forge runs now that
@@ -114,6 +183,7 @@ pub struct OpenRouter {
     /// (item 34), resolved together from one fetch and cached so a client
     /// never pulls the large model list twice.
     models: tokio::sync::Mutex<Option<std::sync::Arc<ModelsIndex>>>,
+    rate_limiter: std::sync::Arc<RateLimiter>,
 }
 
 impl OpenRouter {
@@ -133,12 +203,14 @@ impl OpenRouter {
         url: impl Into<String>,
     ) -> Self {
         let timeout = timeout_from_env();
+        let base_url = url.into().trim_end_matches('/').to_string();
+        let rate_limiter = shared_rate_limiter(provider, &base_url);
         Self {
             provider,
             quirks: std::sync::atomic::AtomicU8::new(0),
             routes: std::sync::Mutex::new(Vec::new()),
             api_key: api_key.into(),
-            base_url: url.into().trim_end_matches('/').to_string(),
+            base_url,
             http: std::sync::Mutex::new(build_client(timeout, false)),
             timeout,
             max_attempts: if provider == ProviderPreset::OpenRouter {
@@ -151,6 +223,7 @@ impl OpenRouter {
             events: std::sync::Mutex::new(None),
             cancel: std::sync::Mutex::new(None),
             models: tokio::sync::Mutex::new(None),
+            rate_limiter,
         }
     }
 
@@ -403,6 +476,57 @@ impl OpenRouter {
         !self.is_cancelled()
     }
 
+    fn rate_limit_status(&self, req: &ChatRequest, delay: Duration) {
+        let message = format!("{}, role {}, model {}: rate limit (429); retry in {:.1}s.",
+            self.provider.name(), req.role, req.model, delay.as_secs_f64());
+        if let Some(tx) = self.events.lock().unwrap().as_ref() {
+            let _ = tx.send(EngineEvent::Warning { message });
+        } else if !crate::tui::is_quiet() {
+            eprintln!("    {message}");
+        }
+    }
+
+    async fn rate_limit_permit(&self, req: &ChatRequest) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, SlagError> {
+        if !self.rate_limiter.active() {
+            return Ok(None);
+        }
+        let gate = self.rate_limiter.gate.lock();
+        tokio::pin!(gate);
+        let guard = loop {
+            tokio::select! {
+                guard = &mut gate => break guard,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if self.is_cancelled() {
+                        return Err(SlagError::Cancelled);
+                    }
+                    if let Some(error) = crate::error::provider_run_failure() {
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        if !self.rate_limiter.active() {
+            return Ok(None);
+        }
+        let delay = self.rate_limiter.remaining();
+        if !delay.is_zero() {
+            self.rate_limit_status(req, delay);
+        }
+        loop {
+            if self.is_cancelled() {
+                return Err(SlagError::Cancelled);
+            }
+            if let Some(error) = crate::error::provider_run_failure() {
+                return Err(error);
+            }
+            let remaining = self.rate_limiter.remaining();
+            if remaining.is_zero() {
+                return Ok(Some(guard));
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+    }
+
     /// Decide whether one more retry happens and how long to wait.
     ///
     /// Bounded failures ride the 500ms→32s curve until the attempt budget
@@ -521,7 +645,7 @@ impl OpenRouter {
             }
             let free = match next.take() {
                 Some(plan) => {
-                    if !self.wait_out(attempts_made, &plan).await {
+                    if (plan.status != 429 || plan.heartbeats) && !self.wait_out(attempts_made, &plan).await {
                         return Err(SlagError::Cancelled);
                     }
                     if plan.heartbeats {
@@ -536,6 +660,7 @@ impl OpenRouter {
                 budget_used += 1;
             }
 
+            let rate_limit_permit = self.rate_limit_permit(&req).await?;
             let client = self.http.lock().unwrap().clone();
             let mut request = client.post(&url);
             if !self.api_key.is_empty() {
@@ -600,6 +725,9 @@ impl OpenRouter {
                         }
                     }
                     Ok(mut resp) => {
+                        if rate_limit_permit.is_some() {
+                            self.rate_limiter.reset();
+                        }
                         self.attribute(&mut resp, &req, cached_tokens).await;
                         return Ok(resp);
                     }
@@ -643,24 +771,32 @@ impl OpenRouter {
                 // whenever the server sent one, not only on 429.
                 last_category = category;
                 last_err = format!("{status}: {excerpt}");
+                let retry_after = retry_after_header.or_else(|| if code == 429 { parse_retry_after_body(&text) } else { None });
+                let retry_after = if code == 429 {
+                    let hint = if self.unattended && req.retry.persistent {
+                        reset_wait.or(retry_after)
+                    } else {
+                        retry_after.or(reset_wait.map(|delay| delay.min(Duration::from_secs(RETRY_AFTER_CAP_SECS))))
+                    };
+                    Some(self.rate_limiter.delay(hint))
+                } else {
+                    retry_after
+                };
                 match self.plan_retry(
                     Some(code),
-                    retry_after_header.or_else(|| if code == 429 { parse_retry_after_body(&text) } else { None }),
-                    reset_wait,
+                    retry_after,
+                    if code == 429 { None } else { reset_wait },
                     attempts_made,
                     budget_used,
                     unattended_waited,
                     req.retry,
                 ) {
                     Some(plan) => {
-                        if category == ProviderErrorCategory::RateLimit && plan.delay >= Duration::from_secs(1) {
-                            let message = format!("{}, role {}, model {}: rate limit (429); retry in {:.1}s.",
-                                self.provider.name(), req.role, req.model, plan.delay.as_secs_f64());
-                            if let Some(tx) = self.events.lock().unwrap().as_ref() {
-                                let _ = tx.send(EngineEvent::Warning { message });
-                            } else if !crate::tui::is_quiet() {
-                                eprintln!("    {message}");
-                            }
+                        if code == 429 {
+                            self.rate_limiter.defer(plan.delay);
+                        }
+                        if category == ProviderErrorCategory::RateLimit && plan.heartbeats {
+                            self.rate_limit_status(&req, plan.delay);
                         }
                         next = Some(plan);
                         continue;
@@ -960,8 +1096,7 @@ fn parse_retry_after_at(headers: &reqwest::header::HeaderMap, now: std::time::Sy
 static JITTER_STATE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
 
-/// 0..=25, a fresh percentage per call (Knuth MMIX LCG constants).
-fn next_jitter_percent() -> u64 {
+fn next_jitter() -> u64 {
     use std::sync::atomic::Ordering;
     let step = |s: u64| {
         s.wrapping_mul(6_364_136_223_846_793_005)
@@ -971,7 +1106,18 @@ fn next_jitter_percent() -> u64 {
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| Some(step(s)))
         .expect("closure always returns Some");
     // High bits of the advanced state; low LCG bits cycle too predictably.
-    (step(prev) >> 33) % 26
+    step(prev) >> 1
+}
+
+/// Draw full jitter from the exponential window, capped at 30 seconds.
+fn rate_limit_backoff(retry: usize, draw: u64) -> Duration {
+    let ceiling = (1_000u64 << retry.saturating_sub(1).min(5)).min(RATE_LIMIT_BACKOFF_CAP_MS);
+    Duration::from_millis(draw % (ceiling + 1))
+}
+
+/// 0..=25, a fresh percentage per call.
+fn next_jitter_percent() -> u64 {
+    next_jitter() % 26
 }
 
 /// Delay before retry `retry` (1-based): 500ms doubling capped at 32s,
@@ -1797,7 +1943,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_429_then_succeeds() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
@@ -2036,6 +2182,149 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_full_jitter_grows_and_caps_at_thirty_seconds() {
+        for (retry, ceiling) in [(1, 1_000), (2, 2_000), (3, 4_000), (4, 8_000), (5, 16_000), (6, 30_000), (100, 30_000)] {
+            assert_eq!(rate_limit_backoff(retry, ceiling), Duration::from_millis(ceiling));
+            assert_eq!(rate_limit_backoff(retry, ceiling + 1), Duration::ZERO);
+            let draws = (0..100).map(|_| rate_limit_backoff(retry, next_jitter())).collect::<Vec<_>>();
+            assert!(draws.iter().all(|delay| *delay <= Duration::from_millis(ceiling)));
+            assert!(draws.iter().collect::<HashSet<_>>().len() > 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_backoff_survives_new_clients_and_keeps_hosts_separate() {
+        // A pooled server's address outlives its test, and the process-wide
+        // rate limiter is keyed on it: the 429 tests take a fresh server so
+        // one test's failures and waits never reach another's.
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limit"))
+            .expect(7).mount(&server).await;
+        let mut saved: Option<std::sync::Weak<RateLimiter>> = None;
+        for expected in 1..=7 {
+            let provider = OpenRouter::with_provider(ProviderPreset::Mistral, "test-key", server.uri())
+                .with_max_attempts(1);
+            if let Some(limiter) = &saved {
+                assert!(std::sync::Arc::ptr_eq(&limiter.upgrade().expect("limiter survives client drop"), &provider.rate_limiter));
+            }
+            assert!(provider.chat(request(vec![], None)).await.is_err());
+            let mut state = provider.rate_limiter.state.lock().unwrap();
+            assert_eq!(state.failures, expected);
+            assert!(state.deadline.unwrap().saturating_duration_since(tokio::time::Instant::now())
+                <= Duration::from_millis((1_000 << (expected - 1).min(5)).min(RATE_LIMIT_BACKOFF_CAP_MS)));
+            state.deadline = None;
+            drop(state);
+            saved = Some(std::sync::Arc::downgrade(&provider.rate_limiter));
+        }
+        let limiter = saved.unwrap().upgrade().unwrap();
+        let path_alias = shared_rate_limiter(ProviderPreset::Mistral, &format!("{}/other-path", server.uri()));
+        assert!(std::sync::Arc::ptr_eq(&limiter, &path_alias));
+        let other_preset = shared_rate_limiter(ProviderPreset::OpenAI, &server.uri());
+        assert!(!std::sync::Arc::ptr_eq(&limiter, &other_preset));
+        let other_server = MockServer::builder().start().await;
+        let other_host = shared_rate_limiter(ProviderPreset::Mistral, &other_server.uri());
+        assert!(!std::sync::Arc::ptr_eq(&limiter, &other_host));
+    }
+
+    #[tokio::test]
+    async fn concurrent_clients_share_rate_limit_waits_and_retry_gate() {
+        let server = MockServer::builder().start().await;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                observed.lock().unwrap().push(std::time::Instant::now());
+                ResponseTemplate::new(429).set_body_string("rate limit; try again in 0.08s")
+            })
+            .expect(3).mount(&server).await;
+        let first = OpenRouter::with_provider(ProviderPreset::Mistral, "test-key", server.uri())
+            .with_max_attempts(1);
+        assert!(first.chat(request(vec![], None)).await.is_err());
+        let second = OpenRouter::with_provider(ProviderPreset::Mistral, "test-key", server.uri())
+            .with_max_attempts(1);
+        let third = OpenRouter::with_provider(ProviderPreset::Mistral, "test-key", server.uri())
+            .with_max_attempts(1);
+        let (tx, mut rx) = super::super::events::channel();
+        second.set_event_sink(tx.clone());
+        third.set_event_sink(tx);
+        let (a, b) = tokio::join!(second.chat(request(vec![], None)), third.chat(request(vec![], None)));
+        assert!(a.is_err() && b.is_err());
+        let calls = calls.lock().unwrap();
+        for pair in calls.windows(2) {
+            assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(70));
+        }
+        let mut warnings = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::Warning { message } = event {
+                assert!(message.contains("mistral") && message.contains("rate limit (429)"));
+                warnings += 1;
+            }
+        }
+        assert_eq!(warnings, 2, "one status line per wait");
+        assert_eq!(first.rate_limiter.state.lock().unwrap().failures, 3);
+    }
+
+    #[tokio::test]
+    async fn unattended_rate_limit_keeps_the_shared_gate_after_recovery() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0").set_body_string("rate limit"))
+            .up_to_n_times(1).expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(1).mount(&server).await;
+        let provider = pinned(&server.uri()).with_max_attempts(1).with_unattended(true);
+        assert!(provider.chat(request(vec![], None)).await.is_ok());
+        let sibling = pinned(&server.uri()).with_unattended(true);
+        assert!(std::sync::Arc::ptr_eq(&provider.rate_limiter, &sibling.rate_limiter));
+        assert!(sibling.rate_limiter.active());
+        assert_eq!(sibling.rate_limiter.state.lock().unwrap().failures, 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_success_does_not_clear_a_new_rate_limit() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST")).and(body_partial_json(json!({"model": "slow"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()).set_delay(Duration::from_millis(100)))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(body_partial_json(json!({"model": "limited"})))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1")
+                .set_body_string("rate limit").set_delay(Duration::from_millis(10)))
+            .expect(1).mount(&server).await;
+        let slow = OpenRouter::with_provider(ProviderPreset::Mistral, "test-key", server.uri()).with_max_attempts(1);
+        let limited = OpenRouter::with_provider(ProviderPreset::Mistral, "test-key", server.uri()).with_max_attempts(1);
+        let mut slow_req = request(vec![], None);
+        slow_req.model = "slow".into();
+        let mut limited_req = request(vec![], None);
+        limited_req.model = "limited".into();
+        let (success, failure) = tokio::join!(slow.chat(slow_req), limited.chat(limited_req));
+        assert!(success.is_ok() && failure.is_err());
+        assert_eq!(slow.rate_limiter.state.lock().unwrap().failures, 1);
+        assert!(slow.rate_limiter.remaining() > Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn shared_rate_limit_wait_observes_cancellation() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60").set_body_string("rate limit"))
+            .expect(1).mount(&server).await;
+        let provider = OpenRouter::with_provider(ProviderPreset::Mistral, "test-key", server.uri()).with_max_attempts(1);
+        assert!(provider.chat(request(vec![], None)).await.is_err());
+        let cancel = CancelFlag::default();
+        provider.set_cancel_flag(cancel.clone());
+        let started = std::time::Instant::now();
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::join!(provider.chat(request(vec![], None)), stop);
+        assert!(matches!(result, Err(SlagError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn jitter_stays_in_percent_range_and_varies() {
         let draws: Vec<u64> = (0..100).map(|_| next_jitter_percent()).collect();
         assert!(draws.iter().all(|&p| p <= 25));
@@ -2093,7 +2382,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_after_overrides_computed_backoff() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -2693,7 +2982,7 @@ mod tests {
     #[tokio::test]
     async fn unattended_capacity_errors_retry_past_the_budget_with_heartbeats() {
         for status in [429u16, 529] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(
@@ -2837,7 +3126,7 @@ mod tests {
     /// to 6 hours. A raised flag now aborts before the next request.
     #[tokio::test]
     async fn cancel_flag_aborts_a_retry_wait_before_the_next_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string("limited"))
@@ -3011,7 +3300,7 @@ mod tests {
             (503, "Service unavailable", ProviderErrorCategory::Overloaded, "restores service"),
             (500, "Internal error", ProviderErrorCategory::Server, "restores service"),
         ] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(status).insert_header("x-should-retry", "true").set_body_string(body))
@@ -3041,7 +3330,7 @@ mod tests {
 
     #[tokio::test]
     async fn groq_tpm_with_billing_url_waits_and_retries() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST")).and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string(GROQ_TPM_BODY))
             .up_to_n_times(1).expect(1).mount(&server).await;
@@ -3063,7 +3352,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_headers_override_billing_text_on_429() {
         for header in ["retry-after", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-tokens"] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST")).and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(429).insert_header(header, "1").set_body_string("Check billing limits"))
                 .expect(1).mount(&server).await;
@@ -3091,7 +3380,7 @@ mod tests {
             (ProviderPreset::Xai, 403, "Your team has exhausted its credits. Purchase credits to continue."),
             (ProviderPreset::OpenAI, 429, r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#),
         ] {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST")).and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(status).set_body_string(body))
                 .expect(1).mount(&server).await;
@@ -3600,7 +3889,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_retry_after_waits_and_stops_at_the_attempt_budget() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1")
                 .set_body_json(json!({"error": {"message": "rate limit"}})))

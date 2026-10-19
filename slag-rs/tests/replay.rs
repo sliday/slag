@@ -66,7 +66,21 @@ fn the_warden_verdict_reaches_both_views() {
     let stream = stdout(slag(&scratch).args(["replay", &fixture(TEMPER), "--at", "assay", "--size", "100x30"]));
     assert!(stream.contains("WARDEN"), "{stream}");
     let dash = stdout(slag(&scratch).args(["replay", &fixture(TEMPER), "--tui", "--at", "warden", "--size", "100x30"]));
-    assert!(dash.contains("warden"), "{dash}");
+    assert!(dash.contains("WARDEN"), "{dash}");
+    assert!(dash.contains("judging"), "{dash}");
+    assert!(dash.contains("judge says fail"), "{dash}");
+}
+
+#[test]
+fn a_wide_frame_keeps_each_line_count_near_its_file() {
+    let scratch = tempfile::tempdir().unwrap();
+    // The cards go to stderr, beside the skeleton on stdout.
+    let out = slag(&scratch).args(["replay", &fixture(FORGE), "--at", "plan", "--size", "160x48"]).output().unwrap();
+    assert!(out.status.success());
+    let frame = String::from_utf8_lossy(&out.stderr);
+    let row = frame.lines().find(|l| l.contains("✓ read") && l.ends_with(" lines"));
+    let row = row.unwrap_or_else(|| panic!("no read row with a count:\n{frame}"));
+    assert!(row.chars().count() <= 80, "the count drifted to the far edge: {row:?}");
 }
 
 #[test]

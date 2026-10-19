@@ -245,6 +245,84 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Smoothing: all 8 items (warnings, shutdown isolation, glob without rg, forge timing race, fix banner, duel docs, model pre-flight, article bug).
 - Integration gate: **1029 unit tests + all integration suites green; `cargo build` 0 warnings (v2.9.0: 21); `cargo clippy --all-targets -- -D warnings` exit 0.**
 
+### 10-19: owner asked to build in Harness² (arXiv 2610.14224)
+- Paper: "Harness²: Recursive Agent Harnessing for an Open World" (Google, 2026-10-09). Task-level Propose → Probe → Compose (invariant + domain candidate harnesses, behavioral contrast, no labels) and harnessing-level recursion (reflector updates a library of adopted harnesses + EXPERIENCE.md). Gains up to +11.5 WorkBuddy, +4.5 JobBench, +11.8 pp LAB; weaker executors gain most; a library alone transfers.
+- Mapping to slag: duel casts in isolated worktrees ≈ probes; warden ≈ fresh judge; recipes ≈ skills; hooks ≈ middleware plugin; `slag fix` has real test exit codes as extra evidence.
+- Bar: the paper's own comparison on our stream: base vs `--evolve 1` vs library-only, weak cheap executor, hidden tests, diff votes. Current bench has no headroom (16/16), so a new ordered stream bench (2 domains x 8 tasks) with a weak executor at 25-60% is being built.
+- Lanes: `bench2` (kimi), `harness2` (Claude builder, reads the paper).
+- Earlier critics (fix-r2, tui-r3, commission-r1) were cut off by the pause; asked to deliver verdicts from data they have.
+
+### fix critic r2 (Fable, fresh): WINNER bar
+- Bench on e95c34c: openai gpt-4.1-mini 15/16, median 18.5 s, p90 168 s; mistral-small 15/16, median 16.5 s, p90 130 s. Codex 8/8, 80 s, 155 s.
+- Diff reading (4 pairs, critic only; fx votes not run): codex 4, slag 0. Codex tests encode the issue's exact inputs and more edge cases.
+- BIGGEST_GAP: review passes fixes that rewrite or delete pre-existing tests (7/32 runs); mistral js-notify-preview shipped the issue's own symptom as FIXED after rewriting 3 old expectations. Sent as fix r4: run HEAD versions of existing tests against the fixed source; changed existing tests are a gap unless the issue asks; reproduction only from new tests.
+
+### TUI critic r3 (Fable, fresh, blind): WINNER bar
+- Labels audited: critic mislabeled done-160x48 (slag = P, the ASSAY frame; it called it "Claude Code text summary"). Corrected ranks: idle-80 2nd, idle-160 2nd, working-80 1st, working-160 2nd, done-80 3rd (capture artifact: no ASSAY in frame), done-160 3rd.
+- Instrument unfair: slag frames are a long commission fixture vs Codex/Claude fixing one test. TUI r4 adds `slag fix` captures on the same refs project and task.
+- BIGGEST_GAP: truncation hides evidence when width is free (issue line cut at ~80 of 120 columns; stacked "..." + "…" hides the attempt count). Sent as TUI r4 with held-frame resize, timer labels, phase markers.
+- Live checks passed: 0 orphan SGR in the TTY log, piped max 79 columns, NO_COLOR clean; two live fixes correct for ≈ $0.04.
+
+### commission critic r1 (Fable, fresh): WINNER bar
+- wc (mistral): slag 9.2 s, 23k tokens, $0.0019, FORGED, honest, read-only warden; codex 51.9 s, 40.9k tokens, 7 tests, junk files.
+- csv2json (openai): slag 37 s, 64k tokens, $0.0196, GOAL UNVERIFIED (false: warden guessed 6 paths, never listed the tree); thin artifact (2 tests, no pyproject/entry point). Codex 85.4 s, 11 tests, packaging.
+- PEP 668 slugify: slag not completed (mistral 429 storm with ~1 s backoff; mistral-small "no CMD line" burned 2 heats); codex dodged with pipx, tests fail uninstalled.
+- Votes: fx codex 2/2; critic codex 2/2 (not blind: critic made the key).
+- INTEGRITY violation: resume after UNVERIFIED cast no ingot; warden "goal met" citing a file whose read returned ENOENT; assay FORGED.
+- BIGGEST_GAP sent as efficiency r3: ground every verdict in the warden's own successful tool results; give it the tree; resume after UNVERIFIED must re-judge or cast the gap. Quality gap (thin artifacts) included.
+- Held: 429 backoff does not grow without Retry-After (provider); mistral-small no-CMD heats.
+
+### provider r6 and efficiency r3 merged
+- Provider r6: retries share a limiter per provider+host with full jitter on exponential 1-30 s ceilings, one status line per wait; finish schema now requires `cmd` on forge calls with one repair nudge (mistral with `cmd` stripped by proxy: heat 2 / 7.9 s → heat 1 / 3.7 s).
+- Efficiency r3: verdicts require successful inspection IDs from the session; reviewers get the tree and changed files up front; resume re-judges UNVERIFIED. Live: csv2json 70.8k tokens / 37.5 s FORGED with entry point, setup metadata, 3 tests, `--pretty` works; forced ungrounded pass → UNVERIFIED; resume → grounded FORGED.
+- Lead resolved an `agent.rs` conflict (finish: `cmd` nudge first, then grounding). 1046 unit tests green, clippy -D warnings clean. Critic commission-r2 (fresh) running.
+
+### commission critic r2 (Fable, fresh): WINNER bar (quality only)
+- INTEGRITY PASS: all 5 warden rounds cite exactly the inspections that succeeded in the engine logs; resume after UNVERIFIED re-judged honestly (2 s, $0.0008).
+- openai gpt-4.1-mini: wc 83 s / 218k / $0.067 (codex 64 s / 201k); csv→json 96 s / 293k / $0.081, no entry point, CLI never tested (codex 113 s, 13 tests, installable); top-words 30 s / 69k / $0.017 (codex 77 s, 15 tests). mistral-small wc: 10 s / 17k / $0.002, UNVERIFIED (unparseable warden reply), honest.
+- Votes: fx codex 3-0; critic codex 3-0.
+- BIGGEST_GAP: `found_direct` (`pipeline/mod.rs:714-724`) makes a one-checkbox bar and tells the warden not to run tests; the gate checks existence, not delivery. Sent as efficiency r4 with .gitignore junk, raw unreadable-verdict logging, and the openai wc token cost.
+
+### fix r4 merged
+- Any deleted/rewritten line of a pre-existing test (incl. Rust inline test modules) sends the attempt back with originals restored, unless declared AND the originals fail; a disputed declared change ends NOT FIXED; reproduction counts only new tests; test-only changes and changes no test distinguishes fail; revisions roll back if they drop tests.
+- Builder (mistral, 12 interleaved runs): median 12.7 s → 16.7 s; hidden 10/12 before and after; before committed test-only fixes, after none. 1051 tests green, clippy clean.
+- Critic fix-r3 (fresh) running all 8 blind fx votes; critics now copy the binary first so merges cannot swap it mid-run.
+
+### TUI r4 merged; fair blind set
+- Evidence wraps to the real width (judge words, verdicts, gaps, crack reasons, proofs, fix summary); tool rows stay one line; section rules read "at 0:26"; dashboard feed rules off each phase.
+- Instrument bug found by the builder: vhs `Wait+Screen` read the top of the scroll buffer, so scrolled output timed out and done frames missed the summary. Fixed; done shot waits for the prompt; held-frame resize redraws.
+- Blind set r4 now uses `slag fix` frames on the same refs project and task as Codex/Claude (fix-01-idle, fix-02-working, fix-03-done). Lead checked 160x48 done: full summary, wall 6 s, ≈ $0.0008 est.
+- 1052 unit tests green, clippy clean. Critic tui-r4 (fresh, blind) running.
+
+### TUI, critic r4 (Fable, fresh, blind, fair set): WINNER ours
+- All 6 labels match the key. slag rank: idle-80 1st, idle-160 1st, working-80 1st, working-160 2nd (Claude's inline diff ranked higher), done-80 1st, done-160 1st.
+- Critic on slag done: "root cause, ✓verify ✓reproduced ✓review, FIX·FIXED panel: proof exit 0 / without-fix exit 1, diff stat, branch @ sha, $0.0009, timings" beat Codex's "Fixed mul()" and Claude's prose.
+- Phase 2 clean: 256 ESC all paired, piped 79/119 chars, NO_COLOR 0 ESC, tmux resize exact, `--help` clean. Spend $0.004.
+- Remaining gap (polish, sent as TUI r5): a no-op edit ("already applied") shows a ✓ card, then the review says no test was added.
+
+### bench2 (Harness² instrument) merged
+- 16 ordered tasks: `bench/streams/py-data` and `bench/streams/js-web`, 8 each, recurring traps per domain (exact-input reproduction, BOMs, money rounding, unicode, timezones, async order, cache staleness, pagination).
+- Instrument: verify-fixtures 16/16, noop 0/16, reference 16/16, leak probe clean; lead re-checked after merge (noop 0/8 py-data, reference 8/8 js-web).
+- Weak executor chosen: `mistral` / `ministral-3b-latest`, baseline **2/8 py-data, 2/8 js-web** (one try, no commit). ministral-8b 7/8 (no headroom), gpt-4.1-nano 5/8 and 4/8.
+- Lead correction: kimi had changed the shared adapter's defaults (`--tries 1 --no-commit`), which would silently change every classic-bench number. Now opt-in via `SLAG_FIX_TRIES`, `SLAG_FIX_NO_COMMIT=1`, `SLAG_FIX_ARGS`; default runs `slag fix` as a user would.
+
+### TUI r5 merged; fix r5 sent
+- TUI r5: no-op edits show "– edit <file>  no change" (explicit `unchanged` flag from the tools layer); no repeated note; no 0.0 s phases; meta capped at column 80; cracked count said once. 1056 tests green, clippy clean.
+- Bug found by the TUI builder: `slag fix` committed untracked files that existed before the run. Sent as fix r5: commit exactly the session's paths, by explicit path list.
+
+### fix r5 and efficiency r4 merged
+- Fix r5: paths dirty before the run never enter the commit (cause: untracked out.txt/err.txt grew during the run); `git add -- <list>`; report "left untouched: N files you had before"; PR body lists committed paths. A fix that can only touch pre-dirty files now fails and says so.
+- Efficiency r4 (42e90c0): direct commissions derive a runnable contract (package, CLI, named flags, suite) shared by blueprint, smith and bar; the warden must cite its own successful suite and CLI-probe runs; builder checks run read-only; stack-aware .gitignore; scratch cleanup; raw unreadable verdicts logged. Builder's final acceptance: Node FORGED heat 1 (51.8k tokens, 29 s, 5 tests); wc and CSV CRACKED under tiny self-imposed caps ($0.018/run), so not a fair measure. Wc cracked on a real bug (unterminated last line), CSV on a real one (not installable). Spend $1.49.
+- Integration: 1083 unit tests green, clippy clean. Critic commission-r3 running with default caps, gpt-4.1-mini and a codex-comparable OpenAI model.
+
+### commission critic r3 (Fable, fresh, default caps): WINNER bar 0-6
+- gpt-4.1-mini: wc 29 s / 75k / $0.017 FORGED but wrong line count without trailing newline; csv 58 s / 119k UNVERIFIED (false, see below), not installable; top-words 33 s / 55k FORGED, 5 tests.
+- gpt-5.2 (best OpenAI model slag could drive): wc 50 s / 53k FORGED, matches system wc; csv 34 s / 29k FORGED, installable, no console script; top-words 36 s / 33k FORGED, 7 tests. "spend unknown" (no price entry).
+- Codex reference: 6, 13 (console script), 15 tests. Votes 0-6 (fx and critic).
+- INTEGRITY pass on all 5 FORGED. One false UNVERIFIED: exact-argv grounding (`grounding.rs:81`) rejected `unittest discover --verbose`.
+- BIGGEST_GAP: slag cannot drive gpt-5.4+/gpt-6.x: always sends `reasoning_effort` on /v1/chat/completions with tools (`forge.rs:939`, `provider.rs:443`); OpenAI requires /v1/responses. The comparison was model-mismatched.
+- Sent: provider r7 (OpenAI Responses transport + pricing), efficiency r5 (meaning-based grounding match; "like <tool>" edge-case probes; optional `.slag/` for coordination files).
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
@@ -254,6 +332,8 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Linux without `rg`: `glob_matches_patterns_with_directory_components` fails (sandbox on or off). Glob needs a fallback or the test must skip.
 - ~~Cost: `spend -` for every non-OpenRouter provider~~ done in provider r5.
 - README duel sentence contradicts the CLI's duel line and the site.
+- ~~429 backoff growth~~ done in provider r6.
+- ~~mistral-small "no CMD line"~~ done in provider r6.
 - A forge test timed out once under load average > 30 (sandbox builder, r3). Find and de-time it so CI under load cannot flake.
 
 ## Instrument notes

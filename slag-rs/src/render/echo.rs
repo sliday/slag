@@ -280,7 +280,7 @@ impl Echo {
                     return;
                 }
                 out.push(String::new());
-                out.push(tui::rule_line(text, &tui::clock(self.elapsed(at)), self.width));
+                out.push(tui::rule_line(text, &format!("at {}", tui::clock(self.elapsed(at))), self.width));
             }
             Mark::Status { icon, tone, text } => {
                 if let Some(path) = text.strip_prefix("Blueprint: ") {
@@ -483,7 +483,7 @@ impl Echo {
             Some(c) if ok && room > 10 => format!("  {}", dim(&tui::clip(c, room))),
             _ => String::new(),
         };
-        tui::spread(&format!("{head}{cmd}"), &dim(&tail), self.width)
+        tui::beside(&format!("{head}{cmd}"), &dim(&tail), self.width)
     }
 
     /// `  ⚒ 3 anvils  i1 · i2 · i3`, once per parallel batch: the batch is
@@ -541,7 +541,7 @@ impl Echo {
             paint(PURE, id),
             tui::clip(&title(&ingot.work), room)
         );
-        out.push(tui::spread(&left, &dim(&tags), self.width));
+        out.push(tui::beside(&left, &dim(&tags), self.width));
         if !ingot.proof.is_empty() {
             let room = self.width.saturating_sub(12);
             out.push(format!("    {}  {}", dim("proof"), dim(&tui::clip(&unescape(&ingot.proof), room))));
@@ -671,7 +671,7 @@ impl Echo {
         let stats = self.stats.clone().unwrap_or_default();
         let w = self.width;
         out.push(String::new());
-        out.push(tui::rule_line("ASSAY", &tui::clock(self.elapsed(at)), w));
+        out.push(tui::rule_line("ASSAY", &format!("at {}", tui::clock(self.elapsed(at))), w));
 
         // The verdict: one word, one clause.
         let left = counts.ore + counts.molten;
@@ -693,7 +693,7 @@ impl Echo {
 
         // Why, when it failed: the gap, or each cracked ingot's last reason.
         if let Some(gap) = &self.goal_gap {
-            out.extend(wrap_indented(gap, w, 4, 3).into_iter().map(|l| paint(WARM, &l)));
+            out.extend(wrap_indented(gap, w, 4, 6).into_iter().map(|l| paint(WARM, &l)));
         }
         let cracked: Vec<&Ingot> = self.plan.iter().filter(|i| i.status == Status::Cracked).collect();
         for ingot in &cracked {
@@ -703,20 +703,21 @@ impl Echo {
                 .and_then(|p| p.why.clone())
                 .unwrap_or_else(|| "every heat failed its proof".to_string());
             let name = tui::clip(&title(&ingot.work), (w / 3).max(12));
-            // `    ✗ id  name  — why`: twelve fixed columns besides the three.
-            let room = w.saturating_sub(12 + ingot.id.len() + name.chars().count());
-            out.push(format!(
-                "    {} {}  {}  {}",
-                paint(WARM, "✗"),
-                paint(WARM, &ingot.id),
-                name,
-                dim(&format!("— {}", tui::clip(&why, room.max(8))))
-            ));
+            // The reason is the evidence: it wraps under itself, never
+            // trails off while the screen has room for it.
+            let head = format!("    {} {}  {}  ", paint(WARM, "✗"), paint(WARM, &ingot.id), name);
+            let indent = 6 + ingot.id.chars().count() + 2;
+            out.extend(
+                tui::wrap(&head, &format!("— {why}"), w, indent, 3)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, l)| if i == 0 { l } else { dim(&l) }),
+            );
         }
 
         // The next command, the one thing to type.
         let next = if self.goal_gap.is_some() {
-            Some((format!("slag --temper {} resume", self.warden_rounds + 1), "forges the gap as new ingots".to_string()))
+            Some((format!("slag --temper {} resume", self.warden_rounds + 1), if self.goal_gap.as_ref().is_some_and(|gap| crate::pipeline::warden::is_unverified_report(gap)) { "rechecks the goal with fresh evidence" } else { "forges the gap as new ingots" }.to_string()))
         } else if let Some(first) = cracked.first() {
             Some((format!("less logs/*_ASSAY_{}_*.log", first.id), "the failing proof's own output".to_string()))
         } else if left > 0 {
@@ -750,17 +751,21 @@ impl Echo {
                         continue;
                     }
                     let cmd = p.cmd.clone().unwrap_or_else(|| unescape(&ingot.proof));
-                    let room = w.saturating_sub(22 + ingot.id.len());
-                    // The exit code sits in its own column: a reader scans
-                    // down it for anything that is not 0.
-                    let left = format!(
-                        "  {}  {} {}  {}",
+                    // The command is what ran, so it wraps rather than
+                    // losing its tail; the exit code keeps its own column on
+                    // the first line, where a reader scans for anything not 0.
+                    let head = format!(
+                        "  {}  {} {}  ",
                         dim(&format!("{:<6}", if ran.is_empty() { "ran" } else { "" })),
                         paint(PURE, "✓"),
-                        paint(PURE, &ingot.id),
-                        tui::clip(&cmd, room.max(8))
+                        paint(PURE, &ingot.id)
                     );
-                    ran.push(tui::spread(&left, &dim("exit 0"), w));
+                    let indent = tui::visible_len(&head);
+                    let mut rows = tui::wrap(&head, &cmd, w.saturating_sub(8), indent, 3);
+                    if let Some(first) = rows.first_mut() {
+                        *first = tui::beside(first, &dim("exit 0"), w);
+                    }
+                    ran.extend(rows);
                     continue;
                 }
                 // Forged, but this tape kept no outcome for its proof: say

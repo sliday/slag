@@ -1,0 +1,19 @@
+diff --git a/schedulite/schedule.py b/schedulite/schedule.py
+index f508fdc..8fc0475 100644
+--- a/schedulite/schedule.py
++++ b/schedulite/schedule.py
+@@ -1,6 +1,6 @@
+ """Daily scheduling at a fixed local wall time."""
+ 
+-from datetime import datetime, timedelta, timezone
++from datetime import datetime, timedelta
+ 
+ from .zone import AppZone
+ 
+@@ -21,5 +21,5 @@ def next_run(after):
+         local.year, local.month, local.day, RUN_TIME[0], RUN_TIME[1], tzinfo=zone
+     )
+     while run <= after:
+-        run = (run.astimezone(timezone.utc) + timedelta(hours=24)).astimezone(zone)
++        run = run + timedelta(days=1)
+     return run

@@ -563,7 +563,7 @@ fn show_status() -> Result<(), error::SlagError> {
             tui::paint(if ingot.status == sexp::Status::Ore { tui::COLD } else { tui::PURE }, &format!("{:<id_w$}", ingot.id)),
             tui::clip(&title, room)
         );
-        println!("{}", tui::spread(&left, &tui::paint(color, &heat), width));
+        println!("{}", tui::beside(&left, &tui::paint(color, &heat), width));
     }
     if crucible.ingots.len() > shown {
         println!("    {}", tui::dim(&format!("… {} more in {}", crucible.ingots.len() - shown, config::CRUCIBLE)));

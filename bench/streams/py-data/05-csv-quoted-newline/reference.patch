@@ -1,0 +1,22 @@
+diff --git a/csvsplit/parser.py b/csvsplit/parser.py
+index 6f34dab..85bef7f 100644
+--- a/csvsplit/parser.py
++++ b/csvsplit/parser.py
+@@ -1,13 +1,12 @@
+ """Split CSV text into rows and fields."""
+ 
++import csv
++import io
++
+ 
+ def parse(csv_text):
+     """Parse CSV text into a list of rows.
+ 
+     Each row is a list of field strings. The first row is the header.
+     """
+-    rows = []
+-    for line in csv_text.split("\n"):
+-        if line:
+-            rows.append(line.split(","))
+-    return rows
++    return [row for row in csv.reader(io.StringIO(csv_text))]
