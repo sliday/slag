@@ -378,7 +378,60 @@ pub fn rule_line(title: &str, right: &str, width: usize) -> String {
 /// prints as a diamond.
 pub fn status_text(icon: &str, color: Color, msg: &str, width: usize) -> String {
     let icon = if icon == "█" { "◆" } else { icon };
-    format!("  {} {}", paint(color, icon), clip(msg, width.saturating_sub(4)))
+    // A status is evidence (the issue, the test command, a reproduction):
+    // it wraps under itself rather than losing its end to an ellipsis.
+    wrap(&format!("  {} ", paint(color, icon)), msg, width, 4, 3).join("\n")
+}
+
+/// `text` broken to `width` under a hanging indent, at most `max` lines,
+/// the last one clipped with an ellipsis when the text runs longer.
+pub fn wrap(head: &str, text: &str, width: usize, indent: usize, max: usize) -> Vec<String> {
+    let head_w = visible_len(head);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut room = width.saturating_sub(head_w).max(10);
+    // A word longer than a line (a path, a hash, a command with no spaces)
+    // breaks into line-sized pieces instead of running off the screen.
+    let piece = room.min(width.saturating_sub(indent).max(10));
+    let words: Vec<String> = text
+        .split_whitespace()
+        .flat_map(|w| {
+            let chars: Vec<char> = w.chars().collect();
+            chars.chunks(piece).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>()
+        })
+        .collect();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].as_str();
+        let need = if cur.is_empty() { w.chars().count() } else { cur.chars().count() + 1 + w.chars().count() };
+        if need > room && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            room = width.saturating_sub(indent).max(10);
+            if out.len() == max {
+                break;
+            }
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(w);
+        i += 1;
+    }
+    let cut = i < words.len();
+    if out.len() < max && !cur.is_empty() {
+        out.push(cur);
+    }
+    if cut {
+        let budget = if out.len() == 1 { width.saturating_sub(head_w) } else { width.saturating_sub(indent) };
+        if let Some(last) = out.last_mut() {
+            *last = crate::engine::events::preview(&format!("{last} {}", words[i..].join(" ")), budget.max(4));
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(n, l)| if n == 0 { format!("{head}{l}") } else { format!("{}{l}", " ".repeat(indent)) })
+        .collect()
 }
 
 /// The forge's progress at a glance: a fire-gradient bar, then the tally.
@@ -421,7 +474,21 @@ pub fn bar(counts: &CrucibleCounts, cells: usize) -> String {
     out
 }
 
+/// The phase the pipeline last announced, and how many it has announced,
+/// so a view that only hears engine events (the dashboard) can still mark
+/// where one phase ends and the next begins.
+static PHASE: std::sync::Mutex<(u64, String)> = std::sync::Mutex::new((0, String::new()));
+
+/// `(generation, header)` of the latest phase.
+pub fn phase() -> (u64, String) {
+    PHASE.lock().map(|p| p.clone()).unwrap_or_default()
+}
+
 pub fn header(title: &str) {
+    if let Ok(mut p) = PHASE.lock() {
+        p.0 += 1;
+        p.1 = title.to_string();
+    }
     crate::render::tape::mark(crate::render::tape::Mark::Header { text: title.to_string() });
     if is_quiet() {
         return;
@@ -908,7 +975,7 @@ pub fn dim(s: &str) -> String {
 /// the whole binary on `slag status`.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
-        format!("{}...", s.chars().take(max).collect::<String>())
+        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>().trim_end())
     } else {
         s.to_string()
     }
@@ -1239,8 +1306,8 @@ mod tests {
     fn truncate_counts_characters_not_bytes() {
         let cyrillic = "сделать очень длинное описание проекта на русском";
         let cut = truncate(cyrillic, 10);
-        assert_eq!(cut, "сделать оч...");
-        assert_eq!(cut.chars().count(), 13);
+        assert_eq!(cut, "сделать о…");
+        assert_eq!(cut.chars().count(), 10);
 
         // Short strings pass through untouched, multibyte or not.
         assert_eq!(truncate("日本語", 10), "日本語");

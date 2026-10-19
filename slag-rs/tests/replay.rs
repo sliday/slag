@@ -66,7 +66,9 @@ fn the_warden_verdict_reaches_both_views() {
     let stream = stdout(slag(&scratch).args(["replay", &fixture(TEMPER), "--at", "assay", "--size", "100x30"]));
     assert!(stream.contains("WARDEN"), "{stream}");
     let dash = stdout(slag(&scratch).args(["replay", &fixture(TEMPER), "--tui", "--at", "warden", "--size", "100x30"]));
-    assert!(dash.contains("warden"), "{dash}");
+    assert!(dash.contains("WARDEN"), "{dash}");
+    assert!(dash.contains("judging"), "{dash}");
+    assert!(dash.contains("judge says fail"), "{dash}");
 }
 
 #[test]

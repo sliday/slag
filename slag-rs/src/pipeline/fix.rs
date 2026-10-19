@@ -324,7 +324,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         &hooks.events,
         EngineEvent::IngotStart { id: FIX_ID.into(), work: issue.title.clone() },
     );
-    tui::status_line("░", tui::COLD, &format!("issue: {}", tui::truncate(&issue.title, 70)));
+    tui::status_line("░", tui::COLD, &format!("issue: {}", issue_line(&issue)));
 
     // A test command that cannot run here says nothing about the bug, and
     // verifying with it would fail every attempt for the wrong reason.
@@ -1468,30 +1468,56 @@ fn report(out: &Outcome) {
     }
 }
 
+/// The issue's first line as written. The stored title is capped for
+/// branch names and commit subjects; the report has the room to show the
+/// whole line, so it takes it from the body when the title was cut.
+fn issue_line(issue: &Issue) -> String {
+    let stem = issue.title.trim_end_matches(['…', '.']).trim_end();
+    issue
+        .body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .filter(|first| first.starts_with(stem) && first.len() > issue.title.len())
+        .map(str::to_string)
+        .unwrap_or_else(|| issue.title.clone())
+}
+
 /// The report card's lines under its header. Every glyph is painted on
 /// its own and every value clipped as plain text, so no escape sequence
 /// is ever cut in half on its way to the screen.
 fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let label = |name: &str| tui::dim(&format!("{name:<6}"));
-    let row = |name: &str, value: &str| format!("  {}  {}", label(name), tui::clip(value, w.saturating_sub(10)));
+    // Evidence wraps under its label instead of trailing off in `…`.
+    let wrapped = |name: &str, value: &str, max: usize| tui::wrap(&format!("  {}  ", label(name)), value, w, 10, max);
     let title = match out.issue.number {
-        Some(n) => format!("#{n} {}", out.issue.title),
-        None => out.issue.title.clone(),
+        Some(n) => format!("#{n} {}", issue_line(&out.issue)),
+        None => issue_line(&out.issue),
     };
     let attempts = plural(out.attempts, "attempt");
 
-    // The verdict, alone on its line.
+    // The verdict and the attempt count, alone on their line; the issue
+    // and the reason follow whole, on lines of their own.
     match &out.verdict {
         Verdict::Fixed => {
-            let head = format!("  {} {}  ", tui::paint(tui::PURE, "✓"), tui::paint(tui::PURE, &format!("{}FIXED{}", bold(), reset())));
-            let rest = format!("{title} · {attempts}");
-            lines.push(format!("{head}{}", tui::clip(&rest, w.saturating_sub(tui::visible_len(&head)))));
+            lines.push(format!(
+                "  {} {} {}",
+                tui::paint(tui::PURE, "✓"),
+                tui::paint(tui::PURE, &format!("{}FIXED{}", bold(), reset())),
+                tui::dim(&format!("in {attempts}"))
+            ));
+            lines.extend(wrapped("issue", &title, 3));
         }
         Verdict::Failed(reason) => {
-            let head = format!("  {} {}  ", tui::paint(tui::WARM, "✗"), tui::paint(tui::WARM, &format!("{}NOT FIXED{}", bold(), reset())));
-            lines.push(format!("{head}{}", tui::clip(reason, w.saturating_sub(tui::visible_len(&head)))));
-            lines.push(row("issue", &title));
+            lines.push(format!(
+                "  {} {} {}",
+                tui::paint(tui::WARM, "✗"),
+                tui::paint(tui::WARM, &format!("{}NOT FIXED{}", bold(), reset())),
+                tui::dim(&format!("after {attempts}"))
+            ));
+            lines.extend(wrapped("why", reason, 4).into_iter().map(|l| tui::paint(tui::WARM, &l)));
+            lines.extend(wrapped("issue", &title, 3));
         }
     }
 
@@ -1553,7 +1579,7 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
 
     // What changed, and where it is.
     for (i, line) in out.stat.iter().enumerate() {
-        lines.push(row(if i == 0 { "diff" } else { "" }, line.trim()));
+        lines.extend(wrapped(if i == 0 { "diff" } else { "" }, line.trim(), 2));
     }
     let mut work = Vec::new();
     if let (Some(branch), Some(sha)) = (&out.branch, &out.commit) {
@@ -1563,10 +1589,10 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
         work.push(pr.clone());
     }
     if !work.is_empty() {
-        lines.push(row("work", &work.join(" · ")));
+        lines.extend(wrapped("work", &work.join(" · "), 2));
     }
     for n in &out.notes {
-        lines.push(row("note", n));
+        lines.extend(wrapped("note", n, 3));
     }
 
     // What it took.
@@ -1578,9 +1604,9 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
         took.push(spend.to_string());
     }
     if !took.is_empty() {
-        lines.push(row("run", &took.join(" · ")));
+        lines.extend(wrapped("run", &took.join(" · "), 2));
     }
-    lines.push(row("", &out.phases.line()));
+    lines.extend(wrapped("", &out.phases.line(), 2));
     lines.push(String::new());
     lines
 }

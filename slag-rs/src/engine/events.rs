@@ -398,46 +398,9 @@ fn error_gist(name: &str, preview_text: &str) -> String {
     t.to_string()
 }
 
-/// `text` broken to `width` under a hanging indent, at most `max` lines,
-/// the last one clipped with an ellipsis when the text runs longer.
+/// `text` broken to `width` under a hanging indent (see `tui::wrap`).
 fn wrap_hanging(head: &str, text: &str, width: usize, indent: usize, max: usize) -> Vec<String> {
-    let head_w = crate::tui::visible_len(head);
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut room = width.saturating_sub(head_w).max(10);
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut i = 0;
-    while i < words.len() {
-        let w = words[i];
-        let need = if cur.is_empty() { w.chars().count() } else { cur.chars().count() + 1 + w.chars().count() };
-        if need > room && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-            room = width.saturating_sub(indent).max(10);
-            if out.len() == max {
-                break;
-            }
-            continue;
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(w);
-        i += 1;
-    }
-    let cut = i < words.len();
-    if out.len() < max && !cur.is_empty() {
-        out.push(cur);
-    }
-    if cut {
-        let budget = if out.len() == 1 { width.saturating_sub(head_w) } else { width.saturating_sub(indent) };
-        if let Some(last) = out.last_mut() {
-            *last = preview(&format!("{last} {}", words[i..].join(" ")), budget.max(4));
-        }
-    }
-    out.into_iter()
-        .enumerate()
-        .map(|(n, l)| if n == 0 { format!("{head}{l}") } else { format!("{}{l}", " ".repeat(indent)) })
-        .collect()
+    crate::tui::wrap(head, text, width, indent, max)
 }
 
 /// An emitted ToolCallStart waiting for its ToolResult.
@@ -673,7 +636,7 @@ impl RenderState {
                     let (word, color) = if pass { ("pass", PURE) } else if crate::pipeline::warden::is_unverified_report(&why) { ("unverified", WARM) } else { ("fail", WARM) };
                     let head = format!("  {} {}  ", paint(color, "⚖"), paint(color, &format!("judge says {word}")));
                     prints.extend(
-                        wrap_hanging(&head, &format!("“{why}”"), width, 4, 2)
+                        wrap_hanging(&head, &format!("“{why}”"), width, 4, 5)
                             .into_iter()
                             .enumerate()
                             .map(|(i, l)| if i == 0 { l } else { dim(&l) }),
@@ -682,7 +645,7 @@ impl RenderState {
                     prints.push(line(PURE, "■", &dim(&preview(&gist, width.saturating_sub(4)))));
                 } else {
                     let head = format!("  {} ", paint(PURE, "■"));
-                    prints.extend(wrap_hanging(&head, summary, width, 4, 2));
+                    prints.extend(wrap_hanging(&head, summary, width, 4, 4));
                 }
             }
             EngineEvent::Error { message } if is_fatal_provider(message) => {
@@ -692,7 +655,7 @@ impl RenderState {
                 self.flush_streak(&mut prints);
                 let head = format!("  {} ", paint(WARM, "✗"));
                 prints.extend(
-                    wrap_hanging(&head, message, width, 4, 2).into_iter().map(|l| paint(WARM, &l)),
+                    wrap_hanging(&head, message, width, 4, 3).into_iter().map(|l| paint(WARM, &l)),
                 );
             }
             EngineEvent::Warning { message } => {
@@ -943,7 +906,7 @@ fn warning_lines(message: &str, width: usize) -> Vec<String> {
             paint(BRIGHT, "!"),
             paint(BRIGHT, &format!("warden sent back the {}", doc.to_lowercase()))
         );
-        return wrap_hanging(&head, gap, width, 4, 3);
+        return wrap_hanging(&head, gap, width, 4, 5);
     }
     // `[i2] rewound 3 file(s) to attempt start for a clean retry` follows
     // every failed heat. The heat's own ✗ line already says it failed and
@@ -957,7 +920,7 @@ fn warning_lines(message: &str, width: usize) -> Vec<String> {
         }
     }
     let head = format!("  {} ", paint(BRIGHT, "!"));
-    wrap_hanging(&head, message, width, 4, 2).into_iter().map(|l| paint(BRIGHT, &l)).collect()
+    wrap_hanging(&head, message, width, 4, 3).into_iter().map(|l| paint(BRIGHT, &l)).collect()
 }
 
 /// The warden's word on the goal: `✓ warden · round 1  goal met — …` or
