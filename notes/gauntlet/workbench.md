@@ -323,6 +323,35 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - BIGGEST_GAP: slag cannot drive gpt-5.4+/gpt-6.x: always sends `reasoning_effort` on /v1/chat/completions with tools (`forge.rs:939`, `provider.rs:443`); OpenAI requires /v1/responses. The comparison was model-mismatched.
 - Sent: provider r7 (OpenAI Responses transport + pricing), efficiency r5 (meaning-based grounding match; "like <tool>" edge-case probes; optional `.slag/` for coordination files).
 
+### Harness² round 1 landed (not merged yet)
+- 10 commits on `gauntlet/harness2`. Harness tree under `slag-rs/src/harness/`: systemprompt/guardrails/memory/tool_guidance appended to the stable prompt band; skills = recipes; scripts via the sandboxed shell; plugin = `hooks.toml` in a read-only sandbox; no subagents (slag has no delegation tool). Empty harness = byte-identical prompts (test in prompt.rs).
+- CLI: `slag fix ISSUE --evolve K [--sequential] [--harness DIR|library|none] [--editor-model M] [--evolve-budget USD] [--evolve-tokens N] [--domain D] [--library DIR]`.
+- Runs in throwaway copies with a shadow git (not duel worktrees: worktrees only see HEAD and add branches to the user's repo). Improvers get file tools rooted at their evidence dir and must read it before answering. Library entry needs a helped/hurt row slag's own measures agree with.
+- Builder smoke (26 runs, ministral-8b executor, gpt-4.1(-mini) editor, $2.26): one failure rescued by a domain recipe (40 turns failing → 25 turns passing), one 12 → 6 turn run; one evolve step ≈ 72 s, 238k tokens, $0.24 vs base 19 s, $0.006.
+- Lead merge attempt: text conflicts resolvable, but `evolve.rs` no longer compiles against fix r4/r5 APIs. Merge aborted; sent to the builder as Harness² r2 (merge production into the lane, keep every guard).
+- Builder's known gaps: (1) K = 1 means one run per harness; composers often keep the base; many runs leave no library entry. (2) Weaker editors write issue-specific lessons. (3) Token cap does not stop a running session (dollar cap does). (4) Library ranked by word overlap, no merge/prune; memory facts taken line by line. (5) `--evolve` refuses repos over 20k files; dependency dirs linked. (6) Dashboard shows narration only. (7) Evidence guard matches names and patterns, not renamed content.
+
+### provider r7 merged: frontier OpenAI models
+- OpenAI gpt-5.4+ use the Responses API (`/v1/responses`); older models keep chat completions; a matching 400 triggers one fallback cached per endpoint+model. Tool calls, results, encrypted reasoning and cached/reasoning usage preserved. Dated prices (2026-10-19) for the new models and cheaper tiers.
+- Live: gpt-6.1-sol commission FORGED 84 s ≈ $0.047; fix FIXED 28 s ≈ $0.015. gpt-5.5 commission FORGED 20 s ≈ $0.046; fix FIXED 16 s ≈ $0.034.
+- Integration: 1096 unit tests green, clippy clean.
+
+### Harness² r2 merged
+- Builder merged production into the lane (2410e27); evolve runs use the real repo snapshot and obey the existing-test guard and own-paths commit rule; delivery refuses user files. Builder fixed a merge-born flake (429 tests shared a wiremock server). Smoke: composed harness cut 21 turns / 3 tool errors to 13 / 1, fix delivered, library entry added.
+- Integration: 1126 unit tests green 4 runs in a row, clippy clean.
+- Critic harness2-r1 (fresh) running the paper's comparison on bench/streams: A base, B `--evolve 1` with growing library, C library from tasks 1-4 applied to 5-8. Executor ministral-3b, editor gpt-5.5.
+
+### efficiency r5 merged
+- Grounding accepts known output flags (`--verbose`), rejects narrowed suites; "like <tool>" sentences get reference probes on empty and unterminated input.
+- Live on gpt-4.1-mini (honest misses): CSV GOAL NOT MET (default discovery found zero tests); wc UNVERIFIED (unterminated line still counted 2 vs wc's 1). The gate now catches what mini gets wrong.
+- Integration: 1131 unit tests green, clippy clean. Critic commission-r4 running model for model (slag on gpt-6.1-sol vs codex on gpt-6.1-sol).
+
+### commission critic r4 (Fable, fresh, MODEL FOR MODEL gpt-6.1-sol): WINNER bar 0-6
+- slag 1.5-2x faster and ~6x fewer tokens on every prompt: wc 75 s / 78k / $0.098 FORGED (matches system wc on all edge cases, 3 tests) vs codex 113 s; csv 71 s / 38k / $0.056 UNVERIFIED (false: harness abort) vs codex 124 s; node 54 s / 40k / $0.053 FORGED, 14 tests vs codex 79 s.
+- Integrity pass. Votes 0-6: codex delivers idiomatic extras (stdin, flags, console script, package.json, --help); slag the literal minimum; slag commits its coordination md files into the user's repo.
+- BIGGEST_GAP: `agent.rs:943-947` aborts the read-only warden on any "review policy violation" tool outcome; a pytest traceback matched a sandbox marker after the real checks passed. Sent as efficiency r6 with idiomatic expectations and moving coordination files to `.slag/`.
+- Instrument correction: pytest exists at /opt/homebrew/bin/pytest.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.

@@ -1,22 +1,24 @@
-Committed `42e90c0` on `gauntlet/efficiency`. Live acceptance remains partial.
+Committed `a26c81c` on `gauntlet/efficiency`.
 
-| Final OpenAI run | Tokens | Seconds | Verdict | CLI check |
-|---|---:|---:|---|---|
-| wc.py | 75,632 | 39.0 | CRACKED; no warden verdict | Runs; miscounts unterminated lines |
-| CSV→JSON | 72,934 | 37.0 | CRACKED; no warden verdict | `--pretty` works; package installation fails |
-| Node top words | 51,842 | 29.1 | FORGED, heat 1 | Correct output; five tests pass |
+Review failures now return ordinary tool errors. Contracts cover conventional CLI interfaces. New commissions keep coordination files under ignored `.slag/`.
 
-Wc and CSV exhausted their small final spend caps. First-pass Python reliability remains unresolved.
+| Run | Tokens | Seconds | Est. cost | Verdict |
+|---|---:|---:|---:|---|
+| wc | 68,744 | 106.2 | $0.1003 | FORGED |
+| CSV | 67,318 | 78.1 | $0.0824 | FORGED |
+| Node | 74,624 | 89.5 | $0.0897 | UNVERIFIED |
+| Node resume | 12,257 | 12.9 | $0.0108 | FORGED |
 
-The changes add concrete noun checks, grounded suite and CLI runs, early read-only verification, cache ignores, scratch cleanup, and raw verdict logs.
+Node’s first review cited an unknown ID. Resume obtained a grounded pass.
 
-- Cargo: **1,121 passed**, one ignored; exit **0**.
-- Clippy with `-D warnings`: exit **0**.
-- Total estimated live spend: **$1.4853**.
-- Worktree and main checkout: clean. No push.
+Independent checks passed for installation, console scripts, Node bin, stdin, help, defaults, and wc boundaries. `git ls-files` shows no coordination files.
 
-The [report](notes/gauntlet/efficiency-round4.md) lists all 14 changed files, regression names, per-phase token tables, experiments, and exact commands.
+Cargo passed: **1,207 tests, one ignored**. Clippy passed with warnings denied. Both checkouts are clean.
 
-ASK: Improve small-commission quality and verify three live runs.
-🟩Got 🟩Had 🟨Did — Python live acceptance remains incomplete.
-🧠 High
+Recorded spend totals **$0.6416 estimated**, including preliminary runs. A $0.40 cancellation reserve brings the accounted total to **$1.0416**.
+
+[Report: changed files, tests, commands, and phase tables](notes/gauntlet/efficiency-round6.md)
+
+ASK: Harden review, deliver idiomatic CLIs, isolate metadata, and verify live.
+🟩Got 🟩Had 🟩Did
+🧠 —

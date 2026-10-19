@@ -1,40 +1,35 @@
-Committed:
+Committed **`b542e4c`**, `provider: support OpenAI Responses models and usage`.
 
-- `151d61a provider: share throttled retries with capped full jitter`
-- `28bb5bb agent: repair missing finish commands before burning a heat`
+OpenAI GPT-5.4 and later models use Responses. Older models retain chat completions. A matching 400 triggers one fallback, cached per endpoint and model.
 
-Retries share a limiter by provider and host. Full jitter uses exponential ceilings from 1 to 30 seconds. Each wait prints a status line.
+The transport preserves tool calls, results, encrypted reasoning, and cached/reasoning usage.
 
-The finish schema required only `summary`. Forge calls now require `cmd` and receive one repair nudge before the heat fails.
+| Model | Run | Result | Wall time | Logged input/output tokens | Printed spend |
+|---|---|---|---:|---:|---|
+| gpt-6.1-sol | Commission | FORGED | 84.02 s | 64,653 / 10,190 | ≈ $0.0465 est. |
+| gpt-6.1-sol | Fix | FIXED | 27.80 s | 16,412 / 411 | ≈ $0.0145 est. |
+| gpt-5.5 | Commission | FORGED | 20.06 s | 26,188 / 1,424 | ≈ $0.0458 est. |
+| gpt-5.5 | Fix | FIXED | 16.21 s | 26,211 / 592 | ≈ $0.0341 est. |
 
-Live Mistral results:
+Planner/reviewer roles used the default model. Fix token counts exclude unlogged advisory review calls; printed spend includes them.
 
-| Test | Before | After |
-|---|---|---|
-| Natural control | FORGED, 2.94 s, heat 1 | FORGED, 4.07 s, heat 1 |
-| Proxy removes first finish `cmd` | FORGED, 7.90 s, heat 2 | FORGED, 3.70 s, heat 1 |
+Total estimated spend: **about $0.182**, including the aborted sandbox-blocked check.
 
-The natural control did not reproduce the omission. The proxy test used real Mistral replies and confirmed one bounded repair. Total estimated spend: **$0.00664**.
+Added dated prices for requested models and cheaper tiers. Rates follow [OpenAI’s published table](https://developers.openai.com/api/docs/pricing.md), checked **2026-10-19**.
 
-Verification passed:
+Verification exited **0**:
 
 ```sh
 cargo test --offline --manifest-path slag-rs/Cargo.toml
 cargo clippy --offline --manifest-path slag-rs/Cargo.toml --all-targets -- -D warnings
-git diff --check
 ```
 
-Cargo reported **1,081 passed, 0 failed, 1 ignored**. Clippy reported zero warnings. Both working trees are clean.
+**1,153 tests passed; one ignored. Zero Clippy warnings.** Tests cover mappings, tool round trips, reasoning replay, fallback caching, usage, and pricing.
 
-Files changed:
+Changed: `CLAUDE.md`, `README.md`, and `slag-rs/src/engine/{provider,agent,mod,pricing}.rs`.
 
-- `slag-rs/src/engine/provider.rs`
-- `slag-rs/src/engine/agent.rs`
-- `slag-rs/src/pipeline/forge.rs`
-- `slag-rs/src/smith/mod.rs`
-- `slag-rs/src/smith/native.rs`
-- `slag-rs/tests/forge_loop.rs`
+Both working trees are clean.
 
-ASK: Fix shared retry backoff and missing-command recovery, verify live, and commit.
+ASK: Add OpenAI Responses support, pricing, tests, live verification, and commit.
 🟩Got 🟩Had 🟩Did
 🧠 —
