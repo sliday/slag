@@ -277,6 +277,10 @@ struct Candidate {
     dropped: Vec<String>,
     /// The components it changed against the harness it started from.
     components: Vec<String>,
+    /// For a composer that kept edits in its notes and wrote none: what
+    /// slag copied from the candidates on its word.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied: Vec<String>,
     #[serde(skip)]
     dir: PathBuf,
     #[serde(skip)]
@@ -997,7 +1001,7 @@ impl Evolver<'_, '_> {
              after reading the runs: KEEP_BASE is an answer about evidence you have read.\n\n{}",
             evidence_map(&ws, base_runs)
         );
-        self.edit(label, kind, round, &ws, start, prompts::editor(dim, i, k), task).await
+        self.edit(label, kind, round, &ws, start, prompts::editor(dim, i, k), task, &[]).await
     }
 
     /// Prompts 3 and 4: one composer over the candidate pool.
@@ -1047,16 +1051,20 @@ impl Evolver<'_, '_> {
         let task = format!(
             "You are composer `{label}` ({j} of {}). Read `context/task.md`, the base runs, and for \
              every candidate its `diff.md`, `notes.md` and `run/`, then compose `context/harness/`. \
-             Decide only after reading them.\n\n{}",
+             Decide only after reading them. To keep a candidate's edit, write it with the \
+             write_file tool: the content of `context/candidates/<label>/harness/<path>` goes to \
+             `context/harness/<path>`. Notes alone change no file.\n\n{}",
             if round.is_some() { 1 } else { k },
             evidence_map(&ws, runs)
         );
-        self.edit(label, Kind::Composed, round.unwrap_or(1), &ws, start, system, task).await
+        self.edit(label, Kind::Composed, round.unwrap_or(1), &ws, start, system, task, pool).await
     }
 
     /// One harness-writing session: run it, validate what it left in
     /// `context/harness/`, retry once with the validator's message, and
     /// fall back to `start` when it still fails. The fallback is recorded.
+    /// A composer whose notes keep edits from `pool` but who wrote none
+    /// gets them copied on its word before any retry.
     #[allow(clippy::too_many_arguments)]
     async fn edit(
         &self,
@@ -1067,6 +1075,7 @@ impl Evolver<'_, '_> {
         start: &Path,
         system: String,
         task: String,
+        pool: &[Candidate],
     ) -> Result<Candidate, SlagError> {
         let edited = ws.join("context").join("harness");
         let out = self.sh.run_dir.join("harness").join(label);
@@ -1079,6 +1088,7 @@ impl Evolver<'_, '_> {
             fallback: None,
             dropped: Vec::new(),
             components: Vec::new(),
+            applied: Vec::new(),
             dir: out.clone(),
             start: start.to_path_buf(),
             notes: String::new(),
@@ -1086,7 +1096,15 @@ impl Evolver<'_, '_> {
         let checked = match soft(self.improver(label, ws, system.clone(), task.clone(), &WRITER_TOOLS, EDITOR_TURNS).await)? {
             Err(e) => Err(format!("the session failed: {e}")),
             Ok(reply) => {
-                let first = check_tree(&edited, start, &reply).await;
+                let mut first = check_tree(&edited, start, &reply).await;
+                if first.is_err() && harness::tree(&edited) == harness::tree(start) {
+                    cand.applied = apply_kept(&reply, pool, &edited);
+                    if !cand.applied.is_empty() {
+                        let line = format!("{label}: wrote nothing; applied the edits its notes keep: {}", cand.applied.join(", "));
+                        note(self.ctx.hooks, &tui::truncate(&line, 160), false);
+                        first = check_tree(&edited, start, &reply).await;
+                    }
+                }
                 cand.notes = reply;
                 match first {
                     Ok(dropped) => Ok(dropped),
@@ -1984,6 +2002,59 @@ pub(super) fn guard(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A composer that keeps edits in its notes and writes none of them
+/// leaves an unchanged tree. Each `kept` or `revised` line names
+/// candidates from `pool`, and maybe some of their components; copy those
+/// components from the candidates' trees into `edited`, all of a
+/// candidate's when the line names none. A revision that was never
+/// written applies as the candidate had it, and the line says so.
+fn apply_kept(notes: &str, pool: &[Candidate], edited: &Path) -> Vec<String> {
+    let mut applied: Vec<String> = Vec::new();
+    for line in notes.lines() {
+        let l = line.trim().trim_start_matches(['-', '*', ' ', '`']).to_ascii_lowercase();
+        let revised = l.starts_with("revised");
+        if !(l.starts_with("kept") || revised) {
+            continue;
+        }
+        for c in pool.iter().filter(|c| c.outcome == "edited" && library::cites(&l, &c.label)) {
+            let named: Vec<&String> = c.components.iter().filter(|p| names_component(&l, p)).collect();
+            let take: Vec<&String> = if named.is_empty() { c.components.iter().collect() } else { named };
+            for p in take {
+                let (src, dst) = (c.dir.join(p), edited.join(p));
+                let done = if src.is_file() {
+                    dst.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::copy(&src, &dst).is_ok()
+                } else {
+                    std::fs::remove_file(&dst).is_ok()
+                };
+                let what = format!("{}/{p}{}", c.label, if revised { " (its revision was never written)" } else { "" });
+                if done && !applied.contains(&what) {
+                    applied.push(what);
+                }
+            }
+        }
+    }
+    applied
+}
+
+/// Whether a notes line names a harness component: its path, its recipe,
+/// or its file name.
+fn names_component(line: &str, path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    if line.contains(&path) {
+        return true;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    match parts.as_slice() {
+        ["recipes", name, ..] => {
+            line.contains(&format!("recipes/{name}"))
+                || line.contains(&format!("recipe {name}"))
+                || line.contains(&format!("recipe `{name}`"))
+        }
+        [file] => line.contains(file.rsplit_once('.').map_or(*file, |(stem, _)| stem)),
+        _ => parts.last().is_some_and(|f| line.contains(f)),
+    }
+}
+
 /// Validate what a writing session left, after one check of its own: an
 /// unchanged tree is an answer only when the notes say KEEP_BASE. Notes
 /// that describe kept or adopted edits over an unchanged tree, or that
@@ -2489,6 +2560,7 @@ mod tests {
             fallback: None,
             dropped: Vec::new(),
             components: components.iter().map(|c| c.to_string()).collect(),
+            applied: Vec::new(),
             dir: PathBuf::new(),
             start: PathBuf::new(),
             notes: String::new(),
@@ -2609,7 +2681,65 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_line_names_its_unit_and_an_unknown_spend() {
+    fn a_composer_that_only_names_its_kept_edits_gets_them_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = |label: &str, files: &[(&str, &str)]| {
+            let d = dir.path().join(label);
+            for (p, body) in files {
+                std::fs::create_dir_all(d.join(p).parent().unwrap()).unwrap();
+                std::fs::write(d.join(p), body).unwrap();
+            }
+            d
+        };
+        let cand = |label: &str, components: &[&str], outcome: &str| Candidate {
+            label: label.into(),
+            kind: Kind::Invariant,
+            round: 1,
+            outcome: outcome.into(),
+            retried: false,
+            fallback: None,
+            dropped: Vec::new(),
+            components: components.iter().map(|c| c.to_string()).collect(),
+            applied: Vec::new(),
+            dir: dir.path().join(label),
+            start: PathBuf::new(),
+            notes: String::new(),
+        };
+        tree("inv-1", &[("systemprompt.md", "Reproduce first.\n"), ("memory.md", "Tests: bash.\n")]);
+        tree("dom-1", &[("recipes/ends/RECIPE.md", "---\nname: ends\n---\n")]);
+        tree("inv-10", &[("guardrails.md", "never\n")]);
+        let pool = [
+            cand("inv-1", &["systemprompt.md", "memory.md"], "edited"),
+            cand("dom-1", &["recipes/ends/RECIPE.md"], "edited"),
+            cand("inv-10", &["guardrails.md"], "edited"),
+        ];
+        let edited = tree("composed", &[("memory.md", "old\n")]);
+        let notes = "<notes>\n- kept -> inv-1/systemprompt.md -> failed in 1/1 base runs\n                     revised -> dom-1 recipe ends -> base-1 never tested the end\n                     dropped -> inv-10 guardrails -> no run needed it\n</notes>";
+        let applied = apply_kept(notes, &pool, &edited);
+        assert_eq!(applied, ["inv-1/systemprompt.md", "dom-1/recipes/ends/RECIPE.md (its revision was never written)"]);
+        assert_eq!(std::fs::read_to_string(edited.join("systemprompt.md")).unwrap(), "Reproduce first.\n");
+        assert_eq!(std::fs::read_to_string(edited.join("memory.md")).unwrap(), "old\n", "a component the line does not name stays");
+        assert!(edited.join("recipes/ends/RECIPE.md").exists() && !edited.join("guardrails.md").exists());
+        // A line that names the candidate alone keeps all of it; a
+        // fallen-back candidate has nothing to give.
+        let all = apply_kept("kept -> everything inv-1 did", &pool, &edited);
+        assert_eq!(all, ["inv-1/systemprompt.md", "inv-1/memory.md"]);
+        let fell = [cand("inv-1", &["systemprompt.md"], "fallback")];
+        assert!(apply_kept("kept -> inv-1", &fell, &edited).is_empty());
+    }
+
+    #[test]
+    fn a_model_is_priced_by_the_list_or_by_openrouter_never_by_a_guess() {
+        assert!(priced("mistral::ministral-3b-latest"));
+        assert!(priced("openai::gpt-4.1"));
+        assert!(priced("openrouter::mistralai/ministral-8b"), "OpenRouter reports each call's cost");
+        assert!(!priced("mistral::ministral-99b-latest"));
+        assert_eq!(spend_text(0.0, 0), "≈ $0.0000 est.");
+        assert_eq!(spend_text(0.01234, 2_500), "≈ $0.0123 est. + 2.5k unpriced tokens");
+    }
+
+    #[test]
+    fn a_stage_line_names_its_unit_and_always_an_estimate() {
         let stage = Stage {
             name: "probe".into(),
             sessions: 2,

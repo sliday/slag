@@ -37,6 +37,8 @@ fn memory() -> Value {
 struct Roles {
     systems: Arc<Mutex<Vec<String>>>,
     nudges: Arc<Mutex<Vec<String>>>,
+    /// A composer that names the edits it keeps and writes none.
+    lazy_composer: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn tool_call(calls: Vec<(&str, Value)>) -> ResponseTemplate {
@@ -106,6 +108,9 @@ impl Respond for Roles {
             };
         }
         if first.contains("You are composing") {
+            if self.lazy_composer.load(std::sync::atomic::Ordering::Relaxed) {
+                return text("<notes>\nkept -> inv-1 recipes/tests -> base-1 wrote no test\n</notes>");
+            }
             return match turn {
                 0 => tool_call(vec![
                     ("write_file", recipe()),
@@ -354,6 +359,27 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     let systems = roles.systems.lock().unwrap().clone();
     let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
     assert!(!smith.contains("# Harness"), "{smith}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_composer_that_only_describes_its_choices_gets_them_applied() {
+    let repo = buggy_repo();
+    let home = tempfile::tempdir().unwrap();
+    let (server, roles) = model().await;
+    roles.lazy_composer.store(true, std::sync::atomic::Ordering::Relaxed);
+    let args = ["fix", "value is wrong", "--test", "bash tests/check.sh", "--evolve", "1"];
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let rec = record(repo.path());
+    let comp = rec["candidates"].as_array().unwrap().iter().find(|c| c["label"] == "comp-1").unwrap().clone();
+    assert_eq!(comp["outcome"], "edited", "{rec:#}");
+    assert_eq!(comp["retried"], false, "no second session was needed");
+    assert_eq!(comp["applied"], json!(["inv-1/recipes/tests/RECIPE.md"]), "only the edit the line names: {comp}");
+    assert_eq!(comp["components"], json!(["recipes/tests/RECIPE.md"]));
+    let composed = rec["runs"].as_array().unwrap().iter().find(|r| r["label"] == "comp-1-run").unwrap().clone();
+    assert!(composed["files"].as_array().unwrap().contains(&json!("tests/value_test.sh")), "the kept recipe reached the smith: {composed}");
+    assert!(stdout.contains("applied the edits its notes keep"), "{stdout}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
