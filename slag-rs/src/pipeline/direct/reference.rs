@@ -24,25 +24,28 @@ pub(super) fn named_tool(commission: &str) -> Option<String> {
     Some(pattern.captures(commission)?[1].to_string())
 }
 
-pub(super) fn checks(commission: &str, reference: Option<Reference>, launches: &[String]) -> Option<Checks> {
+pub(super) fn checks(commission: &str, reference: Option<Reference>) -> Result<Checks, &'static str> {
     let Some(tool) = named_tool(commission) else {
-        return reference.is_none().then(Checks::default);
+        return if reference.is_none() { Ok(Checks::default()) } else { Err("the commission names no reference tool") };
     };
-    let reference = reference?;
-    if reference.command.first()? != &tool || reference.actual.first()? == &tool { return None }
+    let reference = reference.ok_or("the named reference mapping is missing")?;
+    if reference.command.first() != Some(&tool) { return Err("reference.command must start with the named reference tool") }
+    if reference.actual.first() == Some(&tool) { return Err("reference.actual must launch the product, not the reference tool") }
     for argv in [&reference.actual, &reference.command] {
-        if argv.len() > 16 || !argv.iter().any(|arg| arg == "{input}")
+        if argv.is_empty() || argv.len() > 16 || argv.iter().filter(|arg| arg.as_str() == "{input}").count() != 1
             || argv.iter().any(|arg| arg.is_empty() || arg.len() > 256 || arg.chars().any(char::is_control))
             || crate::engine::agent::review_command_error(&shell_words::join(argv)).is_some()
-        { return None; }
+        { return Err("reference argv must contain one {input}, safe nonempty arguments, and no write command"); }
     }
-    let input = reference.actual.iter().position(|arg| arg == "{input}")?;
-    if input == 0 || !launches.iter().any(|launch| shell_words::split(launch).ok()
-        .is_some_and(|argv| argv.starts_with(&reference.actual[..input])))
-    { return None; }
+    if reference.actual.iter().any(|arg| coordinator_probe(arg)) {
+        return Err("reference.actual must launch the product, not a coordinator probe");
+    }
+    if reference.actual.first().is_some_and(|arg| arg == "{input}") {
+        return Err("reference.actual must start with the product executable, not {input}");
+    }
     let mut checks = Checks::default();
     for (case, text) in [("empty", ""), ("no-final-newline", "alpha beta\nalpha")] {
-        let path = format!("tests/fixtures/reference-{case}.txt");
+        let path = format!(".slag/checks/reference-{case}.txt");
         let replace = |argv: &[String]| argv.iter().map(|arg| {
             if arg == "{input}" { path.clone() } else { arg.clone() }
         }).collect::<Vec<_>>();
@@ -57,5 +60,19 @@ pub(super) fn checks(commission: &str, reference: Option<Reference>, launches: &
     checks.criterion = Some(format!(
         "Match {tool}'s documented behavior on empty input and a final unterminated text record. Run the reference comparisons, including their exit-status checks."
     ));
-    Some(checks)
+    Ok(checks)
+}
+
+fn coordinator_probe(arg: &str) -> bool {
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for component in std::path::Path::new(arg).components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            Component::ParentDir => { parts.pop(); }
+            Component::RootDir | Component::Prefix(_) => parts.clear(),
+            Component::CurDir => {}
+        }
+    }
+    parts.windows(2).any(|pair| pair[0] == ".slag" && pair[1] == "checks")
 }

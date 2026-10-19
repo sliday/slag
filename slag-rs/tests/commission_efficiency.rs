@@ -946,7 +946,7 @@ async fn source_inspection_without_the_declared_run_cannot_pass() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_invalid_reference_contract_stops_before_forging() {
+async fn an_invalid_reference_contract_falls_back_with_the_original_goal() {
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
@@ -955,14 +955,25 @@ async fn an_invalid_reference_contract_stops_before_forging() {
         "commands": ["python3 copy.py fixtures/sample.txt"]
     }).to_string();
     Mock::given(method("POST")).and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": invalid}, "finish_reason": "stop"}]
-        }))).expect(2).mount(&server).await;
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let messages = body["messages"].to_string();
+            if messages.contains("Choose the work scope") {
+                return response(json!({"content": invalid}));
+            }
+            if messages.contains("PREVIOUS REFERENCE REPLY") {
+                assert!(messages.contains("the named reference mapping is missing"));
+                return response(json!({"content": invalid}));
+            }
+            assert!(messages.contains("ROLE: Master Surveyor"), "{messages}");
+            assert!(messages.contains("A tiny file-copy CLI like cat with a unittest suite."));
+            ResponseTemplate::new(400).set_body_json(json!({"error": {"message": "mock survey stopped after fallback"}}))
+        }).expect(3).mount(&server).await;
     let output = base_command(root.path(), config.path(), &server)
         .args(["--temper", "1", "A tiny file-copy CLI like cat with a unittest suite."])
         .assert().failure().get_output().clone();
     assert!(!String::from_utf8_lossy(&output.stdout).contains("FORGED"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no valid comparison contract"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mock survey stopped after fallback"));
     assert!(!root.path().join("copy.py").exists());
     assert!(!root.path().join("PLAN.md").exists());
     server.verify().await;

@@ -730,10 +730,40 @@ fn empty_project(root: &std::path::Path) -> bool {
     })
 }
 
+fn write_direct_fixture(root: &std::path::Path, path: &str, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let relative = std::path::Path::new(path);
+    let denied = || std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+        "reference fixtures require regular paths under .slag/checks");
+    if !relative.starts_with(".slag/checks") || relative.components().count() < 3
+        || relative.components().any(|component| !matches!(component, std::path::Component::Normal(_)))
+    { return Err(denied()); }
+    let mut parent = root.to_path_buf();
+    for component in relative.parent().unwrap().components() {
+        parent.push(component);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(denied()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&parent)?,
+            Err(error) => return Err(error),
+        }
+    }
+    let target = root.join(relative);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(denied()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut fixture = tempfile::NamedTempFile::new_in(parent)?;
+    fixture.write_all(content.as_bytes())?;
+    fixture.persist(target).map_err(|error| error.error)?;
+    Ok(())
+}
+
 fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagError> {
     for (path, content) in &plan.fixtures {
-        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap())?;
-        std::fs::write(path, content)?;
+        write_direct_fixture(std::path::Path::new("."), path, content)?;
     }
     let checklist = plan.criteria.iter().map(|item| format!("- [ ] {item}")).collect::<Vec<_>>().join("\n");
     let commands: Vec<_> = std::iter::once(&plan.proof).chain(&plan.commands).cloned().collect();
@@ -748,7 +778,8 @@ fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagE
          Read the product and test source, then run the declared suite and CLI probes.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful run IDs in EVIDENCE.\n\
          Check each named behavior and flag through the actual CLI tests. Source inspection alone cannot pass this bar.\n\
-         Use in-memory test data or committed fixtures under tests/fixtures. The reviewer cannot create fixtures or caches.\n\
+         Keep verification instruments and reference fixtures under .slag/checks/. Product tests must work without .slag/.\n\
+         The reviewer can read and run instruments. Use private TMPDIR for scratch; keep the workspace read-only.\n\
          Judge the commission without extra naming, style, or test-count rules.\n"
     ))?;
     let mut ingot = crate::sexp::parser::parse_ingot("(ingot :id \"i1\")").unwrap();
@@ -923,6 +954,47 @@ fn fire_furnace(commission: Option<&str>) -> Result<Ore, SlagError> {
 #[cfg(test)]
 mod coordinator_tests {
     use super::*;
+
+    #[test]
+    fn direct_fixtures_stay_under_the_instrument_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = ".slag/checks/reference-empty.txt";
+        write_direct_fixture(root.path(), path, "").unwrap();
+        write_direct_fixture(root.path(), path, "updated").unwrap();
+        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "updated");
+        for invalid in ["tests/fixtures/reference.txt", ".slag/checks/../PLAN.md", ".slag/checks", "/tmp/reference.txt"] {
+            assert!(write_direct_fixture(root.path(), invalid, "bad").is_err(), "{invalid}");
+        }
+        assert!(!root.path().join(".slag/PLAN.md").exists());
+        assert!(!root.path().join("tests").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_fixtures_reject_symlinks_and_replace_hardlinks() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("reference.txt");
+        std::fs::write(&target, "original").unwrap();
+        symlink(outside.path(), root.path().join(".slag")).unwrap();
+        assert!(write_direct_fixture(root.path(), ".slag/checks/reference.txt", "bad").is_err());
+        std::fs::remove_file(root.path().join(".slag")).unwrap();
+        std::fs::create_dir(root.path().join(".slag")).unwrap();
+        symlink(outside.path(), root.path().join(".slag/checks")).unwrap();
+        assert!(write_direct_fixture(root.path(), ".slag/checks/reference.txt", "bad").is_err());
+        std::fs::remove_file(root.path().join(".slag/checks")).unwrap();
+        std::fs::create_dir(root.path().join(".slag/checks")).unwrap();
+        let fixture = root.path().join(".slag/checks/reference.txt");
+        symlink(&target, &fixture).unwrap();
+        assert!(write_direct_fixture(root.path(), ".slag/checks/reference.txt", "bad").is_err());
+        std::fs::remove_file(&fixture).unwrap();
+        std::fs::hard_link(&target, &fixture).unwrap();
+        write_direct_fixture(root.path(), ".slag/checks/reference.txt", "new fixture").unwrap();
+        assert_eq!(std::fs::read_to_string(&fixture).unwrap(), "new fixture");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        assert!(!outside.path().join("checks").exists());
+    }
 
     #[test]
     fn saved_goal_gaps_accept_both_ledger_headers_and_ignore_unverified_results() {

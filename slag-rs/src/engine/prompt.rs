@@ -116,6 +116,7 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
             Do not edit files, restore git state, or add requirements. \
             slag owns .slag/ and legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
             Ignore these coordinator files in cleanliness checks. \
+            Verification instruments under .slag/checks/ stay outside the product. Read and run them as declared. \
             Judge behavior and tests; allow normal local imports and project conventions. \
             Only contract-named checks are required. Treat inferred check commands as optional candidates. \
             An optional failure affects the verdict only if it proves an unmet contract requirement. \
@@ -195,7 +196,8 @@ fn stable_band(model: &str, mode: PromptMode) -> String {
          - Never touch .env files. Never commit unless the ingot explicitly asks.\n\
          - slag owns .slag/ and legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/. \
            Read them for context. Do not write, restore, remove, or commit them. \
-           Ignore them in cleanliness checks.\n\
+           The sole write exception is .slag/checks/ for verification instruments. Keep probe scripts and reference fixtures there. \
+           Product tests must work without .slag/. Never commit instruments. Ignore coordinator files in cleanliness checks.\n\
          - ≤25 words of commentary between tool calls; finish summary ≤120 words.\n\
          - Report outcomes faithfully. Never claim checks pass when output shows failures. \
            Never weaken a test or the proof command to manufacture a pass. Never modify \

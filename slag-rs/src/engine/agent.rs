@@ -1622,9 +1622,69 @@ fn review_tool(name: &str) -> bool {
     matches!(name, "read_file" | "bash")
 }
 
+fn normalized_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => { normalized.pop(); }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn instrument_path(path: &std::path::Path) -> bool {
+    let path = normalized_path(path);
+    path.starts_with(".slag/checks")
+}
+
 fn coordinator_path(path: &std::path::Path) -> bool {
-    matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == "logs" || name == ".slag")
-        || matches!(path.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md"))
+    !instrument_path(path)
+        && (matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == "logs" || name == ".slag")
+            || matches!(path.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md")))
+}
+
+fn coordinator_write_error(root: &std::path::Path, raw: &str) -> Option<&'static str> {
+    let path = normalized_path(&root.join(raw));
+    let relative = path.strip_prefix(root).unwrap_or(&path);
+    if coordinator_path(relative) {
+        return Some("slag owns this coordinator file; change only artifact files or .slag/checks instruments");
+    }
+    let mut ancestor = root.to_path_buf();
+    if let Ok(relative) = path.strip_prefix(root) {
+        for component in relative.components() {
+            ancestor.push(component);
+            if let Ok(metadata) = std::fs::symlink_metadata(&ancestor) {
+                if metadata.file_type().is_symlink() {
+                    if instrument_path(relative) {
+                        return Some("verification instruments must use regular paths under .slag/checks");
+                    }
+                    if let Ok(resolved) = ancestor.canonicalize() {
+                        let resolved = resolved.strip_prefix(root).unwrap_or(&resolved);
+                        if coordinator_path(resolved) || instrument_path(resolved) {
+                            return Some("slag owns the coordinator target of this symlink");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut existing = path.clone();
+    let mut tail = Vec::new();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        let Some(name) = existing.file_name() else { break };
+        tail.push(name.to_os_string());
+        existing.pop();
+    }
+    if let Ok(mut resolved) = existing.canonicalize() {
+        for name in tail.into_iter().rev() { resolved.push(name); }
+        let resolved = resolved.strip_prefix(root).unwrap_or(&resolved);
+        if coordinator_path(resolved) || (instrument_path(resolved) && !instrument_path(relative)) {
+            return Some("slag owns the coordinator target of this path");
+        }
+    }
+    None
 }
 
 pub(crate) fn coordinator_command_error(command: &str) -> Option<&'static str> {
@@ -1643,8 +1703,11 @@ pub(crate) fn coordinator_command_error(command: &str) -> Option<&'static str> {
     };
     let reads_only = ToolBox::path_access(&call).is_some_and(|(_, writer)| !writer);
     if !reads_only && words.iter().any(|w| {
-        let path = std::path::Path::new(w.trim_matches(['>', '<']));
-        path.components().any(|c| matches!(c, std::path::Component::Normal(name) if matches!(name.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md" | "logs" | ".slag"))))
+        let path = normalized_path(std::path::Path::new(w.trim_matches(['>', '<'])));
+        let components: Vec<_> = path.components().collect();
+        let instrument = components.windows(2).any(|pair| matches!(pair,
+            [std::path::Component::Normal(a), std::path::Component::Normal(b)] if *a == ".slag" && *b == "checks"));
+        !instrument && path.components().any(|c| matches!(c, std::path::Component::Normal(name) if matches!(name.to_str(), Some("PLAN.md" | "PROGRESS.md" | "BLUEPRINT.md" | "BAR.md" | "PRD.md" | "AGENTS.md" | "logs" | ".slag"))))
     }) {
         return Some("slag owns coordinator files and logs; inspect them with read_file and change only artifact files");
     }
@@ -1668,11 +1731,8 @@ async fn guarded_dispatch(
         return toolbox.dispatch(call).await;
     };
     if let Some((path, true)) = ToolBox::path_access(call) {
-        let path = root.join(path);
-        let resolved = path.canonicalize().unwrap_or(path);
-        let relative = resolved.strip_prefix(root).unwrap_or(&resolved);
-        if coordinator_path(relative) {
-            return refused("slag owns this coordinator file; change only artifact files".into());
+        if let Some(reason) = coordinator_write_error(root, &path) {
+            return refused(reason.into());
         }
     }
     if call.name == "bash" {
@@ -1689,6 +1749,16 @@ async fn guarded_dispatch(
                 .and_then(coordinator_command_error)
             {
                 return refused(reason.into());
+            }
+            if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+                for word in command.split(|c: char| c.is_whitespace() || ";|&()".contains(c)) {
+                    let path = word.trim_matches(['\'', '"', '>', '<']);
+                    if path.contains(".slag/checks") {
+                        if let Some(reason) = coordinator_write_error(root, path) {
+                            return refused(reason.into());
+                        }
+                    }
+                }
             }
         }
     }
@@ -2502,6 +2572,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builder_can_write_instruments_but_not_coordinator_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".slag/checks")).unwrap();
+        std::fs::write(dir.path().join(".slag/PLAN.md"), "live status").unwrap();
+        assert!(super::super::sandbox::git().args(["init", "--quiet"]).current_dir(dir.path()).status().unwrap().success());
+        crate::pipeline::hygiene::install_ignores(dir.path(), Some("Python script")).unwrap();
+        let smith = agent(MockProvider::new(vec![]), dir.path()).with_coordinator_root(dir.path());
+        let outcomes = smith.dispatch_batch(&[
+            tc("p", "write_file", serde_json::json!({"path": ".slag/checks/probe.py", "content": "print('checked')\n"})),
+            tc("c", "write_file", serde_json::json!({"path": ".slag/PLAN.md", "content": "stale"})),
+            tc("t", "write_file", serde_json::json!({"path": ".slag/checks/../PRD.md", "content": "stale"})),
+        ]).await;
+        assert!(!outcomes[0].is_error, "{:?}", outcomes[0]);
+        assert!(outcomes[1].is_error && outcomes[2].is_error);
+        assert!(dir.path().join(".slag/checks/probe.py").is_file());
+        assert_eq!(std::fs::read_to_string(dir.path().join(".slag/PLAN.md")).unwrap(), "live status");
+        assert!(!dir.path().join(".slag/PRD.md").exists());
+        assert!(super::super::sandbox::git().args(["add", "-A"]).current_dir(dir.path()).status().unwrap().success());
+        let tracked = super::super::sandbox::git().arg("ls-files").current_dir(dir.path()).output().unwrap();
+        assert!(tracked.status.success());
+        assert!(!String::from_utf8_lossy(&tracked.stdout).contains(".slag/"));
+        let status = super::super::sandbox::git().args(["status", "--porcelain", "--", ".slag"])
+            .current_dir(dir.path()).output().unwrap();
+        assert!(status.status.success() && status.stdout.is_empty());
+        let reviewer = agent(MockProvider::new(vec![]), dir.path())
+            .with_coordinator_root(dir.path()).with_read_only_tools();
+        let outcome = reviewer.dispatch_batch(&[tc("e", "edit_file", serde_json::json!({
+            "path": ".slag/checks/probe.py", "old_string": "checked", "new_string": "forged",
+        }))]).await;
+        assert!(outcome[0].is_error && outcome[0].output.contains(REVIEW_VIOLATION));
+        assert!(std::fs::read_to_string(dir.path().join(".slag/checks/probe.py")).unwrap().contains("checked"));
+        let runs = reviewer.dispatch_batch(&[
+            tc("r", "bash", serde_json::json!({"command": "python3 .slag/checks/probe.py"})),
+            tc("w", "bash", serde_json::json!({"command": "touch .slag/checks/changed"})),
+        ]).await;
+        assert!(!runs[0].is_error && runs[0].output.contains("checked"), "{runs:?}");
+        assert!(runs[1].is_error && runs[1].output.contains(REVIEW_VIOLATION));
+        assert!(!dir.path().join(".slag/checks/changed").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instrument_writes_reject_symlinks_into_coordinator_files() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".slag/checks")).unwrap();
+        std::fs::write(dir.path().join(".slag/PLAN.md"), "live status").unwrap();
+        symlink("..", dir.path().join(".slag/checks/link")).unwrap();
+        symlink(".", dir.path().join("alias")).unwrap();
+        let smith = agent(MockProvider::new(vec![]), dir.path()).with_coordinator_root(dir.path());
+        let outcomes = smith.dispatch_batch(&[
+            tc("w", "write_file", serde_json::json!({"path": ".slag/checks/link/new.md", "content": "bad"})),
+            tc("e", "write_file", serde_json::json!({"path": ".slag/checks/link/PLAN.md", "content": "bad"})),
+            tc("a", "write_file", serde_json::json!({"path": "alias/.slag/PRD.md", "content": "bad"})),
+            tc("b", "bash", serde_json::json!({"command": "printf bad > .slag/checks/link/PLAN.md"})),
+        ]).await;
+        assert!(outcomes.iter().all(|outcome| outcome.is_error), "{outcomes:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join(".slag/PLAN.md")).unwrap(), "live status");
+        assert!(!dir.path().join(".slag/new.md").exists());
+        assert!(!dir.path().join(".slag/PRD.md").exists());
+    }
+
+    #[tokio::test]
     async fn coordinator_guard_repairs_indirect_shell_changes_to_recovery_logs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("logs/transcripts")).unwrap();
@@ -2528,6 +2661,9 @@ mod tests {
         assert!(coordinator_command_error("rm -rf logs/").is_some());
         assert!(coordinator_command_error("printf bad > PLAN.md").is_some());
         assert!(coordinator_command_error("python3 -m unittest").is_none());
+        assert!(coordinator_command_error("python3 .slag/checks/probe.py").is_none());
+        assert!(coordinator_command_error("printf fixture > .slag/checks/input.txt").is_none());
+        assert!(coordinator_command_error("printf bad > .slag/checks/../PLAN.md").is_some());
     }
 
     #[tokio::test]

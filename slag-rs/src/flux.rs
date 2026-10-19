@@ -131,7 +131,7 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
         {crucible}\n\
         \n\
         slag owns .slag/ and legacy PLAN.md, PROGRESS.md, BLUEPRINT.md, BAR.md, PRD.md, AGENTS.md, and logs/.\n\
-        Do not write, restore, remove, or commit these paths. Do not run git commands.\n\
+        Do not write, restore, remove, or commit these paths, except harness instruments under .slag/checks/. Do not run git commands.\n\
         Ignore coordinator files and generated caches when you inspect cleanliness.\n\n",
         id = ingot.id,
         work = ingot.work,
@@ -145,7 +145,7 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
 
     flux.push_str(DELIVERY_RULES);
     flux.push_str("\n\nVERIFICATION CONTRACT: The independent reviewer runs the suite and CLI with a read-only filesystem. \
-        Use in-memory data or committed fixtures under tests/fixtures. Create fixture files during construction, before verification. Tests must not create or delete workspace fixtures. \
+        Keep harness probes, reference fixtures, and comparison scripts under .slag/checks/. Do not put them in product tests or scripts. Product tests must pass without .slag/. Use private TMPDIR for temporary test data. Keep product fixtures only when the product suite needs them. \
         Use subprocess CLI tests to exercise each named flag and behavior. Assert exact expected results, not only exit codes or output shapes. Keep scratch files in TMPDIR, not the product tree. \
         The documented suite must pass from a fresh clone without prior installation. Use source or module launches in tests, not an installed console command. The coordinator checks package installation in an isolated copy. Keep generated .venv, *.egg-info, and *.dist-info outside the product tree. Never use global pip or bypass PEP 668. \
         For named reference tools, check the requested behavior against the reference instead of guessing fixture expectations. \
@@ -296,7 +296,7 @@ pub fn surveyor_prompt(ore: &str) -> String {
         ## 7. ACCEPTANCE CRITERIA\n- Trace each named behavior, flag, CLI and package requirement to an observable check.\n\
         - Put standard semantics and edge-case assertions before interface conveniences.\n\
         - Include actual CLI subprocess tests for requested flags and behavior.\n\
-        - Keep workspace paths read-only in tests and probes. Use in-memory data, committed fixtures, or private TMPDIR scratch.\n\
+        - Keep workspace paths read-only in tests and probes. Keep harness instruments under .slag/checks/. Product tests use in-memory data or private TMPDIR scratch.\n\
         - Add no unstated features, fixed test counts or packaging formats.\n\n\
         RULES:\n\
         - You are the EXPERT. Make ALL decisions yourself.\n\
@@ -348,7 +348,7 @@ fn founder_format_rules() -> String {
         - :smelt = 0 (re-smelt count; system manages this)\n\
         - :proof = the declared read-only-compatible test command\n\
         - Carry every acceptance item from the blueprint or bar into task work and proof.\n\
-        - CLI tests must call the actual CLI and requested flags. Use in-memory data or committed fixtures.\n\
+        - CLI tests must call the actual CLI and requested flags. Keep harness probes under .slag/checks/. Keep product tests independent of that directory.\n\
         - :bar = what DONE means for this ingot, stated so a reviewer can \
         inspect it. The proof shows something appeared; the bar says whether \
         the ingot's goal was met. Name the observable behaviour, not the file: \
@@ -385,7 +385,7 @@ const DELIVERY_RULES: &str = "\
     Verify named behavior before interface conveniences.\n\
     Derive semantics from the named operation or format, then test its boundary cases with exact expected results.\n\
     Examples apply only to named behavior. Tail selects the last N lines (default 10), supports -n including 0 and +N, and follows complete appended records. Wc-like tools support -l/-w/-c and combined flags.\n\
-    CSV conversion handles BOM and quoted newlines, and rejects ragged rows without silent data loss. Unicode word frequency normalizes equivalent words with NFC.\n\
+    CSV conversion handles BOM and quoted newlines, and rejects ragged rows before writing any JSON output. Unicode word frequency normalizes equivalent words with NFC.\n\
     File/text stream operations process input incrementally. Follow tests cover appends and partial lines.\n\
     Spend implementation and review effort on these behaviors before optional interfaces. Do not invent input aliases, unrelated features, or a test quota.\n\
     A requested CLI must run through its intended entry command in the delivered project.\n\
@@ -393,7 +393,7 @@ const DELIVERY_RULES: &str = "\
     Include the local modules, dependency declarations, and configuration needed for that command.\n\
     For a package deliverable, include the metadata needed for its intended installation or distribution.\n\
     A Python package CLI supports its installed console script and python -m PACKAGE through __main__.py.\n\
-    File/text CLIs accept stdin without a file and with literal -. Named top-N arguments support FILE N and a sensible default. Require a flag only when named.\n\
+    Derive secondary interfaces from the tool kind. Unix stream filters such as wc, tail, CSV conversion, and word frequency accept stdin without a file and with literal -. Scalar parsers take their value positionally; do not add file or stdin interfaces. Named top-N arguments support FILE N and a sensible default. Require a flag only when named.\n\
     The documented full suite passes from a fresh clone without prior installation.\n\
     Require installation only when the commission or its stated invocation requires it.\n\
     Do not require a packaging format, a publish step, or a fixed test count without that requirement.";
@@ -485,8 +485,8 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
          Judge core semantics first. Inspect tests and successful runs for exact results on each named behavior and its boundary cases. Check interface conveniences after those behaviors.\n\
-         Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
-         The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures.\n\
+         Python skips bytecode writes. Harness probes and reference fixtures live under .slag/checks/. They are not product deliverables. Product tests must pass without them.\n\
+         The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures. Reject harness probes or comparison scripts in product paths.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
          Do not edit files. Do not install packages. Do not run git commands.\n\
@@ -520,8 +520,8 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
          Judge core semantics first. Inspect tests and successful runs for exact results on each named behavior and its boundary cases. Check interface conveniences after those behaviors.\n\
-         Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
-         The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures.\n\
+         Python skips bytecode writes. Harness probes and reference fixtures live under .slag/checks/. They are not product deliverables. Product tests must pass without them.\n\
+         The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures. Reject harness probes or comparison scripts in product paths.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          For visual or interactive work, inspect the interface.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
