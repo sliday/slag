@@ -516,7 +516,7 @@ Projects that already keep `PLAN.md` or `PRD.md` at the root use the same names 
 - A key for your provider, or a local Ollama or LM Studio server
 - `git` (slag commits each forged ingot)
 
-`install.sh` reads the latest release tag from the GitHub API, downloads `slag-<arch>-<os>.tar.gz`, unpacks the `slag` binary into `~/.slag/bin`, and tells you to add that directory to your PATH. The published v2.9.0 release carries one target: `slag-aarch64-apple-darwin.tar.gz` (macOS on Apple Silicon), alongside the same binary uncompressed and a `sha256.sum`. The next release ships four targets: Apple Silicon, Intel Mac, and Linux on x86_64 and aarch64. `install.sh` and `slag update` already handle all four. Until then, other platforms build from source:
+`install.sh` reads the latest release tag from the GitHub API, downloads `slag-<arch>-<os>.tar.gz`, unpacks the `slag` binary into `~/.slag/bin`, and tells you to add that directory to your PATH. Each release since v3.0.0 carries four targets: macOS on Apple Silicon and Intel, and Linux on x86_64 and aarch64 (glibc 2.17 or newer). Every target ships as a tarball and as the raw binary, with one `sha256.sum`. `install.sh` and `slag update` pick the target for your machine. Other platforms build from source:
 
 ```bash
 cargo install --path slag-rs

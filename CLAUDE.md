@@ -214,7 +214,7 @@ cargo build --release
 
 Binary surface: `slag "commission"`, `slag fix ISSUE` (`--issue-file`, `--test CMD`, `--tries N`, `--pr`, `--no-commit`, `--temper`, `--model`, `--plan-model`, `--tui`, `--evolve K`, `--sequential`, `--harness DIR|library|none`, `--editor-model`, `--evolve-budget`, `--evolve-tokens`, `--domain`, `--library`), `slag key [KEY]`, `slag status [--json]`, `slag runs`, `slag insights [--refresh]`, `slag ps`, `slag resume`, `slag rewind [--ingot ID --heat N]`, `slag cost`, `slag replay FILE` (`--speed`, `--tui`, `--at`, `--hold`, `--size`, `--points`), `slag hooks list`, `slag update`. Flags: `--tui`, `--temper N`, `--force`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--duel`, `--trace FILE`, `--no-sandbox`, `--worktree` (parses, warns, not implemented). `--provider` and `--no-sandbox` also work on every subcommand.
 
-Releases: the published v2.9.0 ships `aarch64-apple-darwin` only. `slag-rs/dist-local/publish-release.sh --build` builds four targets (Apple Silicon, Intel Mac, Linux x86_64 and aarch64), and `install.sh` and `update.rs` handle all four. `slag-rs/.github/workflows/` sits below the repo root, so GitHub never runs it.
+Releases: v3.0.0 and later ship four targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` (glibc 2.17 floor). `slag-rs/dist-local/publish-release.sh --build` builds them, and `install.sh` and `update.rs` handle all four. `slag-rs/.github/workflows/` sits below the repo root, so GitHub never runs it.
 
 ## Website (website/)
 
