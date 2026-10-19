@@ -384,6 +384,9 @@ pub struct ForgeAgent {
     /// The only tools this session may see and call. `None` keeps the
     /// usual set.
     tool_allowlist: Option<Vec<String>>,
+    /// Files, by path from the root, the session must read before it may
+    /// end on text. Empty asks for nothing.
+    required_reads: Vec<String>,
 }
 
 impl ForgeAgent {
@@ -412,7 +415,16 @@ impl ForgeAgent {
             role: Role::Smith,
             harness_hooks: None,
             tool_allowlist: None,
+            required_reads: Vec::new(),
         }
+    }
+
+    /// Hold the session's final answer until it has read these files.
+    /// A model that claims to have read evidence it never opened gets the
+    /// list back, as long as turns remain.
+    pub fn with_required_reads(mut self, paths: Vec<String>) -> Self {
+        self.required_reads = paths;
+        self
     }
 
     /// Fire a harness's hooks around every tool call.
@@ -625,6 +637,7 @@ impl ForgeAgent {
         let mut nudges = 0usize;
         let mut tool_validation_errors = 0usize;
         let mut inspected = false;
+        let mut read: Vec<String> = Vec::new();
 
         for turn in 1..=self.max_turns {
             self.check_cancel()?;
@@ -760,6 +773,23 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     record_msg(tw, messages.last().unwrap());
                     continue;
                 }
+                let unread: Vec<&str> = self
+                    .required_reads
+                    .iter()
+                    .filter(|p| !read.iter().any(|r| r == *p || r.ends_with(&format!("/{p}"))))
+                    .map(String::as_str)
+                    .collect();
+                if !unread.is_empty() && turn < self.max_turns {
+                    messages.push(ChatMessage::assistant(resp.content.clone(), None));
+                    messages.push(ChatMessage::user(format!(
+                        "You have not read these files, and your answer must rest on them. Read them with \
+                         read_file, then answer again: {}",
+                        unread.join(", ")
+                    )));
+                    record_msg(tw, &messages[messages.len() - 2]);
+                    record_msg(tw, messages.last().unwrap());
+                    continue;
+                }
                 emit(&self.events, EngineEvent::Finish { summary: resp.content.clone() });
                 return Ok(resp.content);
             }
@@ -814,6 +844,14 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             let mut finish_summary: Option<String> = None;
             for (call, outcome) in calls.iter().zip(&outcomes) {
                 inspected |= !outcome.is_error && matches!(call.name.as_str(), "read_file" | "bash");
+                if call.name == "read_file" && !outcome.is_error {
+                    if let Some(path) = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|p| p.trim_start_matches("./").to_string()))
+                    {
+                        read.push(path);
+                    }
+                }
                 let content = if outcome.is_error {
                     format!("ERROR: {}", outcome.output)
                 } else {
@@ -1787,6 +1825,27 @@ mod tests {
         let outcomes = editor.dispatch_batch(&[tc("b", "bash", serde_json::json!({"command": "touch marker"}))]).await;
         assert!(outcomes[0].is_error && outcomes[0].output.contains("unavailable"), "{:?}", outcomes[0]);
         assert!(!dir.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    async fn an_answer_waits_until_the_required_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("context/runs/base-1")).unwrap();
+        std::fs::write(dir.path().join("context/runs/base-1/trajectory.md"), "turn 1\n").unwrap();
+        let provider = MockProvider::new(vec![
+            resp_text("KEEP_BASE: I read everything.", FinishReason::Stop),
+            resp_tools(vec![tc("r", "read_file", serde_json::json!({"path": "./context/runs/base-1/trajectory.md"}))]),
+            resp_text("KEEP_BASE: base-1 already passed.", FinishReason::Stop),
+        ]);
+        let editor = agent(provider.clone(), dir.path())
+            .without_finish()
+            .with_required_reads(vec!["context/runs/base-1/trajectory.md".into()]);
+        let reply = editor.run("edit".into(), "task".into()).await.unwrap();
+        assert_eq!(reply, "KEEP_BASE: base-1 already passed.");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        let nudge = &requests[1].messages.last().unwrap().content;
+        assert!(nudge.contains("You have not read these files") && nudge.contains("context/runs/base-1/trajectory.md"), "{nudge}");
     }
 
     #[tokio::test]

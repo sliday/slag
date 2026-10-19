@@ -274,7 +274,7 @@ The domain is the repository's stack (`python`, `node`, `rust`, `go`, `shell`, o
 
 ### Safety and cost
 
-- Improver sessions (editor, composer, selector, reflector) get their evidence as files under `.slag/evolve/<run>/sessions/<name>/context/`. They have file tools rooted there and no shell. slag reads back only `context/harness/` and the reply.
+- Improver sessions (editor, composer, selector, reflector) get their evidence as files under `.slag/evolve/<run>/sessions/<name>/context/`. They have file tools rooted there and no shell. slag reads back only `context/harness/` and the reply. An answer that comes before the session opened its evidence (each run's trajectory and checks, each candidate's diff) goes back with the list of files still unread.
 - A guard refuses any working directory that holds a grader verdict, a rubric, a score file, a `hidden/` directory, or a bench path. Absolute paths of your repository read as `<repo>`.
 - A harness lives outside your repository, so no harness edit can touch your code or tests. Harness scripts run through the smith's sandboxed shell. Harness hooks run in the read-only sandbox without credential variables (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`), die at their timeout, and do not run at all where no OS sandbox exists.
 - The chosen fix lands in your repository only when every path it changed is a plain path inside the tree, outside `.git`, `.slag` and `logs`, and under no symbolic link. A link at a changed path is replaced, never written through.

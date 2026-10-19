@@ -31,10 +31,12 @@ fn memory() -> Value {
     json!({"path": "context/harness/memory.md", "content": format!("{FACT}\n")})
 }
 
-/// Answers by role; keeps every request's system prompt for the asserts.
+/// Answers by role; keeps every request's system prompt, and every
+/// nudge slag sent, for the asserts.
 #[derive(Clone, Default)]
 struct Roles {
     systems: Arc<Mutex<Vec<String>>>,
+    nudges: Arc<Mutex<Vec<String>>>,
 }
 
 fn tool_call(calls: Vec<(&str, Value)>) -> ResponseTemplate {
@@ -73,6 +75,15 @@ impl Respond for Roles {
         let task = messages.get(1).and_then(|m| m["content"].as_str()).unwrap_or_default().to_string();
         let turn = messages.iter().filter(|m| m["role"] == "assistant").count();
         self.systems.lock().unwrap().push(first.clone());
+
+        // An improver that answered without opening its evidence is sent
+        // back to read it; this model complies.
+        let last = messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default().to_string();
+        if let Some(list) = last.strip_prefix("You have not read these files").and_then(|r| r.split_once("answer again: ")) {
+            self.nudges.lock().unwrap().push(last.clone());
+            let reads: Vec<(&str, Value)> = list.1.split(", ").map(|p| ("read_file", json!({"path": p.trim()}))).collect();
+            return tool_call(reads);
+        }
 
         if first.contains("ROLE: reviewer of a bug fix") {
             return text("VERDICT: pass\nGAP:");
@@ -244,9 +255,12 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
     assert!(exp.contains("cue: the smith fixes the value") && exp.contains("verdict: helped"), "{exp}");
     assert!(std::fs::read_to_string(entry.join("harness/recipes/tests/RECIPE.md")).unwrap().contains(RULE));
 
-    // Improver sessions never saw a shell or a finish tool.
+    // An improver that answered without opening the runs was sent back
+    // to read them.
     let systems = roles.systems.lock().unwrap().clone();
     assert!(systems.iter().any(|s| s.contains("YOUR DIMENSION: INV")));
+    let nudges = roles.nudges.lock().unwrap().clone();
+    assert!(nudges.iter().any(|n| n.contains("context/runs/base-1/trajectory.md")), "{nudges:?}");
 
     // `slag status --json` carries the stage table.
     let status = run(slag(repo.path(), &server, home.path(), &["status", "--json"])).await;
@@ -347,7 +361,9 @@ async fn two_wide_evolution_picks_blind_among_verified_fixes() {
     assert_eq!(selection["ids"][chosen], "B");
     let systems = roles.systems.lock().unwrap().clone();
     let picks = systems.iter().filter(|s| s.contains("You are choosing which of")).count();
-    assert_eq!(picks, 1);
+    assert!(picks >= 1);
+    let nudges = roles.nudges.lock().unwrap().clone();
+    assert!(nudges.iter().any(|n| n.contains("context/candidates/A.md")), "the selector had to open every candidate: {nudges:?}");
     let candidates = std::fs::read_dir(repo.path().join(format!(".slag/evolve/{}/sessions/select/context/candidates", rec["run"].as_str().unwrap())))
         .unwrap()
         .count();
