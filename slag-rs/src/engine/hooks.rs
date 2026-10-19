@@ -1046,7 +1046,7 @@ fn announce_finish(tx: &Option<crate::engine::EventTx>, def: &HookDef, outcome: 
 /// The hook config as it stood when the forge opened.
 ///
 /// Read once, then frozen. `forge.rs` hands the workspace to smiths that
-/// can rewrite any file in it, `slag.toml` included — without this
+/// can rewrite files, `config.toml` among them when it is reachable; without this
 /// freeze, a smith could register a hook into the session that is
 /// currently running it.
 #[derive(Default)]
@@ -1055,7 +1055,7 @@ pub struct HookSnapshot {
     /// `disable_all_hooks` in config, or `SLAG_DISABLE_HOOKS` in env.
     pub disabled: bool,
     /// Models and key for the Prompt and Agent kinds, frozen with the
-    /// hooks: a smith rewriting `slag.toml` mid-run cannot repoint its
+    /// hooks: a smith rewriting `config.toml` mid-run cannot repoint its
     /// own verifier at a cheaper model.
     pub engine: Option<crate::config::EngineConfig>,
     /// How command hooks run: plain for the operator's, sandboxed for a
