@@ -490,6 +490,17 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - A4 (base, `--tries 4`, matched compute): py-data 4/4 on tasks 1-4 so far.
 - Lead check of a suspected fault: the composer's KEEP_BASE does not block delivery. `select()` (evolve.rs:1271) pools every verified run (composed, candidates, reference), so a passing candidate ships. KEEP_BASE only decides which harness enters the library.
 
+### Harness² critic r2 (Fable, fresh, matched compute): WINNER bar → gap fixed by the lead
+- Instrument proven (noop 0/8, reference 8/8 per stream). Executor ministral-3b, editor gpt-4.1-mini (gpt-5.5 hit the $3 cap on one task). Spent $8.25 of $12.
+- py-data: A1 6/16 · A4 (`--tries 4`) 4/8 · B (`--evolve 1`) 3/8 · C(5-8) 3/8 vs A1(5-8) 2/8. js-web: A1 7/16 · A4 3/8 · B 3/8 · C(5-8) 3/8 vs A1(5-8) 3/8. B costs $1.41-1.82 per stream against $0.50-0.65 for A4.
+- Library: 3 entries, all low confidence, all admitted on tool-error deltas from unfixed tasks; transfer effect none measurable. Safety pass (no grader data in any library, harness or evidence dir).
+- BIGGEST_GAP: `evolve.rs:501` a probe's provider error aborted the fix after base-1 verified (js-web 06: dom-1 re-sent an empty assistant turn, Mistral 400, exit 1, no fix).
+- Lead fix `4cbc4bb`: `ChatMessage::assistant` writes "(no reply)" for a blank turn with no tool calls; `evolve::run` stops on a stage error when a run verified, clears the process-wide provider failure it now owns (`error::clear_provider_failure`), and delivers. Test `a_failed_probe_keeps_the_verified_fix_it_already_has` red without it.
+- Second tier, lead fix `d0c7a9c`: orphaned `node --test` after a bench timeout. slag handled only Ctrl-C; SIGTERM skipped every cleanup, and bash-tool process groups were untracked. Now SIGTERM exits 143 after the cleanups, and `tools::kill_running` kills the smith's commands. Test `sigterm_ends_the_command_the_smith_is_running` (10/10 stress, red without the registration).
+- Not done: admission gate for tool-error-only lessons; library fit check; bench `check.sh` has no timeout.
+- Docs `871c289`: README result sentence, CLAUDE.md stop rule, site CLI row ("has not beaten plain `--tries 4`").
+- Lead incident: the disk filled (123 MB free) during the Linux cross-build; the lead deleted its own build caches (job scratch 20 → 3.7 GB, lane `target/` dirs ≈ 50 GB). Docker Desktop still did not answer afterwards.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
