@@ -253,7 +253,7 @@ async fn direct_proof_repairs_fixture_writes_before_sealing_the_ingot() {
         .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
         .unwrap();
     assert!(failed.contains("exit=1"), "{failed}");
-    assert!(failed.contains("PermissionError"), "{failed}");
+    assert!(failed.contains("PermissionError") || failed.contains("Read-only file system"), "{failed}");
     assert!(git(root.path(), &["status", "--porcelain"]).is_empty());
     server.verify().await;
 }

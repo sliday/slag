@@ -178,7 +178,7 @@ PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGR
 
 ### Phase 1: SURVEYOR
 
-Small local commissions share a short contract between the builder and reviewer. The contract checks named behavior and boundary cases first. It then checks interfaces that fit the tool: stdin for Unix filters, positional values for scalar parsers, and package entry points when requested. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation. Package installation checks use a separate temporary copy. Slag keeps verification instruments under gitignored `.slag/checks/`. Product tests work without that directory.
+Small local commissions share a short contract between the builder and reviewer. The contract checks named behavior and boundary cases first. It then checks interfaces that fit the tool: stdin for Unix filters, positional values for scalar parsers, and package entry points when requested. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation. Package installation checks use a separate temporary copy. They try venv, virtualenv, then pip with a private target. If host tools are missing, slag records a skipped installation check and still requires the other checks. Slag keeps verification instruments under gitignored `.slag/checks/`. Product tests work without that directory.
 
 The surveyor reads `.slag/PRD.md` (the ore). It writes `.slag/BLUEPRINT.md` with architecture decisions, dependencies, risks, and the forging sequence. It uses the plan model.
 
@@ -328,7 +328,7 @@ Nothing a sandboxed command writes may become code that runs outside the sandbox
 | Linux with neither | No confinement. slag prints one warning per run that names bubblewrap. |
 | Other platforms | No confinement, with one warning per run |
 
-On macOS, `sandbox-exec` fails when slag already runs inside another sandbox. slag then runs unconfined and warns once. On Linux, a `bwrap` that fails to start (no user namespaces) falls through to Landlock.
+On macOS, `sandbox-exec` fails when slag already runs inside another sandbox. slag then runs unconfined and warns once. On Linux, a `bwrap` that fails to start (no user namespaces) falls through to Landlock. Strict read-only checks require bubblewrap on Linux. Landlock cannot block metadata writes, so slag refuses those checks and warns once.
 
 When the sandbox refuses a write, the tool result tells the model `write outside the workspace was blocked by slag's sandbox: <path>` (or `write to git's hooks or config was blocked by slag's sandbox: <path>`), so it changes approach instead of retrying.
 

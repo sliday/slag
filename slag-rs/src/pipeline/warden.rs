@@ -214,9 +214,11 @@ pub async fn judge_artifact(
             }
         }
     } else { None };
+    let mut install_skipped = None;
     let installed = if python_package_cli(&ore, &bar) {
         match checkout::prepare_install(std::path::Path::new(".")).await {
-            Ok(checkout) => { commands.push(checkout.command.clone()); Some(checkout) }
+            Ok(checkout::InstallCheck::Ready(checkout)) => { commands.push(checkout.command.clone()); Some(checkout) }
+            Ok(checkout::InstallCheck::Skipped(reason)) => { install_skipped = Some(reason); None }
             Err(error) => {
                 let verdict = Verdict::unverified(format!("cannot prepare the isolated installation check: {error}"));
                 record(round, &verdict);
@@ -227,7 +229,13 @@ pub async fn judge_artifact(
     let install_context = installed.as_ref().map(|checkout| format!(
         "ISOLATED INSTALL CHECK: {}\nThe coordinator installed committed HEAD in a separate temporary clone. First run the fresh-clone suite without installation. Then run this exact command in its own bash call. It checks installed console-script metadata and --help. Cite its successful ID.\n",
         checkout.command,
-    )).unwrap_or_default();
+    )).unwrap_or_else(|| install_skip_context(install_skipped.as_deref()));
+    if let Some(reason) = &install_skipped {
+        record_install_skip(std::path::Path::new(crate::config::project_path(LEDGER)), reason);
+        crate::engine::emit(&hooks.events, crate::engine::EngineEvent::Warning {
+            message: format!("install check skipped: {reason}"),
+        });
+    }
     let fresh_context = fresh.as_ref().map(|checkout| format!(
         "FRESH CLONE CHECK: {}\nThe coordinator cloned committed HEAD without ignored files or prior package installs. Run this exact command in its own bash call. Cite its successful ID. A failure is a delivery gap.\n",
         checkout.command,
@@ -252,6 +260,19 @@ pub async fn judge_artifact(
     if verdict.is_unverified() { log_raw(&raw); }
     record(round, &verdict);
     Ok(verdict)
+}
+
+fn record_install_skip(path: &std::path::Path, reason: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "\n- install check skipped: {reason}");
+    }
+}
+
+fn install_skip_context(reason: Option<&str>) -> String {
+    reason.map(|reason| format!(
+        "install check skipped: {reason}\nMissing host installation tools alone do not establish a package gap. Judge the fresh-clone suite and package source. Do not claim installed-console verification.\n"
+    )).unwrap_or_default()
 }
 
 fn python_package_cli(ore: &str, bar: &str) -> bool {
@@ -442,6 +463,28 @@ fn record(round: usize, v: &Verdict) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_install_check_reports_limits_without_an_unverified_verdict() {
+        let context = install_skip_context(Some("Python installation tools are unavailable"));
+        assert!(context.starts_with("install check skipped: Python installation tools are unavailable\n"));
+        assert!(context.contains("Do not claim installed-console verification"));
+        assert!(!context.contains("REQUIRED RUN COMMANDS"));
+        let root = tempfile::tempdir().unwrap();
+        let ledger = root.path().join("PROGRESS.md");
+        record_install_skip(&ledger, "Python installation tools are unavailable");
+        assert_eq!(std::fs::read_to_string(ledger).unwrap().matches("install check skipped:").count(), 1);
+        let commands = vec!["python3 -m unittest".to_string()];
+        let mut inspections = InspectionLog::default();
+        inspections.record(&crate::engine::ToolCall {
+            id: "suite".into(), name: "bash".into(),
+            arguments: serde_json::json!({"command": commands[0]}).to_string(),
+        }, &crate::engine::ToolOutcome { output: "Ran 2 tests\nOK".into(), is_error: false });
+        let verdict = parse_grounded_verdict("VERDICT: pass\nEVIDENCE: [\"suite\"]", &inspections, true, &commands);
+        assert!(verdict.fulfilled);
+        assert!(!verdict.is_unverified());
+        assert!(install_skip_context(None).is_empty());
+    }
 
     fn git(root: &std::path::Path, args: &[&str]) -> String {
         let output = crate::engine::sandbox::git().args(args).current_dir(root)

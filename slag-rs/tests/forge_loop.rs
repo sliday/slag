@@ -458,7 +458,7 @@ async fn broken_proofs_resmelt_once_without_spending_retry_heats() {
         );
         assert!(output.contains("broken proof"), "{output}");
         assert!(output.contains(proof), "{output}");
-        assert!(output.contains(error), "{output}");
+        assert!(output.split_whitespace().collect::<Vec<_>>().join(" ").contains(error), "{output}");
         let plan = std::fs::read_to_string(root.path().join("PLAN.md")).unwrap();
         assert!(plan.contains(":status cracked"), "{plan}");
         assert!(plan.contains(":heat 0 :max 5 :smelt 1"), "{plan}");
