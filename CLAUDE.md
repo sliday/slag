@@ -74,6 +74,7 @@ New commissions use gitignored `.slag/`. Slag stores its ignore patterns in `.gi
 | `.slag/BAR.md` | Acceptance criteria and required checks |
 | `.slag/PROGRESS.md` | Work history ledger |
 | `.slag/logs/` | Debug logs (slag heap) |
+| `.slag/checks/` | Untracked verification probes and reference fixtures. Builders can write here; reviewers cannot. Product tests must not depend on it. |
 | `recipes/<name>/RECIPE.md` | The recipes proper (`engine/recipes.rs`): frontmatter-fenced markdown discovered under `<root>/recipes/` and the config dir, indexed into the prompt and loadable by name |
 
 ### Configuration

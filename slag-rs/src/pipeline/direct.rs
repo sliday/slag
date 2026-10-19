@@ -57,16 +57,16 @@ pub fn scope_prompt(commission: &str) -> String {
          Match a named reference only for requested behavior, including input boundaries and byte versus character counts.\n\
          Keep conventional interfaces secondary. Do not invent --file, --input, or --regex aliases when positional arguments suffice. Add no unrelated features, dependency bans, test quotas, or output-order rules.\n\
          proof must run the full declared test suite from a fresh clone without prior installation or environment activation. Use the system interpreter, not .venv. Do not select, skip, or filter tests.\n\
-         CLI/scripts need a normal launch probe with concrete fixture paths the builder will commit; exercise each named flag.\n\
-         CLI probes must write no workspace output files. Print results to stdout. Use private TMPDIR for scratch. Prefer committed Python probe scripts over nested python -c quoting.\n\
-         For long-running flags such as --follow, pass the flag to a committed probe script. It must assert child results, enforce a timeout, and terminate the child.\n\
-         Prefer probes that assert primary semantics and a named flag in the same run. Cover --help, stdin, and literal - in the CLI suite. Allow up to six direct probes. Non-CLI libraries may use commands=[].\n\
+         CLI/scripts need a normal launch probe; exercise each named flag. Keep harness fixtures and probe scripts under .slag/checks/.\n\
+         CLI probes must write no workspace output files. Print results to stdout. Use private TMPDIR for scratch. Put probe scripts under .slag/checks/, outside product tests.\n\
+         For long-running flags such as --follow, pass the flag to a probe script under .slag/checks/. It must assert child results, enforce a timeout, and terminate the child.\n\
+         Prefer probes that assert primary semantics and a named flag in the same run. Derive secondary interfaces from this tool's kind. Allow up to six direct probes. Non-CLI libraries may use commands=[].\n\
          A Python package CLI needs installation metadata with a console-script entry point and __main__.py. Probe python3 -m PACKAGE from source. The coordinator verifies installation and the console script in an isolated copy. Never install into the product workspace. The suite uses source or module launches.\n\
          A Node CLI needs package.json with a bin entry. Probe that bin target.\n\
-         A file/text CLI reads stdin without a file or with literal - and supports --help. Named file and value arguments support a positional form. A top-N CLI has a documented default N. Test FILE N and the default; do not require an extra flag unless the sentence names it.\n\
+         A Unix stream filter, such as wc, tail, CSV conversion, or word frequency, reads stdin without a file or with literal -. A scalar parser, such as duration parsing, takes its value positionally; do not add file or stdin interfaces. CLIs support --help. A top-N CLI has a documented default N. Test FILE N and the default; do not require an extra flag unless the sentence names it.\n\
          Test these conventional interfaces with subprocess assertions. Match any explicit interface restrictions in the commission.\n\
          Launch standalone scripts with their interpreter. Keep each verification command within the declared environment.\n\
-         The workspace stays read-only during tests/probes. Use in-memory data, committed fixtures, or private TMPDIR scratch. Do not install dependencies or write workspace fixtures or caches.\n\
+         The workspace stays read-only during tests/probes. Use in-memory data, .slag/checks/ fixtures, or private TMPDIR scratch. Product tests must not depend on .slag/. Do not install dependencies or write workspace fixtures or caches.\n\
          Return direct=false if this verification contract conflicts with the commission.\n\
          Criteria must be single lines of at most 320 characters; proof and each probe must fit 1024 characters.\n\
          Output the JSON itself without tools, prose, or document descriptions.{reference}"
@@ -112,6 +112,27 @@ pub fn reference_mapping_prompt(commission: &str, raw: &str) -> Option<String> {
          These commands will compare empty input and an unterminated final text record. Do not use tools.",
         scope["commands"],
     ))
+}
+
+pub fn reference_validation_error(commission: &str, raw: &str) -> Option<String> {
+    reference::named_tool(commission)?;
+    let value: serde_json::Value = serde_json::from_str(scope_json(raw)?).ok()?;
+    let reference = value.get("reference").unwrap_or(&value);
+    let reference = if reference.is_null() || value.get("direct").is_some() && value.get("reference").is_none() {
+        None
+    } else {
+        match serde_json::from_value(reference.clone()) {
+            Ok(reference) => Some(reference),
+            Err(error) => return Some(format!("the reference mapping has an invalid JSON shape: {error}")),
+        }
+    };
+    reference::checks(commission, reference).err().map(str::to_string)
+}
+
+pub fn reference_repair_prompt(commission: &str, scope: &str, reply: &str) -> Option<String> {
+    let reason = reference_validation_error(commission, reply)?;
+    Some(format!("{}\n\nPREVIOUS REFERENCE REPLY:\n{reply}\n\nVALIDATION ERROR: {reason}.\nReturn one corrected reference object. The product command may differ from a probe wrapper.",
+        reference_mapping_prompt(commission, scope)?))
 }
 
 pub fn complete_reference(commission: &str, scope: &str, reply: &str) -> Option<DirectPlan> {
@@ -194,7 +215,7 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
     for criterion in conventions {
         if !criteria.iter().any(|existing| existing == criterion) { criteria.push(criterion.into()); }
     }
-    let reference = reference::checks(commission, choice.reference, &commands)?;
+    let reference = reference::checks(commission, choice.reference).ok()?;
     if let Some(criterion) = reference.criterion { criteria.push(criterion); }
     commands.extend(reference.commands);
     Some(DirectPlan { proof: proof.to_string(), criteria, commands, fixtures: reference.fixtures })
@@ -203,6 +224,16 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
 fn python_commission(commission: &str) -> bool {
     let lower = commission.to_ascii_lowercase();
     ["python", "unittest", ".py"].iter().any(|word| lower.contains(word))
+}
+
+fn stream_filter(commission: &str) -> bool {
+    let lower = commission.to_ascii_lowercase();
+    let operation = regex::Regex::new(r"\b(wc|tail|tails|tailing)\b").unwrap();
+    let converts = regex::Regex::new(r"\b(convert|converts|converter|conversion)\b").unwrap();
+    let words = regex::Regex::new(r"\bwords?\b").unwrap();
+    operation.is_match(&lower)
+        || lower.contains("csv") && converts.is_match(&lower)
+        || words.is_match(&lower) && ["frequent", "frequency", "top n", "top-n"].iter().any(|term| lower.contains(term))
 }
 
 fn conventional_criteria(commission: &str, cli: bool, package: bool) -> Vec<&'static str> {
@@ -215,7 +246,7 @@ fn conventional_criteria(commission: &str, cli: bool, package: bool) -> Vec<&'st
     if lower.contains("node") {
         criteria.push("Provide package.json with a bin entry that points to the runnable CLI. Document and verify that entry.");
     }
-    if ["file", "text", "csv", "like "].iter().any(|word| lower.contains(word)) {
+    if stream_filter(commission) {
         criteria.push("Read stdin when no input file is given or the input file is literal -. Document both interfaces and --help. Run stdin, dash, and help probes. Test their results through the real CLI.");
     }
     if lower.contains("top n") || lower.contains("top-n") {
@@ -269,7 +300,7 @@ mod tests {
 
     #[test]
     fn conventional_interfaces_follow_the_requested_deliverable() {
-        let python = conventional_criteria("a Python package CLI for CSV files", true, true);
+        let python = conventional_criteria("a Python package CLI that converts CSV files to JSON", true, true);
         assert!(python.iter().any(|item| item.contains("console-script")));
         assert!(python.iter().any(|item| item.contains("stdin")));
         let node = conventional_criteria("a tiny Node CLI for top N words of a text file", true, false);
@@ -278,6 +309,38 @@ mod tests {
         assert!(!node.iter().any(|item| item.contains("console-script")));
         assert!(conventional_criteria("a Python package library", false, true).is_empty());
         assert!(conventional_criteria("a CLI that shows the date", true, false).is_empty());
+    }
+
+    #[test]
+    fn scalar_and_file_tools_do_not_inherit_stream_filter_interfaces() {
+        for commission in [
+            "a small Python library and CLI that parses durations like 1h30m or 90s into seconds, with tests",
+            "a CLI that inspects a file and prints its metadata",
+            "a CLI that renders text like a typewriter",
+            "a CLI that validates a CSV schema file",
+        ] {
+            let criteria = conventional_criteria(commission, true, false);
+            assert!(!criteria.iter().any(|item| item.contains("stdin")), "{commission}");
+        }
+        for commission in [
+            "write wc.py that counts lines, words and bytes of a file like wc",
+            "a Python CLI that tails a log file and prints only lines matching a regex",
+            "a small Python CLI that converts CSV to JSON",
+            "a tiny Node CLI that prints the top N most frequent words of a text file",
+        ] {
+            assert!(stream_filter(commission), "{commission}");
+        }
+        let prompt = scope_prompt("a Python CLI that parses durations");
+        assert!(prompt.contains("takes its value positionally"));
+        assert!(prompt.contains("do not add file or stdin interfaces"));
+    }
+
+    #[test]
+    fn scope_keeps_harness_instruments_out_of_product_tests() {
+        let prompt = scope_prompt("a Python CLI with tests");
+        assert!(prompt.contains("Keep harness fixtures and probe scripts under .slag/checks/"));
+        assert!(prompt.contains("Product tests must not depend on .slag/"));
+        assert!(!prompt.contains("committed probe script"));
     }
 
     #[test]
@@ -316,7 +379,7 @@ mod tests {
         ]), &["python3 -m tally tests/fixtures/input.txt --lines -q"]);
         let plan = parse_scope(&raw, commission).unwrap();
         assert_eq!(plan.proof, "python3 -m unittest");
-        assert_eq!(plan.criteria.len(), 9);
+        assert_eq!(plan.criteria.len(), 8);
         assert!(plan.criteria[2].contains("--lines"));
         assert_eq!(plan.commands, ["python3 -m tally tests/fixtures/input.txt --lines -q"]);
     }
@@ -346,12 +409,12 @@ mod tests {
 
     #[test]
     fn first_review_conventions_cover_module_dash_and_positional_launches() {
-        let python = conventional_criteria("A Python package CLI for CSV files", true, true);
+        let python = conventional_criteria("A Python package CLI that converts CSV files to JSON", true, true);
         assert!(python.iter().any(|item| item.contains("__main__.py") && item.contains("python3 -m PACKAGE")));
         assert!(python.iter().any(|item| item.contains("literal -")));
         let node = conventional_criteria("A Node CLI for top N words of a text file", true, false);
         assert!(node.iter().any(|item| item.contains("FILE N positionally") && item.contains("only when the commission names it")));
-        let prompt = scope_prompt("A Python package CLI for CSV files");
+        let prompt = scope_prompt("A Python package CLI that converts CSV files to JSON");
         assert!(prompt.contains("fresh clone without prior installation"));
         assert!(prompt.contains("suite uses source or module launches"));
     }
@@ -450,12 +513,12 @@ mod tests {
         let commission = "Create a package with a CLI and unittest for CSV totals.";
         let commands = ["python3 -m totals tests/fixtures/input.csv"];
         let plan = parse_scope(&answer_with_commands(serde_json::json!(["CSV totals print the requested result."]), &commands), commission).unwrap();
-        assert_eq!(plan.criteria.len(), 6);
+        assert_eq!(plan.criteria.len(), 5);
         assert!(plan.criteria.iter().any(|item| item.contains("installation metadata") && item.contains("importable modules")));
         assert!(plan.criteria.iter().any(|item| item.contains("subprocess checks") && item.contains("exact expected results")));
         assert!(plan.criteria.iter().any(|item| item.contains("nonempty full test suite") && item.contains("named behavior")));
         let repeated = parse_scope(&answer_with_commands(serde_json::json!(plan.criteria), &commands), commission).unwrap();
-        assert_eq!(repeated.criteria.len(), 6);
+        assert_eq!(repeated.criteria.len(), 5);
     }
 
     #[tokio::test]
@@ -468,9 +531,9 @@ mod tests {
         let plan = parse_scope(&raw, "A file CLI like cat with tests.").unwrap();
         assert_eq!(plan.commands.len(), 3);
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("tests/fixtures")).unwrap();
-        std::fs::write(root.path().join("tests/fixtures/reference-empty.txt"), "").unwrap();
-        std::fs::write(root.path().join("tests/fixtures/reference-no-final-newline.txt"), "alpha beta\nalpha").unwrap();
+        std::fs::create_dir_all(root.path().join(".slag/checks")).unwrap();
+        std::fs::write(root.path().join(".slag/checks/reference-empty.txt"), "").unwrap();
+        std::fs::write(root.path().join(".slag/checks/reference-no-final-newline.txt"), "alpha beta\nalpha").unwrap();
         let script = root.path().join("copy.py");
         let sandbox = crate::engine::sandbox::Sandbox::read_only().unwrap();
         for (source, expected) in [
@@ -485,7 +548,7 @@ mod tests {
             }
         }
         std::fs::write(&script, "import pathlib,sys\nsys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n").unwrap();
-        std::fs::write(root.path().join("tests/fixtures/reference-no-final-newline.txt"), "alpha beta\nalpha\n").unwrap();
+        std::fs::write(root.path().join(".slag/checks/reference-no-final-newline.txt"), "alpha beta\nalpha\n").unwrap();
         let result = sandbox.wrap("bash").args(["-c", &plan.commands[2]]).current_dir(root.path()).output().await.unwrap();
         assert!(!result.status.success(), "changed boundary input must not pass");
         assert!(String::from_utf8_lossy(&result.stderr).contains("reference fixture changed"));
@@ -517,6 +580,42 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_product_launch_does_not_need_to_match_a_probe_wrapper() {
+        let raw = serde_json::json!({
+            "direct": true, "proof": "python3 -m unittest", "criteria": ["Count lines, words and bytes like wc."],
+            "commands": ["python3 -B tests/cli_probe.py wc.py fixture.txt"],
+            "reference": {"actual": ["python3", "-B", "wc.py", "{input}"], "command": ["wc", "{input}"], "comparison": "words"}
+        }).to_string();
+        let plan = parse_scope(&raw, "Write wc.py like wc with unittest.").unwrap();
+        assert_eq!(plan.fixtures.len(), 2);
+        assert!(plan.fixtures.iter().all(|(path, _)| path.starts_with(".slag/checks/reference-")));
+        assert!(reference_validation_error("Write wc.py like wc with unittest.", &raw).is_none());
+    }
+
+    #[test]
+    fn reference_product_paths_cannot_hide_coordinator_probes() {
+        let mut raw = serde_json::json!({
+            "direct": true, "proof": "python3 -m unittest", "criteria": ["Copy contents like cat."],
+            "commands": ["python3 copy.py fixture.txt"],
+            "reference": {"actual": ["python3", "copy.py", "{input}"], "command": ["cat", "{input}"], "comparison": "bytes"}
+        });
+        for path in [
+            ".slag/checks/probe.py", "./.slag/checks/probe.py", "/tmp/project/.slag/checks/probe.py",
+            "helpers/../.slag/checks/probe.py", "./.slag/helpers/../checks/probe.py",
+            "../project/.slag/checks/./probe.py",
+        ] {
+            raw["reference"]["actual"][1] = serde_json::json!(path);
+            let reply = raw.to_string();
+            assert!(parse_scope(&reply, "A CLI like cat with tests.").is_none(), "{path}");
+            assert!(reference_validation_error("A CLI like cat with tests.", &reply).unwrap().contains("coordinator probe"));
+        }
+        for path in ["./copy.py", "helpers/../copy.py", "/tmp/project/copy.py", ".slag/checks/../../copy.py"] {
+            raw["reference"]["actual"][1] = serde_json::json!(path);
+            assert!(parse_scope(&raw.to_string(), "A CLI like cat with tests.").is_some(), "{path}");
+        }
+    }
+
+    #[test]
     fn a_named_reference_requires_the_actual_reference_and_artifact_launch() {
         let mut raw = serde_json::json!({
             "direct": true, "proof": "python3 -m unittest", "criteria": ["Copy file contents like cat."],
@@ -532,7 +631,7 @@ mod tests {
         for (key, value) in [
             ("command", serde_json::json!(["echo", "{input}"])),
             ("actual", serde_json::json!(["cat", "{input}"])),
-            ("actual", serde_json::json!(["python3", "other.py", "{input}"])),
+            ("actual", serde_json::json!(["python3", ".slag/checks/probe.py", "{input}"])),
             ("actual", serde_json::json!(["python3", "copy.py", "unrelated.txt"])),
             ("comparison", serde_json::json!("ignore errors")),
         ] {

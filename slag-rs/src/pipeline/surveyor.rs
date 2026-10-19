@@ -9,10 +9,17 @@ pub async fn direct_proof(smith: &dyn Smith, commission: &str) -> Result<Option<
     if let Some(plan) = super::direct::parse_scope(&raw, commission) {
         return Ok(Some(plan));
     }
-    if let Some(prompt) = super::direct::reference_mapping_prompt(commission, &raw) {
-        let reference = smith.invoke(&prompt).await?;
-        return super::direct::complete_reference(commission, &raw, &reference).map(Some)
-            .ok_or_else(|| SlagError::SurveyFailed("the named reference has no valid comparison contract".into()));
+    if let Some(prompt) = super::direct::reference_repair_prompt(commission, &raw, &raw) {
+        log_to_file("REFERENCE_REPAIR", &prompt);
+        let repaired = smith.invoke(&prompt).await?;
+        let plan = super::direct::complete_reference(commission, &raw, &repaired);
+        if plan.is_none() {
+            let reason = super::direct::reference_validation_error(commission, &repaired)
+                .unwrap_or_else(|| "the reference does not complete the direct contract".into());
+            log_to_file("REFERENCE_FALLBACK", &reason);
+            tui::status_line("!", tui::WARM, &format!("reference contract: {reason}; using full planning"));
+        }
+        return Ok(plan);
     }
     let Some(prompt) = super::direct::scope_repair_prompt(commission, &raw) else { return Ok(None) };
     let repaired = smith.invoke(&prompt).await?;
@@ -162,7 +169,45 @@ mod tests {
             assert_eq!(smith.call_count(), 2);
         }
         let smith = crate::smith::mock::MockSmith::fixed(&scope);
-        assert!(direct_proof(&smith, "A file CLI like cat with tests.").await.is_err());
+        assert!(direct_proof(&smith, "A file CLI like cat with tests.").await.unwrap().is_none());
+        assert_eq!(smith.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn reference_contract_repair_reports_the_exact_reason_and_falls_back() {
+        let scope = serde_json::json!({
+            "direct": true, "proof": "python3 -m unittest", "criteria": ["Copy contents like cat."],
+            "commands": ["python3 tests/cli_probe.py copy.py fixture.txt"]
+        }).to_string();
+        let invalid = r#"{"actual":["python3","copy.py","{input}"],"command":["echo","{input}"],"comparison":"bytes"}"#;
+        let valid = r#"{"actual":["python3","copy.py","{input}"],"command":["cat","{input}"],"comparison":"bytes"}"#;
+        let prompt = super::super::direct::reference_repair_prompt("A CLI like cat with tests.", &scope, invalid).unwrap();
+        assert!(prompt.contains("reference.command must start with the named reference tool"));
+        let mut invalid_scope: serde_json::Value = serde_json::from_str(&scope).unwrap();
+        invalid_scope["reference"] = serde_json::from_str(invalid).unwrap();
+        let smith = crate::smith::mock::MockSmith::new(vec![invalid_scope.to_string(), valid.into()]);
+        assert!(direct_proof(&smith, "A CLI like cat with tests.").await.unwrap().is_some());
+        assert_eq!(smith.call_count(), 2);
+        let smith = crate::smith::mock::MockSmith::new(vec![scope, invalid.into()]);
+        assert!(direct_proof(&smith, "A CLI like cat with tests.").await.unwrap().is_none());
+        assert_eq!(smith.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_valid_reference_with_invalid_proof_gets_a_full_scope_repair() {
+        let commission = "A file CLI like cat with tests.";
+        let mut scope = serde_json::json!({
+            "direct": true, "proof": "true", "criteria": ["Copy contents like cat."],
+            "commands": ["python3 copy.py fixture.txt"],
+            "reference": {"actual": ["python3", "copy.py", "{input}"], "command": ["cat", "{input}"], "comparison": "bytes"}
+        });
+        let invalid = scope.to_string();
+        assert!(super::super::direct::reference_repair_prompt(commission, &invalid, &invalid).is_none());
+        assert!(super::super::direct::scope_repair_prompt(commission, &invalid).unwrap().contains("direct contract failed validation"));
+        scope["proof"] = serde_json::json!("python3 -m unittest");
+        let smith = crate::smith::mock::MockSmith::new(vec![invalid, scope.to_string()]);
+        let plan = direct_proof(&smith, commission).await.unwrap().unwrap();
+        assert_eq!(plan.proof, "python3 -m unittest");
         assert_eq!(smith.call_count(), 2);
     }
 

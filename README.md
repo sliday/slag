@@ -178,7 +178,7 @@ PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGR
 
 ### Phase 1: SURVEYOR
 
-Small local commissions share a short contract between the builder and reviewer. The contract checks named behavior and boundary cases first. It then checks conventional CLI interfaces: help, stdin, package entry points, and stated defaults. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation. Package installation checks use a separate temporary copy.
+Small local commissions share a short contract between the builder and reviewer. The contract checks named behavior and boundary cases first. It then checks interfaces that fit the tool: stdin for Unix filters, positional values for scalar parsers, and package entry points when requested. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation. Package installation checks use a separate temporary copy. Slag keeps verification instruments under gitignored `.slag/checks/`. Product tests work without that directory.
 
 The surveyor reads `.slag/PRD.md` (the ore). It writes `.slag/BLUEPRINT.md` with architecture decisions, dependencies, risks, and the forging sequence. It uses the plan model.
 
