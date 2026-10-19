@@ -349,6 +349,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     let test_files: Vec<String> = files.iter().filter(|f| repo::is_test_path(f)).cloned().collect();
     let context =
         context_block(job, &issue, &files, &test_files, test.as_ref(), baseline.as_ref());
+    let rescuer = Rescuer { register: &register_shutdown, stop: repo::kill_running };
     let ctx = Ctx {
         job,
         config,
@@ -357,6 +358,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         context: &context,
         before: &before,
         usable_test: usable_test.as_deref(),
+        rescuer: &rescuer,
     };
     let tries = job.args.tries.max(1);
 
@@ -364,6 +366,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     let mut checks: Vec<Run> = Vec::new();
     let mut summary = String::new();
     let mut changed: Vec<String> = Vec::new();
+    let mut declared: Option<String> = None;
     let mut passed = false;
     let mut attempts = 0u8;
 
@@ -381,8 +384,8 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         let retry = failure.as_ref().map(|f| retry_block(&f.detail, &ctx.diff(&changed)));
         let label = format!("attempt {attempt}");
         match ctx.attempt(grade, retry.as_deref(), &label, &mut phases).await? {
-            Attempted::Passed { checks: c, summary: s, changed: ch } => {
-                (checks, summary, changed) = (c, s, ch);
+            Attempted::Passed { checks: c, summary: s, changed: ch, declared: d } => {
+                (checks, summary, changed, declared) = (c, s, ch, d);
                 passed = true;
                 break;
             }
@@ -435,11 +438,25 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     if let Some(git) = &job.git {
         sweep_debris(git, &before, &mut changed, &mut out.notes, hooks);
     }
-    let rescuer = Rescuer { register: &register_shutdown, stop: repo::kill_running };
+    let edited_now = |changed: &[String]| -> Vec<EditedTest> {
+        job.git.as_ref().map(|g| edited_old_tests(g, &before, changed)).unwrap_or_default()
+    };
+    let paths = |edited: &[EditedTest]| -> Vec<String> {
+        edited.iter().map(|e| e.path.clone()).collect()
+    };
+    let edited = edited_now(&changed);
     let clock = std::time::Instant::now();
     let proof_cmd = out.checks[0].cmd.clone();
-    let (mut repro, mut without) =
-        reproduce(job, &before, &changed, &proof_cmd, baseline.as_ref(), &rescuer).await;
+    let (mut repro, mut without) = reproduce(
+        job,
+        &before,
+        &changed,
+        &paths(&edited),
+        &proof_cmd,
+        baseline.as_ref(),
+        &rescuer,
+    )
+    .await;
     out.phases.repro += clock.elapsed().as_secs_f64();
     note_repro(hooks, &repro, &proof_cmd);
 
@@ -447,11 +464,25 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     // test that does not encode the reported case, a test in the wrong
     // file, a test that cannot run here. One gap, one chance to close it.
     let clock = std::time::Instant::now();
-    let gap = ctx.quality_gap(&changed, &test_files, &repro, without.as_ref()).await?;
+    let found = ctx
+        .quality_gap(&changed, &test_files, &repro, without.as_ref(), &edited, declared.as_deref())
+        .await?;
+    let mut gap_open = found.as_ref().map(|g| g.text.clone());
+    let gap_kind = found.as_ref().map(|g| g.kind);
     out.phases.review += clock.elapsed().as_secs_f64();
-    if let (Some(gap), Some(git)) = (gap, job.git.as_ref()) {
+    if let (Some(found), Some(git)) = (found, job.git.as_ref()) {
+        let gap = found.text;
         note(hooks, &format!("review: {gap}"), false);
         let kept = keep(git, &changed);
+        // What the first fix proved, so a revision can only add to it.
+        let first_added = added_test(git, &before, &changed, &edited);
+        let first_caught = matches!(repro, Repro::Regression { .. });
+        let first_tests: Vec<(PathBuf, repo::Content)> = changed
+            .iter()
+            .zip(&kept)
+            .filter(|(p, _)| repo::is_test_path(p) && !edited.iter().any(|e| &e.path == *p))
+            .map(|(_, (path, content, _))| (path.clone(), content.clone()))
+            .collect();
         let block = revision_block(&gap, &ctx.diff(&changed));
         emit(&hooks.events, EngineEvent::HeatTick { id: FIX_ID.into(), heat: attempts + 1 });
         tui::status_line(
@@ -465,17 +496,58 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                 note(hooks, "revision changed nothing; kept the first fix", false);
                 out.notes.push(format!("review gap left open: {gap}"));
             }
-            Attempted::Passed { checks: c, summary: s, changed: ch } => {
-                (out.checks, out.summary, changed) = (c, s, ch);
-                sweep_debris(git, &before, &mut changed, &mut out.notes, hooks);
-                let proof_cmd = out.checks[0].cmd.clone();
+            Attempted::Passed { checks: c, summary: s, changed: mut ch, declared: d } => {
+                sweep_debris(git, &before, &mut ch, &mut out.notes, hooks);
+                let ed = edited_now(&ch);
+                let proof_cmd = c[0].cmd.clone();
                 let clock = std::time::Instant::now();
-                (repro, without) =
-                    reproduce(job, &before, &changed, &proof_cmd, baseline.as_ref(), &rescuer)
-                        .await;
+                let (r, w) = reproduce(
+                    job,
+                    &before,
+                    &ch,
+                    &paths(&ed),
+                    &proof_cmd,
+                    baseline.as_ref(),
+                    &rescuer,
+                )
+                .await;
+                // A reviewer can be wrong, and a revision that follows a
+                // wrong gap makes the fix worse. It may add to what the
+                // first fix proved, never take from it.
+                let mut worse = None;
+                // A gap slag measured is closed only when the measure says so.
+                let closes = match found.kind {
+                    GapKind::NoTest => added_test(git, &before, &ch, &ed),
+                    GapKind::PassesWithoutFix => !w.as_ref().is_some_and(|run| run.ok()),
+                    GapKind::Review => true,
+                };
+                if !closes {
+                    worse = Some("did not close the gap");
+                } else if first_added && !added_test(git, &before, &ch, &ed) {
+                    worse = Some("dropped the regression test");
+                } else if first_caught && !matches!(r, Repro::Regression { .. }) {
+                    worse = Some("left tests that no longer catch the bug");
+                } else if found.kind == GapKind::Review && !first_tests.is_empty() {
+                    // The first fix's tests encode the issue; against the
+                    // revised source they must still pass.
+                    let run = swap_and_run(job, first_tests.clone(), &proof_cmd, &rescuer).await;
+                    if run.is_some_and(|run| !run.ok()) {
+                        worse = Some("broke what the first fix's tests pin");
+                    }
+                }
                 out.phases.repro += clock.elapsed().as_secs_f64();
-                note_repro(hooks, &repro, &proof_cmd);
-                out.notes.push(format!("revised once after review: {gap}"));
+                if let Some(why) = worse {
+                    let now = git.changed_since(&before);
+                    roll_back(git, &before, &kept, &now);
+                    note(hooks, &format!("kept the first fix; the revision {why}"), false);
+                    out.notes.push(format!("review gap left open: {gap}"));
+                } else {
+                    (out.checks, out.summary, changed, declared) = (c, s, ch, d);
+                    (repro, without) = (r, w);
+                    note_repro(hooks, &repro, &proof_cmd);
+                    out.notes.push(format!("revised once after review: {gap}"));
+                    gap_open = None;
+                }
             }
             Attempted::Failed { failure, changed: now, .. } => {
                 // The first fix passed; a revision that broke it must not
@@ -493,6 +565,39 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     }
     drop(without);
     out.repro = repro;
+    // A change to what existing tests pin stands only when the issue asks
+    // for it. Declared, judged against the issue, and still disputed after
+    // the one revision: that is not a fix to hand over.
+    if let (Some(said), Some(gap)) = (&declared, &gap_open) {
+        emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: false });
+        out.verdict = Verdict::Failed(format!(
+            "changes existing tests the issue does not ask to change ({said}): {gap}"
+        ));
+        out.notes.push("the changes are left in the working tree".into());
+        stamp(&mut out);
+        return Ok(out);
+    }
+    // Tests that pass with and without the source change, after the one
+    // chance to fix them, are no evidence the change does anything; with no
+    // failing test before the edit either, nothing says the bug is gone.
+    let unproven = gap_open.is_some()
+        && gap_kind == Some(GapKind::PassesWithoutFix)
+        && !matches!(out.repro, Repro::Baseline { .. });
+    if unproven {
+        emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: false });
+        out.verdict = Verdict::Failed(
+            "no test shows the change fixes anything: the new tests pass with the source \
+             change reverted"
+                .into(),
+        );
+        out.notes.push("the changes are left in the working tree".into());
+        stamp(&mut out);
+        return Ok(out);
+    }
+    if let Some(said) = &declared {
+        note(hooks, said, false);
+        out.notes.push(said.clone());
+    }
     emit(&hooks.events, EngineEvent::IngotDone { id: FIX_ID.into(), ok: true });
 
     let clock = std::time::Instant::now();
@@ -524,12 +629,15 @@ struct Ctx<'a> {
     context: &'a str,
     before: &'a BTreeMap<String, repo::Content>,
     usable_test: Option<&'a str>,
+    rescuer: &'a Rescuer<'a>,
 }
 
 /// One session, judged by slag.
 enum Attempted {
-    /// The change passed every check slag ran.
-    Passed { checks: Vec<Run>, summary: String, changed: Vec<String> },
+    /// The change passed every check slag ran. `declared` is the session's
+    /// own account of a deliberate change to existing tests, when it made
+    /// one.
+    Passed { checks: Vec<Run>, summary: String, changed: Vec<String>, declared: Option<String> },
     /// It did not. `changed` is what the session left on disk.
     Failed { failure: Failure, summary: String, changed: Vec<String> },
 }
@@ -631,6 +739,22 @@ impl Ctx<'_> {
             }
         }
 
+        // A test alone fixes nothing. A session that touched only tests
+        // most often read the reported behavior as the intended one.
+        if job.git.is_some() && changed.iter().all(|p| repo::is_test_path(p)) {
+            note(hooks, &format!("{label}: only tests changed"), false);
+            return fail(
+                Failure::new(
+                    "only tests changed; the code was not fixed",
+                    "The session changed only test files. The issue reports wrong behavior \
+                     in the code, and a fix changes the code. Re-read the issue: the behavior \
+                     it reports is the bug, and your test must expect what the issue says \
+                     should happen instead.",
+                ),
+                summary,
+            );
+        }
+
         // The session's own test runs cached bytecode for whatever was on
         // disk then; slag's verdict must come from the source as it is.
         if let Some(git) = &job.git {
@@ -669,6 +793,90 @@ impl Ctx<'_> {
             );
         }
 
+        // Existing tests are the user's contract. Run them as they were
+        // against the new source: an edit that hides a broken expectation
+        // fails here, before any model gets a say.
+        let mut declared = None;
+        if let Some(git) = &job.git {
+            let edited = edited_old_tests(git, self.before, &changed);
+            if !edited.is_empty() {
+                let names: Vec<&str> = edited.iter().map(|e| e.path.as_str()).collect();
+                let names = names.join(", ");
+                let swaps = edited
+                    .iter()
+                    .map(|e| (git.top.join(&e.path), e.original_tests.clone()))
+                    .collect();
+                let clock = std::time::Instant::now();
+                let run = swap_and_run(job, swaps, &checks[0].cmd, self.rescuer).await;
+                phases.verify += clock.elapsed().as_secs_f64();
+                let Some(run) = run else { return Err(SlagError::Cancelled) };
+                let removed = removed_text(&edited);
+                // Whatever happens next, the retry starts from the old tests
+                // as they were, beside the session's source change: a model
+                // told to restore lines often cannot, but it can add.
+                let put_back = || {
+                    let olds: Vec<Saved> = edited
+                        .iter()
+                        .map(|e| (git.top.join(&e.path), e.original_tests.clone(), None))
+                        .collect();
+                    restore(&olds);
+                };
+                if run.ok() {
+                    note(hooks, &format!("{label}: edited existing tests that pass unchanged: {names}"), false);
+                    put_back();
+                    // A model that replaced a test while meaning to add one
+                    // tends to do it again; a new file cannot break an old one.
+                    let fresh: Vec<String> = edited
+                        .iter()
+                        .filter(|e| repo::is_test_path(&e.path))
+                        .map(|e| repo::regression_sibling(&e.path))
+                        .collect();
+                    let instead = match fresh.first() {
+                        Some(path) => format!("Put your new tests in a new file instead, such as {path}"),
+                        None => "Add your new tests after the last existing test".to_string(),
+                    };
+                    return fail(
+                        Failure::new(
+                            format!("edited existing tests that pass unchanged: {names}"),
+                            format!(
+                                "You deleted or rewrote lines of existing tests, though the \
+                                 original tests pass against your fix. slag put {names} back \
+                                 as it was, so any new tests you had added there are gone with \
+                                 the edit. Do not edit {names} again. {instead}, and leave \
+                                 every existing line alone. The lines you had changed:\n{removed}"
+                            ),
+                        ),
+                        summary,
+                    );
+                }
+                declared = declaration(&summary, &edited);
+                if declared.is_none() {
+                    note(hooks, &format!("{label}: the fix breaks existing tests: {names}"), false);
+                    put_back();
+                    return fail(
+                        Failure::new(
+                            format!("the fix breaks existing tests in {names}"),
+                            format!(
+                                "Your fix breaks existing tests, and you edited them to pass. \
+                                 slag ran the original {names} against your fix: `{}` gave \
+                                 {}:\n{}\n\nslag put {names} back as it was. The lines you \
+                                 had changed:\n{removed}\nFix the source so the existing tests \
+                                 pass as written, and add your new tests beside them. Only if the \
+                                 issue explicitly asks for the behavior they pin, change \
+                                 them again and say so in the summary, on its own line: \
+                                 changed existing tests: <file>: <why>",
+                                run.cmd,
+                                run.status(),
+                                repo::tail(&run.output, OUTPUT_TAIL_LINES, OUTPUT_TAIL_BYTES)
+                            ),
+                        ),
+                        summary,
+                    );
+                }
+                note(hooks, &format!("{label}: changed existing tests, declared"), false);
+            }
+        }
+
         if job.temper {
             match judge(self.config, hooks, self.issue, &checks[0].cmd).await {
                 Ok(v) if v.fulfilled => {
@@ -693,7 +901,7 @@ impl Ctx<'_> {
                 Err(e) => note(hooks, &format!("warden could not judge the fix: {e}"), false),
             }
         }
-        Ok(Attempted::Passed { checks, summary, changed })
+        Ok(Attempted::Passed { checks, summary, changed, declared })
     }
 
     /// The one gap worth a revision, if any. Two are certain and cost no
@@ -706,34 +914,27 @@ impl Ctx<'_> {
         test_files: &[String],
         repro: &Repro,
         without: Option<&Run>,
-    ) -> Result<Option<String>, SlagError> {
+        edited: &[EditedTest],
+        declared: Option<&str>,
+    ) -> Result<Option<Gap>, SlagError> {
         let Some(git) = &self.job.git else { return Ok(None) };
-        // A changed test file, or more test definitions anywhere: Rust
-        // keeps unit tests inside the source they test.
-        let added_test = changed.iter().any(|p| {
-            let count = |text: Option<Vec<u8>>| {
-                text.map_or(0, |b| repo::test_marks(&String::from_utf8_lossy(&b)).0)
-            };
-            repo::is_test_path(p)
-                || count(std::fs::read(git.top.join(p)).ok()) > count(git.original(self.before, p))
-        });
         let has_tests = !test_files.is_empty() || self.usable_test.is_some();
-        if !added_test && has_tests {
-            return Ok(Some(
+        if !added_test(git, self.before, changed, edited) && has_tests {
+            return Ok(Some(Gap::new(
+                GapKind::NoTest,
                 "no regression test was added: add one that asserts the issue's reported \
                  cases, in the test file for the module you fixed, or in a new file named \
-                 after it"
-                    .into(),
-            ));
+                 after it",
+            )));
         }
         // Checked on the run itself, not the verdict: a failing baseline
         // proves the bug, and says nothing about the new test.
         if without.is_some_and(|run| run.ok()) {
-            return Ok(Some(
+            return Ok(Some(Gap::new(
+                GapKind::PassesWithoutFix,
                 "the new test also passes with the source change reverted, so it does not \
-                 catch the bug: make it assert the exact result the issue reports"
-                    .into(),
-            ));
+                 catch the bug: make it assert the exact result the issue reports",
+            )));
         }
 
         let without_fix = match (repro, without) {
@@ -754,15 +955,24 @@ impl Ctx<'_> {
         } else {
             test_files.iter().take(60).cloned().collect::<Vec<_>>().join("\n")
         };
+        let existing = match declared {
+            Some(said) if !edited.is_empty() => format!(
+                "The fix rewrites lines of existing tests, and the original tests fail \
+                 against it. Its own account: {said}\nThe lines it removed:\n{}",
+                removed_text(edited)
+            ),
+            _ => "untouched: every line of every pre-existing test is as it was".to_string(),
+        };
         let prompt = crate::flux::fix_review_prompt(
             &self.issue.render(),
             &clip(&self.diff(changed), REVIEW_DIFF_BYTES),
             &listed,
             &without_fix,
+            &existing,
             repo::platform(),
         );
         match review(self.config, self.hooks, &prompt).await {
-            Ok(Some(gap)) => Ok(Some(gap)),
+            Ok(Some(gap)) => Ok(Some(Gap { text: gap, kind: GapKind::Review })),
             Ok(None) => {
                 note(self.hooks, "review: pass", true);
                 Ok(None)
@@ -775,6 +985,48 @@ impl Ctx<'_> {
             }
         }
     }
+}
+
+/// The one gap a passing fix gets sent back with.
+struct Gap {
+    text: String,
+    kind: GapKind,
+}
+
+/// Where a gap came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapKind {
+    /// slag measured it: no test was added.
+    NoTest,
+    /// slag measured it: the new tests pass with the fix reverted.
+    PassesWithoutFix,
+    /// A model's opinion. A revision that follows it must keep passing the
+    /// first fix's own tests.
+    Review,
+}
+
+impl Gap {
+    fn new(kind: GapKind, text: &str) -> Self {
+        Self { text: text.to_string(), kind }
+    }
+}
+
+/// Did the session add a test? A new or extended test file, or more test
+/// definitions anywhere (Rust keeps unit tests inside the source they
+/// test). Rewriting an old test is not adding one.
+fn added_test(
+    git: &Git,
+    before: &BTreeMap<String, repo::Content>,
+    changed: &[String],
+    edited: &[EditedTest],
+) -> bool {
+    changed.iter().any(|p| {
+        let count = |text: Option<Vec<u8>>| {
+            text.map_or(0, |b| repo::test_marks(&String::from_utf8_lossy(&b)).0)
+        };
+        let more = count(std::fs::read(git.top.join(p)).ok()) > count(git.original(before, p));
+        more || (repo::is_test_path(p) && !edited.iter().any(|e| &e.path == p))
+    })
 }
 
 /// One tool-free call to the judge model. `Some(gap)` on a clear fail with
@@ -966,6 +1218,7 @@ async fn reproduce(
     job: &Job,
     before: &BTreeMap<String, repo::Content>,
     changed: &[String],
+    edited: &[String],
     cmd: &str,
     baseline: Option<&Run>,
     rescuer: &Rescuer<'_>,
@@ -998,46 +1251,18 @@ async fn reproduce(
         return (from_baseline().unwrap_or(Repro::NotShown("the fix changed a symlink".into())), None);
     }
 
-    // Swap the source files back to their pre-session content, run, swap
-    // the fix back in. A Ctrl-C at any point must not cost the user the
-    // fix, so a rescue is registered first, and every swap and the rescue
-    // take one lock: see `Swap`.
-    let fixed: Vec<Saved> = sources
+    // The source goes back to its pre-session content, and so does any
+    // pre-existing test the session edited: the bug must be caught by the
+    // new tests, never by old ones rewritten to fit the fix.
+    let swaps: Vec<(PathBuf, repo::Content)> = sources
         .iter()
-        .map(|p| {
-            let path = git.top.join(p);
-            let mode = std::fs::metadata(&path).ok().map(|m| m.permissions());
-            let now = std::fs::read(&path).ok();
-            (path, now, mode)
-        })
+        .copied()
+        .chain(edited.iter().filter(|p| !sources.contains(p)))
+        .map(|p| (git.top.join(p), git.original(before, p)))
         .collect();
-    let swap = Arc::new(Mutex::new(Swap { phase: Phase::Armed, fixed }));
-    let rescue = swap.clone();
-    let stop = rescuer.stop;
-    (rescuer.register)(Box::new(move || Swap::rescue(&rescue, stop)));
-    let originals: Vec<Saved> = sources
-        .iter()
-        .map(|p| (git.top.join(p), git.original(before, p), None))
-        .collect();
-    let interrupted = || Repro::NotShown("interrupted".into());
-    {
-        let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
-        if s.phase != Phase::Armed {
-            return (interrupted(), None);
-        }
-        restore(&originals);
-        s.phase = Phase::Swapped;
-    }
-    let run = repo::run(cmd, &job.cwd, TEST_TIMEOUT).await;
-    {
-        let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
-        if s.phase != Phase::Swapped {
-            // The rescue ran during the check and already put the fix back.
-            return (interrupted(), None);
-        }
-        restore(&s.fixed);
-        s.phase = Phase::Done;
-    }
+    let Some(run) = swap_and_run(job, swaps, cmd, rescuer).await else {
+        return (Repro::NotShown("interrupted".into()), None);
+    };
 
     let repro = if run.unusable() {
         from_baseline()
@@ -1049,6 +1274,127 @@ async fn reproduce(
         Repro::Regression { status: run.status() }
     };
     (repro, Some(run))
+}
+
+/// Put `swaps` on disk in place of the current files, run `cmd`, and put
+/// the current files back. `None` when the rescue ran in between: the
+/// current files are on disk then, and the run proves nothing. A Ctrl-C at
+/// any point must not cost the user the fix, so the rescue is registered
+/// first, and every swap and the rescue take one lock: see `Swap`.
+async fn swap_and_run(
+    job: &Job,
+    swaps: Vec<(PathBuf, repo::Content)>,
+    cmd: &str,
+    rescuer: &Rescuer<'_>,
+) -> Option<Run> {
+    let fixed: Vec<Saved> = swaps
+        .iter()
+        .map(|(path, _)| {
+            let mode = std::fs::metadata(path).ok().map(|m| m.permissions());
+            (path.clone(), std::fs::read(path).ok(), mode)
+        })
+        .collect();
+    let swap = Arc::new(Mutex::new(Swap { phase: Phase::Armed, fixed }));
+    let rescue = swap.clone();
+    let stop = rescuer.stop;
+    (rescuer.register)(Box::new(move || Swap::rescue(&rescue, stop)));
+    let originals: Vec<Saved> = swaps.into_iter().map(|(path, old)| (path, old, None)).collect();
+    {
+        let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
+        if s.phase != Phase::Armed {
+            return None;
+        }
+        restore(&originals);
+        s.phase = Phase::Swapped;
+    }
+    let run = repo::run(cmd, &job.cwd, TEST_TIMEOUT).await;
+    let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
+    if s.phase != Phase::Swapped {
+        // The rescue ran during the check and already put the fix back.
+        return None;
+    }
+    restore(&s.fixed);
+    s.phase = Phase::Done;
+    Some(run)
+}
+
+/// A pre-existing test the session deleted or rewrote lines of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditedTest {
+    path: String,
+    /// The lines it lost, trimmed.
+    removed: Vec<String>,
+    /// What the original tests look like against the session's source:
+    /// the whole original file, or, for a source file with an inline test
+    /// module, the session's code above the module and the original
+    /// module below it.
+    original_tests: repo::Content,
+}
+
+/// Pre-existing tests the session deleted or rewrote: test files, and the
+/// inline test module of a source file (Rust keeps unit tests there).
+/// Pure additions are fine and do not appear here.
+fn edited_old_tests(
+    git: &Git,
+    before: &BTreeMap<String, repo::Content>,
+    changed: &[String],
+) -> Vec<EditedTest> {
+    changed
+        .iter()
+        .filter_map(|p| {
+            let old = String::from_utf8(git.original(before, p)?).ok()?;
+            let new = std::fs::read(git.top.join(p)).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
+            if repo::is_test_path(p) {
+                let removed = repo::removed_lines(&old, new.as_deref().unwrap_or(""));
+                return (!removed.is_empty()).then(|| EditedTest {
+                    path: p.clone(),
+                    removed,
+                    original_tests: Some(old.clone().into_bytes()),
+                });
+            }
+            let (_, old_tests) = repo::split_inline_tests(&old)?;
+            let new = new?;
+            let (new_code, new_tests) = repo::split_inline_tests(&new).unwrap_or((&new, ""));
+            let removed = repo::removed_lines(old_tests, new_tests);
+            (!removed.is_empty()).then(|| EditedTest {
+                path: p.clone(),
+                removed,
+                original_tests: Some(format!("{new_code}{old_tests}").into_bytes()),
+            })
+        })
+        .collect()
+}
+
+/// The lines each edited test lost, for a prompt or a report.
+fn removed_text(edited: &[EditedTest]) -> String {
+    let mut s = String::new();
+    for e in edited {
+        s.push_str(&format!("{}:\n", e.path));
+        for line in e.removed.iter().take(30) {
+            s.push_str(&format!("- {line}\n"));
+        }
+        if e.removed.len() > 30 {
+            s.push_str(&format!("- ... and {} more\n", e.removed.len() - 30));
+        }
+    }
+    s
+}
+
+/// The session's own account of a deliberate change to existing tests: the
+/// summary lines that say `changed existing tests:`, when together they
+/// name every edited file. `None` when the change went unsaid.
+fn declaration(summary: &str, edited: &[EditedTest]) -> Option<String> {
+    let lines: Vec<&str> = summary
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.to_ascii_lowercase().contains("changed existing tests"))
+        .collect();
+    let said = lines.join(" ");
+    let named = edited.iter().all(|e| {
+        let name = e.path.rsplit('/').next().unwrap_or(&e.path);
+        said.contains(e.path.as_str()) || said.contains(name)
+    });
+    (!lines.is_empty() && named).then(|| lines.join("; "))
 }
 
 /// Where `reproduce` hands its rescue, and how the rescue stops a check
@@ -1768,7 +2114,7 @@ mod tests {
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
 
-        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", None, &rescuer).await.0;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         assert_eq!(value(&job), "2\n", "fix restored");
 
@@ -1781,10 +2127,10 @@ mod tests {
         // A test that passes either way proves nothing; a failing baseline
         // is the fallback evidence.
         std::fs::write(job.cwd.join("value.txt"), "2\n").unwrap();
-        let weak = reproduce(&job, &before, &changed, "true", None, &rescuer).await.0;
+        let weak = reproduce(&job, &before, &changed, &[], "true", None, &rescuer).await.0;
         assert!(matches!(weak, Repro::NotShown(_)), "{weak:?}");
         let base = Run { cmd: "t".into(), code: Some(1), output: String::new(), secs: 0.0, timed_out: false };
-        let fallback = reproduce(&job, &before, &changed, "true", Some(&base), &rescuer).await.0;
+        let fallback = reproduce(&job, &before, &changed, &[], "true", Some(&base), &rescuer).await.0;
         assert_eq!(fallback, Repro::Baseline { status: "exit 1".into() });
     }
 
@@ -1798,7 +2144,7 @@ mod tests {
         let fire_at_once = |hook: Box<dyn FnOnce() + Send>| hook();
         let rescuer = Rescuer { register: &fire_at_once, stop: no_stop };
 
-        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", None, &rescuer).await.0;
         assert_eq!(repro, Repro::NotShown("interrupted".into()));
         assert_eq!(value(&job), "2\n", "the fix is on disk");
     }
@@ -1814,7 +2160,7 @@ mod tests {
 
         let check = "echo seen > seen.txt; while [ ! -f continue.txt ]; do sleep 0.01; done; bash tests/check.sh";
         let (repro, during) = tokio::join!(
-            reproduce(&job, &before, &changed, check, None, &rescuer),
+            reproduce(&job, &before, &changed, &[], check, None, &rescuer),
             async {
                 while !job.cwd.join("seen.txt").exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1875,7 +2221,7 @@ mod tests {
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
         let cmd = "python3 -m unittest discover -s tests";
-        let (repro, _) = reproduce(&job, &before, &changed, cmd, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &[], cmd, None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
 
         // Same second, same size again: only a purged cache recompiles.
@@ -1921,7 +2267,7 @@ mod tests {
         let rescuer = Rescuer { register: &keep, stop: no_stop };
         let started = std::time::SystemTime::now();
         let writes_bytecode = "env -u PYTHONDONTWRITEBYTECODE python3 -m unittest discover -s tests";
-        let (repro, _) = reproduce(&job, &before, &changed, writes_bytecode, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &[], writes_bytecode, None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
 
         let secs = |t: std::time::SystemTime| {
@@ -1969,6 +2315,58 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_or_deleted_old_tests_are_found_and_additions_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let pin = "test('preview', () => {\n  assert.equal(makePreview(s, 10), 'hello worl…');\n});\n";
+        std::fs::write(root.join("tests/preview.test.js"), pin).unwrap();
+        std::fs::write(root.join("tests/extra.test.js"), "test('x', () => {});\n").unwrap();
+        std::fs::write(root.join("tests/gone.test.js"), "test('gone', () => {});\n").unwrap();
+        let lib = "pub fn f() -> u8 { 1 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn missing_value_is_an_error() {}\n}\n";
+        std::fs::write(root.join("src/lib.rs"), lib).unwrap();
+        sh(root, "git add -A && git commit -qm init");
+        let git = Git::open(root).unwrap();
+        let before = git.snapshot();
+
+        // js-notify-preview: an expectation rewritten to fit the fix.
+        std::fs::write(root.join("tests/preview.test.js"), pin.replace("hello worl…", "hello wor…")).unwrap();
+        // An addition beside the old tests is what a regression test is.
+        std::fs::write(root.join("tests/extra.test.js"), "test('x', () => {});\ntest('y', () => {});\n").unwrap();
+        // A pre-existing test file deleted outright.
+        std::fs::remove_file(root.join("tests/gone.test.js")).unwrap();
+        // rust-hawkconf: an inline test deleted beside a source change.
+        let new_lib = "pub fn f() -> u8 { 2 }\n#[cfg(test)]\nmod tests {\n}\n";
+        std::fs::write(root.join("src/lib.rs"), new_lib).unwrap();
+
+        let changed = git.changed_since(&before);
+        let edited = edited_old_tests(&git, &before, &changed);
+        let paths: Vec<&str> = edited.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["src/lib.rs", "tests/gone.test.js", "tests/preview.test.js"], "{edited:?}");
+        let preview = edited.iter().find(|e| e.path == "tests/preview.test.js").unwrap();
+        assert_eq!(preview.removed, ["assert.equal(makePreview(s, 10), 'hello worl…');"]);
+        assert_eq!(preview.original_tests.as_deref(), Some(pin.as_bytes()));
+        let rust = edited.iter().find(|e| e.path == "src/lib.rs").unwrap();
+        let hybrid = String::from_utf8(rust.original_tests.clone().unwrap()).unwrap();
+        assert!(hybrid.starts_with("pub fn f() -> u8 { 2 }"), "the fixed code: {hybrid}");
+        assert!(hybrid.contains("fn missing_value_is_an_error"), "with the original tests: {hybrid}");
+    }
+
+    #[test]
+    fn a_change_to_old_tests_counts_as_declared_only_when_every_file_is_named() {
+        let edited = |path: &str| EditedTest { path: path.into(), removed: vec![], original_tests: None };
+        let both = [edited("tests/preview.test.js"), edited("tests/limits.test.js")];
+        let said = "Fixed the slice.\nchanged existing tests: tests/preview.test.js: the issue asks for 20 code points";
+        assert!(declaration(said, &both).is_none(), "limits.test.js went unsaid");
+        let all = format!("{said}\nChanged existing tests: limits.test.js: same ask");
+        let decl = declaration(&all, &both).expect("both named");
+        assert!(decl.contains("preview.test.js") && decl.contains("limits.test.js"), "{decl}");
+        assert!(declaration("Fixed it.", &both[..1]).is_none());
+    }
+
+    #[test]
     fn only_an_explicit_fail_with_a_named_gap_sends_a_fix_back() {
         let fail = "Looks off.\nVERDICT: fail\nGAP: move the test to tests/test_password.py";
         assert_eq!(review_gap(fail).as_deref(), Some("move the test to tests/test_password.py"));
@@ -1985,7 +2383,11 @@ mod tests {
         assert!(prompt.contains("REVIEW: ONE GAP LEFT"), "{prompt}");
         assert!(prompt.contains("assert export_csv on 2024-01-01..03") && prompt.contains("+fixed line"));
         assert!(!prompt.contains("PREVIOUS ATTEMPT FAILED"), "a passing fix is not a failure");
-        let review = crate::flux::fix_review_prompt("the issue", "the diff", "tests/a.py", "exit 1", repo::platform());
+        let review = crate::flux::fix_review_prompt("the issue", "the diff", "tests/a.py", "exit 1", "untouched", repo::platform());
+        assert!(!review.contains("EXISTING BEHAVIOR"), "only offered when old tests changed");
+        assert!(review.contains("Never ask the author to restore the behavior the issue reports"));
+        let declared = crate::flux::fix_review_prompt("i", "d", "t", "w", "The fix rewrites lines", "p");
+        assert!(declared.contains("EXISTING BEHAVIOR"), "{declared}");
         for part in ["ROOT CAUSE", "THE ISSUE'S CASES", "PLACE", "VALID", "VERDICT: pass or fail", "the diff"] {
             assert!(review.contains(part), "{part} missing");
         }
@@ -2048,7 +2450,7 @@ mod tests {
         let slot = Slot::default();
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
-        let repro = reproduce(&job, &before, &changed, "bash tests/check.sh", None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", None, &rescuer).await.0;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         let mode = std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "the restored script is still executable");

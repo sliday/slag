@@ -591,7 +591,9 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         the internals of your fix.\n\
         - in the test file for the module you fix (see TESTS above). When that module \
         has none, create one beside the existing tests, named after the module, in \
-        their framework and style. Never put it in a test file for another module.\n\
+        their framework and style. Never put it in a test file for another module. To \
+        add to an existing test file, append after its last test: an edit whose \
+        old_string is an existing test must keep that test whole in new_string.\n\
         - valid on this platform as written, and deterministic: no timing, no file \
         creation order, no network.\n\
         slag reruns your test with the fix reverted: it must then fail on an \
@@ -604,7 +606,11 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         5. Finish. summary: the root cause as path:line, the fix, the reproduction. \
         cmd: the full test command, which now runs your regression test.\n\n\
         RULES:\n\
-        - Never weaken, skip, or delete an existing test.\n\
+        - Never delete, skip, weaken, or rewrite a line of an existing test. slag \
+        reruns the original test files against your fix, and an attempt that fails \
+        them, or edits them, fails. Only when the issue explicitly asks for the \
+        behavior an existing test pins, update that test and say so in the summary, \
+        on its own line: changed existing tests: <file>: <why>.\n\
         - Create no notes, plans, PRD.md, PLAN.md, or BLUEPRINT.md. Put throwaway \
         scripts under /tmp, not in the repository.\n\
         - Run no git commands. slag tracks the changes and commits after it verifies.\n\
@@ -623,8 +629,21 @@ pub fn fix_review_prompt(
     diff: &str,
     test_files: &str,
     without_fix: &str,
+    existing: &str,
     platform: &str,
 ) -> String {
+    // Only a fix that rewrote existing tests gets the existing-behavior
+    // check: offered on every review, weak reviewers misread it as a
+    // request to restore the behavior the issue reports.
+    let existing_check = if existing.starts_with("untouched") {
+        String::new()
+    } else {
+        "0. EXISTING BEHAVIOR: the fix rewrites existing tests, so the issue text must \
+         explicitly ask for the exact behavior the new expectations pin. Without that \
+         ask, the fix breaks what the user relied on: fail, and say which expectation to \
+         restore.\n"
+            .to_string()
+    };
     format!(
         "ROLE: reviewer of a bug fix. You did not write it and you owe its author \
          nothing. You cannot run anything: judge from what is below.\n\n\
@@ -632,8 +651,13 @@ pub fn fix_review_prompt(
          THE CHANGE (unified diff against the code before the fix):\n{diff}\n\n\
          TEST FILES THAT EXISTED BEFORE THE FIX:\n{test_files}\n\n\
          WITH THE SOURCE CHANGE REVERTED, THE TESTS DID THIS:\n{without_fix}\n\n\
+         EXISTING TESTS: {existing}\n\n\
          PLATFORM: {platform}\n\n\
-         Check these four in order. Fail only on a clear miss, never on style:\n\
+         The issue reports a bug. Never ask the author to restore the behavior the \
+         issue reports as wrong, to expect it in a test, or to remove a test that checks \
+         what the issue says should happen. When unsure, pass.\n\n\
+         Check these in order. Fail only on a clear miss, never on style:\n\
+         {existing_check}\
          1. ROOT CAUSE: the source change fixes the cause the issue describes where it \
          is produced, not a special case for the reported input, and not a patch where \
          the symptom shows.\n\

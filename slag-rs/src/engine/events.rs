@@ -365,12 +365,15 @@ fn extract_str_field(json_ish: &str, key: &str) -> Option<String> {
 /// Collapsed-streak summary: `ran 4 commands`, `read 3 files`. File verbs
 /// count distinct files, not calls: four edits of one file is `edited 1
 /// file (4 calls)`, never `edited 4 files`.
-fn streak_summary(verb: &str, n: usize, files: usize) -> String {
-    let files = match (files, n > files) {
-        (1, true) => format!("1 file ({n} calls)"),
-        (1, false) => "1 file".to_string(),
-        (f, true) => format!("{f} files ({n} calls)"),
-        (f, false) => format!("{f} files"),
+fn streak_summary(verb: &str, n: usize, keys: &std::collections::BTreeSet<String>) -> String {
+    // A count alone reads as the run's total ("edited 1 file" beside a
+    // diff of two). Up to three files, name them: the line then says
+    // plainly which files this streak touched.
+    let calls = if n > keys.len() { format!(" ({n} calls)") } else { String::new() };
+    let files = match keys.len() {
+        0 => format!("{n} files"),
+        1..=3 => format!("{}{calls}", keys.iter().cloned().collect::<Vec<_>>().join(", ")),
+        f => format!("{f} files{calls}"),
     };
     match verb {
         "run" => format!("ran {n} commands"),
@@ -918,7 +921,7 @@ impl RenderState {
             prints.push(format!(
                 "  {} {}",
                 paint(COLD, "✓"),
-                dim(&streak_summary(verb, self.streak_count, self.streak_keys.len()))
+                dim(&streak_summary(verb, self.streak_count, &self.streak_keys))
             ));
         } else if let Some(held) = self.held.take() {
             prints.push(held.line);
@@ -1425,10 +1428,16 @@ mod tests {
         events.push(start("bash", r#"{"command": "ls"}"#));
         events.push(result("bash", true, "ok"));
         let joined = printed(&feed_all(&mut state, &events)).join("\n");
-        assert!(joined.contains("read 2 files (4 calls)"), "{joined}");
-        assert!(!joined.contains("read 4 files"), "{joined}");
-        assert_eq!(streak_summary("edit", 3, 3), "edited 3 files");
-        assert_eq!(streak_summary("edit", 4, 1), "edited 1 file (4 calls)");
+        assert!(joined.contains("read a.rs, b.rs (4 calls)"), "{joined}");
+        assert!(!joined.contains("4 files"), "{joined}");
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect();
+        assert_eq!(streak_summary("edit", 3, &keys(&["a", "b", "c"])), "edited a, b, c");
+        assert_eq!(
+            streak_summary("edit", 3, &keys(&["src/preview.js"])),
+            "edited src/preview.js (3 calls)",
+            "names the file, so it never reads as the whole diff"
+        );
+        assert_eq!(streak_summary("edit", 6, &keys(&["a", "b", "c", "d"])), "edited 4 files (6 calls)");
     }
 
     #[test]
