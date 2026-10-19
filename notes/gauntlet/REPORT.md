@@ -43,6 +43,14 @@ Method: every piece had a bar a critic could inspect, a builder, and a separate 
 4. Harness² shows no gain over plain retries at matched compute. Its library admits lessons backed only by tool-error deltas from unfixed tasks, and `--harness library` applies the best entry to every issue regardless of fit.
 5. The installed v2.9.0 on PATH turns `slag fix --help` into a paid commission (old parser); fixed in this branch, so cut the release.
 
+## Release 3.0.0 (prepared, not yet published)
+
+- `slag-rs/Cargo.toml` is 3.0.0; commit `63f47d4` holds the bump, the README/CLAUDE.md/site release lines, and all four targets in `slag-rs/dist-local` (`publish-release.sh --check`: 8 assets pass).
+- Runtime: `slag 3.0.0` from each binary on its own platform (Linux arm64 and amd64 in `debian:stable-slim` under Apple `container`, Intel Mac under Rosetta, Apple Silicon native).
+- Linux suite, non-root (UID 1000) with bubblewrap under Apple `container`, rust 1.99.1: 1274 passed, 0 failed, every test binary. One earlier run failed `pipeline::duel::tests::transient_provider_blips_do_not_fail_a_cast` once; it passed alone and in the full rerun. Treat it as a rare flake to chase.
+- rust 1.99 warns that `AtomicU64::fetch_update` (`engine/provider.rs:1300`) is deprecated; the local 1.98 toolchain lacks `try_update`, so the change waits for a toolchain bump.
+- Notes: `notes/gauntlet/release-3.0.0.md`.
+
 ## Next commands (owner decides)
 
 ```sh
