@@ -1,25 +1,22 @@
-Committed `1cae627` on `gauntlet/efficiency`.
+Committed `f997117` on `gauntlet/efficiency`.
 
-| Run | Seconds | Tokens | Spend | Verdict |
-|---|---:|---:|---:|---|
-| wc 1 | 128.3 | 134,447 | $0.1617 | FORGED |
-| wc 2 | 124.1 | 121,433 | $0.1396 | FORGED |
-| wc 3 | 115.2 | 112,173 | $0.1413 | FORGED |
-| CSV | 148.9 | 136,980 | $0.1634 | FORGED |
-| Node | 160.0 | 114,933 | $0.1242 | FORGED |
-| Tail | 142.8 | 139,471 | $0.1734 | FORGED |
-| Durations | 96.5 | 109,948 | $0.1022 | FORGED |
+The Linux write failed with EROFS. The test failed because it expected `PermissionError`. Bubblewrap now also drops all capabilities.
 
-Total estimated spend: **$1.0058**.
+Landlock permits metadata writes. Strict checks now refuse that backend, warn once, and produce no read-only evidence.
 
-All three wc runs avoided contract crashes. Fresh-clone checks passed across all seven repositories. Tracked files contain no probes or reference fixtures.
+Install checks now try venv, virtualenv, then isolated pip target. Missing tools produce a recorded skip. Package failures remain errors.
 
-Durations uses positional input without file/stdin extras. CSV rejects malformed rows without partial JSON.
+| Verification | Passed | Cargo exit |
+|---|---:|---:|
+| Linux root, full suite | 1,260 | 0 |
+| Linux UID 1000, full suite | 1,260 | 0 |
+| macOS, full suite | 1,258 | 0 |
+| Clippy, all targets, warnings denied | Clean | 0 |
 
-Cargo passed **1,251 tests**, with one ignored. Clippy passed with warnings denied. Both checkouts are clean.
+Both Linux runs also passed Landlock refusal tests. Non-root pip fallback checks passed without python3-venv.
 
-[Report: changes, tests, per-phase usage, exact commands, and `git ls-files` for each repository](/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/notes/gauntlet/efficiency-round9.md).
+Both checkouts are clean. [Report, changed files, tests, and exact commands](notes/gauntlet/efficiency-round10.md).
 
-ASK: Complete Round 9 instrument isolation, interface rules, reference repair, live checks, and commit.
+ASK: Fix Linux portability of fresh-checkout verification and verify root, non-root, and macOS.
 🟩Got 🟩Had 🟩Did
 🧠 —

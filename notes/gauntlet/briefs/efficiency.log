@@ -156178,3 +156178,1731 @@ hook: PostToolUse Completed
 hook: PostToolUse Completed
 hook: PostToolUse Completed
 hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg -n 'async fn run\\(|pub.*fn run\\(' slag-rs/src/pipeline/fix/repo.rs; sed -n '459,552p' slag-rs/src/pipeline/fix/repo.rs" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+270:pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
+        .filter(|c| c.tag() == ChangeTag::Delete)
+        .map(|c| c.value().trim())
+        .filter(|l| !l.is_empty() && !inserted.contains(l))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Split a source file at its inline test module (`#[cfg(test)]`, the
+/// Rust convention): the code above it, and the tests from it on. `None`
+/// when the file has no such module.
+pub fn split_inline_tests(text: &str) -> Option<(&str, &str)> {
+    let at = text.find("#[cfg(test)]")?;
+    Some(text.split_at(at))
+}
+
+/// A new test file beside `existing`, named so the runner still finds it:
+/// `tests/test_x.py` gives `tests/test_x_regression.py`,
+/// `test/store.test.js` gives `test/store_regression.test.js`,
+/// `pkg/thing_test.go` gives `pkg/thing_regression_test.go`.
+pub fn regression_sibling(existing: &str) -> String {
+    let (dir, file) = existing.rsplit_once('/').map_or(("", existing), |(d, f)| (d, f));
+    let (stem, rest) = file.split_once('.').unwrap_or((file, ""));
+    let stem = match stem.strip_suffix("_test") {
+        Some(base) => format!("{base}_regression_test"),
+        None => format!("{stem}_regression"),
+    };
+    let name = if rest.is_empty() { stem } else { format!("{stem}.{rest}") };
+    if dir.is_empty() {
+        name
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// A file's content before the session: `None` when it did not exist.
+pub type Content = Option<Vec<u8>>;
+
+/// Git state for one repository, addressed from its top level.
+pub struct Git {
+    pub top: PathBuf,
+    /// The working directory, relative to `top` (`""` at the top, else
+    /// `sub/dir/`). Scratch the engine writes lands here.
+    pub prefix: String,
+    /// For a directory outside git: a private repository in the temp dir
+    /// whose one commit is the directory as it was before the session.
+    /// It gives a plain directory the same change tracking and the same
+    /// reproduction check, commits nothing for the user, and is deleted
+    /// on drop.
+    shadow: Option<PathBuf>,
+}
+
+/// What a shadow repository never tracks: build output, dependencies,
+/// and the engine's own scratch.
+const SHADOW_EXCLUDES: &str = "logs/\n.slag/\nnode_modules/\ntarget/\n__pycache__/\n*.pyc\n.venv/\nvenv/\n";
+/// A directory with more files than this is not a project; shadowing it
+/// would cost more than the fix.
+const SHADOW_MAX_FILES: usize = 20_000;
+
+impl Git {
+    /// The repository containing `dir`, if any.
+    pub fn open(dir: &Path) -> Option<Self> {
+        let top = git_in(dir, &["rev-parse", "--show-toplevel"])?;
+        let prefix = git_in(dir, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+        Some(Self { top: PathBuf::from(top.trim()), prefix: prefix.trim().to_string(), shadow: None })
+    }
+
+    /// Snapshot a directory that is not in git into a shadow repository.
+    pub fn shadow(dir: &Path) -> Option<Self> {
+        let top = dir.canonicalize().ok()?;
+        let mut count = Vec::new();
+        walk(&top, &top, 8, &mut count, SHADOW_MAX_FILES);
+        if count.len() >= SHADOW_MAX_FILES {
+            return None;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or_default();
+        let home = std::env::temp_dir().join(format!("slag-fix-{}-{nanos}", std::process::id()));
+        git_in(Path::new("."), &["init", "-q", &home.to_string_lossy()])?;
+        let git_dir = home.join(".git");
+        // The shadow sits in the temp dir, which model commands can write.
+        crate::engine::sandbox::protect_git_dir(&git_dir);
+        let _ = std::fs::write(git_dir.join("info").join("exclude"), SHADOW_EXCLUDES);
+        let git = Self { top, prefix: String::new(), shadow: Some(git_dir) };
+        git.git_checked(&["add", "-A"]).ok()?;
+        git.git_checked(&[
+            "-c",
+            "user.name=slag",
+            "-c",
+            "user.email=slag@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "sed -n '256,329p' slag-rs/src/pipeline/fix/repo.rs" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+    /// program, or it never finished. Neither says anything about the bug.
+    pub fn unusable(&self) -> bool {
+        self.timed_out || self.code == Some(127)
+    }
+}
+
+/// Run `cmd` under bash in `dir`, stdout and stderr interleaved as a
+/// terminal would show them. `CI=true` keeps watch-mode runners from
+/// waiting on a keypress that never comes. `PYTHONDONTWRITEBYTECODE`
+/// keeps slag's own runs from leaving `.pyc` files behind: the
+/// reproduction check compiles the old source, and a cache entry from it
+/// can outlive the swap back (see `purge_bytecode`). The session can rewrite the
+/// test scripts this runs, so it runs in the smith's shell sandbox; a
+/// refused write ends the output with the sandbox's note.
+pub async fn run(cmd: &str, dir: &Path, timeout: Duration) -> Run {
+    let start = Instant::now();
+    let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let sandbox = crate::engine::sandbox::Sandbox::for_root(&root);
+    let mut command = sandbox.wrap("bash");
+    command
+        .arg("-c")
+        .arg(format!("exec 2>&1\n{cmd}"))
+        .current_dir(dir)
+        .env("CI", "true")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return Run {
+                cmd: cmd.to_string(),
+                code: None,
+                output: format!("could not start bash: {e}"),
+                secs: 0.0,
+                timed_out: false,
+            }
+        }
+    };
+    let pid = child.id();
+    if let Some(pid) = pid {
+        running().lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+    }
+    let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    if let Some(pid) = pid {
+        running().lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != pid);
+    }
+    let secs = start.elapsed().as_secs_f64();
+    match waited {
+        Ok(Ok(out)) => {
+            let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
+            output.push_str(&String::from_utf8_lossy(&out.stderr));
+            if let Some(note) = sandbox.denial_note(&output, !out.status.success()) {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&note);
+            }
+            Run { cmd: cmd.to_string(), code: out.status.code(), output, secs, timed_out: false }
+        }
+        Ok(Err(e)) => Run {
+            cmd: cmd.to_string(),
+            code: None,
+            output: format!("wait failed: {e}"),
+            secs,
+            timed_out: false,
+        },
+        Err(_) => {
+            // kill_on_drop reaches bash only; the test runner it started
+            // lives in the same process group.
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'docker run --rm --privileged -v /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency:/src:ro -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/cache:/cache -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/run.sh:/run.sh:ro rust:1-bookworm bash /run.sh > /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-result.log 2>&1' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 27555ms:
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'head -17 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-result.log; tail -4 slag-rs/target/round10-cargo-test-final.log' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+== with bwrap
+test result: ok. 1191 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.78s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+test direct_proof_repairs_fixture_writes_before_sealing_the_ingot ... FAILED
+thread 'direct_proof_repairs_fixture_writes_before_sealing_the_ingot' (9389) panicked at tests/local_hygiene.rs:256:5:
+FAILED (errors=1)
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+bwrap-exit=101
+== landlock only
+running 35 tests
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 1157 filtered out; finished in 0.29s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+test the_stream_view_plays_a_recorded_forge_to_its_assay ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "sed -n '174,266p' slag-rs/tests/local_hygiene.rs" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+                1 | 4 => (json!({"content": "CMD: python3 -m unittest"}), "stop"),
+                2 => {
+                    assert!(body["messages"].to_string().contains("generated-fixture.txt"));
+                    (json!({"content": null, "tool_calls": [
+                        {"id": "read-progress", "type": "function", "function": {
+                            "name": "read_file", "arguments": json!({"path": "build-progress.txt"}).to_string()
+                        }},
+                        {"id": "read-test", "type": "function", "function": {
+                            "name": "read_file", "arguments": json!({"path": "test_fixture.py"}).to_string()
+                        }},
+                    ]}), "tool_calls")
+                }
+                3 => {
+                    let progress = body["messages"].as_array().unwrap().iter()
+                        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "read-progress")
+                        .unwrap()["content"].as_str().unwrap();
+                    assert!(!progress.starts_with("ERROR:"), "{progress}");
+                    assert!(progress.contains("done"), "{progress}");
+                    (json!({"content": null, "tool_calls": [{"id": "fix-test", "type": "function", "function": {
+                        "name": "write_file", "arguments": json!({"path": "test_fixture.py", "content": static_test}).to_string()
+                    }}]}), "tool_calls")
+                }
+                _ => panic!("unexpected extra model request {n}"),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": message, "finish_reason": finish}]
+            }))
+        })
+        .expect(5)
+        .mount(&server).await;
+
+    Command::new(env!("CARGO_BIN_EXE_slag"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("TMPDIR", std::env::temp_dir())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("SLAG_CONFIG_DIR", config.path())
+        .env("SLAG_BASE_URL", server.uri())
+        .env("OPENAI_API_KEY", "test-key")
+        .env("SLAG_DUEL", "off")
+        .env("NO_COLOR", "1")
+        .args([
+            "--provider",
+            "openai",
+            "--model",
+            "test/work",
+            "--plan-model",
+            "test/plan",
+            "--temper",
+            "0",
+            "resume",
+        ])
+        .current_dir(root.path())
+        .timeout(Duration::from_secs(15))
+        .assert()
+        .success();
+
+    let plan = git(root.path(), &["show", "HEAD:PLAN.md"]);
+    assert!(plan.contains(":status forged"), "{plan}");
+    assert!(plan.contains(":heat 2"), "{plan}");
+    assert_eq!(
+        git(root.path(), &["show", "HEAD:test_fixture.py"]),
+        static_test
+    );
+    assert_eq!(
+        git(root.path(), &["show", "HEAD:build-progress.txt"]),
+        "done\n"
+    );
+    assert!(!root.path().join("generated-fixture.txt").exists());
+    let failed = std::fs::read_dir(root.path().join("logs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("_ASSAY_i1_1.log")
+        })
+        .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+        .unwrap();
+    assert!(failed.contains("exit=1"), "{failed}");
+    assert!(failed.contains("PermissionError"), "{failed}");
+    assert!(git(root.path(), &["status", "--porcelain"]).is_empty());
+    server.verify().await;
+}
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg -n 'contains\\(\"PermissionError\"\\)|assert.*PermissionError|except PermissionError' slag-rs/src slag-rs/tests" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+slag-rs/tests/local_hygiene.rs:256:    assert!(failed.contains("PermissionError"), "{failed}");
+slag-rs/src/pipeline/warden/checkout.rs:376:        assert!(stderr.contains("PermissionError") || stderr.contains("Read-only file system"), "{stderr}");
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+codex
+Landlock denied data writes but allowed metadata changes under root and UID 1000. I will refuse strict checks there and warn once.
+
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "python3 - <<'PY'
+from pathlib import Path
+p=Path('slag-rs/tests/local_hygiene.rs');s=p.read_text();old='    assert"'!(failed.contains("PermissionError"), "{failed}");'"';new='    assert"'!(failed.contains("PermissionError") || failed.contains("Read-only file system"), "{failed}");'"';assert old in s;s=s.replace(old,new);p.write_text(s)
+PY
+git diff --check" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+context compacted
+hook: SessionStart
+hook: SessionStart
+hook: SessionStart
+hook: SessionStart Completed
+hook: SessionStart Completed
+hook: SessionStart Failed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git status --short; cat CLAUDE.md >/dev/null; cat AGENTS.md >/dev/null; for f in PROCESS.md LEARNED.md ~/.Codex/AGENTS.md; do if test -f "$f"; then cat "$f" >/dev/null; fi; done' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+ M CLAUDE.md
+ M README.md
+ M slag-rs/src/engine/agent.rs
+ M slag-rs/src/engine/sandbox.rs
+ M slag-rs/src/pipeline/warden.rs
+ M slag-rs/src/pipeline/warden/checkout.rs
+ M slag-rs/tests/forge_loop.rs
+ M slag-rs/tests/local_hygiene.rs
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+codex
+The Linux write test failed on its error text assertion. Bubblewrap blocked the write with EROFS. I will verify both user modes.
+
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'docker run --rm --privileged -v /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency:/src:ro -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/cache:/cache -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/run.sh:/run.sh:ro rust:1-bookworm bash /run.sh > /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-final-result.log 2>&1' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'TMPDIR=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/tmp CARGO_HOME=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/cargo-home CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test --offline --manifest-path slag-rs/Cargo.toml > target/round10-macos-final.log 2>&1' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ exited 1 in 0ms:
+zsh:1: no such file or directory: target/round10-macos-final.log
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg -n 'Landlock|install check|virtualenv' CLAUDE.md README.md; cat /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/nonroot.sh" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+CLAUDE.md:158:`engine/sandbox.rs` confines the `bash` tool's writes to the workspace, `/tmp` and this user's `$TMPDIR`, `~/.npm/_logs`, and an out-of-root git dir. No package cache is writable (each holds code a later outside build runs; cargo does not re-check a cached `.crate`); `THROWAWAY_CACHES` points npm, pnpm, Yarn, bun, pip, uv and `GOCACHE` at `$TMPDIR/slag-cache-$USER` for sandboxed commands, and an outside `CARGO_TARGET_DIR` becomes `<root>/target`. A refused write into a package cache gets `CACHE_TAIL` (fetch outside, vendor, or `sandbox_writable`). The git control paths in `GIT_CONTROL` (hooks, config, `config.worktree`, `commondir`) and the `.git` entry stay read-only inside those trees, for the shell and for `write_file`/`edit_file`. Every git command slag runs itself goes through `sandbox::git()` / `git_async()`, which add `-c core.hooksPath=/dev/null -c core.fsmonitor=false`; never call `Command::new("git")` directly. `sandbox::protect_git_dir` locks slag's private repos (the `slag fix` shadow). Landlock cannot lock a file inside a writable tree, so `git_guard` records the program-running config keys when a sandbox first covers a repo and `git()` refuses once they change. Reads and network stay open. Read-only reviews allow writes only in private temporary scratch space and remove it after each command. Tests use TMPDIR there; Python probes run from temporary scripts. Package installation checks use a separate temporary clone and runtime. They fall back from venv to virtualenv or pip with a private target. Missing installer tools produce a recorded skip; package build failures remain errors. Strict bubblewrap checks drop capabilities, including for root. `ToolBox` resolves it at the first shell call; `bash`, `grep`, `glob`, and background jobs all run under it. `proof::run_shell_in` runs proofs and CMD lines (forge and duel) in it, and `fix::repo::run` runs every `slag fix` test command in it, because the model writes or can edit both. Hooks, `screenshot_cmd` and `[mcp]` servers stay outside: the user wrote them. Every other spawn is either a fixed binary with fixed arguments (`tar`, `kill`, `uname`, `gh` with `GIT_GUARD_ENV`, guarded `git`) or runs through `Sandbox::wrap`/`wrap_std`; anything whose program, script or import the workspace controls (test detection's `imports()` probe included) must take the sandbox.
+CLAUDE.md:165:Backends: macOS runs `sandbox-exec` with a generated Seatbelt profile. Linux uses `bwrap` when it works, else Landlock (raw syscalls, no crate), else runs unconfined. `main.rs` calls `sandbox::preflight()` before the dashboard starts, which prints one warning per run when nothing can confine writes. A refused write adds `write outside the workspace was blocked by slag's sandbox: <path>` to the tool result, leads a failed proof's output, and rides on a fix test run's `status()`.
+README.md:181:Small local commissions share a short contract between the builder and reviewer. The contract checks named behavior and boundary cases first. It then checks interfaces that fit the tool: stdin for Unix filters, positional values for scalar parsers, and package entry points when requested. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation. Package installation checks use a separate temporary copy. They try venv, virtualenv, then pip with a private target. If host tools are missing, slag records a skipped installation check and still requires the other checks. Slag keeps verification instruments under gitignored `.slag/checks/`. Product tests work without that directory.
+README.md:321:Nothing a sandboxed command writes may become code that runs outside the sandbox. slag's own git (commits, snapshots, diffs, worktrees) runs outside it, so the workspace's `.git/hooks`, `.git/config`, `config.worktree`, `commondir` and the `.git` entry itself stay read-only for model commands and for the file tools, and every git command slag runs passes `-c core.hooksPath=/dev/null -c core.fsmonitor=false`. Ordinary git use that writes objects, refs and the index keeps working; `git init` over the workspace and `git config` do not. Landlock cannot carve a read-only file out of a writable tree, so on Landlock slag instead records what the git config would run and refuses its own git once a command changes that. A workspace in a linked git worktree or a repo subdirectory can also write its git dir's objects and refs. The file tools already refuse paths outside the workspace. The sandbox needs no setup:
+README.md:327:| Linux without `bwrap` | Landlock, kernel 5.13 or later |
+README.md:331:On macOS, `sandbox-exec` fails when slag already runs inside another sandbox. slag then runs unconfined and warns once. On Linux, a `bwrap` that fails to start (no user namespaces) falls through to Landlock.
+#!/usr/bin/env bash
+set -uo pipefail
+export CARGO_TARGET_DIR=/cache/target CARGO_HOME=/cache/cargo CARGO_PROFILE_DEV_DEBUG=line-tables-only
+apt-get update -qq >/dev/null
+apt-get install -y -qq bubblewrap ripgrep git python3 nodejs >/dev/null 2>&1
+useradd --uid 1000 --create-home slagtest
+mkdir -p /cache/round10-home
+chown -R 1000:1000 /cache/target /cache/cargo /cache/round10-home
+trap 'chown -R 0:0 /cache/target /cache/cargo /cache/round10-home' EXIT
+runuser -u slagtest -- env HOME=/cache/round10-home git config --global user.email t@t
+runuser -u slagtest -- env HOME=/cache/round10-home git config --global user.name t
+runuser -u slagtest -- bwrap --ro-bind / / --cap-drop ALL -- sh -c 'id -u; grep CapEff /proc/self/status'
+failed=0
+suite() {
+    local label=$1 user=$2
+    shift 2
+    echo "== $label (user=$user)"
+    if [ "$user" = root ]; then
+        (cd /src/slag-rs && cargo test --offline "$@") 2>&1 | tee "/cache/round10-$label.log" | grep -E '^test result|FAILED|panicked|running|install check skipped|Installed console'
+    else
+        runuser -u slagtest -- env HOME=/cache/round10-home CARGO_HOME=/cache/cargo CARGO_TARGET_DIR=/cache/target CARGO_PROFILE_DEV_DEBUG=line-tables-only bash -c 'cd /src/slag-rs && cargo test --offline "$@"' -- "$@" 2>&1 | tee "/cache/round10-$label.log" | grep -E '^test result|FAILED|panicked|running|install check skipped|Installed console'
+    fi
+    local result=${PIPESTATUS[0]}
+    echo "$label-exit=$result"
+    if [ "$result" != 0 ]; then failed=1; fi
+}
+suite nonroot-bwrap-full nonroot
+apt-get install -y -qq --no-install-recommends python3-pip >/dev/null 2>&1
+suite nonroot-bwrap-checkout-pip nonroot pipeline::warden::checkout -- --nocapture
+apt-get remove -y -qq bubblewrap >/dev/null 2>&1
+suite nonroot-landlock-sandbox nonroot sandbox
+suite nonroot-landlock-checkout-pip nonroot pipeline::warden::checkout -- --nocapture
+suite root-landlock-checkout-pip root pipeline::warden::checkout -- --nocapture
+exit "$failed"
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'TMPDIR=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/tmp CARGO_HOME=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/cargo-home CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo test --offline --manifest-path slag-rs/Cargo.toml > slag-rs/target/round10-macos-final.log 2>&1' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git diff --stat; tail -15 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-final-result.log' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+ CLAUDE.md                               |   2 +-
+ README.md                               |   2 +-
+ slag-rs/src/engine/agent.rs             |   6 +-
+ slag-rs/src/engine/sandbox.rs           | 116 +++++++++++++----
+ slag-rs/src/pipeline/warden.rs          |  47 ++++++-
+ slag-rs/src/pipeline/warden/checkout.rs | 223 +++++++++++++++++++++++++++-----
+ slag-rs/tests/forge_loop.rs             |   2 +-
+ slag-rs/tests/local_hygiene.rs          |   2 +-
+ 8 files changed, 338 insertions(+), 62 deletions(-)
+== with bwrap
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "sed -n '1,245p' slag-rs/src/pipeline/warden/checkout.rs" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::engine::sandbox::git_async;
+use crate::error::SlagError;
+
+pub(super) struct FreshCheckout {
+    _temp: tempfile::TempDir,
+    pub command: String,
+}
+
+pub(super) async fn prepare(root: &Path, suite: &str) -> Result<FreshCheckout, SlagError> {
+    let root = root.canonicalize()?;
+    let temp = tempfile::Builder::new().prefix("slag-review-clone-").tempdir()?;
+    let checkout = temp.path().join("checkout");
+    let mut clone = git_async();
+    clone.args(["clone", "--quiet", "--no-hardlinks", "--no-local", "--"])
+        .arg(&root).arg(&checkout).current_dir(temp.path()).kill_on_drop(true);
+    checked(&mut clone, "fresh checkout").await?;
+
+    let mut paths = clean_paths(&root);
+    let words = shell_words::split(suite).map_err(|error| SlagError::Config(error.to_string()))?;
+    let python = words.iter().find(|word| !word.contains('='))
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("python"));
+    if python {
+        let runtime = temp.path().join("runtime");
+        let mut create = tokio::process::Command::new("python3");
+        create.args(["-I", "-m", "venv", "--without-pip"]).arg(&runtime)
+            .current_dir(temp.path()).env_remove("PYTHONPATH").env_remove("PYTHONHOME")
+            .env_remove("VIRTUAL_ENV").env("PATH", std::env::join_paths(&paths).map_err(|error| SlagError::Config(error.to_string()))?)
+            .kill_on_drop(true);
+        checked(&mut create, "clean Python runtime").await?;
+        paths.insert(0, runtime.join("bin"));
+    }
+    let path = std::env::join_paths(paths).map_err(|error| SlagError::Config(error.to_string()))?;
+    let env = shell_words::join([
+        "env", "-u", "PYTHONPATH", "-u", "PYTHONHOME", "-u", "VIRTUAL_ENV", "-u", "NODE_PATH",
+        &format!("PATH={}", path.to_string_lossy()), "PYTHONDONTWRITEBYTECODE=1", "NODE_DISABLE_COMPILE_CACHE=1",
+    ]);
+    let command = format!("cd {} && {env} {suite}", shell_words::quote(&checkout.to_string_lossy()));
+    Ok(FreshCheckout { _temp: temp, command })
+}
+
+pub(super) enum InstallCheck {
+    Ready(FreshCheckout),
+    Skipped(String),
+}
+
+#[derive(Clone, Copy)]
+enum InstallMethod { Venv, Virtualenv, Target }
+
+pub(super) async fn prepare_install(root: &Path) -> Result<InstallCheck, SlagError> {
+    prepare_install_with(root, &[InstallMethod::Venv, InstallMethod::Virtualenv, InstallMethod::Target]).await
+}
+
+async fn prepare_install_with(root: &Path, methods: &[InstallMethod]) -> Result<InstallCheck, SlagError> {
+    let mut prepared = prepare(root, "true").await?;
+    let root = prepared._temp.path();
+    let checkout = root.join("checkout");
+    let runtime = root.join("installed-runtime");
+    let temp = root.join("scratch");
+    std::fs::create_dir(&temp)?;
+    let sandbox = crate::engine::sandbox::Sandbox::for_scratch(root)?;
+    let mut selected = None;
+    for method in methods {
+        let (module, args) = match method {
+            InstallMethod::Venv => ("venv", vec![runtime.to_string_lossy().into_owned()]),
+            InstallMethod::Virtualenv => ("virtualenv", virtualenv_args(root, &runtime)),
+            InstallMethod::Target => ("pip", vec!["--version".to_string()]),
+        };
+        if runtime.exists() { std::fs::remove_dir_all(&runtime)?; }
+        let mut create = sandbox.wrap("python3");
+        create.args(["-I", "-m", module]).args(args).current_dir(root)
+            .env("VIRTUALENV_NO_PERIODIC_UPDATE", "1").env_remove("PYTHONPATH").env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV")
+            .env("TMPDIR", &temp).kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), create.output()).await
+            .map_err(|_| SlagError::Config("isolated installation runtime timed out".into()))??;
+        if output.status.success() {
+            selected = Some(*method);
+            break;
+        }
+        let error = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        if !missing_install_tool(&error) {
+            return Err(SlagError::Config(format!("isolated installation runtime failed: {error}")));
+        }
+    }
+    let Some(method) = selected else {
+        return Ok(InstallCheck::Skipped("Python venv/ensurepip, virtualenv, and pip are unavailable".into()));
+    };
+    let target = root.join("installed-target");
+    let targeted = matches!(method, InstallMethod::Target);
+    let mut python = if targeted { PathBuf::from("python3") } else { runtime.join("bin/python") };
+    if targeted {
+        let mut create = sandbox.wrap("python3");
+        create.args(["-I", "-m", "venv", "--without-pip"]).arg(&runtime).current_dir(root)
+            .env_remove("PYTHONPATH").env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV")
+            .env("TMPDIR", &temp).kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), create.output()).await
+            .map_err(|_| SlagError::Config("isolated target runtime timed out".into()))??;
+        if output.status.success() { python = runtime.join("bin/python"); }
+        else {
+            let error = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            if !missing_install_tool(&error) { return Err(SlagError::Config(format!("isolated target runtime failed: {error}"))); }
+        }
+    }
+    if targeted && python != Path::new("python3") {
+        let mut probe = sandbox.wrap("python3");
+        probe.args(["-I", "-m", "pip", "--python"]).arg(&python).arg("--version")
+            .current_dir(root).env_remove("PYTHONPATH").env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV")
+            .env("TMPDIR", &temp).kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), probe.output()).await
+            .map_err(|_| SlagError::Config("isolated pip probe timed out".into()))??;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            if error.contains("no such option: --python") {
+                return Ok(InstallCheck::Skipped("host pip support for an isolated Python runtime is unavailable (--python)".into()));
+            }
+            return Err(SlagError::Config(format!("isolated pip probe failed: {error}")));
+        }
+    }
+    let launcher = if targeted { "python3" } else { python.to_str().ok_or_else(|| SlagError::Config("non-UTF-8 installation path".into()))? };
+    let mut install = sandbox.wrap(launcher);
+    install.args(["-I", "-m", "pip"]);
+    if targeted && python != Path::new("python3") { install.arg("--python").arg(&python); }
+    install.args(["--isolated", "--timeout", "10", "--retries", "0", "install", "--disable-pip-version-check", "--no-input", "--no-deps", "--no-cache-dir", "--progress-bar", "off"]);
+    if targeted { install.arg("--target").arg(&target); }
+    install.arg(".").current_dir(&checkout).env_remove("PYTHONPATH").env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV")
+        .env("TMPDIR", &temp).kill_on_drop(true);
+    checked(&mut install, "package installation in a temporary clone").await?;
+    let probe = root.join("installed-console-check.py");
+    std::fs::write(&probe, INSTALL_CHECK)?;
+    let mut command = vec![python.to_string_lossy().into_owned(), if targeted { "-s".into() } else { "-I".into() },
+        probe.to_string_lossy().into_owned(), checkout.to_string_lossy().into_owned()];
+    if targeted {
+        command.push(target.to_string_lossy().into_owned());
+        command.splice(0..0, ["env".into(), "-u".into(), "PYTHONHOME".into(), "-u".into(), "VIRTUAL_ENV".into(),
+            format!("PYTHONPATH={}", target.to_string_lossy()), "PYTHONDONTWRITEBYTECODE=1".into()]);
+    }
+    prepared.command = shell_words::join(command);
+    Ok(InstallCheck::Ready(prepared))
+}
+
+fn virtualenv_args(root: &Path, runtime: &Path) -> Vec<String> {
+    vec!["--app-data".into(), root.join("virtualenv-data").to_string_lossy().into_owned(),
+        runtime.to_string_lossy().into_owned()]
+}
+
+fn missing_install_tool(error: &str) -> bool {
+    let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    error.contains("No module named venv") || error.contains("No module named virtualenv")
+        || error.contains("No module named pip") || error.contains("ensurepip is not available")
+        || error.contains("No module named ensurepip")
+}
+
+const INSTALL_CHECK: &str = r#"import importlib.metadata, json, os, pathlib, subprocess, sys
+source = pathlib.Path(sys.argv[1]).resolve().as_uri()
+entries = []
+target = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
+environment = {key: value for key, value in os.environ.items() if key not in ('PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV')}
+environment['PYTHONDONTWRITEBYTECODE'] = '1'
+if target:
+    environment['PYTHONPATH'] = str(target)
+    environment['PYTHONNOUSERSITE'] = '1'
+for distribution in importlib.metadata.distributions(**({'path': [str(target)]} if target else {})):
+    direct = distribution.read_text('direct_url.json')
+    if direct and json.loads(direct).get('url', '').rstrip('/') == source.rstrip('/'):
+        entries.extend(entry for entry in distribution.entry_points if entry.group == 'console_scripts')
+assert entries, 'the installed package has no console-script entry point'
+for entry in entries:
+    assert pathlib.Path(entry.name).name == entry.name and entry.name not in ('.', '..'), entry.name
+    command = (target / 'bin' if target else pathlib.Path(sys.executable).parent) / entry.name
+    result = subprocess.run([str(command), '--help'], cwd=pathlib.Path(__file__).parent, env=environment, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, (entry.name, result.returncode, result.stdout, result.stderr)
+    assert result.stdout.strip() or result.stderr.strip(), 'console --help produced no output'
+    print('Installed console script:', entry.name)
+    print(result.stdout, end='')
+"#;
+
+fn clean_paths(root: &Path) -> Vec<PathBuf> {
+    let active = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from)
+        .map(|path| path.canonicalize().unwrap_or(path));
+    let inherited = std::env::var_os("PATH").map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut paths = Vec::new();
+    for path in inherited {
+        if !path.is_absolute() || !path.is_dir() { continue; }
+        let resolved = path.canonicalize().unwrap_or(path);
+        if resolved.starts_with(root) || active.as_ref().is_some_and(|active| resolved.starts_with(active))
+            || resolved.components().any(|part| part.as_os_str() == ".slag" || part.as_os_str() == "logs")
+            || paths.contains(&resolved) { continue; }
+        paths.push(resolved);
+    }
+    for path in ["/usr/local/bin", "/usr/bin", "/bin"] {
+        let path = PathBuf::from(path);
+        if !paths.contains(&path) { paths.push(path); }
+    }
+    paths
+}
+
+async fn checked(command: &mut tokio::process::Command, label: &str) -> Result<(), SlagError> {
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output()).await
+        .map_err(|_| SlagError::Config(format!("{label} timed out")))??;
+    if !output.status.success() {
+        return Err(SlagError::Config(format!("{label} failed: {}", String::from_utf8_lossy(&output.stderr))));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::sandbox::{git, Sandbox};
+
+    fn repository(source: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("test_clean.py"), source).unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "."], vec!["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "Initial commit"]] {
+            assert!(git().args(args).current_dir(repo.path()).status().unwrap().success());
+        }
+        repo
+    }
+
+    fn enforced(sandbox: std::io::Result<Sandbox>) -> Option<Sandbox> {
+        match sandbox {
+            Ok(sandbox) => Some(sandbox),
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error}");
+                assert!(error.to_string().contains("Landlock cannot block"), "{error}");
+                None
+            }
+        }
+    }
+
+    async fn run(checkout: &FreshCheckout) -> Option<std::process::Output> {
+        let sandbox = enforced(Sandbox::read_only())?;
+        Some(sandbox.command(&checkout.command).output().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn fresh_checkout_excludes_untracked_files_and_local_runtime() {
+        let repo = repository("import unittest\nclass Clean(unittest.TestCase):\n def test_clean(self):\n  import pathlib\n  self.assertFalse(pathlib.Path('untracked').exists())\n  self.assertFalse(pathlib.Path('.venv').exists())\n");
+        std::fs::write(repo.path().join("untracked"), "junk").unwrap();
+        std::fs::create_dir(repo.path().join(".venv")).unwrap();
+        let checkout = prepare(repo.path(), "python3 -m unittest").await.unwrap();
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "python3 - <<'PY'
+from pathlib import Path
+p=Path('CLAUDE.md');s=p.read_text();s=s.replace('Strict bubblewrap checks drop capabilities, including for root.', 'Strict bubblewrap checks drop capabilities, including for root. Strict reviews refuse Landlock because it cannot block metadata writes; slag warns once and does not run those checks.');p.write_text(s)
+p=Path('README.md');s=p.read_text();s=s.replace('On Linux, a "'`bwrap` that fails to start (no user namespaces) falls through to Landlock.'"', 'On Linux, a "'`bwrap` that fails to start (no user namespaces) falls through to Landlock. Strict read-only checks require bubblewrap on Linux. Landlock cannot block metadata writes, so slag refuses those checks and warns once.'"');p.write_text(s)
+PY
+" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'tail -12 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-final-result.log; tail -5 slag-rs/target/round10-macos-final.log' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+== with bwrap
+  ⚖ judge says pass  “["source"] read_file "output.txt"; ["check"] bash "cat
+    output.txt" (exit 0)”
+test smith::native::tests::warden_inspects_files_and_runs_checks_without_builder_tools ... ok
+test smith::tests::detect_questions ... ok
+test smith::tests::engine_hooks_default_is_inert ... ok
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'CARGO_HOME=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/cargo-home CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy --offline --manifest-path slag-rs/Cargo.toml --all-targets -- -D warnings > slag-rs/target/round10-clippy-result.log 2>&1' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git diff -- slag-rs/src/engine/sandbox.rs slag-rs/src/pipeline/warden.rs' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+diff --git a/slag-rs/src/engine/sandbox.rs b/slag-rs/src/engine/sandbox.rs
+index ea4b6d5..692f5a2 100644
+--- a/slag-rs/src/engine/sandbox.rs
++++ b/slag-rs/src/engine/sandbox.rs
+@@ -195,30 +195,34 @@ impl Sandbox {
+ 
+     /// Allow writes only beneath `root`, without configured writable paths.
+     pub fn for_scratch(root: &Path) -> std::io::Result<Self> {
+-        let backend = backend();
++        Self::scratch_with_backend(root, backend()).inspect_err(|error| {
++            if error.kind() == std::io::ErrorKind::Unsupported {
++                static WARNING: std::sync::Once = std::sync::Once::new();
++                WARNING.call_once(|| crate::tui::status_line("!", crate::tui::WARM,
++                    &format!("read-only checks unavailable: {error}; checks will not run")));
++            }
++        })
++    }
++
++    fn scratch_with_backend(root: &Path, backend: Backend) -> std::io::Result<Self> {
+         if backend == Backend::None {
+             return Err(std::io::Error::new(
+                 std::io::ErrorKind::Unsupported,
+                 "read-only review requires a working OS sandbox; no unconfined fallback",
+             ));
+         }
++        if backend == Backend::Landlock {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "read-only review requires bubblewrap: Landlock cannot block chmod, timestamps, or extended attribute writes",
++            ));
++        }
+         let path = root.canonicalize()?;
+         let mut sandbox = Self::with(backend, vec![path.clone()], Locked::default());
+         sandbox.read_only = true;
+         for name in ["TMPDIR", "TMP", "TEMP"] {
+             sandbox.env.push((name.to_string(), path.clone()));
+         }
+-        #[cfg(target_os = "linux")]
+-        if backend == Backend::Landlock {
+-            sandbox.ruleset = landlock::read_only_ruleset(&sandbox.writable);
+-            if sandbox.ruleset.is_none() {
+-                return Err(std::io::Error::new(
+-                    std::io::ErrorKind::Unsupported,
+-                    "read-only review requires Landlock ABI 3 or a working bubblewrap",
+-                ));
+-            }
+-            sandbox.backend = Backend::Landlock;
+-        }
+         if sandbox.backend == Backend::None {
+             return Err(std::io::Error::new(
+                 std::io::ErrorKind::Unsupported,
+@@ -409,6 +413,9 @@ impl Sandbox {
+         for tree in self.locked.trees.iter().filter(|t| t.exists()) {
+             args.extend(["--ro-bind".into(), tree.into(), tree.into()]);
+         }
++        if self.read_only {
++            args.extend(["--cap-drop".into(), "ALL".into()]);
++        }
+         args.push("--die-with-parent".into());
+         args
+     }
+@@ -898,16 +905,6 @@ mod landlock {
+         ruleset_with_devices(writable, &[PathBuf::from("/dev")])
+     }
+ 
+-    pub fn read_only_ruleset(writable: &[PathBuf]) -> Option<OwnedFd> {
+-        if abi()? < 3 {
+-            return None;
+-        }
+-        ruleset_with_devices(
+-            writable,
+-            &[PathBuf::from("/dev/null"), PathBuf::from("/dev/zero")],
+-        )
+-    }
+-
+     fn ruleset_with_devices(writable: &[PathBuf], devices: &[PathBuf]) -> Option<OwnedFd> {
+         let abi = abi()?;
+         let mut handled = WRITE_FILE
+@@ -1145,6 +1142,81 @@ mod tests {
+         assert!(!args
+             .iter()
+             .any(|arg| arg == "--bind" || arg == "--dev-bind"));
++        assert!(args.windows(2).any(|args| args == ["--cap-drop", "ALL"]));
++    }
++
++    #[test]
++    fn readonly_scratch_refuses_unconfined_backend() {
++        let scratch = tempfile::tempdir().unwrap();
++        let error = Sandbox::scratch_with_backend(scratch.path(), Backend::None)
++            .err()
++            .expect("read-only review must not run unconfined");
++        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
++        assert!(error.to_string().contains("no unconfined fallback"));
++    }
++
++    #[cfg(target_os = "linux")]
++    async fn readonly_backend_blocks_checkout_writes(backend: Backend) {
++        if backend == Backend::Bwrap
++            && !runs("bwrap", &["--ro-bind", "/", "/", "true"])
++        {
++            eprintln!("skipped: bubblewrap cannot create a sandbox here");
++            return;
++        }
++        let workspace = tempfile::tempdir().unwrap();
++        let scratch = tempfile::tempdir().unwrap();
++        std::fs::write(workspace.path().join("existing"), "unchanged").unwrap();
++        std::os::unix::fs::symlink(workspace.path(), scratch.path().join("workspace")).unwrap();
++        let sb = Sandbox::scratch_with_backend(scratch.path(), backend).unwrap();
++        let code = r#"import errno, os, pathlib, sys, tempfile
++root = pathlib.Path(sys.argv[1])
++with tempfile.TemporaryDirectory() as directory:
++    pathlib.Path(directory, 'allowed').write_text('scratch')
++for path in (pathlib.Path('written'), root / 'absolute', root / 'existing', pathlib.Path(os.environ['TMPDIR']) / 'workspace' / 'escape'):
++    try:
++        path.write_text('blocked')
++    except OSError as error:
++        assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), error
++    else:
++        raise AssertionError(f'workspace write succeeded: {path}')
++for operation in (lambda: (root / 'existing').chmod(0o600), lambda: os.utime(root / 'existing', ns=(1, 1)), lambda: os.setxattr(root / 'existing', 'user.slag_probe', b'blocked')):
++    try:
++        operation()
++    except OSError as error:
++        assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), error
++    else:
++        raise AssertionError('workspace metadata write succeeded')
++if sys.argv[2] == 'bwrap':
++    caps = next(line for line in pathlib.Path('/proc/self/status').read_text().splitlines() if line.startswith('CapEff:'))
++    assert int(caps.split()[1], 16) == 0, caps
++print('checkout read-only; private temporary files allowed')
++"#;
++        let program = shell_words::join([
++            "python3", "-B", "-c", code, workspace.path().to_str().unwrap(),
++            if backend == Backend::Bwrap { "bwrap" } else { "landlock" },
++        ]);
++        let command = format!("cd {} && {program}", shell_words::quote(workspace.path().to_str().unwrap()));
++        let output = sb.command(&command).output().await.unwrap();
++        assert!(output.status.success(), "{backend:?}: {}", String::from_utf8_lossy(&output.stderr));
++        assert_eq!(std::fs::read_to_string(workspace.path().join("existing")).unwrap(), "unchanged");
++        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
++    }
++
++    #[cfg(target_os = "linux")]
++    #[tokio::test]
++    async fn bwrap_readonly_blocks_checkout_writes_and_allows_private_temp() {
++        readonly_backend_blocks_checkout_writes(Backend::Bwrap).await;
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn landlock_readonly_refuses_unprotected_metadata_writes() {
++        let scratch = tempfile::tempdir().unwrap();
++        let error = Sandbox::scratch_with_backend(scratch.path(), Backend::Landlock)
++            .err()
++            .expect("Landlock cannot enforce a read-only workspace");
++        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
++        assert!(error.to_string().contains("Landlock cannot block chmod, timestamps, or extended attribute writes"));
+     }
+ 
+     #[tokio::test]
+diff --git a/slag-rs/src/pipeline/warden.rs b/slag-rs/src/pipeline/warden.rs
+index 9417907..4929f0b 100644
+--- a/slag-rs/src/pipeline/warden.rs
++++ b/slag-rs/src/pipeline/warden.rs
+@@ -214,9 +214,11 @@ pub async fn judge_artifact(
+             }
+         }
+     } else { None };
++    let mut install_skipped = None;
+     let installed = if python_package_cli(&ore, &bar) {
+         match checkout::prepare_install(std::path::Path::new(".")).await {
+-            Ok(checkout) => { commands.push(checkout.command.clone()); Some(checkout) }
++            Ok(checkout::InstallCheck::Ready(checkout)) => { commands.push(checkout.command.clone()); Some(checkout) }
++            Ok(checkout::InstallCheck::Skipped(reason)) => { install_skipped = Some(reason); None }
+             Err(error) => {
+                 let verdict = Verdict::unverified(format!("cannot prepare the isolated installation check: {error}"));
+                 record(round, &verdict);
+@@ -227,7 +229,13 @@ pub async fn judge_artifact(
+     let install_context = installed.as_ref().map(|checkout| format!(
+         "ISOLATED INSTALL CHECK: {}\nThe coordinator installed committed HEAD in a separate temporary clone. First run the fresh-clone suite without installation. Then run this exact command in its own bash call. It checks installed console-script metadata and --help. Cite its successful ID.\n",
+         checkout.command,
+-    )).unwrap_or_default();
++    )).unwrap_or_else(|| install_skip_context(install_skipped.as_deref()));
++    if let Some(reason) = &install_skipped {
++        record_install_skip(std::path::Path::new(crate::config::project_path(LEDGER)), reason);
++        crate::engine::emit(&hooks.events, crate::engine::EngineEvent::Warning {
++            message: format!("install check skipped: {reason}"),
++        });
++    }
+     let fresh_context = fresh.as_ref().map(|checkout| format!(
+         "FRESH CLONE CHECK: {}\nThe coordinator cloned committed HEAD without ignored files or prior package installs. Run this exact command in its own bash call. Cite its successful ID. A failure is a delivery gap.\n",
+         checkout.command,
+@@ -254,6 +262,19 @@ pub async fn judge_artifact(
+     Ok(verdict)
+ }
+ 
++fn record_install_skip(path: &std::path::Path, reason: &str) {
++    use std::io::Write;
++    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
++        let _ = writeln!(file, "\n- install check skipped: {reason}");
++    }
++}
++
++fn install_skip_context(reason: Option<&str>) -> String {
++    reason.map(|reason| format!(
++        "install check skipped: {reason}\nMissing host installation tools alone do not establish a package gap. Judge the fresh-clone suite and package source. Do not claim installed-console verification.\n"
++    )).unwrap_or_default()
++}
++
+ fn python_package_cli(ore: &str, bar: &str) -> bool {
+     let goal = ore.to_ascii_lowercase();
+     let cli = goal.contains("cli") || goal.contains("command-line") || goal.contains("command line");
+@@ -443,6 +464,28 @@ fn record(round: usize, v: &Verdict) {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn skipped_install_check_reports_limits_without_an_unverified_verdict() {
++        let context = install_skip_context(Some("Python installation tools are unavailable"));
++        assert!(context.starts_with("install check skipped: Python installation tools are unavailable\n"));
++        assert!(context.contains("Do not claim installed-console verification"));
++        assert!(!context.contains("REQUIRED RUN COMMANDS"));
++        let root = tempfile::tempdir().unwrap();
++        let ledger = root.path().join("PROGRESS.md");
++        record_install_skip(&ledger, "Python installation tools are unavailable");
++        assert_eq!(std::fs::read_to_string(ledger).unwrap().matches("install check skipped:").count(), 1);
++        let commands = vec!["python3 -m unittest".to_string()];
++        let mut inspections = InspectionLog::default();
++        inspections.record(&crate::engine::ToolCall {
++            id: "suite".into(), name: "bash".into(),
++            arguments: serde_json::json!({"command": commands[0]}).to_string(),
++        }, &crate::engine::ToolOutcome { output: "Ran 2 tests\nOK".into(), is_error: false });
++        let verdict = parse_grounded_verdict("VERDICT: pass\nEVIDENCE: [\"suite\"]", &inspections, true, &commands);
++        assert!(verdict.fulfilled);
++        assert!(!verdict.is_unverified());
++        assert!(install_skip_context(None).is_empty());
++    }
++
+     fn git(root: &std::path::Path, args: &[&str]) -> String {
+         let output = crate::engine::sandbox::git().args(args).current_dir(root)
+             .env("GIT_AUTHOR_NAME", "slag test").env("GIT_AUTHOR_EMAIL", "test@slag.test")
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+ succeeded in 2792ms:
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'tail -15 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-final-result.log; tail -5 slag-rs/target/round10-macos-final.log' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+== with bwrap
+test result: ok. 1191 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.78s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+bwrap-exit=0
+
+     Running tests/evolve.rs (slag-rs/target/debug/deps/evolve-4eb733a1c93ef10a)
+
+running 10 tests
+test sequential_without_evolve_is_refused ... ok
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+ succeeded in 39015ms:
+codex
+The root Linux suite passed with bubblewrap, Cargo exit 0. Clippy also passed. The macOS suite and non-root checks remain.
+
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git diff --check; git -C /Users/stas/Playground/slag status --short; tail -6 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-final-result.log' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+landlock-exit=0
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+ succeeded in 36387ms:
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'docker run --rm --privileged -v /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency:/src:ro -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/cache:/cache -v /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/nonroot.sh:/run.sh:ro rust:1-bookworm bash /run.sh > /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-nonroot-result.log 2>&1' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg '"'^test result:'"' slag-rs/target/round10-macos-final.log; rg '"'^test result:|exit='"' /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-root-final-result.log" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+test result: ok. 1189 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.73s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.48s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.98s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 1191 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.78s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+bwrap-exit=0
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 1157 filtered out; finished in 0.34s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+landlock-exit=0
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg -n '"'^    (async )?fn |''^    #'"\\[.*test' slag-rs/src/pipeline/warden/checkout.rs | tail -35; tail -10 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-nonroot-result.log" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+215:    fn repository(source: &str) -> tempfile::TempDir {
+224:    fn enforced(sandbox: std::io::Result<Sandbox>) -> Option<Sandbox> {
+235:    async fn run(checkout: &FreshCheckout) -> Option<std::process::Output> {
+240:    #[tokio::test]
+241:    async fn fresh_checkout_excludes_untracked_files_and_local_runtime() {
+251:    #[tokio::test]
+252:    async fn fresh_checkout_refuses_uncommitted_import_dependency() {
+261:    #[tokio::test]
+262:    async fn fresh_checkout_prefixed_python_uses_isolated_runtime() {
+270:    #[tokio::test]
+271:    async fn isolated_install_checks_console_without_workspace_residue() {
+275:    #[tokio::test]
+276:    async fn isolated_install_falls_back_to_target_without_workspace_residue() {
+280:    async fn assert_install_methods(methods: &[InstallMethod]) {
+332:    #[tokio::test]
+333:    async fn isolated_install_missing_tools_skips_without_a_proof_command() {
+342:    #[tokio::test]
+343:    async fn isolated_install_package_failures_remain_errors() {
+357:    #[test]
+358:    fn virtualenv_keeps_app_data_in_private_installation_directory() {
+364:    #[test]
+365:    fn install_tool_detection_does_not_hide_package_failures() {
+373:    #[tokio::test]
+374:    async fn fresh_checkout_suite_can_use_private_tempfile() {
+381:    #[tokio::test]
+382:    async fn fresh_checkout_tests_cannot_write() {
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "sed -n '280,358p' slag-rs/src/pipeline/warden/checkout.rs; tail -12 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-nonroot-result.log; git branch --show-current" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+    async fn assert_install_methods(methods: &[InstallMethod]) {
+        let repo = repository("import unittest\nclass Clean(unittest.TestCase):\n def test_source(self):\n  import example_cli\n  self.assertTrue(callable(example_cli.main))\n");
+        std::fs::write(repo.path().join("example_cli.py"), "def main():\n print('usage: example-cli [--help]')\n").unwrap();
+        std::fs::write(repo.path().join("pyproject.toml"), "[build-system]\nrequires = []\nbuild-backend = 'backend'\nbackend-path = ['.']\n").unwrap();
+        std::fs::write(repo.path().join("backend.py"), r#"import pathlib, zipfile
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    pathlib.Path('example_cli.egg-info').mkdir(exist_ok=True)
+    pathlib.Path('.venv').mkdir(exist_ok=True)
+    filename = 'example_cli-1.0-py3-none-any.whl'
+    prefix = 'example_cli-1.0.dist-info/'
+    with zipfile.ZipFile(pathlib.Path(wheel_directory) / filename, 'w') as wheel:
+        wheel.write('example_cli.py')
+        wheel.writestr(prefix + 'METADATA', 'Metadata-Version: 2.1\nName: example-cli\nVersion: 1.0\n')
+        wheel.writestr(prefix + 'WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+        wheel.writestr(prefix + 'entry_points.txt', '[console_scripts]\nexample-cli = example_cli:main\n')
+        wheel.writestr(prefix + 'RECORD', '')
+    return filename
+"#).unwrap();
+        let backend = repo.path().join("backend.py");
+        let source = std::fs::read_to_string(&backend).unwrap();
+        let original = serde_json::to_string(&repo.path().join("install-escaped").to_string_lossy()).unwrap();
+        let guarded = source.replace("    filename =", &format!(
+            "    try:\n        pathlib.Path({original}).write_text('escape')\n    except OSError as error:\n        if error.errno not in (1, 13, 30):\n            raise\n    else:\n        raise AssertionError('installation wrote into the original repository')\n    filename ="));
+        std::fs::write(backend, guarded).unwrap();
+        assert!(git().args(["add", "."]).current_dir(repo.path()).status().unwrap().success());
+        assert!(git().args(["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "Add package"])
+            .current_dir(repo.path()).status().unwrap().success());
+        let fresh = prepare(repo.path(), "python3 -m unittest").await.unwrap();
+        let Some(suite) = run(&fresh).await else { return };
+        assert!(suite.status.success(), "{}", String::from_utf8_lossy(&suite.stderr));
+        let installed = match prepare_install_with(repo.path(), methods).await.unwrap() {
+            InstallCheck::Ready(checkout) => checkout,
+            InstallCheck::Skipped(reason) => {
+                assert!(reason.contains("unavailable"));
+                assert!(!repo.path().join(".venv").exists());
+                assert!(!repo.path().join("example_cli.egg-info").exists());
+                assert!(!repo.path().join("install-escaped").exists());
+                return;
+            }
+        };
+        let installed_root = installed._temp.path().to_path_buf();
+        let Some(result) = run(&installed).await else { return };
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("Installed console script: example-cli"));
+        assert!(!repo.path().join(".venv").exists());
+        assert!(!repo.path().join("example_cli.egg-info").exists());
+        assert!(!repo.path().join("install-escaped").exists());
+        assert!(!fresh._temp.path().join("checkout/.venv").exists());
+        drop(installed);
+        assert!(!installed_root.exists());
+    }
+
+    #[tokio::test]
+    async fn isolated_install_missing_tools_skips_without_a_proof_command() {
+        let repo = repository("import unittest\n");
+        let Some(_sandbox) = enforced(Sandbox::for_scratch(repo.path())) else { return };
+        match prepare_install_with(repo.path(), &[]).await.unwrap() {
+            InstallCheck::Skipped(reason) => assert!(reason.contains("unavailable")),
+            InstallCheck::Ready(_) => panic!("missing installation tools produced a proof command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_install_package_failures_remain_errors() {
+        let repo = repository("import unittest\n");
+        let Some(_sandbox) = enforced(Sandbox::for_scratch(repo.path())) else { return };
+        std::fs::write(repo.path().join("pyproject.toml"), "[invalid TOML").unwrap();
+        assert!(git().args(["add", "."]).current_dir(repo.path()).status().unwrap().success());
+        assert!(git().args(["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "Invalid package"])
+            .current_dir(repo.path()).status().unwrap().success());
+        match prepare_install(repo.path()).await {
+            Err(error) => assert!(error.to_string().contains("package installation in a temporary clone failed"), "{error}"),
+            Ok(InstallCheck::Skipped(reason)) => assert!(reason.contains("unavailable")),
+            Ok(InstallCheck::Ready(_)) => panic!("invalid package passed installation"),
+        }
+    }
+
+    #[test]
+    fn virtualenv_keeps_app_data_in_private_installation_directory() {
+1000
+CapEff:	0000000000000000
+== nonroot-bwrap-full (user=nonroot)
+gauntlet/efficiency
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'tail -12 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-nonroot-result.log; cat slag-rs/target/round10-clippy-result.log | tail -3; git diff --check' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+1000
+CapEff:	0000000000000000
+== nonroot-bwrap-full (user=nonroot)
+    Checking slag v2.9.0 (/Users/stas/Playground/slag/.claude/worktrees/lane-efficiency/slag-rs)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.84s
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+codex
+macOS passed: 1,258 tests, Cargo exit 0. The non-root Linux run confirms UID 1000 and zero effective capabilities inside bubblewrap.
+
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "cat > notes/gauntlet/efficiency-round10.md <<'EOF'
+# Round 10: portable fresh-checkout checks
+
+## Causes and changes
+
+The original Linux failure did not show a successful workspace write. The write failed with "'`OSError: [Errno 30] Read-only file system`. The test then failed because it expected `PermissionError`. Bubblewrap mounted the checkout read-only for root. The regression now checks the failed command, one executed test, and absence of the file. It accepts the kernel'"'s read-only error text.
+
+Strict bubblewrap sessions also drop all capabilities. Linux regressions check relative writes, absolute writes, truncation, symlink escapes, chmod, timestamps, and extended attributes. Private temporary files remain writable.
+
+Landlock blocks file data writes but does not block chmod, timestamps, or extended attributes. Direct probes confirmed this under root and UID 1000. Strict read-only factories now return "'`Unsupported` before they run commands on Landlock. Slag warns once. It cannot cite those checks as successful read-only evidence. Ordinary Landlock confinement remains unchanged.
+
+Debian'"'s Python lacks ensurepip without "'`python3-venv`. The error spans two lines. Installer detection now normalizes whitespace. Installation tries venv, virtualenv, then pip with a private target. Each method uses a temporary clone. Virtualenv also keeps its app data there. Missing installer tools produce `install check skipped: <reason>` in the review context, warning event, and progress ledger. Package build failures remain errors. A skip adds no required proof command and permits no installed-console claim.
+
+Two integration assertions also assumed platform-specific error text. They now accept Linux EROFS or normalize terminal wrapping.
+
+## Verification
+
+Results and exact commands follow after the final Linux run.
+
+## Regression coverage
+
+- `fresh_checkout_tests_cannot_write`
+- `fresh_checkout_suite_can_use_private_tempfile`
+- `bwrap_readonly_blocks_checkout_writes_and_allows_private_temp`
+- `landlock_readonly_refuses_unprotected_metadata_writes`
+- `readonly_scratch_refuses_unconfined_backend`
+- `isolated_install_checks_console_without_workspace_residue`
+- `isolated_install_falls_back_to_target_without_workspace_residue`
+- `isolated_install_missing_tools_skips_without_a_proof_command`
+- `isolated_install_package_failures_remain_errors`
+- `install_tool_detection_does_not_hide_package_failures`
+- `virtualenv_keeps_app_data_in_private_installation_directory`
+- `skipped_install_check_reports_limits_without_an_unverified_verdict`
+EOF' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+ succeeded in 41762ms:
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'tail -15 /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-nonroot-result.log; tail -4 /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/cache/round10-nonroot-bwrap-full.log' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+root-landlock-checkout-pip-exit=0
+test the_stream_view_plays_a_recorded_forge_to_its_assay ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "rg '"'^==|exit=|test result: ok'"\\. (1191|35|11) ' /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/linux-nonroot-result.log; stat -f '%u:%g' /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/cache/target; git diff --check" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+== nonroot-bwrap-full (user=nonroot)
+test result: ok. 1191 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 18.76s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+nonroot-bwrap-full-exit=0
+== nonroot-bwrap-checkout-pip (user=nonroot)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1181 filtered out; finished in 1.03s
+nonroot-bwrap-checkout-pip-exit=0
+== nonroot-landlock-sandbox (user=nonroot)
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 1157 filtered out; finished in 0.26s
+nonroot-landlock-sandbox-exit=0
+== nonroot-landlock-checkout-pip (user=nonroot)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1181 filtered out; finished in 0.14s
+nonroot-landlock-checkout-pip-exit=0
+== root-landlock-checkout-pip (user=root)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1181 filtered out; finished in 0.12s
+root-landlock-checkout-pip-exit=0
+501:20
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+codex
+Root and UID 1000 passed the full Linux suite: 1,260 tests each. The pip fallback checks also passed without python3-venv.
+
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc "python3 - <<'PY'
+from pathlib import Path
+p=Path('notes/gauntlet/efficiency-round10.md');s=p.read_text().replace('Results and exact commands follow after the final Linux run.', '''| Environment | Cargo result | Tests passed | Ignored |
+| --- | --- | ---: | ---: |
+| macOS, full suite | exit 0 | 1,258 | 1 |
+| Linux root, bubblewrap, full suite | exit 0 | 1,260 | 1 |
+| Linux UID 1000, bubblewrap, full suite | exit 0 | 1,260 | 1 |
+| Linux root, Landlock-only sandbox tests | exit 0 | 35 | 0 |
+| Linux UID 1000, Landlock-only sandbox tests | exit 0 | 35 | 0 |
+| Linux UID 1000, bubblewrap, pip present and python3-venv absent | exit 0 | 11 | 0 |
+| Linux root, Landlock-only checkout tests | exit 0 | 11 | 0 |
+| Linux UID 1000, Landlock-only checkout tests | exit 0 | 11 | 0 |
+
+Landlock-only checkout tests validate explicit refusal. They do not run product commands under a claimed read-only profile. Bubblewrap tests execute the checks under root and UID 1000.
+
+The original root image has no installation tools. Its suite verifies graceful skips. The non-root wrapper then installs "'`python3-pip` without recommended packages. The checkout tests exercise the private target fallback without `python3-venv`.
+
+macOS Clippy passed with exit 0 and `--all-targets -- -D warnings`. `git diff --check` passed. The main checkout stayed clean. No live API calls ran.
+
+An interim Docker run hit the existing timeout test in `pipeline::fix::repo`. Both final full Linux runs passed it. No fix module changed.
+
+Exact root command, using the lead'"'s unchanged script:
+
+"'```sh
+docker run --rm --privileged '"\\\\
+  -v /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency:/src:ro \\\\
+  -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/cache:/cache \\\\
+  -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/run.sh:/run.sh:ro \\\\
+  rust:1-bookworm bash /run.sh
+"'```
+
+The original script reports each Cargo exit through `PIPESTATUS[0]`. Its final results were `bwrap-exit=0` and `landlock-exit=0`.
+
+Exact non-root command:
+
+```sh
+docker run --rm --privileged '"\\\\
+  -v /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency:/src:ro \\\\
+  -v /Users/stas/.claude/jobs/f353e9d3/tmp/linux-final/cache:/cache \\\\
+  -v /Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/nonroot.sh:/run.sh:ro \\\\
+  rust:1-bookworm bash /run.sh
+"'```
+
+The wrapper creates UID 1000, sets a writable HOME, and runs Cargo through `runuser`. It restores cache ownership afterward. Each Cargo invocation and the wrapper returned 0.
+
+Exact native commands from the worktree:
+
+```sh
+TMPDIR=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/tmp '"\\\\
+CARGO_HOME=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/cargo-home \\\\
+CARGO_PROFILE_DEV_DEBUG=line-tables-only \\\\
+cargo test --offline --manifest-path slag-rs/Cargo.toml
+
+CARGO_HOME=/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r3/cargo-home \\\\
+CARGO_PROFILE_DEV_DEBUG=line-tables-only \\\\
+cargo clippy --offline --manifest-path slag-rs/Cargo.toml --all-targets -- -D warnings
+"'```
+
+Evidence under `/Users/stas/.claude/jobs/f353e9d3/tmp/efficiency-r10/`:
+
+- `linux-diagnose.log`: original EROFS failure.
+- `linux-venv-diagnose.log`: Debian'"'s wrapped ensurepip error.
+- "'`probes/landlock-metadata.log`: root and UID 1000 metadata probes.
+- `linux-root-final-result.log`: exact lead script, final run.
+- `linux-nonroot-result.log`: non-root wrapper, final run.
+
+Native logs: `slag-rs/target/round10-macos-final.log` and `slag-rs/target/round10-clippy-result.log`.'"''');p.write_text(s)
+PY
+git diff --check
+git status --short" in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+ M CLAUDE.md
+ M README.md
+ M slag-rs/src/engine/agent.rs
+ M slag-rs/src/engine/sandbox.rs
+ M slag-rs/src/pipeline/warden.rs
+ M slag-rs/src/pipeline/warden/checkout.rs
+ M slag-rs/tests/forge_loop.rs
+ M slag-rs/tests/local_hygiene.rs
+?? notes/gauntlet/efficiency-round10.md
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git add CLAUDE.md README.md slag-rs/src/engine/agent.rs slag-rs/src/engine/sandbox.rs slag-rs/src/pipeline/warden.rs slag-rs/src/pipeline/warden/checkout.rs slag-rs/tests/forge_loop.rs slag-rs/tests/local_hygiene.rs notes/gauntlet/efficiency-round10.md
+git commit -m "warden: make isolated verification portable on Linux"' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+[gauntlet/efficiency f997117] warden: make isolated verification portable on Linux
+ 9 files changed, 435 insertions(+), 63 deletions(-)
+ create mode 100644 notes/gauntlet/efficiency-round10.md
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Failed
+hook: PostToolUse Failed
+hook: PostToolUse Failed
+hook: PreToolUse
+hook: PreToolUse
+hook: PreToolUse Completed
+hook: PreToolUse Completed
+exec
+/bin/zsh -lc 'git status --short; git -C /Users/stas/Playground/slag status --short; git show --stat --oneline HEAD' in /Users/stas/Playground/slag/.claude/worktrees/lane-efficiency
+ succeeded in 0ms:
+f997117 warden: make isolated verification portable on Linux
+ CLAUDE.md                               |   2 +-
+ README.md                               |   4 +-
+ notes/gauntlet/efficiency-round10.md    |  96 ++++++++++++++
+ slag-rs/src/engine/agent.rs             |   6 +-
+ slag-rs/src/engine/sandbox.rs           | 116 +++++++++++++----
+ slag-rs/src/pipeline/warden.rs          |  47 ++++++-
+ slag-rs/src/pipeline/warden/checkout.rs | 223 +++++++++++++++++++++++++++-----
+ slag-rs/tests/forge_loop.rs             |   2 +-
+ slag-rs/tests/local_hygiene.rs          |   2 +-
+ 9 files changed, 435 insertions(+), 63 deletions(-)
+
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+codex
+Committed `f997117` on `gauntlet/efficiency`.
+
+The Linux write failed with EROFS. The test failed because it expected `PermissionError`. Bubblewrap now also drops all capabilities.
+
+Landlock permits metadata writes. Strict checks now refuse that backend, warn once, and produce no read-only evidence.
+
+Install checks now try venv, virtualenv, then isolated pip target. Missing tools produce a recorded skip. Package failures remain errors.
+
+| Verification | Passed | Cargo exit |
+|---|---:|---:|
+| Linux root, full suite | 1,260 | 0 |
+| Linux UID 1000, full suite | 1,260 | 0 |
+| macOS, full suite | 1,258 | 0 |
+| Clippy, all targets, warnings denied | Clean | 0 |
+
+Both Linux runs also passed Landlock refusal tests. Non-root pip fallback checks passed without python3-venv.
+
+Both checkouts are clean. [Report, changed files, tests, and exact commands](notes/gauntlet/efficiency-round10.md).
+
+ASK: Fix Linux portability of fresh-checkout verification and verify root, non-root, and macOS.
+🟩Got 🟩Had 🟩Did
+🧠 —
+hook: Stop
+hook: Stop
+hook: Stop
+hook: Stop Completed
+hook: Stop Completed
+hook: Stop Completed
+tokens used
+2,600,815
+Committed `f997117` on `gauntlet/efficiency`.
+
+The Linux write failed with EROFS. The test failed because it expected `PermissionError`. Bubblewrap now also drops all capabilities.
+
+Landlock permits metadata writes. Strict checks now refuse that backend, warn once, and produce no read-only evidence.
+
+Install checks now try venv, virtualenv, then isolated pip target. Missing tools produce a recorded skip. Package failures remain errors.
+
+| Verification | Passed | Cargo exit |
+|---|---:|---:|
+| Linux root, full suite | 1,260 | 0 |
+| Linux UID 1000, full suite | 1,260 | 0 |
+| macOS, full suite | 1,258 | 0 |
+| Clippy, all targets, warnings denied | Clean | 0 |
+
+Both Linux runs also passed Landlock refusal tests. Non-root pip fallback checks passed without python3-venv.
+
+Both checkouts are clean. [Report, changed files, tests, and exact commands](notes/gauntlet/efficiency-round10.md).
+
+ASK: Fix Linux portability of fresh-checkout verification and verify root, non-root, and macOS.
+🟩Got 🟩Had 🟩Did
+🧠 —

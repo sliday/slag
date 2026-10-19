@@ -418,6 +418,18 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - Docker `rust:1-bookworm --privileged`, as root, bubblewrap installed: 1180 passed, 2 FAILED, both in efficiency's fresh-checkout warden code: `fresh_checkout_tests_cannot_write` (a test could write inside the "read-only" checkout) and `isolated_install_checks_console_without_workspace_residue` (`prepare_install` Err; likely no `python3-venv` on Debian). Landlock-only sandbox tests: 32/32 pass.
 - Sent as efficiency r10 (Linux portability, root and non-root). Script: tmp/linux-final/run.sh.
 
+### fix r6 merged
+- Runner-reach probe: each new test file is made unrunnable and the suite reruns; still passing = the runner never reached it → sent back once with the runner's wiring. Each reported case plus its boundary, in the repo's idiom. Declared existing-test change must name something in the issue and get an explicit review pass. Edit misses show the nearest region verbatim.
+- Builder: gpt-6.1-sol 24.0 → 21.8 s, 2.5 → 5.8 cases/run, hidden 4/4; mistral-small 13.6 → 18.1 s, 1.7 → 3.5 cases, hidden 7/8.
+- Integration: 1187 unit tests green, clippy clean. Critic fix-r4 running MODEL FOR MODEL (gpt-6.1-sol) from copied binary and bench.
+
+### commission critic r8 (Fable, fresh, 7 prompts, 2 unseen): WINNER bar 0-4-3
+- All seven FORGED at heat 1, warden round 1, no crash; $0.74 total; 81-144 s; 58k-125k tokens. Instruments gone from user repos (probes/fixtures under untracked `.slag/checks/`). Fresh-clone suites pass, no install.
+- Wins over codex on detail: wc handles NBSP like system wc (codex does not); CSV rejects ragged rows before any output.
+- Defects: tail drops an unterminated last line and exits 1 on a non-UTF-8 byte; slugify deletes punctuation instead of separating; retry has no maxDelay cap.
+- Votes (order-stable): codex 4, split 3, slag 0. Vote trend: 0-6, 0-6, 0-2-1, 0-3-1, 1-3-1, 0-4-3: oscillating between breadth and depth.
+- BIGGEST_GAP: the BAR inflates scope (stdin twice via surveyor + `direct.rs:239`) and skips mundane edge cases. Queued as efficiency r11, declared the LAST commission round; one final critic after it, then the lane closes.
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
