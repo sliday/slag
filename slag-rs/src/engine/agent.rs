@@ -88,6 +88,90 @@ fn reinject_file_cap(token_budget: usize) -> usize {
 /// the ingot, not each session from a fresh $0.
 pub type SpendAccum = Arc<std::sync::Mutex<f64>>;
 
+/// A budget several sessions draw on together (`slag fix --evolve`):
+/// dollars counted only from calls slag can price, every token, and the
+/// tokens no price covered. A model with no price is never charged an
+/// invented rate; its calls count toward the token cap alone.
+#[derive(Debug, Clone, Default)]
+pub struct SharedBudget {
+    dollars: SpendAccum,
+    tokens: Arc<std::sync::atomic::AtomicU64>,
+    unpriced: Arc<std::sync::atomic::AtomicU64>,
+    usd_cap: f64,
+    token_cap: u64,
+    /// Counts this session's spend without stopping it at the cap.
+    count_only: bool,
+}
+
+impl SharedBudget {
+    pub fn new(usd_cap: f64, token_cap: u64) -> Self {
+        Self { usd_cap, token_cap, ..Self::default() }
+    }
+
+    pub fn usd_cap(&self) -> f64 {
+        self.usd_cap
+    }
+
+    pub fn token_cap(&self) -> u64 {
+        self.token_cap
+    }
+
+    /// Dollars spent on calls slag could price.
+    pub fn dollars(&self) -> f64 {
+        *self.dollars.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn tokens(&self) -> u64 {
+        self.tokens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Tokens from calls no price covered.
+    pub fn unpriced(&self) -> u64 {
+        self.unpriced.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The same budget for a session that must finish once started: its
+    /// spend still counts, so later sessions see the cap.
+    pub fn counting_only(&self) -> Self {
+        Self { count_only: true, ..self.clone() }
+    }
+
+    /// Why a session under this budget must stop now, or `None`.
+    pub fn stops(&self) -> Option<String> {
+        if self.count_only {
+            None
+        } else {
+            self.over()
+        }
+    }
+
+    /// Why the budget is spent, or `None` while room remains.
+    pub fn over(&self) -> Option<String> {
+        let spent = self.dollars();
+        if spent >= self.usd_cap {
+            return Some(format!(
+                "the evolve budget is spent: ≈ ${spent:.4} est. of ${:.2} on priced calls",
+                self.usd_cap
+            ));
+        }
+        let tokens = self.tokens();
+        (tokens >= self.token_cap)
+            .then(|| format!("the evolve token cap is spent: {tokens} of {} tokens", self.token_cap))
+    }
+
+    pub fn fold(&self, usage: &Usage) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tokens = usage.total_tokens.max(usage.prompt_tokens + usage.completion_tokens);
+        self.tokens.fetch_add(tokens, Relaxed);
+        match usage.cost.filter(|c| c.is_finite() && *c >= 0.0) {
+            Some(cost) => *self.dollars.lock().unwrap_or_else(|e| e.into_inner()) += cost,
+            None => {
+                self.unpriced.fetch_add(tokens, Relaxed);
+            }
+        }
+    }
+}
+
 /// `SLAG_CHAR_BUDGET` (in chars, converted at chars/4) still overrides
 /// everything so smaller-context models can be forced to compact early;
 /// window-derived budgets only apply when it is unset.
@@ -390,6 +474,8 @@ pub struct ForgeAgent {
     /// Files, by path from the root, the session must read before it may
     /// end on text. Empty asks for nothing.
     required_reads: Vec<String>,
+    /// A budget shared with other sessions, checked at every turn.
+    shared_budget: Option<SharedBudget>,
 }
 
 impl ForgeAgent {
@@ -421,11 +507,20 @@ impl ForgeAgent {
             harness_hooks: None,
             tool_allowlist: None,
             required_reads: Vec::new(),
+            shared_budget: None,
         }
     }
 
     /// Keep the last `rounds` tool rounds verbatim (default 2). A session
     /// that reads many files to compare them needs them all in view.
+    /// Draw on a budget other sessions share. Pair it with
+    /// `with_cost_cap(None)`: the shared caps then bind, and a model with no
+    /// price is charged nothing it was not charged.
+    pub fn with_shared_budget(mut self, budget: Option<SharedBudget>) -> Self {
+        self.shared_budget = budget;
+        self
+    }
+
     pub fn with_recent_rounds(mut self, rounds: usize) -> Self {
         self.recent_tool_rounds = rounds.max(1);
         self
@@ -874,6 +969,11 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     );
                 }
             }
+            if let Some(why) = self.shared_budget.as_ref().and_then(SharedBudget::stops) {
+                let e = SlagError::SmithFailed(why);
+                emit(&self.events, EngineEvent::Error { message: e.to_string() });
+                return Err(e);
+            }
             // Run-wide gate: without it a session keeps forging (and
             // spending) long after the run total crossed the cap, since
             // the forge scheduler only checks between anvil batches.
@@ -1041,6 +1141,9 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
     /// Fold one response's cost into the shared ingot accumulator and the
     /// run-wide spend accumulator (see `spend_for`).
     fn track_spend(&self, usage: &Usage) {
+        if let Some(budget) = &self.shared_budget {
+            budget.fold(usage);
+        }
         let c = spend_for(usage);
         if c > 0.0 {
             *self.ingot_spend.lock().unwrap() += c;
@@ -1984,6 +2087,56 @@ mod tests {
         let outcomes = editor.dispatch_batch(&[tc("b", "bash", serde_json::json!({"command": "touch marker"}))]).await;
         assert!(outcomes[0].is_error && outcomes[0].output.contains("unavailable"), "{:?}", outcomes[0]);
         assert!(!dir.path().join("marker").exists());
+    }
+
+    #[test]
+    fn a_shared_budget_charges_no_invented_rate() {
+        let budget = SharedBudget::new(0.01, 1_000);
+        let unpriced = Usage { prompt_tokens: 400, completion_tokens: 100, ..Default::default() };
+        budget.fold(&unpriced);
+        assert_eq!(budget.dollars(), 0.0, "a model with no price costs nothing it was not charged");
+        assert_eq!((budget.tokens(), budget.unpriced()), (500, 500));
+        assert!(budget.over().is_none());
+        let priced = Usage { prompt_tokens: 100, completion_tokens: 0, cost: Some(0.02), estimated: true, ..Default::default() };
+        budget.fold(&priced);
+        assert!(budget.over().unwrap().contains("≈ $0.0200 est. of $0.01"));
+        let tokens = SharedBudget::new(10.0, 600);
+        tokens.fold(&unpriced);
+        tokens.fold(&unpriced);
+        assert!(tokens.over().unwrap().contains("token cap"));
+    }
+
+    #[tokio::test]
+    async fn a_shared_token_cap_stops_a_session_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "x\n").unwrap();
+        let used = |mut r: NormalizedResponse| {
+            r.usage = Usage { prompt_tokens: 600, completion_tokens: 10, ..Default::default() };
+            r
+        };
+        let provider = MockProvider::new(vec![
+            used(resp_tools(vec![tc("1", "read_file", serde_json::json!({"path": "a.md"}))])),
+            used(resp_tools(vec![tc("2", "read_file", serde_json::json!({"path": "a.md", "force": true}))])),
+            resp_text("done", FinishReason::Stop),
+        ]);
+        let budget = SharedBudget::new(10.0, 1_000);
+        let err = agent(provider.clone(), dir.path())
+            .with_shared_budget(Some(budget.clone()))
+            .run("s".into(), "t".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("token cap"), "{err}");
+        assert_eq!(provider.requests().len(), 2, "the second turn's spend tripped the cap before a third call");
+        assert_eq!(budget.dollars(), 0.0);
+
+        // A session that must finish still counts toward the same cap.
+        let provider = MockProvider::new(vec![
+            used(resp_tools(vec![tc("1", "read_file", serde_json::json!({"path": "a.md"}))])),
+            resp_text("done", FinishReason::Stop),
+        ]);
+        agent(provider, dir.path()).with_shared_budget(Some(budget.counting_only())).run("s".into(), "t".into()).await.unwrap();
+        assert_eq!(budget.tokens(), 1_830);
+        assert!(budget.over().is_some() && budget.counting_only().stops().is_none());
     }
 
     #[tokio::test]

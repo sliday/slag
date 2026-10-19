@@ -116,34 +116,44 @@ impl Settings {
     }
 }
 
-/// Everything `--evolve` spends draws on one accumulator with one dollar
-/// cap, so a session stops mid-flight once the cap is reached; tokens are
-/// checked between stages.
+/// Everything `--evolve` spends draws on one shared budget: dollars from
+/// the calls slag can price, at the dated list rates, and every token. A
+/// session stops at its next turn once either cap is reached. A model
+/// with no price is charged no invented rate; the token cap budgets it.
 struct Budget {
-    usd: f64,
-    tokens: u64,
-    start: Usage,
-    spend: crate::engine::agent::SpendAccum,
+    shared: crate::engine::agent::SharedBudget,
 }
 
 impl Budget {
-    fn used(&self) -> Usage {
-        delta(&stats::snapshot().ledger.total(), &self.start)
-    }
-
-    fn dollars(&self) -> f64 {
-        *self.spend.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     fn over(&self) -> Option<String> {
-        let spent = self.dollars();
-        if spent >= self.usd {
-            return Some(format!("the evolve budget is spent: ${spent:.4} of ${:.2}", self.usd));
-        }
-        let tokens = tokens_of(&self.used());
-        (tokens >= self.tokens)
-            .then(|| format!("the evolve token cap is spent: {tokens} of {} tokens", self.tokens))
+        self.shared.over()
     }
+}
+
+/// Spend as every evolve line shows it: the priced dollars as an
+/// estimate, and the tokens no price covered, when there were any.
+fn spend_text(dollars: f64, unpriced: u64) -> String {
+    let est = format!("≈ ${dollars:.4} est.");
+    if unpriced > 0 {
+        format!("{est} + {} unpriced tokens", token_count(unpriced))
+    } else {
+        est
+    }
+}
+
+/// Whether slag can price a model's calls: a list or override price, or
+/// OpenRouter, which reports what each call cost.
+fn priced(model: &str) -> bool {
+    let (provider, bare) = match crate::config::provider_for_model(model) {
+        Ok(Some((provider, bare))) => (provider, bare),
+        _ => match crate::config::active_provider() {
+            Ok(provider) => (provider, model.to_string()),
+            Err(_) => return false,
+        },
+    };
+    provider == crate::config::ProviderPreset::OpenRouter
+        || crate::engine::pricing::override_price(provider, &bare).is_some()
+        || crate::engine::pricing::builtin_price(provider, &bare).is_some()
 }
 
 fn tokens_of(u: &Usage) -> u64 {
@@ -267,12 +277,24 @@ struct Candidate {
     dropped: Vec<String>,
     /// The components it changed against the harness it started from.
     components: Vec<String>,
+    /// For a composer that kept edits in its notes and wrote none: what
+    /// slag copied from the candidates on its word.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applied: Vec<String>,
     #[serde(skip)]
     dir: PathBuf,
     #[serde(skip)]
     start: PathBuf,
     #[serde(skip)]
     notes: String,
+}
+
+/// Where a stage started: the clock, the run ledger, and the budget.
+struct Mark {
+    clock: Instant,
+    ledger: Usage,
+    dollars: f64,
+    unpriced: u64,
 }
 
 /// One stage's cost.
@@ -285,7 +307,10 @@ struct Stage {
     completion_tokens: u64,
     total_tokens: u64,
     spend: String,
+    /// Priced dollars, estimated at the dated list rates.
     usd: Option<f64>,
+    /// Tokens from calls no price covered.
+    unpriced_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,6 +345,8 @@ pub(super) struct Record {
     notes: Vec<String>,
     library: Option<String>,
     reflection: Option<String>,
+    /// slag's own confidence in the admitted lesson, from run counts.
+    confidence: Option<String>,
     total: Option<Stage>,
     verdict: Option<String>,
 }
@@ -374,7 +401,7 @@ pub(super) async fn run(ctx: &Ctx<'_>, baseline: Option<&Run>, settings: Setting
         None => std::fs::create_dir_all(&base)?,
     }
     let mode = if settings.sequential { "sequential" } else { "parallel" };
-    let record = Record {
+    let mut record = Record {
         run: run_id.clone(),
         issue: ctx.issue.title.clone(),
         domain: settings.domain.clone(),
@@ -386,12 +413,7 @@ pub(super) async fn run(ctx: &Ctx<'_>, baseline: Option<&Run>, settings: Setting
         adopted: "base".into(),
         ..Default::default()
     };
-    let budget = Budget {
-        usd: settings.usd,
-        tokens: settings.tokens,
-        start: stats::snapshot().ledger.total(),
-        spend: Default::default(),
-    };
+    let budget = Budget { shared: crate::engine::agent::SharedBudget::new(settings.usd, settings.tokens) };
     let sh = Shared {
         run_id,
         run_dir,
@@ -410,6 +432,19 @@ pub(super) async fn run(ctx: &Ctx<'_>, baseline: Option<&Run>, settings: Setting
             sh.settings.k, sh.settings.editor_model, sh.settings.usd, sh.settings.tokens, sh.settings.domain
         ),
     );
+    let mut unpriced: Vec<&str> = [ctx.config.model_base.as_str(), sh.settings.editor_model.as_str()]
+        .into_iter()
+        .filter(|m| !priced(m))
+        .collect();
+    unpriced.dedup();
+    if !unpriced.is_empty() {
+        let line = format!(
+            "no price for {}: its calls count toward the token cap only, and spend lines name its tokens apart",
+            unpriced.join(", ")
+        );
+        note(ctx.hooks, &format!("evolve: {line}"), false);
+        record.notes.push(line);
+    }
     let mut ev = Evolved { sh, record };
     let evolver = Evolver { ctx, baseline, sh: &ev.sh };
     let outcome = if ev.sh.settings.sequential {
@@ -558,22 +593,26 @@ impl Evolver<'_, '_> {
         tui::status_line(glyph, color, text);
     }
 
-    fn mark(&self) -> (Instant, Usage) {
-        (Instant::now(), stats::snapshot().ledger.total())
+    fn mark(&self) -> Mark {
+        let b = &self.sh.budget.shared;
+        Mark { clock: Instant::now(), ledger: stats::snapshot().ledger.total(), dollars: b.dollars(), unpriced: b.unpriced() }
     }
 
     /// Record one stage's time, tokens and spend.
-    fn close(&self, record: &mut Record, name: &str, sessions: usize, (clock, before): (Instant, Usage)) {
-        let used = delta(&stats::snapshot().ledger.total(), &before);
+    fn close(&self, record: &mut Record, name: &str, sessions: usize, mark: Mark) {
+        let used = delta(&stats::snapshot().ledger.total(), &mark.ledger);
+        let b = &self.sh.budget.shared;
+        let (dollars, unpriced) = ((b.dollars() - mark.dollars).max(0.0), b.unpriced().saturating_sub(mark.unpriced));
         let stage = Stage {
             name: name.to_string(),
             sessions,
-            secs: clock.elapsed().as_secs_f64(),
+            secs: mark.clock.elapsed().as_secs_f64(),
             prompt_tokens: used.prompt_tokens,
             completion_tokens: used.completion_tokens,
             total_tokens: tokens_of(&used),
-            spend: crate::engine::pricing::format_cost(&used),
-            usd: used.cost,
+            spend: spend_text(dollars, unpriced),
+            usd: Some(dollars),
+            unpriced_tokens: unpriced,
         };
         self.say("◆", tui::COLD, &stage_line(&stage));
         record.stages.push(stage);
@@ -732,7 +771,13 @@ impl Evolver<'_, '_> {
                 smith: SmithOpts {
                     harness: Some(Arc::new(Harness::load(dir))),
                     transcripts: Some(self.sh.run_dir.clone()),
-                    spend: Some((self.sh.budget.spend.clone(), self.sh.budget.usd)),
+                    // The reference runs are the plain fix: the cap may
+                    // stop what comes after them, never them midway.
+                    budget: Some(if kind == Kind::Reference {
+                        self.sh.budget.shared.counting_only()
+                    } else {
+                        self.sh.budget.shared.clone()
+                    }),
                 },
             };
             let mut phases = Phases::default();
@@ -956,7 +1001,7 @@ impl Evolver<'_, '_> {
              after reading the runs: KEEP_BASE is an answer about evidence you have read.\n\n{}",
             evidence_map(&ws, base_runs)
         );
-        self.edit(label, kind, round, &ws, start, prompts::editor(dim, i, k), task).await
+        self.edit(label, kind, round, &ws, start, prompts::editor(dim, i, k), task, &[]).await
     }
 
     /// Prompts 3 and 4: one composer over the candidate pool.
@@ -1006,16 +1051,20 @@ impl Evolver<'_, '_> {
         let task = format!(
             "You are composer `{label}` ({j} of {}). Read `context/task.md`, the base runs, and for \
              every candidate its `diff.md`, `notes.md` and `run/`, then compose `context/harness/`. \
-             Decide only after reading them.\n\n{}",
+             Decide only after reading them. To keep a candidate's edit, write it with the \
+             write_file tool: the content of `context/candidates/<label>/harness/<path>` goes to \
+             `context/harness/<path>`. Notes alone change no file.\n\n{}",
             if round.is_some() { 1 } else { k },
             evidence_map(&ws, runs)
         );
-        self.edit(label, Kind::Composed, round.unwrap_or(1), &ws, start, system, task).await
+        self.edit(label, Kind::Composed, round.unwrap_or(1), &ws, start, system, task, pool).await
     }
 
     /// One harness-writing session: run it, validate what it left in
     /// `context/harness/`, retry once with the validator's message, and
     /// fall back to `start` when it still fails. The fallback is recorded.
+    /// A composer whose notes keep edits from `pool` but who wrote none
+    /// gets them copied on its word before any retry.
     #[allow(clippy::too_many_arguments)]
     async fn edit(
         &self,
@@ -1026,6 +1075,7 @@ impl Evolver<'_, '_> {
         start: &Path,
         system: String,
         task: String,
+        pool: &[Candidate],
     ) -> Result<Candidate, SlagError> {
         let edited = ws.join("context").join("harness");
         let out = self.sh.run_dir.join("harness").join(label);
@@ -1038,6 +1088,7 @@ impl Evolver<'_, '_> {
             fallback: None,
             dropped: Vec::new(),
             components: Vec::new(),
+            applied: Vec::new(),
             dir: out.clone(),
             start: start.to_path_buf(),
             notes: String::new(),
@@ -1045,7 +1096,15 @@ impl Evolver<'_, '_> {
         let checked = match soft(self.improver(label, ws, system.clone(), task.clone(), &WRITER_TOOLS, EDITOR_TURNS).await)? {
             Err(e) => Err(format!("the session failed: {e}")),
             Ok(reply) => {
-                let first = check_tree(&edited, start, &reply).await;
+                let mut first = check_tree(&edited, start, &reply).await;
+                if first.is_err() && harness::tree(&edited) == harness::tree(start) {
+                    cand.applied = apply_kept(&reply, pool, &edited);
+                    if !cand.applied.is_empty() {
+                        let line = format!("{label}: wrote nothing; applied the edits its notes keep: {}", cand.applied.join(", "));
+                        note(self.ctx.hooks, &tui::truncate(&line, 160), false);
+                        first = check_tree(&edited, start, &reply).await;
+                    }
+                }
                 cand.notes = reply;
                 match first {
                     Ok(dropped) => Ok(dropped),
@@ -1134,8 +1193,8 @@ impl Evolver<'_, '_> {
             .with_role(crate::engine::Role::Harness)
             .with_context_window(window)
             .with_effort(config.effort.or(Some(crate::engine::Effort::Medium)))
-            .with_ingot_spend(self.sh.budget.spend.clone())
-            .with_cost_cap(Some(self.sh.budget.usd))
+            .with_cost_cap(None)
+            .with_shared_budget(Some(self.sh.budget.shared.clone()))
             .with_max_turns(max_turns)
             .with_tool_allowlist(tools)
             .with_required_reads(required_reads(ws))
@@ -1485,15 +1544,35 @@ impl Evolved {
             .iter()
             .any(|c| c.outcome == "edited" && harness::tree(&c.dir) != base);
         let backed = backed_rows(&rows, &self.record);
-        let line = match (library::admit(lesson.as_ref(), edited, &rows, &backed), &self.sh.settings.library, lesson) {
+        let supports: Vec<Support> = backed.iter().map(|r| support(r, &self.record)).collect();
+        let confidence = measured_confidence(&supports);
+        let measured: Vec<String> = supports.iter().map(Support::line).collect();
+        let labels: Vec<&str> = self
+            .record
+            .runs
+            .iter()
+            .map(|r| r.label.as_str())
+            .chain(self.record.candidates.iter().map(|c| c.label.as_str()))
+            .collect();
+        let admitted = library::admit(lesson.as_ref(), edited, &rows, &backed, &labels);
+        if admitted.is_ok() {
+            self.record.confidence = Some(confidence.clone());
+        }
+        let line = match (admitted, &self.sh.settings.library, lesson) {
             (Ok(()), Some(lib), Some(lesson)) => {
                 let repository = self.sh.top.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let adopted = self.adopted();
-                let mut evidence: Vec<(String, PathBuf)> = Vec::new();
-                for row in &backed {
-                    for c in carriers(row, &self.record) {
-                        if c.label != self.record.adopted && !evidence.iter().any(|(l, _)| *l == c.label) {
-                            evidence.push((c.label.clone(), c.dir.clone()));
+                // A rejected candidate's edit that helped travels with the
+                // entry; one that hurt is on record in the rows, never
+                // applied.
+                let mut evidence: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+                for row in backed.iter().filter(|r| r.verdict.starts_with("helped")) {
+                    let component = component_of(row).to_string();
+                    for c in carriers(row, &self.record).into_iter().filter(|c| c.label != self.record.adopted) {
+                        match evidence.iter_mut().find(|(l, _, _)| *l == c.label) {
+                            Some((_, _, parts)) if !parts.contains(&component) => parts.push(component.clone()),
+                            Some(_) => {}
+                            None => evidence.push((c.label.clone(), c.dir.clone(), vec![component.clone()])),
                         }
                     }
                 }
@@ -1505,9 +1584,15 @@ impl Evolved {
                     lesson: &lesson,
                     rows: &rows,
                     evidence: &evidence,
+                    confidence: &confidence,
+                    measured: &measured,
                 };
+                let level = confidence.split(':').next().unwrap_or("low");
                 match lib.add(&self.sh.settings.domain, &entry) {
-                    Ok(dir) => format!("added {}", dir.strip_prefix(&lib.root).unwrap_or(&dir).display()),
+                    Ok(dir) => format!(
+                        "added {} (confidence {level}, by slag's run counts)",
+                        dir.strip_prefix(&lib.root).unwrap_or(&dir).display()
+                    ),
                     Err(e) => format!("no entry: could not write the library: {e}"),
                 }
             }
@@ -1591,11 +1676,9 @@ impl Evolved {
             prompt_tokens: self.record.stages.iter().map(|s| s.prompt_tokens).sum(),
             completion_tokens: self.record.stages.iter().map(|s| s.completion_tokens).sum(),
             total_tokens: self.record.stages.iter().map(|s| s.total_tokens).sum(),
-            spend: {
-                let used = self.sh.budget.used();
-                crate::engine::pricing::format_cost(&used)
-            },
-            usd: self.sh.budget.used().cost,
+            spend: spend_text(self.sh.budget.shared.dollars(), self.sh.budget.shared.unpriced()),
+            usd: Some(self.sh.budget.shared.dollars()),
+            unpriced_tokens: self.sh.budget.shared.unpriced(),
         };
         self.record.total = Some(total.clone());
         persist(&self.sh, &self.record);
@@ -1650,8 +1733,7 @@ fn stage_line(s: &Stage) -> String {
         "session"
     };
     let count = if s.sessions == 1 { format!("1 {unit}") } else { format!("{} {unit}s", s.sessions) };
-    let spend = if s.usd.is_some() { s.spend.as_str() } else { "spend unknown" };
-    format!("{:<10} {count} · {:.1}s · {} tok · {spend}", s.name, s.secs, token_count(s.total_tokens))
+    format!("{:<10} {count} · {:.1}s · {} tok · {}", s.name, s.secs, token_count(s.total_tokens), s.spend)
 }
 
 fn token_count(n: u64) -> String {
@@ -1676,51 +1758,183 @@ enum Contrast {
 /// whether it verified, how strongly it showed the bug, its tool errors
 /// (one fewer or more than the reference mean), its turns (two).
 fn contrast(r: &Rollout, base: &[&Rollout]) -> Contrast {
+    judge(r, base).0
+}
+
+/// A contrast with the measure that decided it and the difference it saw.
+/// `verified` and `reproduction` judge the outcome; `tool errors` and
+/// `turns` only the path to it.
+fn judge(r: &Rollout, base: &[&Rollout]) -> (Contrast, &'static str, String) {
     let all = |f: &dyn Fn(&Rollout) -> bool| base.iter().all(|b| f(b));
     if r.verified && all(&|b| !b.verified) {
-        return Contrast::Better;
+        return (Contrast::Better, "verified", "verified where the reference runs did not".into());
     }
     if !r.verified && all(&|b| b.verified) {
-        return Contrast::Worse;
+        return (Contrast::Worse, "verified", "did not verify where the reference runs did".into());
     }
     if r.verified {
+        let ranks = base.iter().map(|b| b.repro_rank.to_string()).collect::<Vec<_>>().join("/");
+        let shown = format!("showed the bug at rank {} against {ranks} for the reference", r.repro_rank);
         if all(&|b| b.repro_rank < r.repro_rank) {
-            return Contrast::Better;
+            return (Contrast::Better, "reproduction", shown);
         }
         if all(&|b| b.repro_rank > r.repro_rank) {
-            return Contrast::Worse;
+            return (Contrast::Worse, "reproduction", shown);
         }
     }
     let mean = |f: &dyn Fn(&Rollout) -> f64| base.iter().map(|b| f(b)).sum::<f64>() / base.len().max(1) as f64;
     let errors = r.metrics.tool_errors as f64 - mean(&|b| b.metrics.tool_errors as f64);
+    let error_text = format!("{errors:+.1} tool errors against the reference mean");
     if errors <= -1.0 {
-        return Contrast::Better;
+        return (Contrast::Better, "tool errors", error_text);
     }
     if errors >= 1.0 {
-        return Contrast::Worse;
+        return (Contrast::Worse, "tool errors", error_text);
     }
     let turns = r.metrics.turns as f64 - mean(&|b| b.metrics.turns as f64);
+    let turn_text = format!("{turns:+.1} turns against the reference mean");
     if turns <= -2.0 {
-        Contrast::Better
+        (Contrast::Better, "turns", turn_text)
     } else if turns >= 2.0 {
-        Contrast::Worse
+        (Contrast::Worse, "turns", turn_text)
     } else {
-        Contrast::Same
+        (Contrast::Same, "none", "no measure separated it from the reference".into())
     }
 }
 
-/// The candidates that changed the component a row names, as an edited
-/// harness. The row may spell the path from the working directory.
-fn carriers<'r>(row: &library::EditRow, record: &'r Record) -> Vec<&'r Candidate> {
+/// What slag's numbers say behind one row: the runs that carried its edit,
+/// how many of them agree with the verdict and how many contradict it,
+/// against how many reference runs, and on which measures.
+#[derive(Debug, Clone, PartialEq)]
+struct Support {
+    row: String,
+    carried: usize,
+    agree: usize,
+    against: usize,
+    base: usize,
+    /// Every agreeing run decided on whether it verified or caught the bug.
+    outcome: bool,
+    detail: Vec<String>,
+}
+
+impl Support {
+    /// `high`, `medium` or `low`, from the counts alone. One run against
+    /// one, or a difference in turns or tool errors only, stays `low`:
+    /// either can come from chance.
+    fn level(&self) -> &'static str {
+        if self.against > 0 || !self.outcome {
+            "low"
+        } else if self.agree >= 3 && self.base >= 2 {
+            "high"
+        } else if self.agree >= 2 {
+            "medium"
+        } else {
+            "low"
+        }
+    }
+
+    fn line(&self) -> String {
+        let runs = |n: usize| if n == 1 { "1 run".to_string() } else { format!("{n} runs") };
+        let mut s = format!(
+            "{}: {} of {} that carried the edit agree, {} against, beside {} of the reference ({})",
+            self.row,
+            self.agree,
+            runs(self.carried),
+            self.against,
+            runs(self.base),
+            self.detail.join("; ")
+        );
+        if self.level() == "low" {
+            let why = if self.against > 0 {
+                "the runs disagree"
+            } else if !self.outcome {
+                "turns or tool errors alone can come from chance"
+            } else {
+                "too few runs to tell it from chance"
+            };
+            s.push_str(&format!(", could be noise: {why}"));
+        }
+        s
+    }
+}
+
+fn support(row: &library::EditRow, record: &Record) -> Support {
+    let base: Vec<&Rollout> = record.runs.iter().filter(|r| r.kind == Kind::Reference).collect();
+    let carriers: Vec<&str> = carriers(row, record).into_iter().map(|c| c.label.as_str()).collect();
+    let (want, opposite) =
+        if row.verdict.starts_with("hurt") { (Contrast::Worse, Contrast::Better) } else { (Contrast::Better, Contrast::Worse) };
+    let mut s = Support {
+        row: format!("{} {}", row.component.trim(), row.verdict.trim()),
+        carried: 0,
+        agree: 0,
+        against: 0,
+        base: base.len(),
+        outcome: true,
+        detail: Vec::new(),
+    };
+    for r in record
+        .runs
+        .iter()
+        .filter(|r| r.reused.is_none() && r.kind != Kind::Reference && carriers.contains(&r.harness.as_str()))
+    {
+        let (c, measure, effect) = judge(r, &base);
+        s.carried += 1;
+        if c == want {
+            s.agree += 1;
+            s.outcome &= matches!(measure, "verified" | "reproduction");
+        } else if c == opposite {
+            s.against += 1;
+        }
+        s.detail.push(format!("{} {}", r.label, effect));
+    }
+    s.outcome &= s.agree > 0;
+    s
+}
+
+/// slag's confidence in a lesson: the best level among its backed rows,
+/// with the run counts that set it.
+fn measured_confidence(backed: &[Support]) -> String {
+    let rank = |l: &str| match l {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    };
+    match backed.iter().max_by_key(|s| rank(s.level())) {
+        Some(best) => format!("{}: {}", best.level(), best.line()),
+        None => "low: no row is backed".into(),
+    }
+}
+
+/// The harness path a row names; the row may spell it from the working
+/// directory.
+fn component_of(row: &library::EditRow) -> &str {
     let component = row.component.trim().trim_start_matches("./");
-    let component = component
+    component
         .strip_prefix("context/harness/")
         .or_else(|| component.strip_prefix("harness/"))
-        .unwrap_or(component);
-    record
+        .unwrap_or(component)
+}
+
+/// The candidates that carried the edit a row describes: they changed the
+/// component it names. Two candidates can change one file in different
+/// ways, so when the row names its candidates, a carrier is one of them,
+/// or holds the same bytes there as one of them (a composer that kept it).
+fn carriers<'r>(row: &library::EditRow, record: &'r Record) -> Vec<&'r Candidate> {
+    let component = component_of(row);
+    let changed: Vec<&Candidate> = record
         .candidates
         .iter()
         .filter(|c| c.outcome == "edited" && c.components.iter().any(|p| p == component))
+        .collect();
+    let named: Vec<&Candidate> = changed.iter().copied().filter(|c| library::cites(&row.candidates, &c.label)).collect();
+    if named.is_empty() {
+        return changed;
+    }
+    let bytes = |c: &Candidate| std::fs::read(c.dir.join(component)).ok();
+    let theirs: Vec<Option<Vec<u8>>> = named.iter().map(|c| bytes(c)).collect();
+    changed
+        .into_iter()
+        .filter(|c| named.iter().any(|n| n.label == c.label) || theirs.contains(&bytes(c)))
         .collect()
 }
 
@@ -1810,6 +2024,59 @@ pub(super) fn guard(dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A composer that keeps edits in its notes and writes none of them
+/// leaves an unchanged tree. Each `kept` or `revised` line names
+/// candidates from `pool`, and maybe some of their components; copy those
+/// components from the candidates' trees into `edited`, all of a
+/// candidate's when the line names none. A revision that was never
+/// written applies as the candidate had it, and the line says so.
+fn apply_kept(notes: &str, pool: &[Candidate], edited: &Path) -> Vec<String> {
+    let mut applied: Vec<String> = Vec::new();
+    for line in notes.lines() {
+        let l = line.trim().trim_start_matches(['-', '*', ' ', '`']).to_ascii_lowercase();
+        let revised = l.starts_with("revised");
+        if !(l.starts_with("kept") || revised) {
+            continue;
+        }
+        for c in pool.iter().filter(|c| c.outcome == "edited" && library::cites(&l, &c.label)) {
+            let named: Vec<&String> = c.components.iter().filter(|p| names_component(&l, p)).collect();
+            let take: Vec<&String> = if named.is_empty() { c.components.iter().collect() } else { named };
+            for p in take {
+                let (src, dst) = (c.dir.join(p), edited.join(p));
+                let done = if src.is_file() {
+                    dst.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::copy(&src, &dst).is_ok()
+                } else {
+                    std::fs::remove_file(&dst).is_ok()
+                };
+                let what = format!("{}/{p}{}", c.label, if revised { " (its revision was never written)" } else { "" });
+                if done && !applied.contains(&what) {
+                    applied.push(what);
+                }
+            }
+        }
+    }
+    applied
+}
+
+/// Whether a notes line names a harness component: its path, its recipe,
+/// or its file name.
+fn names_component(line: &str, path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    if line.contains(&path) {
+        return true;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    match parts.as_slice() {
+        ["recipes", name, ..] => {
+            line.contains(&format!("recipes/{name}"))
+                || line.contains(&format!("recipe {name}"))
+                || line.contains(&format!("recipe `{name}`"))
+        }
+        [file] => line.contains(file.rsplit_once('.').map_or(*file, |(stem, _)| stem)),
+        _ => parts.last().is_some_and(|f| line.contains(f)),
+    }
 }
 
 /// Validate what a writing session left, after one check of its own: an
@@ -2223,7 +2490,7 @@ mod tests {
             },
             run_id: "t".into(),
             run_dir: top.join(".slag/evolve/t"),
-            budget: Budget { usd: 1.0, tokens: 1, start: Usage::default(), spend: Default::default() },
+            budget: Budget { shared: crate::engine::agent::SharedBudget::new(1.0, 1) },
             top: top.to_path_buf(),
             prefix: String::new(),
             base: top.join(".slag/evolve/t/harness/base"),
@@ -2317,6 +2584,7 @@ mod tests {
             fallback: None,
             dropped: Vec::new(),
             components: components.iter().map(|c| c.to_string()).collect(),
+            applied: Vec::new(),
             dir: PathBuf::new(),
             start: PathBuf::new(),
             notes: String::new(),
@@ -2342,6 +2610,115 @@ mod tests {
         ];
         let backed: Vec<String> = backed_rows(&rows, &record).into_iter().map(|r| format!("{} {}", r.component, r.verdict)).collect();
         assert_eq!(backed, ["harness/systemprompt.md helped", "recipes/x/RECIPE.md hurt"]);
+
+        // One run against one is low however clear it looks, and a turn
+        // count alone is low too: both can come from chance.
+        let one = support(&rows[0], &record);
+        assert_eq!((one.carried, one.agree, one.against, one.base, one.level()), (1, 1, 0, 1, "low"));
+        assert!(one.line().contains("inv-1 showed the bug at rank 2") && one.line().contains("too few runs"), "{}", one.line());
+        let turns = support(&rows[2], &record);
+        assert_eq!(turns.level(), "low");
+        assert!(turns.line().contains("turns or tool errors alone"), "{}", turns.line());
+        assert!(measured_confidence(&[one, turns]).starts_with("low: "));
+    }
+
+    #[test]
+    fn two_edits_to_one_file_are_two_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cand = |label: &str, kind: Kind, prompt: &str| {
+            std::fs::create_dir_all(dir.path().join(label)).unwrap();
+            std::fs::write(dir.path().join(label).join("systemprompt.md"), prompt).unwrap();
+            Candidate {
+                label: label.into(),
+                kind,
+                round: 1,
+                outcome: "edited".into(),
+                retried: false,
+                fallback: None,
+                dropped: Vec::new(),
+                components: vec!["systemprompt.md".into()],
+                applied: Vec::new(),
+                dir: dir.path().join(label),
+                start: PathBuf::new(),
+                notes: String::new(),
+            }
+        };
+        let mut inv = run("inv-1", Kind::Invariant, true, &["a.py"], 6, 0);
+        inv.harness = "inv-1".into();
+        let mut dom = run("dom-1", Kind::Domain, false, &[], 6, 2);
+        dom.harness = "dom-1".into();
+        let mut comp = run("comp-1-run", Kind::Composed, true, &["a.py"], 6, 0);
+        comp.harness = "comp-1".into();
+        let record = Record {
+            runs: vec![run("base-1", Kind::Reference, false, &[], 6, 0), inv, dom, comp],
+            candidates: vec![
+                cand("inv-1", Kind::Invariant, "Run the full suite.\n"),
+                cand("dom-1", Kind::Domain, "Think about time zones.\n"),
+                cand("comp-1", Kind::Composed, "Run the full suite.\n"),
+            ],
+            ..Default::default()
+        };
+        let row = |candidates: &str, verdict: &str| library::EditRow {
+            component: "harness/systemprompt.md".into(),
+            candidates: candidates.into(),
+            verdict: verdict.into(),
+            ..Default::default()
+        };
+        let labels = |r: &library::EditRow| carriers(r, &record).iter().map(|c| c.label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels(&row("inv-1", "helped")), ["inv-1", "comp-1"], "the composer kept inv-1's bytes");
+        assert_eq!(labels(&row("dom-1", "hurt")), ["dom-1"]);
+        assert_eq!(labels(&row("", "helped")).len(), 3, "a row that names no candidate counts every edit to the file");
+        let helped = support(&row("inv-1", "helped"), &record);
+        assert_eq!((helped.agree, helped.against, helped.level()), (2, 0, "medium"), "dom-1's other edit is not against it");
+        assert_eq!(backed_rows(&[row("inv-1", "helped"), row("dom-1", "hurt")], &record).len(), 2);
+    }
+
+    #[test]
+    fn confidence_rises_only_with_agreeing_outcome_runs() {
+        let cand = |label: &str| Candidate {
+            label: label.into(),
+            kind: Kind::Invariant,
+            round: 1,
+            outcome: "edited".into(),
+            retried: false,
+            fallback: None,
+            dropped: Vec::new(),
+            components: vec!["memory.md".into()],
+            applied: Vec::new(),
+            dir: PathBuf::new(),
+            start: PathBuf::new(),
+            notes: String::new(),
+        };
+        let carried = |label: &str, harness: &str, verified: bool| {
+            let mut r = run(label, Kind::Invariant, verified, &["value.txt"], 6, 0);
+            r.harness = harness.into();
+            r
+        };
+        let row = library::EditRow { component: "memory.md".into(), verdict: "helped".into(), ..Default::default() };
+        let mut record = Record {
+            runs: vec![
+                run("base-1", Kind::Reference, false, &[], 6, 0),
+                carried("inv-1", "inv-1", true),
+                carried("comp-1", "comp-1", true),
+            ],
+            candidates: vec![cand("inv-1"), cand("comp-1")],
+            ..Default::default()
+        };
+        assert_eq!(support(&row, &record).level(), "medium", "two agreeing runs");
+        record.runs.push(run("base-2", Kind::Reference, false, &[], 6, 0));
+        record.runs.push(carried("inv-2", "inv-1", true));
+        let three = support(&row, &record);
+        assert_eq!((three.agree, three.base, three.level()), (3, 2, "high"));
+        assert!(measured_confidence(&[three]).starts_with("high: memory.md helped: 3 of 3 runs"));
+        record.runs.push(carried("inv-3", "inv-1", false));
+        let split = support(&row, &record);
+        assert_eq!((split.against, split.level()), (0, "high"), "an unverified run beside unverified references is no contrast");
+        let mut worse = run("comp-2", Kind::Composed, false, &[], 14, 3);
+        worse.harness = "comp-1".into();
+        record.runs[0].verified = true;
+        record.runs.push(worse);
+        let mixed = support(&row, &record);
+        assert!(mixed.against > 0 && mixed.level() == "low" && mixed.line().contains("the runs disagree"), "{}", mixed.line());
     }
 
     #[test]
@@ -2379,7 +2756,65 @@ mod tests {
     }
 
     #[test]
-    fn a_stage_line_names_its_unit_and_an_unknown_spend() {
+    fn a_composer_that_only_names_its_kept_edits_gets_them_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = |label: &str, files: &[(&str, &str)]| {
+            let d = dir.path().join(label);
+            for (p, body) in files {
+                std::fs::create_dir_all(d.join(p).parent().unwrap()).unwrap();
+                std::fs::write(d.join(p), body).unwrap();
+            }
+            d
+        };
+        let cand = |label: &str, components: &[&str], outcome: &str| Candidate {
+            label: label.into(),
+            kind: Kind::Invariant,
+            round: 1,
+            outcome: outcome.into(),
+            retried: false,
+            fallback: None,
+            dropped: Vec::new(),
+            components: components.iter().map(|c| c.to_string()).collect(),
+            applied: Vec::new(),
+            dir: dir.path().join(label),
+            start: PathBuf::new(),
+            notes: String::new(),
+        };
+        tree("inv-1", &[("systemprompt.md", "Reproduce first.\n"), ("memory.md", "Tests: bash.\n")]);
+        tree("dom-1", &[("recipes/ends/RECIPE.md", "---\nname: ends\n---\n")]);
+        tree("inv-10", &[("guardrails.md", "never\n")]);
+        let pool = [
+            cand("inv-1", &["systemprompt.md", "memory.md"], "edited"),
+            cand("dom-1", &["recipes/ends/RECIPE.md"], "edited"),
+            cand("inv-10", &["guardrails.md"], "edited"),
+        ];
+        let edited = tree("composed", &[("memory.md", "old\n")]);
+        let notes = "<notes>\n- kept -> inv-1/systemprompt.md -> failed in 1/1 base runs\n                     revised -> dom-1 recipe ends -> base-1 never tested the end\n                     dropped -> inv-10 guardrails -> no run needed it\n</notes>";
+        let applied = apply_kept(notes, &pool, &edited);
+        assert_eq!(applied, ["inv-1/systemprompt.md", "dom-1/recipes/ends/RECIPE.md (its revision was never written)"]);
+        assert_eq!(std::fs::read_to_string(edited.join("systemprompt.md")).unwrap(), "Reproduce first.\n");
+        assert_eq!(std::fs::read_to_string(edited.join("memory.md")).unwrap(), "old\n", "a component the line does not name stays");
+        assert!(edited.join("recipes/ends/RECIPE.md").exists() && !edited.join("guardrails.md").exists());
+        // A line that names the candidate alone keeps all of it; a
+        // fallen-back candidate has nothing to give.
+        let all = apply_kept("kept -> everything inv-1 did", &pool, &edited);
+        assert_eq!(all, ["inv-1/systemprompt.md", "inv-1/memory.md"]);
+        let fell = [cand("inv-1", &["systemprompt.md"], "fallback")];
+        assert!(apply_kept("kept -> inv-1", &fell, &edited).is_empty());
+    }
+
+    #[test]
+    fn a_model_is_priced_by_the_list_or_by_openrouter_never_by_a_guess() {
+        assert!(priced("mistral::ministral-3b-latest"));
+        assert!(priced("openai::gpt-4.1"));
+        assert!(priced("openrouter::mistralai/ministral-8b"), "OpenRouter reports each call's cost");
+        assert!(!priced("mistral::ministral-99b-latest"));
+        assert_eq!(spend_text(0.0, 0), "≈ $0.0000 est.");
+        assert_eq!(spend_text(0.01234, 2_500), "≈ $0.0123 est. + 2.5k unpriced tokens");
+    }
+
+    #[test]
+    fn a_stage_line_names_its_unit_and_always_an_estimate() {
         let stage = Stage {
             name: "probe".into(),
             sessions: 2,
@@ -2387,12 +2822,13 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 500,
             total_tokens: 1_500,
-            spend: "spend unknown · 1.0k in / 500 out tokens".into(),
-            usd: None,
+            spend: spend_text(0.0042, 0),
+            usd: Some(0.0042),
+            unpriced_tokens: 0,
         };
-        assert_eq!(stage_line(&stage), "probe      2 runs · 3.2s · 1.5k tok · spend unknown");
-        let priced = Stage { name: "compose".into(), sessions: 1, usd: Some(0.0042), spend: "$0.0042".into(), ..stage };
-        assert_eq!(stage_line(&priced), "compose    1 session · 3.2s · 1.5k tok · $0.0042");
+        assert_eq!(stage_line(&stage), "probe      2 runs · 3.2s · 1.5k tok · ≈ $0.0042 est.");
+        let partly = Stage { name: "compose".into(), sessions: 1, spend: spend_text(0.0, 1_500), unpriced_tokens: 1_500, ..stage };
+        assert_eq!(stage_line(&partly), "compose    1 session · 3.2s · 1.5k tok · ≈ $0.0000 est. + 1.5k unpriced tokens");
         assert_eq!(headline("the harness failed validation:\n- recipe `x` has no trigger\n- y"), "recipe `x` has no trigger");
     }
 }

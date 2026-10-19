@@ -443,9 +443,17 @@ Too generic is useless (\"be thorough\"); too specific never fires again (\"the 
 on Jan 1\"). Aim between: \"when an issue reports a range that loses its last element, add a \
 recipe that makes the agent test both range ends before editing\".
 
-The `evidence` field cites the edit rows the lesson rests on. A lesson resting only on \
-`confounded` rows is a guess: narrow it to what the record does show, or decline. Adoption \
-alone never establishes that an edit helped. If the record shows no concrete, reusable \
+The `evidence` field cites the edit rows the lesson rests on and the runs behind them by \
+label (`base-1`, `inv-1`), with how many runs stand on each side and the size of the \
+difference (verified or not, turns, tool errors). A lesson resting only on `confounded` rows \
+is a guess: narrow it to what the record does show, or decline. Adoption alone never \
+establishes that an edit helped.
+
+`confidence` follows the counts, not the story. One run against one run is `low`: a single \
+pair can differ by chance. A difference in turns or tool errors alone is `low`. `medium` needs \
+at least two runs that carried the edit agreeing on whether the fix verified or the new test \
+caught the bug; `high` needs at least three such runs and two reference runs, with none \
+disagreeing. slag measures this itself and records its own figure beside yours. If the record shows no concrete, reusable \
 execution contrast, write the single line NO_ENTRY in place of the <experience> block. The \
 edit rows are still worth writing.
 
@@ -475,8 +483,8 @@ verdict: <helped|hurt|no observed effect|confounded>
 <experience>
 cue: <the shape of situation this applies to>
 lesson: <the transferable operation, naming the component>
-evidence: <the edit rows this rests on, and the execution contrast>
-confidence: <high|medium|low, and why>
+evidence: <the edit rows and the runs by label, how many on each side, and the difference>
+confidence: <high|medium|low, and the run counts that set it>
 </experience>";
 
 #[cfg(test)]

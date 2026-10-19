@@ -402,7 +402,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     let library = harnessed
         .then(|| crate::harness::library::Library::resolve(job.args.library.as_deref(), &job.cwd))
         .flatten();
-    let base = base_harness(job, &issue, &domain, library.as_ref(), hooks).await?;
+    let (base, harness_line) = base_harness(job, &issue, &domain, library.as_ref(), hooks).await?;
     ctx.smith.harness = base.as_deref().map(|d| Arc::new(crate::harness::Harness::load(d)));
 
     let mut failure: Option<Failure> = None;
@@ -495,6 +495,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         spend: None,
         evolve: None,
     };
+    out.notes.extend(harness_line);
     if let Some(git) = &job.git {
         out.stat = git.stat(&changed);
         let reverted = git.reverted(&before);
@@ -703,15 +704,16 @@ async fn base_harness(
     domain: &str,
     library: Option<&crate::harness::library::Library>,
     hooks: &EngineHooks,
-) -> Result<Option<PathBuf>, SlagError> {
+) -> Result<(Option<PathBuf>, Option<String>), SlagError> {
     let spec = job.args.harness.as_deref().map(str::trim).unwrap_or_default();
     let scratch = job.cwd.join(".slag").join("harness");
+    let from;
     let dir = match spec {
-        "" | "none" => return Ok(None),
+        "" | "none" => return Ok((None, None)),
         "library" => {
             let Some(lib) = library else {
                 note(hooks, "harness: no library is configured; running without one", false);
-                return Ok(None);
+                return Ok((None, None));
             };
             let dst = scratch.join("library");
             let repository = job
@@ -723,9 +725,13 @@ async fn base_harness(
             let used = lib.apply(domain, &issue.render(), &repository, &dst);
             if used.is_empty() {
                 note(hooks, &format!("harness: no {domain} library entry applies here; running without one"), false);
-                return Ok(None);
+                return Ok((None, None));
             }
-            note(hooks, &format!("harness: {domain} library entries {}", used.join(", ")), true);
+            let entries: Vec<String> =
+                used.iter().map(|(id, parts)| format!("{id} ({})", parts.join(", "))).collect();
+            let line = format!("harness from the {domain} library: {}", entries.join("; "));
+            note(hooks, &line, true);
+            from = Some(line);
             dst
         }
         path => {
@@ -735,6 +741,7 @@ async fn base_harness(
             }
             let dst = scratch.join("given");
             crate::harness::copy_tree(&given, &dst)?;
+            from = None;
             dst
         }
     };
@@ -742,12 +749,14 @@ async fn base_harness(
         Ok(_) => {
             let loaded = crate::harness::Harness::load(&dir);
             note(hooks, &format!("harness: {}", loaded.summary()), true);
-            Ok((!loaded.is_empty()).then_some(dir))
+            let from = from.unwrap_or_else(|| format!("harness from {spec}: {}", loaded.summary()));
+            Ok(if loaded.is_empty() { (None, None) } else { (Some(dir), Some(from)) })
         }
         Err(why) => {
             let first = why.lines().find_map(|l| l.trim().strip_prefix("- ")).unwrap_or(why.as_str());
-            note(hooks, &format!("harness dropped, it failed validation: {first}"), false);
-            Ok(None)
+            let line = format!("harness dropped, it failed validation: {first}");
+            note(hooks, &line, false);
+            Ok((None, Some(line)))
         }
     }
 }
@@ -802,7 +811,7 @@ struct Ctx<'a> {
 struct SmithOpts {
     harness: Option<Arc<crate::harness::Harness>>,
     transcripts: Option<PathBuf>,
-    spend: Option<(crate::engine::agent::SpendAccum, f64)>,
+    budget: Option<crate::engine::agent::SharedBudget>,
 }
 
 /// One session, judged by slag.
@@ -862,8 +871,8 @@ impl Ctx<'_> {
         )
         .with_harness(self.smith.harness.clone())
         .with_transcript_root(self.smith.transcripts.clone());
-        if let Some((spend, cap)) = &self.smith.spend {
-            smith = smith.with_ingot_spend(spend.clone()).with_cost_cap(Some(*cap));
+        if let Some(budget) = &self.smith.budget {
+            smith = smith.with_shared_budget(Some(budget.clone()));
         }
         let smith: Box<dyn crate::smith::Smith> = Box::new(smith);
         let clock = std::time::Instant::now();

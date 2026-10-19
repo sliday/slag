@@ -37,6 +37,8 @@ fn memory() -> Value {
 struct Roles {
     systems: Arc<Mutex<Vec<String>>>,
     nudges: Arc<Mutex<Vec<String>>>,
+    /// A composer that names the edits it keeps and writes none.
+    lazy_composer: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn tool_call(calls: Vec<(&str, Value)>) -> ResponseTemplate {
@@ -106,6 +108,9 @@ impl Respond for Roles {
             };
         }
         if first.contains("You are composing") {
+            if self.lazy_composer.load(std::sync::atomic::Ordering::Relaxed) {
+                return text("<notes>\nkept -> inv-1 recipes/tests -> base-1 wrote no test\n</notes>");
+            }
             return match turn {
                 0 => tool_call(vec![
                     ("write_file", recipe()),
@@ -243,7 +248,11 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
     for s in rec["stages"].as_array().unwrap() {
         assert!(s["total_tokens"].as_u64().unwrap() > 0, "every stage spent tokens: {s}");
         assert!(s["secs"].as_f64().is_some() && s["spend"].as_str().is_some(), "{s}");
+        // The mock reports no cost: each stage says so, never a guess.
+        let spend = s["spend"].as_str().unwrap();
+        assert!(spend.starts_with("≈ $0.0000 est. + ") && spend.ends_with("unpriced tokens"), "{s}");
     }
+    assert!(rec["capped"].is_null(), "a model with no price never trips the dollar cap: {rec:#}");
     let cand = |label: &str| rec["candidates"].as_array().unwrap().iter().find(|c| c["label"] == label).unwrap().clone();
     assert_eq!(cand("inv-1")["outcome"], "edited");
     assert_eq!(cand("dom-1")["outcome"], "fallback", "an invalid tree twice falls back: {rec:#}");
@@ -269,13 +278,19 @@ async fn one_evolved_fix_runs_every_stage_and_teaches_the_library() {
     assert!(stdout.contains("without the fix"), "{stdout}");
 
     // Harnessing-level recursion: one contrast-backed entry, indexed.
-    assert!(rec["library"].as_str().unwrap().starts_with("added"), "{rec:#}");
+    let added = rec["library"].as_str().unwrap();
+    assert!(added.starts_with("added") && added.contains("(confidence medium, by slag's run counts)"), "{rec:#}");
+    let confidence = rec["confidence"].as_str().unwrap();
+    assert!(confidence.starts_with("medium: recipes/tests/RECIPE.md helped: 2 of 2 runs"), "inv-1 and comp-1 both carried it: {rec:#}");
     let domain = home.path().join("library/shell");
     let index = std::fs::read_to_string(domain.join("INDEX.md")).unwrap();
     assert!(index.contains("value-is-wrong") && index.contains("recipe tests"), "{index}");
     let entry = std::fs::read_dir(&domain).unwrap().flatten().find(|e| e.path().is_dir()).unwrap().path();
     let exp = std::fs::read_to_string(entry.join("EXPERIENCE.md")).unwrap();
     assert!(exp.contains("cue: the smith fixes the value") && exp.contains("verdict: helped"), "{exp}");
+    assert!(exp.contains("\nconfidence: medium: ") && exp.contains("reflector's confidence: medium, one run each"), "{exp}");
+    assert!(exp.contains("## What slag measured\n\n- recipes/tests/RECIPE.md helped: 2 of 2 runs"), "{exp}");
+    assert!(index.contains("confidence: medium: "), "{index}");
     assert!(std::fs::read_to_string(entry.join("harness/recipes/tests/RECIPE.md")).unwrap().contains(RULE));
 
     // An improver that answered without opening the runs was sent back
@@ -313,17 +328,19 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     let out = run(slag(repo.path(), &server, home.path(), &args)).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("harness: shell library entries"), "{stdout}");
+    let applied = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(applied.contains("harness from the shell library:"), "{stdout}");
+    assert!(applied.contains("recipes/tests") && applied.contains("memory.md") && applied.contains("systemprompt.md"), "{applied}");
     let systems = roles.systems.lock().unwrap().clone();
     assert!(!systems.iter().any(|s| s.contains("You are composing") || s.contains("YOUR DIMENSION")), "no improver ran");
     let smith = systems.iter().find(|s| s.contains("# slag smith")).expect("a smith ran");
     assert!(smith.contains("# Harness") && smith.contains(RULE), "the lesson reached the smith's prompt");
     assert!(smith.contains(FACT), "the repository's own facts come along");
-    assert!(!smith.contains("Keep the change small."), "the adopting task's procedure stays behind");
+    assert!(smith.contains("Keep the change small."), "every component of the entry applies, the system prompt too");
     let files = sh(repo.path(), "git show --name-only --format= HEAD");
     assert!(files.contains("tests/value_test.sh"), "the applied harness changed behavior: {files}");
 
-    // Another repository gets the recipe, not this one's facts.
+    // Another repository gets every component but this one's facts.
     let other = buggy_repo();
     roles.systems.lock().unwrap().clear();
     let out = run(slag(other.path(), &server, home.path(), &args)).await;
@@ -331,7 +348,7 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     assert!(out.status.success(), "{stdout}");
     let systems = roles.systems.lock().unwrap().clone();
     let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
-    assert!(smith.contains(RULE) && !smith.contains(FACT), "{smith}");
+    assert!(smith.contains(RULE) && smith.contains("Keep the change small.") && !smith.contains(FACT), "{smith}");
 
     // Without --harness, the fast path's prompt carries no harness at all.
     let third = buggy_repo();
@@ -342,6 +359,27 @@ async fn the_library_path_applies_the_lesson_with_no_probing() {
     let systems = roles.systems.lock().unwrap().clone();
     let smith = systems.iter().find(|s| s.contains("# slag smith")).unwrap();
     assert!(!smith.contains("# Harness"), "{smith}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_composer_that_only_describes_its_choices_gets_them_applied() {
+    let repo = buggy_repo();
+    let home = tempfile::tempdir().unwrap();
+    let (server, roles) = model().await;
+    roles.lazy_composer.store(true, std::sync::atomic::Ordering::Relaxed);
+    let args = ["fix", "value is wrong", "--test", "bash tests/check.sh", "--evolve", "1"];
+    let out = run(slag(repo.path(), &server, home.path(), &args)).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let rec = record(repo.path());
+    let comp = rec["candidates"].as_array().unwrap().iter().find(|c| c["label"] == "comp-1").unwrap().clone();
+    assert_eq!(comp["outcome"], "edited", "{rec:#}");
+    assert_eq!(comp["retried"], false, "no second session was needed");
+    assert_eq!(comp["applied"], json!(["inv-1/recipes/tests/RECIPE.md"]), "only the edit the line names: {comp}");
+    assert_eq!(comp["components"], json!(["recipes/tests/RECIPE.md"]));
+    let composed = rec["runs"].as_array().unwrap().iter().find(|r| r["label"] == "comp-1-run").unwrap().clone();
+    assert!(composed["files"].as_array().unwrap().contains(&json!("tests/value_test.sh")), "the kept recipe reached the smith: {composed}");
+    assert!(stdout.contains("applied the edits its notes keep"), "{stdout}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
