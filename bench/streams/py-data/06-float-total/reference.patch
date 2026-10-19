@@ -1,0 +1,27 @@
+diff --git a/tallysheet/reconcile.py b/tallysheet/reconcile.py
+index 4552ed1..6f6bd0a 100644
+--- a/tallysheet/reconcile.py
++++ b/tallysheet/reconcile.py
+@@ -1,12 +1,20 @@
+ """Reconciling item price lists against expected totals."""
+ 
++from decimal import ROUND_HALF_UP, Decimal
++
++_CENT = Decimal("0.01")
++
++
++def _cents(text):
++    return Decimal(text).quantize(_CENT, rounding=ROUND_HALF_UP)
++
+ 
+ def total(items):
+     """Sum a list of price strings and return the total as a string
+     with exactly two decimals, rounded half up after summing."""
+-    return f"{sum(float(i) for i in items):.2f}"
++    return str(_cents(str(sum((Decimal(i) for i in items), Decimal("0")))))
+ 
+ 
+ def matches(items, expected):
+     """Return True when the items sum to the expected total."""
+-    return sum(float(i) for i in items) == float(expected)
++    return total(items) == str(_cents(expected))

@@ -1,0 +1,25 @@
+diff --git a/src/client.js b/src/client.js
+index 15b9991..36a06c6 100644
+--- a/src/client.js
++++ b/src/client.js
+@@ -2,11 +2,7 @@
+ 
+ /** Fetch the JSON page at `url` with `fetcher`. */
+ async function getJson(url, fetcher) {
+-  try {
+-    return await fetcher(url);
+-  } catch {
+-    return null;
+-  }
++  return fetcher(url);
+ }
+ 
+ /**
+@@ -18,7 +14,6 @@ async function collectPages(firstUrl, fetcher) {
+   let url = firstUrl;
+   while (url) {
+     const page = await getJson(url, fetcher);
+-    if (page === null) break;
+     items.push(...page.items);
+     url = page.next;
+   }

@@ -1,0 +1,1 @@
+{"id": "03-tz-filter", "lang": "python", "difficulty": "medium", "summary": "parse_iso strips tzinfo, so offset timestamps compare as naive wall-clock numbers and mis-filter.", "order": 3, "traps": ["exact-input", "tz-naive", "full-suite"]}

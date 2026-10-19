@@ -1,0 +1,1 @@
+{"id": "01-csv-bom", "lang": "python", "difficulty": "easy", "summary": "read_rows opens the CSV without utf-8-sig, so a BOM corrupts the first header name.", "order": 1, "traps": ["exact-input", "csv-edge"]}

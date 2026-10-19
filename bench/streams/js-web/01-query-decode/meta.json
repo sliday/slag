@@ -1,0 +1,1 @@
+{"id": "01-query-decode", "lang": "javascript", "difficulty": "easy", "summary": "parseQuery splits on & and = without decoding, so + stays literal and percent escapes survive.", "order": 1, "traps": ["exact-input", "url-query"]}

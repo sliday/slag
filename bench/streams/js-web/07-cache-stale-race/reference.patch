@@ -1,0 +1,42 @@
+diff --git a/src/ttlcache.js b/src/ttlcache.js
+index e9574a6..e6c2ba2 100644
+--- a/src/ttlcache.js
++++ b/src/ttlcache.js
+@@ -1,24 +1,33 @@
+ "use strict";
+ 
+ const cache = new Map();
++const pending = new Map();
+ 
+ /**
+  * Return the cached value for `key`, calling `loader()` when the value
+- * is missing. The result comes back as a promise.
++ * is missing. Concurrent loads for the same key share one loader call.
++ * The result comes back as a promise.
+  */
+ function cachedLoad(key, loader) {
+   if (cache.has(key)) return Promise.resolve(cache.get(key));
+-  return Promise.resolve()
++  if (pending.has(key)) return pending.get(key);
++  const p = Promise.resolve()
+     .then(() => loader())
+     .then((value) => {
+-      cache.set(key, value);
++      if (pending.get(key) === p) {
++        pending.delete(key);
++        cache.set(key, value);
++      }
+       return value;
+     });
++  pending.set(key, p);
++  return p;
+ }
+ 
+-/** Drop the cached value for `key`. */
++/** Drop the cached value for `key` and supersede any in-flight load. */
+ function invalidate(key) {
+   cache.delete(key);
++  pending.delete(key);
+ }
+ 
+ module.exports = { cachedLoad, invalidate };

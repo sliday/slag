@@ -1,0 +1,28 @@
+diff --git a/nameset/dedupe.py b/nameset/dedupe.py
+index f611889..da537d3 100644
+--- a/nameset/dedupe.py
++++ b/nameset/dedupe.py
+@@ -1,16 +1,20 @@
+ """Deduplicating name lists while keeping first-occurrence order."""
+ 
++import unicodedata
++
+ 
+ def unique_names(names):
+     """Return `names` with duplicates removed.
+ 
+     The first occurrence of each name wins and the order of first
+-    appearances is preserved.
++    appearances is preserved. Names are compared in NFC normalization
++    form, so two strings that spell the same name count as duplicates.
+     """
+     seen = set()
+     result = []
+     for name in names:
+-        if name not in seen:
+-            seen.add(name)
++        key = unicodedata.normalize("NFC", name)
++        if key not in seen:
++            seen.add(key)
+             result.append(name)
+     return result

@@ -1,0 +1,1 @@
+{"id": "05-csv-quoted-newline", "lang": "python", "difficulty": "medium", "summary": "parse splits on raw newlines and commas, so quoted fields with commas or embedded newlines corrupt rows.", "order": 5, "traps": ["exact-input", "csv-edge"]}

@@ -1,0 +1,1 @@
+{"id": "06-fetch-error-swallow", "lang": "javascript", "difficulty": "medium", "summary": "getJson swallows fetch errors into null, so collectPages stops early and resolves with partial data.", "order": 6, "traps": ["exact-input", "error-propagation", "pagination"]}

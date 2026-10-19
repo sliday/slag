@@ -1,0 +1,1 @@
+{"id": "07-cache-stale-race", "lang": "javascript", "difficulty": "hard", "summary": "invalidate does not supersede in-flight loads, so a slow stale load resolves late and repopulates the cache.", "order": 7, "traps": ["exact-input", "caching", "async-order"]}

@@ -13,6 +13,7 @@ ISSUES_DIR="$BENCH_DIR/issues"
 
 AGENT=""
 TASKS=""
+STREAM=""
 TIMEOUT=600
 RUNS=1
 OUT=""
@@ -27,11 +28,17 @@ usage() {
   cat <<'EOF'
 Usage:
   bench/run.sh --agent <adapter> [--tasks id1,id2] [--timeout 600] [--runs 1] [--out results.json]
-  bench/run.sh --verify-fixtures [--tasks id1,id2]
-  bench/run.sh --leak-check
+  bench/run.sh --stream <domain> --agent <adapter> [same options]
+  bench/run.sh --verify-fixtures [--tasks id1,id2] [--stream <domain>]
+  bench/run.sh --leak-check [--stream <domain>]
 
 Options:
   --agent        Path to adapter executable, or a name in bench/agents/.
+  --stream       Run a domain stream from bench/streams/<domain>/ instead of
+                 bench/issues/. Tasks run in the order of their meta.json
+                 'order' field. The runner still isolates every task; an
+                 agent that wants to carry lessons between tasks must do so
+                 itself.
   --tasks        Comma-separated task ids. Default: all tasks.
   --timeout      Per-task timeout in seconds. Default: 600.
   --runs         Repetitions per task. Default: 1.
@@ -49,6 +56,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --agent) AGENT=$2; shift 2 ;;
     --tasks) TASKS=$2; shift 2 ;;
+    --stream) STREAM=$2; shift 2 ;;
     --timeout) TIMEOUT=$2; shift 2 ;;
     --runs) RUNS=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
@@ -59,8 +67,30 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ -n "$STREAM" ]; then
+  case "$STREAM" in
+    */*|..*) echo "invalid stream name: $STREAM" >&2; exit 2 ;;
+  esac
+  ISSUES_DIR="$BENCH_DIR/streams/$STREAM"
+  if [ ! -d "$ISSUES_DIR" ]; then
+    echo "unknown stream: $STREAM (no $ISSUES_DIR)" >&2
+    exit 2
+  fi
+fi
+
+# Prints "order id" lines; stream tasks sort by the meta.json 'order'
+# field, plain issues sort by name.
 discover_tasks() {
-  local d
+  local d id order
+  if [ -n "$STREAM" ]; then
+    for d in "$ISSUES_DIR"/*/; do
+      if [ -f "$d/meta.json" ]; then
+        order=$(sed -n 's/.*"order" *: *\([0-9][0-9]*\).*/\1/p' "$d/meta.json" | head -1)
+        printf '%s %s\n' "${order:-999}" "$(basename "$d")"
+      fi
+    done | sort -n -s | awk '{print $2}'
+    return
+  fi
   for d in "$ISSUES_DIR"/*/; do
     [ -f "$d/meta.json" ] && basename "$d"
   done | sort
@@ -262,7 +292,9 @@ fi
 resolve_agent
 
 TS=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR="$BENCH_DIR/results/$TS"
+# $$ keeps concurrent runs (two streams in parallel) out of each
+# other's records.tsv and work dirs.
+RESULTS_DIR="$BENCH_DIR/results/$TS-$$"
 mkdir -p "$RESULTS_DIR/work"
 if [ -z "$OUT" ]; then
   OUT="$RESULTS_DIR/results.json"
@@ -277,6 +309,7 @@ REC_FILE="$RESULTS_DIR/records.tsv"
 
 echo "agent:   $AGENT"
 echo "timeout: ${TIMEOUT}s   runs: $RUNS"
+[ -n "$STREAM" ] && echo "stream:  $STREAM"
 echo "results: $RESULTS_DIR"
 echo
 
@@ -333,6 +366,7 @@ echo
   echo '{'
   echo "  \"agent\": \"$AGENT\","
   echo "  \"timestamp\": \"$TS\","
+  echo "  \"stream\": \"$STREAM\","
   echo "  \"timeout\": $TIMEOUT,"
   echo "  \"runs\": $RUNS,"
   echo '  "results": ['

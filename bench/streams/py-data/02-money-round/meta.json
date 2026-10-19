@@ -1,0 +1,1 @@
+{"id": "02-money-round", "lang": "python", "difficulty": "easy", "summary": "format_price uses round(float(amount), 2), so exact-half cents round down instead of half up.", "order": 2, "traps": ["exact-input", "decimal"]}

@@ -1,0 +1,20 @@
+diff --git a/pricelib/money.py b/pricelib/money.py
+index 2e15199..d61c369 100644
+--- a/pricelib/money.py
++++ b/pricelib/money.py
+@@ -1,5 +1,9 @@
+ """Price formatting for the catalog and invoices."""
+ 
++from decimal import ROUND_HALF_UP, Decimal
++
++_CENT = Decimal("0.01")
++
+ 
+ def format_price(amount):
+     """Format a decimal string amount with exactly two decimals.
+@@ -7,4 +11,4 @@ def format_price(amount):
+     Rounds half up, like a cashier would: '2.675' becomes '2.68' and
+     '0.125' becomes '0.13'.
+     """
+-    return f"{round(float(amount), 2):.2f}"
++    return str(Decimal(amount).quantize(_CENT, rounding=ROUND_HALF_UP))

@@ -1,0 +1,9 @@
+{
+  "name": "api-client",
+  "version": "1.0.0",
+  "private": true,
+  "description": "URL building for the internal API client",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
