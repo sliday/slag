@@ -131,7 +131,9 @@ prints goes to the run log. Bundled adapters: `noop.sh` (does nothing),
 `probe.sh` (leak check), `reference.sh` (applies the reference patch),
 `codex.sh`, `fx.sh`, `slag-fix.sh` (runs `slag fix` as a user would;
 SLAG_BIN picks the binary; opt in with SLAG_FIX_TRIES, SLAG_FIX_NO_COMMIT=1
-and SLAG_FIX_ARGS).
+and SLAG_FIX_ARGS). Unless you set SLAG_CONFIG_DIR, `slag-fix.sh` points
+it at an empty temp dir, so your personal `config.toml` cannot pin a
+model or a key. Pass keys and models through the environment.
 
 ## Instrument checks
 

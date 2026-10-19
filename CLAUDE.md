@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **slag** is a Rust task orchestrator that uses metallurgical metaphors to manage AI-powered development workflows. It breaks requirements into S-expression "ingots" and forges them through an agent loop with automatic retry and proof-based verification.
 
-slag uses OpenAI-compatible chat completions. OpenRouter stays the default. Cloud providers use their own keys; Ollama and LM Studio need no key. The engine needs no Claude CLI or vendor SDK.
+slag speaks OpenAI-compatible chat completions, and `/responses` for OpenAI GPT-5.4 and later. OpenRouter stays the default. Cloud providers use their own keys; Ollama and LM Studio need no key. The engine needs no Claude CLI or vendor SDK.
 
 The repo has three layers:
 
@@ -16,12 +16,16 @@ The repo has three layers:
 
 ## Orchestrator Architecture (slag-rs/)
 
-### 4-Phase Pipeline
+### Pipeline: four phases plus temper
 
 1. **SURVEYOR**: Reads `.slag/PRD.md` (ore), produces `.slag/BLUEPRINT.md` on the plan model
 2. **FOUNDER**: Reads blueprint, generates S-expression ingots in `.slag/PLAN.md`
 3. **FORGE**: Picks ore, runs an agent session with tools, verifies with `:proof`, commits on pass
 4. **ASSAY**: Final report with pass/fail status. `pipeline::run` calls it on every outcome except `Cancelled`, so a cracked run still prints its counts.
+
+`--temper N` arms the warden (`pipeline/warden.rs`), a fresh critic on the plan model with tools and the strict read-only sandbox. `warden::bar` derives `.slag/BAR.md` once. `checkpoint` judges the blueprint and the plan before the forge, with one corrective pass each. `judge_ingot` judges an ingot with a non-empty `:bar` after its proof passes; a loss burns the heat. After the forge, `judge_artifact` judges the built project; a loss becomes an addendum, `founder::extend` casts gap ingots, and the forge runs again, up to N rounds. An unmet goal ends in `SlagError::GoalNotMet` (exit 1). `warden/checkout.rs` runs the suite from a fresh clone; `warden/grounding.rs` ties a verdict to the commands the warden ran.
+
+With temper armed, a commission of 800 chars or fewer in an empty directory can take the direct path: `surveyor::direct_proof` asks `pipeline/direct.rs` for one contract, and `found_direct` writes one ingot, BLUEPRINT.md and BAR.md, with fixtures only under `.slag/checks/`. `pipeline/hygiene.rs` writes the ignore rules (`.git/info/exclude` for slag's files, `.gitignore` for language caches).
 
 ### Ingot S-Expression Format
 
@@ -29,7 +33,7 @@ The repo has three layers:
 (ingot :id "i1" :status ore :solo t :grade 1 :heat 0 :max 5 :proof "test -f file" :work "Task description")
 ```
 
-`sexp/parser.rs` parses eleven fields and preserves anything else in `Ingot::extra`:
+`sexp/parser.rs` parses thirteen fields and preserves anything else in `Ingot::extra`:
 
 | Field | Values | Meaning |
 |-------|--------|---------|
@@ -42,23 +46,31 @@ The repo has three layers:
 | `:max` | 5-8+ | Max retries before cracking |
 | `:smelt` | 0 / 1 | Re-smelt count. `resmelt.rs` refuses a second pass once this is >= 1 |
 | `:proof` | shell command | Acceptance test (exit 0 = pass) |
+| `:bar` | string | The ingot's acceptance bar. With temper armed, `warden::judge_ingot` judges it after the proof; empty means proof alone |
 | `:work` | string | Task description for the smith |
 | `:duel` | t / nil | Twin-cast override: t forces, nil blocks, absent defers to `DuelMode` |
+| `:casts` | 1 / 2 / 3 | Cast-count override; absent defers to the `DuelMode` heuristics |
 
 ### Source Layout (slag-rs/src)
 
 | Path | Role |
 |------|------|
 | `main.rs` | Entry point, subcommand dispatch, key gate before any forge |
-| `cli.rs` | clap definitions for flags and subcommands |
-| `config.rs` | `EngineConfig`, key storage and verification, model resolution |
-| `engine/` | Chat-completions provider, agent loop, tools, shell sandbox, judge, recipes, events, MCP client |
+| `cli.rs` | clap definitions for flags and subcommands; `status --json`, `runs`, `ps`, `rewind`, `cost`, `hooks list` |
+| `config.rs` | `EngineConfig`, key storage and verification, model resolution, `.slag/` layout (`project_path`), spend caps, hook entries |
+| `engine/` | Provider (chat completions and Responses), agent loop, tools, shell sandbox, hooks, command policy, pricing, judge, recipes, events, compaction, transcripts, MCP client |
 | `smith/` | `NativeSmith` factories (`make_smith`, `make_plan_smith`, `make_base_smith`) |
-| `pipeline/` | surveyor, founder, forge, duel, resmelt, assay, fix (`fix/evolve.rs` is `--evolve`) |
+| `pipeline/` | surveyor, founder, forge, duel, resmelt, assay, warden (`--temper`), direct (the short-commission path), hygiene (ignore rules), fix (`fix/evolve.rs` is `--evolve`) |
 | `harness/` | The execution harness (`mod.rs`), its validator, the library, and the improver's stage prompts |
-| `anvil/` | Worktree helpers. The parallel fan-out itself lives in `pipeline/forge.rs` |
+| `anvil/` | Worktree helpers and attempt checkpoints (`checkpoint.rs`, read by `slag rewind`). The parallel fan-out itself lives in `pipeline/forge.rs` |
 | `crucible.rs`, `sexp/` | Ingot parsing and crucible state |
+| `flux.rs`, `proof.rs` | Prompt builders; `:proof` and CMD runners |
 | `tui.rs`, `dashboard.rs` | Stream-mode output and the Ratatui dashboard |
+| `render/` | Presentation shared by the stream view and the dashboard: stream, echo, diff, the tape (`tape.rs`) and `--trace` export (`trace.rs`) |
+| `replay.rs` | `slag replay`: plays a tape through the live renderers |
+| `insights.rs` | `slag insights`: offline analytics over the logs, cached in `logs/facets/` |
+| `migrations.rs` | Idempotent startup fixups before any command runs |
+| `steer_history.rs`, `shutdown.rs` | Steer history in `~/.slag/history.jsonl`; the cleanup registry for every exit path |
 | `update.rs` | Self-update from GitHub Releases (`sliday/slag`) |
 
 ### Project Files the Pipeline Reads and Writes
@@ -73,7 +85,11 @@ New commissions use gitignored `.slag/`. Slag stores its ignore patterns in `.gi
 | `.slag/AGENTS.md` | Coordinator scratch notes. The coordinator creates a `## Alloy Recipes` stub. Forge prompts read this file. |
 | `.slag/BAR.md` | Acceptance criteria and required checks |
 | `.slag/PROGRESS.md` | Work history ledger |
-| `.slag/logs/` | Debug logs (slag heap) |
+| `.slag/logs/` | Debug logs (slag heap): `engine-*.jsonl`, `run-*.jsonl`, `tape-*.jsonl`, `checkpoints/`, `transcripts/`, `facets/` |
+| `.slag/layout` | Marker that pins the `.slag/` layout (`config::project_path`) |
+| `.slag/session-costs.json` | Spend per run id (`dashboard.rs`), read by `slag cost` and `slag status --json` |
+| `.slag/evolve/<run>/` | `--evolve` record (`record.json`) and improver session roots; `.slag/evolve/latest.json` copies the last record |
+| `.slag/library/` | Optional per-repository harness library |
 | `.slag/checks/` | Untracked verification probes and reference fixtures. Builders can write here; reviewers cannot. Product tests must not depend on it. |
 | `recipes/<name>/RECIPE.md` | The recipes proper (`engine/recipes.rs`): frontmatter-fenced markdown discovered under `<root>/recipes/` and the config dir, indexed into the prompt and loadable by name |
 
@@ -164,7 +180,7 @@ github = "gh-mcp --stdio"
 
 Backends: macOS runs `sandbox-exec` with a generated Seatbelt profile. Linux uses `bwrap` when it works, else Landlock (raw syscalls, no crate), else runs unconfined. `main.rs` calls `sandbox::preflight()` before the dashboard starts, which prints one warning per run when nothing can confine writes. A refused write adds `write outside the workspace was blocked by slag's sandbox: <path>` to the tool result, leads a failed proof's output, and rides on a fix test run's `status()`.
 
-### Recursive harnessing (`slag fix --evolve`, `--harness`)
+### Recursive harnessing (`slag fix --evolve`, `--harness`; experimental)
 
 After Harness² (Xu et al., arXiv:2610.14224). `harness/mod.rs` loads a directory of files: `systemprompt.md`, `guardrails.md`, `memory.md` and `tool_guidance.md` close the stable band (`prompt::build_with`); `recipes/<name>/RECIPE.md` join the recipe index (`recipes::index_with`, `ToolBox::with_harness_recipes`); `scripts/` are named in the band and run through the sandboxed `bash`; `hooks.toml` lines become a `HookSnapshot` whose `CommandScope` runs them in the read-only sandbox, fired before the operator's hooks on the way in. Subagents have no slag equivalent. `NativeSmith::with_harness` drops an empty harness, so the fast path's prompt stays byte-identical (tested in `prompt.rs`).
 
@@ -176,7 +192,13 @@ After Harness² (Xu et al., arXiv:2610.14224). `harness/mod.rs` loads a director
 | dollar cap | `SLAG_EVOLVE_BUDGET` | `evolve_budget` | `--evolve-budget` (default 2) |
 | token cap | `SLAG_EVOLVE_TOKENS` | | `--evolve-tokens` (default 4000000) |
 
-Other environment knobs include `SLAG_DUEL`, `SLAG_DUEL_ROUNDS`, `SLAG_REASONING_EFFORT`, `SLAG_SCREENSHOT_CMD`, `SLAG_CONFIG_DIR`, and `SLAG_CHAR_BUDGET` (agent compaction budget). `tui.rs` also reads `NO_COLOR` and `COLORTERM`.
+### Hooks
+
+`engine/hooks.rs` runs lifecycle hooks from the `[hooks]` table of `config.toml` (`config::hook_entries`), one per line, keyed by event: `pre_tool`, `post_tool`, `tool_error`, `stop`, `session_start`, `pre_compact`, `ingot_forged`, `ingot_cracked`. Kinds are `cmd=` (default), `prompt=`, `agent=` and `url=` (HTTP POST). Exit 0 turns stdout into model context, exit 2 blocks (a `pre_tool` call is refused), anything else is logged. `HookSnapshot` freezes the config at forge start. `disable_all_hooks` or `SLAG_DISABLE_HOOKS` turns all of them off. `slag hooks list` prints the contract.
+
+### Other settings
+
+Environment knobs not covered above: `SLAG_DUEL`, `SLAG_DUEL_ROUNDS`, `SLAG_REASONING_EFFORT`, `SLAG_SCREENSHOT_CMD`, `SLAG_CONFIG_DIR`, `SLAG_CHAR_BUDGET` (agent compaction budget, default 48000 chars), `SLAG_MAX_COST_INGOT` and `SLAG_MAX_COST_RUN` (spend caps), `SLAG_CREDIT_FLOOR` (OpenRouter balance warning), `SLAG_COST_PER_MTOK` (flat rate spend caps charge for an unpriced response, default 5), `SLAG_MODEL_FALLBACK` (OpenRouter `models` fallback), `SLAG_UNATTENDED_RETRY` (retry 429/529 past the budget), `SLAG_MAX_RETRIES` (default 8), `SLAG_API_TIMEOUT_MS` (default 300000), `SLAG_BASH_OUTPUT_CAP` (default 30000), `SLAG_ALLOW_DESTRUCTIVE=1` (lift the destructive-command gate), and `SLAG_DISABLE_HOOKS`. The file-backed ones (`credit_floor`, `fallback_model`, `unattended_retry`, `max_cost_per_ingot`, `max_cost_per_run`) read env first. `tui.rs` also reads `NO_COLOR` and `COLORTERM`.
 
 Behavior constants in `config.rs`: `MAX_ANVILS = 3` (parallel ingot slots), `HIGH_GRADE = 3` (plan-model threshold), `MAX_ITERATE = 3` (self-iteration rounds).
 
@@ -190,7 +212,9 @@ cargo test              # keep this green
 cargo build --release
 ```
 
-Binary surface: `slag "commission"`, `slag fix ISSUE` (`--evolve K`, `--sequential`, `--harness DIR|library|none`, `--editor-model`, `--evolve-budget`, `--evolve-tokens`, `--domain`, `--library`), `slag key [KEY]`, `slag status`, `slag resume`, `slag update`. Flags: `--tui`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--no-sandbox`, `--worktree` (parses, warns, not implemented).
+Binary surface: `slag "commission"`, `slag fix ISSUE` (`--issue-file`, `--test CMD`, `--tries N`, `--pr`, `--no-commit`, `--temper`, `--model`, `--plan-model`, `--tui`, `--evolve K`, `--sequential`, `--harness DIR|library|none`, `--editor-model`, `--evolve-budget`, `--evolve-tokens`, `--domain`, `--library`), `slag key [KEY]`, `slag status [--json]`, `slag runs`, `slag insights [--refresh]`, `slag ps`, `slag resume`, `slag rewind [--ingot ID --heat N]`, `slag cost`, `slag replay FILE` (`--speed`, `--tui`, `--at`, `--hold`, `--size`, `--points`), `slag hooks list`, `slag update`. Flags: `--tui`, `--temper N`, `--force`, `--anvils N`, `--provider`, `--auto`, `--model`, `--plan-model`, `--judge-model`, `--duel`, `--trace FILE`, `--no-sandbox`, `--worktree` (parses, warns, not implemented). `--provider` and `--no-sandbox` also work on every subcommand.
+
+Releases: the published v2.9.0 ships `aarch64-apple-darwin` only. `slag-rs/dist-local/publish-release.sh --build` builds four targets (Apple Silicon, Intel Mac, Linux x86_64 and aarch64), and `install.sh` and `update.rs` handle all four. `slag-rs/.github/workflows/` sits below the repo root, so GitHub never runs it.
 
 ## Website (website/)
 
@@ -221,6 +245,8 @@ Target: Cloudflare Pages at slag.dev (`wrangler.toml` configures `slag-dev` and 
 - `src/main.js`: App init, renders ingots, wires copy buttons
 - `src/content.js`: Example ingot data, `renderIngots()`, `toSExpression()` conversion
 - `src/main.css`: Terminal-UI dark theme, `--slag-*` palette, mobile-first responsive (640px/1024px breakpoints)
+- `public/media/`: The hero video (`slag-hero.webm`, `slag-hero.mp4`) and its poster
+- `video/`: The Remotion project that renders `public/media/` (`./render.sh`)
 - `public/install.sh`: Copy of `slag-rs/install.sh`, served at `https://slag.dev/install.sh`
 - `public/slag.sh`: The legacy v1 script, still served for old installs
 

@@ -118,8 +118,8 @@
         </div>
         <p class="disclaimer">slag needs one key from one provider. Choose the provider with <code>--provider NAME</code>, <code>SLAG_PROVIDER</code>, or <code>provider = "NAME"</code> in <code>~/.config/slag/config.toml</code>: openrouter (the default), openai, anthropic, gemini, groq, cerebras, xai, mistral, deepseek, together, fireworks, ollama, lmstudio, or custom. Each preset brings its base URL and a default model. slag reads the provider's key variable, such as <code>CEREBRAS_API_KEY</code>, or the key that <code>slag key --provider NAME</code> stores. ollama and lmstudio need no key.</p>
         <p class="disclaimer"><code>slag fix</code> takes free text, an issue number, a GitHub issue URL, or <code>--issue-file</code>. It runs your tests before any edit, writes a regression test, fixes the code, and reruns the tests itself. Then it reverts the fix to show the new test fails without it. The fix lands as one commit on a <code>slag/fix-&lt;slug&gt;</code> branch (<code>slag/fix-&lt;n&gt;-&lt;slug&gt;</code> for a GitHub issue). <code>--pr</code> pushes it and opens a draft PR; <code>--no-commit</code> leaves it in the working tree.</p>
-        <p class="disclaimer">slag runs shell commands and edits files in the directory you start it in. Point it at a fresh directory or a repo you can revert.</p>
-        <p class="disclaimer">The published build is macOS on Apple Silicon. Elsewhere, clone the repo and run <code>cargo install --path slag-rs</code>.</p>
+        <p class="disclaimer">slag runs shell commands and edits files in the directory you start it in. Its sandbox keeps shell writes inside that directory and temp space, while reads and the network stay open. Point it at a fresh directory or a repo you can revert.</p>
+        <p class="disclaimer">The published v2.9.0 build is macOS on Apple Silicon. The next release ships four targets: Apple Silicon, Intel Mac, and Linux on x86_64 and aarch64. Until then, elsewhere, clone the repo and run <code>cargo install --path slag-rs</code>.</p>
       </section>
 
       <div is="separator"></div>
@@ -145,8 +145,16 @@
             <p class="phase-desc">Drop <code>recipes/&lt;name&gt;/RECIPE.md</code> files (frontmatter + markdown) in your repo or <code>~/.config/slag/recipes/</code>. slag indexes them into every ingot prompt and the smith loads them by name.</p>
           </div>
           <div class="phase-card" box="square">
-            <div><span is="badge" class="ore phase-num">$</span><span class="phase-name">Spend Caps</span></div>
-            <p class="phase-desc">Dollar ceilings per ingot session (<code>SLAG_MAX_COST_INGOT</code>) and per run (<code>SLAG_MAX_COST_RUN</code>), or <code>max_cost_per_ingot</code> / <code>max_cost_per_run</code> in the config file. Default is uncapped.</p>
+            <div><span is="badge" class="ore phase-num">$</span><span class="phase-name">Spend Estimates and Caps</span></div>
+            <p class="phase-desc">Spend lines show the cost OpenRouter reports, or an estimate from a dated price list (<code>≈ $0.0031 est.</code>). An unknown price shows token counts, and a <code>[pricing]</code> table overrides any rate. Dollar ceilings per ingot session (<code>SLAG_MAX_COST_INGOT</code>) and per run (<code>SLAG_MAX_COST_RUN</code>) are uncapped by default.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="ore phase-num">&#x25A1;</span><span class="phase-name">Shell Sandbox</span></div>
+            <p class="phase-desc">The smith's shell commands write only inside the workspace and temp directories: Seatbelt on macOS, bubblewrap or Landlock on Linux. Package caches and the repo's git hooks and config stay read-only. Proofs and <code>slag fix</code> test runs use the same sandbox. <code>--no-sandbox</code> or <code>SLAG_SANDBOX=off</code> turns it off.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div><span is="badge" class="forged phase-num">&#x25B6;</span><span class="phase-name">Replay</span></div>
+            <p class="phase-desc">Every forge records a tape in <code>.slag/logs/</code>, and <code>slag replay</code> plays it through the same renderers, in the stream view or the dashboard, at any speed, and can hold a frame at a named moment. It needs no key and no network.</p>
           </div>
           <div class="phase-card" box="square">
             <div><span is="badge" class="forged phase-num">&#x2713;</span><span class="phase-name">Proof-Gated Ingots</span></div>
@@ -177,10 +185,14 @@
  <span style="color:var(--slag-cold);">|</span> <span style="color:var(--slag-bright);">SURVEYOR</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FOUNDER</span>      <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">FORGE</span>  <span style="color:var(--slag-cold);">|</span>--->| <span style="color:var(--slag-bright);">ASSAY</span> <span style="color:var(--slag-cold);">|</span>
  <span style="color:var(--slag-cold);">|</span> analyze   <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> cast ingots  <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> strike <span style="color:var(--slag-cold);">|</span>    <span style="color:var(--slag-cold);">|</span> report<span style="color:var(--slag-cold);">|</span>
  <span style="color:var(--slag-cold);">+-----------+</span>    <span style="color:var(--slag-cold);">+--------------+</span>    <span style="color:var(--slag-cold);">+--------+</span>    <span style="color:var(--slag-cold);">+-------+</span>
-    |                    |                    |
-    v                    v                    v
- BLUEPRINT.md        PLAN.md             git commits
- <span style="color:var(--foreground1);">(analysis)</span>        <span style="color:var(--foreground1);">(s-expr ingots)</span>      <span style="color:var(--foreground1);">(per ingot)</span>
+    |                |        ^             |
+    v                v        |             v <span style="color:var(--foreground1);">--temper N</span>
+ BLUEPRINT.md     PLAN.md     |         <span style="color:var(--slag-cold);">+---------+</span>
+ <span style="color:var(--foreground1);">(analysis)</span>   <span style="color:var(--foreground1);">(s-expr ingots)</span> |         <span style="color:var(--slag-cold);">|</span> <span style="color:var(--slag-bright);">TEMPER</span>  <span style="color:var(--slag-cold);">|</span>
+                              +-- <span style="color:var(--slag-warm);">gap</span> --<span style="color:var(--slag-cold);">|</span> warden  <span style="color:var(--slag-cold);">|</span>
+                                        <span style="color:var(--slag-cold);">+---------+</span>
+
+ <span style="color:var(--foreground1);">New commissions keep these files in .slag/.</span>
 </pre>
       </section>
 
@@ -226,21 +238,21 @@
 
       <!-- S5: FOUR PHASES -->
       <section>
-        <h2>Four Phases</h2>
+        <h2>Four Phases and the Warden</h2>
         <div class="phase-grid">
           <div class="phase-card" box="square">
             <div>
               <span is="badge" class="ore phase-num">1</span>
               <span class="phase-name">SURVEYOR</span>
             </div>
-            <p class="phase-desc">Deep analysis on the plan model. Reads PRD.md (ore), produces BLUEPRINT.md with architecture, dependency graph, risk assessment, and forging sequence. Self-iterates to resolve any ambiguity.</p>
+            <p class="phase-desc">Deep analysis on the plan model. Reads <code>.slag/PRD.md</code> (ore), produces <code>.slag/BLUEPRINT.md</code> with architecture, dependency graph, risk assessment, and forging sequence. Self-iterates to resolve any ambiguity.</p>
           </div>
           <div class="phase-card" box="square">
             <div>
               <span is="badge" class="molten phase-num">2</span>
               <span class="phase-name">FOUNDER</span>
             </div>
-            <p class="phase-desc">Casts S-expression ingots from the blueprint. Each ingot has an ID, complexity grade, skill tag, proof command, and work description. Outputs PLAN.md as the crucible.</p>
+            <p class="phase-desc">Casts S-expression ingots from the blueprint. Each ingot has an ID, complexity grade, skill tag, proof command, and work description. Outputs <code>.slag/PLAN.md</code> as the crucible.</p>
           </div>
           <div class="phase-card" box="square">
             <div>
@@ -248,6 +260,13 @@
               <span class="phase-name">FORGE</span>
             </div>
             <p class="phase-desc">Strikes each ingot with an agent session over your provider. Solo ingots run on parallel anvils (up to 3). Grade picks the model. Retries with slag feedback on failure. Commits on success.</p>
+          </div>
+          <div class="phase-card" box="square">
+            <div>
+              <span is="badge" class="molten phase-num">+</span>
+              <span class="phase-name">TEMPER</span>
+            </div>
+            <p class="phase-desc">Opt in with <code>--temper N</code>. A warden on the plan model, a critic that built nothing, writes the acceptance bar to <code>.slag/BAR.md</code> and checks the blueprint and the plan against it first. After the forge it opens the built project, runs its checks in a read-only sandbox, and compares the result with the bar. On a loss, the gap it names becomes new ingots and the forge runs again, up to N rounds.</p>
           </div>
           <div class="phase-card" box="square">
             <div>
@@ -267,7 +286,8 @@
 
         <details box="square">
           <summary>Why Any Provider?</summary>
-          <p>slag speaks the OpenAI-compatible chat-completions API, so any provider that serves it works, local ones included. A preset brings the base URL and a default model for every role, so a fresh key forges without you choosing a model. OpenRouter stays the default. Override any role when you have an opinion: a flag, an environment variable, or a line in <code>~/.config/slag/config.toml</code>. Write <code>provider::model</code> to send one role to another provider; the <code>::</code> keeps OpenRouter ids such as <code>openai/gpt-5</code> working. The file wants the lowercase key; the uppercase name is the environment variable and is ignored inside the file.</p>
+          <p>slag speaks the OpenAI-compatible chat-completions API, so any provider that serves it works, local ones included. OpenAI GPT-5.4 and later go through the Responses API instead. A preset brings the base URL and a default model for every role, so a fresh key forges without you choosing a model. OpenRouter stays the default. Override any role when you have an opinion: a flag, an environment variable, or a line in <code>~/.config/slag/config.toml</code>. Write <code>provider::model</code> to send one role to another provider; the <code>::</code> keeps OpenRouter ids such as <code>openai/gpt-5</code> working. The file wants the lowercase key; the uppercase name is the environment variable and is ignored inside the file.</p>
+          <div style="overflow-x: auto;">
           <table class="field-table">
             <thead>
               <tr>
@@ -302,9 +322,16 @@
                 <td><code>model_judge</code></td>
                 <td><code>--judge-model</code></td>
               </tr>
+              <tr>
+                <td>editor</td>
+                <td><code>SLAG_MODEL_<wbr>EDITOR</code></td>
+                <td><code>model_<wbr>editor</code></td>
+                <td><code>--editor-<wbr>model</code></td>
+              </tr>
             </tbody>
           </table>
-          <p>The provider, its key, the duel knobs, and the spend caps follow the same rule: <code>provider</code>, <code>&lt;provider&gt;_api_key</code> (such as <code>openai_api_key</code>), <code>duel</code>, <code>duel_rounds</code>, <code>screenshot_cmd</code>, <code>max_cost_per_ingot</code>, <code>max_cost_per_run</code> in the file; <code>SLAG_PROVIDER</code>, the provider's key variable (such as <code>OPENAI_API_KEY</code>), <code>SLAG_DUEL</code>, <code>SLAG_DUEL_ROUNDS</code>, <code>SLAG_SCREENSHOT_CMD</code>, <code>SLAG_MAX_COST_INGOT</code>, <code>SLAG_MAX_COST_RUN</code> in the environment.</p>
+          </div>
+          <p>The editor role writes harness edits for <code>slag fix --evolve</code> and defaults to the plan model. The provider, its key, the duel knobs, and the spend caps follow the same rule: <code>provider</code>, <code>&lt;provider&gt;_api_key</code> (such as <code>openai_api_key</code>), <code>duel</code>, <code>duel_rounds</code>, <code>screenshot_cmd</code>, <code>max_cost_per_ingot</code>, <code>max_cost_per_run</code> in the file; <code>SLAG_PROVIDER</code>, the provider's key variable (such as <code>OPENAI_API_KEY</code>), <code>SLAG_DUEL</code>, <code>SLAG_DUEL_ROUNDS</code>, <code>SLAG_SCREENSHOT_CMD</code>, <code>SLAG_MAX_COST_INGOT</code>, <code>SLAG_MAX_COST_RUN</code> in the environment.</p>
         </details>
 
         <details box="square">
@@ -401,6 +428,11 @@
               <td>Acceptance test (exit 0 = pass)</td>
             </tr>
             <tr>
+              <td><code>:bar</code></td>
+              <td>string</td>
+              <td>The ingot's acceptance bar. With <code>--temper</code>, the warden judges it after the proof passes; empty means the proof alone decides</td>
+            </tr>
+            <tr>
               <td><code>:work</code></td>
               <td>string</td>
               <td>Task description for the smith</td>
@@ -410,9 +442,14 @@
               <td>t | nil</td>
               <td>Twin-cast override: t forces a duel, nil blocks one, absent follows SLAG_DUEL</td>
             </tr>
+            <tr>
+              <td><code>:casts</code></td>
+              <td>1 | 2 | 3</td>
+              <td>Cast-count override; absent follows SLAG_DUEL and the grade</td>
+            </tr>
           </tbody>
         </table>
-        <p class="disclaimer">Those eleven are every field the parser reads. Any other <code>:key value</code> pair survives a rewrite untouched.</p>
+        <p class="disclaimer">Those thirteen are every field the parser reads. Any other <code>:key value</code> pair survives a rewrite untouched.</p>
       </section>
 
       <div is="separator"></div>
@@ -428,13 +465,20 @@
             </tr>
           </thead>
           <tbody>
-            <tr><td><code>slag fix ISSUE</code></td><td>Fix one issue in this repository and commit it on a new branch. Takes free text, an issue number, or a GitHub issue URL. <code>--pr</code> opens a draft PR</td></tr>
-            <tr><td><code>slag "commission"</code></td><td>Write PRD.md from the commission and run the full pipeline</td></tr>
-            <tr><td><code>slag</code></td><td>Forge the PRD.md already in this directory</td></tr>
+            <tr><td><code>slag fix ISSUE</code></td><td>Fix one issue in this repository and commit it on a new branch. Takes free text, an issue number, or a GitHub issue URL. <code>--pr</code> opens a draft PR. <code>--tries N</code>, <code>--test CMD</code>, <code>--temper</code>, <code>--tui</code>, <code>--model</code> and <code>--plan-model</code> tune the run</td></tr>
+            <tr><td><code>slag fix --evolve K</code></td><td>Experimental. Evolve the harness on this issue first (Harness², arXiv 2610.14224). It costs several fix attempts, capped at $2 by default. <code>--harness library</code> reuses past lessons with no probing</td></tr>
+            <tr><td><code>slag "commission"</code></td><td>Write <code>.slag/PRD.md</code> from the commission and run the full pipeline</td></tr>
+            <tr><td><code>slag</code></td><td>Forge the <code>.slag/PRD.md</code> already in this directory</td></tr>
             <tr><td><code>slag key [KEY] [--provider NAME]</code></td><td>Show provider setup or store its key</td></tr>
             <tr><td><code>slag cost</code></td><td>Show session spend, and the provider balance when available</td></tr>
-            <tr><td><code>slag status</code></td><td>Show crucible state</td></tr>
+            <tr><td><code>slag status [--json]</code></td><td>Show crucible state; <code>--json</code> prints one object for scripts</td></tr>
             <tr><td><code>slag resume</code></td><td>Resume an existing forge</td></tr>
+            <tr><td><code>slag replay FILE</code></td><td>Play a recorded tape through the renderers. <code>--speed</code>, <code>--tui</code>, <code>--at</code>, <code>--points</code></td></tr>
+            <tr><td><code>slag runs</code></td><td>List past runs from the event logs</td></tr>
+            <tr><td><code>slag insights</code></td><td>Offline analytics over the logs: forged and cracked ingots, heats, spend, tool errors</td></tr>
+            <tr><td><code>slag ps</code></td><td>List live forges on this machine</td></tr>
+            <tr><td><code>slag rewind</code></td><td>Restore the workspace from an attempt checkpoint</td></tr>
+            <tr><td><code>slag hooks list</code></td><td>Print the hook events and the exit-code contract</td></tr>
             <tr><td><code>slag update</code></td><td>Self-update to the latest release</td></tr>
           </tbody>
         </table>
@@ -446,13 +490,18 @@
             </tr>
           </thead>
           <tbody>
-            <tr><td><code>--provider NAME</code></td><td>Chat-completions provider (overrides <code>SLAG_PROVIDER</code>)</td></tr>
+            <tr><td><code>--provider NAME</code></td><td>Provider preset (overrides <code>SLAG_PROVIDER</code>)</td></tr>
             <tr><td><code>--tui</code></td><td>Full-screen dashboard: crucible, live feed, steering input</td></tr>
+            <tr><td><code>--temper N</code></td><td>Judge the result against the goal with the warden, up to N rounds (default 0, off)</td></tr>
             <tr><td><code>--anvils N</code></td><td>Max parallel anvil workers (default 3)</td></tr>
             <tr><td><code>--auto</code></td><td>Reset all roles to the selected provider's default model, ignoring environment and config model settings</td></tr>
             <tr><td><code>--model MODEL</code></td><td>Worker model ID or <code>provider::model</code></td></tr>
             <tr><td><code>--plan-model MODEL</code></td><td>Planner model ID or <code>provider::model</code>, also for grade &ge; 3 ingots</td></tr>
             <tr><td><code>--judge-model MODEL</code></td><td>Duel judge model ID or <code>provider::model</code></td></tr>
+            <tr><td><code>--duel</code></td><td>Give every solo ingot at least two casts (same as <code>SLAG_DUEL=on</code>)</td></tr>
+            <tr><td><code>--trace FILE</code></td><td>Write a Chrome trace-event file, one lane per anvil</td></tr>
+            <tr><td><code>--force</code></td><td>Accept a one-word commission instead of reading it as a mistyped subcommand</td></tr>
+            <tr><td><code>--no-sandbox</code></td><td>Let shell commands write outside the workspace (same as <code>SLAG_SANDBOX=off</code>)</td></tr>
             <tr><td><code>--worktree</code></td><td>Branch-per-ingot isolation. Not implemented yet: warns and runs in the shared checkout</td></tr>
           </tbody>
         </table>
@@ -467,11 +516,16 @@
             <tr><td><code>OPENROUTER_API_KEY</code>, <code>OPENAI_API_KEY</code>, <code>CEREBRAS_API_KEY</code>, …</td><td>The provider's key. Overrides that provider's stored key</td></tr>
             <tr><td><code>SLAG_PROVIDER</code></td><td>Default provider; <code>--provider</code> takes precedence</td></tr>
             <tr><td><code>SLAG_BASE_URL</code></td><td>Override the selected provider's API root</td></tr>
-            <tr><td><code>SLAG_MODEL_BASE</code> / <code>_PLAN</code> / <code>_ALT</code> / <code>_JUDGE</code></td><td>Per-role model ids</td></tr>
+            <tr><td><code>SLAG_&lt;PROVIDER&gt;<wbr>_BASE_URL</code></td><td>Override one provider's API root in a mixed run</td></tr>
+            <tr><td><code>SLAG_MODEL_BASE</code> / <code>_PLAN</code> / <code>_ALT</code> / <code>_JUDGE</code> / <code>_EDITOR</code></td><td>Per-role model ids</td></tr>
+            <tr><td><code>SLAG_SANDBOX</code></td><td><code>auto</code> (default) / <code>off</code> for the shell sandbox</td></tr>
             <tr><td><code>SLAG_DUEL</code></td><td><code>auto</code> (default) / <code>on</code> / <code>off</code></td></tr>
             <tr><td><code>SLAG_DUEL_ROUNDS</code></td><td>Override the duel round cap</td></tr>
             <tr><td><code>SLAG_MAX_COST_INGOT</code></td><td>Dollar ceiling for a single ingot session</td></tr>
             <tr><td><code>SLAG_MAX_COST_RUN</code></td><td>Dollar ceiling for the whole run</td></tr>
+            <tr><td><code>SLAG_EVOLVE_BUDGET</code> / <code>SLAG_EVOLVE_TOKENS</code></td><td>Dollar and token caps for <code>--evolve</code> (defaults 2 and 4000000)</td></tr>
+            <tr><td><code>SLAG_HARNESS_LIBRARY</code></td><td>Harness library directory for <code>--evolve</code> and <code>--harness</code></td></tr>
+            <tr><td><code>SLAG_DISABLE_HOOKS</code></td><td>Turn off every <code>[hooks]</code> entry for this run</td></tr>
             <tr><td><code>SLAG_REASONING_EFFORT</code></td><td><code>low</code> / <code>medium</code> / <code>high</code> for models that take it</td></tr>
             <tr><td><code>SLAG_SCREENSHOT_CMD</code></td><td>Shell command producing a screenshot for visual assay of web ingots</td></tr>
             <tr><td><code>SLAG_CHAR_BUDGET</code></td><td>Transcript char budget before an agent session compacts</td></tr>

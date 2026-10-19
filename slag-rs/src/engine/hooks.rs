@@ -2,7 +2,7 @@
 //!
 //! A hook is a side-effect the operator wires to a point in the forge's
 //! life: before a tool runs, after it fails, when an ingot cracks. Config
-//! lives in the `[hooks]` table of `slag.toml`, one hook per line, keyed
+//! lives in the `[hooks]` table of `config.toml`, one hook per line, keyed
 //! by event name.
 //!
 //! The protocol is the exit code, not the output:
@@ -964,7 +964,7 @@ pub fn describe(snap: &HookSnapshot) -> String {
         out.push_str("  disable_all_hooks is set: nothing will fire.\n");
     }
     if snap.hooks.is_empty() {
-        out.push_str("  none. Add a [hooks] table to slag.toml:\n");
+        out.push_str("  none. Add a [hooks] table to config.toml:\n");
         out.push_str("    [hooks]\n");
         out.push_str("    post_tool = \"name=fmt matcher=edit_file cmd='cargo fmt'\"\n");
         return out;

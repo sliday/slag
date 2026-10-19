@@ -9,7 +9,7 @@
 
 A task orchestrator for AI-powered development. Give slag a product requirement. It splits the work into tasks, calls your chosen model, and checks each task with a shell command.
 
-Choose any OpenAI-compatible chat-completions provider. OpenRouter stays the default. Local providers work without a key. You do not need the Claude CLI or a vendor SDK.
+Choose any provider with an OpenAI-compatible API. slag speaks chat completions, and the Responses API for OpenAI GPT-5.4 and later. OpenRouter stays the default. Local providers work without a key. You do not need the Claude CLI or a vendor SDK.
 
 ## Quick start
 
@@ -136,6 +136,8 @@ With another provider selected, bare `openrouter/auto` uses that provider's defa
 
 Provider settings join the existing model, duel, screenshot, MCP, and spend settings in the same file. OpenRouter keeps its routing, `reasoning_details` replay, pricing lookup, and attribution headers. slag preserves native DeepSeek `reasoning_content` and Gemini tool signatures across tool calls. The agent recovers standalone JSON against declared tool schemas and rejects prose or code fences. It returns provider tool-validation errors to the model, with a limit of three consecutive failures. Other providers receive supported reasoning fields or omit them.
 
+`--auto` resets all four roles to the selected provider's default. Explicit model flags take precedence.
+
 ### MCP servers
 
 An `[mcp]` table adds Model Context Protocol servers over stdio, one command per line:
@@ -148,7 +150,16 @@ github = "gh-mcp --stdio"
 
 slag spawns each server at forge start and hands the smith every tool it advertises, named `mcp__<server>__<tool>`, beside the built-in eight. A server that will not start is named in a warning and skipped; the forge runs on the natives. stdio transport only, so no HTTP, SSE, or OAuth servers.
 
-`--auto` resets all four roles to the selected provider's default. Explicit model flags take precedence.
+### Hooks
+
+A `[hooks]` table in `config.toml` runs your commands at points in a forge. Each line holds one hook, keyed by its event:
+
+```toml
+[hooks]
+post_tool = "name=fmt matcher=edit_file cmd='cargo fmt'"
+```
+
+The events are `pre_tool`, `post_tool`, `tool_error`, `stop`, `session_start`, `pre_compact`, `ingot_forged` and `ingot_cracked`. The exit code is the contract. Exit 0 turns stdout into context the model sees. Exit 2 on `pre_tool` refuses the call and returns stderr as the tool result; on `post_tool` and `tool_error` it appends stderr to the result. slag logs any other code and carries on. `slag hooks list` prints the events, the contract, and your hooks. `SLAG_DISABLE_HOOKS=1` or `disable_all_hooks = "t"` turns them all off. slag reads the table once when a forge opens, so a smith cannot add a hook to its own run.
 
 ## Why
 
@@ -164,21 +175,23 @@ slag takes a different approach:
 - **No questions asked.** The model is instructed to make expert decisions autonomously. If the surveyor's analysis contains questions, slag feeds it back with instructions to resolve them. Up to 3 self-iteration rounds.
 - **Watchable and steerable.** `--tui` opens a Ratatui dashboard with the crucible, a live feed narrated in plain English, and a steer input: type a message, press Enter, and the running smith folds it in.
 - **Spend caps.** `SLAG_MAX_COST_INGOT` and `SLAG_MAX_COST_RUN` put dollar ceilings on a single ingot session and on the whole run. Default is uncapped.
+- **A contained shell.** The smith's shell commands write only inside the workspace and temp directories. See [Sandbox](#sandbox).
 
 ## How it works
 
-slag runs a 4-phase pipeline:
+slag runs four phases. `--temper N` adds a fifth, the warden, between the forge and the assay.
 
 File names below refer to `.slag/` for new commissions.
 
 ```
-PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGRESS.md
- (ore)    (analyze)    (analysis)      (design)   (ingots)   (strike)    (ledger)
+PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE ------> ASSAY
+ (ore)    (analyze)    (analysis)      (design)   (ingots)   (strike)      (report)
+                                                     ^           |
+                                                     |           v  --temper N
+                                                     +--- gap -- TEMPER (warden)
 ```
 
 ### Phase 1: SURVEYOR
-
-Small local commissions share a short contract between the builder and reviewer. The contract checks named behavior and boundary cases first. It then checks interfaces that fit the tool: stdin for Unix filters, positional values for scalar parsers, and package entry points when requested. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation. Package installation checks use a separate temporary copy. They try venv, virtualenv, then pip with a private target. If host tools are missing, slag records a skipped installation check and still requires the other checks. Slag keeps verification instruments under gitignored `.slag/checks/`. Product tests work without that directory.
 
 The surveyor reads `.slag/PRD.md` (the ore). It writes `.slag/BLUEPRINT.md` with architecture decisions, dependencies, risks, and the forging sequence. It uses the plan model.
 
@@ -205,6 +218,19 @@ Independent ingots (`:solo t`) run on up to 3 parallel anvils. Dependent ingots 
 
 Eligible independent ingots use two or three casts in separate git worktrees, with minimal, robust, or creative direction prompts. A judge model assays passing casts, then slag merges the winner. Auto mode uses work shape and grade: grades 3-4 usually use two casts, grade 5 or taste-heavy work uses three, and mechanical work stays single-cast. `:casts`, `:duel`, and `SLAG_DUEL` can override the choice. Cast B may use the same model as cast A.
 
+### Temper: the warden (`--temper N`)
+
+`:proof` shows that a task's artifact appeared. It does not show that the commission was met. `--temper N` adds a warden: a fresh critic on the plan model that built nothing.
+
+1. The warden writes the acceptance bar to `.slag/BAR.md` once and judges every round against it.
+2. Before the forge, it judges the blueprint and the plan against the bar. A gap sends each back for one corrective pass.
+3. An ingot with a `:bar` gets judged after its proof passes. A loss counts as a failed heat.
+4. After the forge, the warden opens the built project, runs its checks in a read-only sandbox, and compares the result with the bar. On a loss, the gap it names becomes new ingots, and the forge runs again, up to N rounds.
+
+A goal still unmet after N rounds exits 1 and names the gap. Raise the count and resume to forge it, for example `slag --temper 2 resume` after one round. `0`, the default, skips the warden.
+
+With `--temper`, a short commission (800 characters or fewer) in an empty directory can take a direct path: one ingot, one bar, one final warden. The contract checks named behavior and boundary cases first, then interfaces that fit the tool: stdin for Unix filters, positional values for scalar parsers, package entry points when requested. The reviewer runs the suite and CLI probes in a read-only sandbox, and runs the suite again from a fresh clone. Package installation checks use a separate temporary copy and try venv, virtualenv, then pip with a private target. Missing host tools produce a recorded skip; the other checks still apply. Verification instruments live in gitignored `.slag/checks/`, and product tests must work without that directory.
+
 ### Phase 4: ASSAY
 
 Final report. Counts forged versus cracked ingots, shows a temperature bar, and exits 0 on a full forge or 1 if anything cracked. It prints on failed runs too, since a run that cracked an ingot is when you most need the cracked list.
@@ -226,11 +252,14 @@ slag fix --issue-file ISSUE.md --pr
 4. slag reverts the source change and reruns the tests to show the new test catches the bug, then puts the fix back.
 5. The fix lands as one commit on a new `slag/fix-<slug>` branch (`slag/fix-<n>-<slug>` for a GitHub issue). The report prints the diff stat and the verification command.
 
-A failed attempt retries on the plan model, starting from the failure slag saw. `--tries N` sets the attempts (default 3), `--no-commit` leaves the fix in the working tree, `--pr` pushes the branch and opens a draft PR, and `--temper` adds the warden as an independent judge. Outside git, slag tracks the changes in a private temporary repository and commits nothing.
+A failed attempt retries on the plan model, starting from the failure slag saw. `--tries N` sets the attempts (default 3), `--no-commit` leaves the fix in the working tree, `--pr` pushes the branch and opens a draft PR, and `--temper` adds the warden as an independent judge. `--model` and `--plan-model` pick the first-attempt and retry models, and `--tui` opens the dashboard. Outside git, slag tracks the changes in a private temporary repository and commits nothing.
 
-## Recursive harnessing
+## Recursive harnessing (experimental)
 
-`slag fix` can improve the harness it works in, issue by issue, with no model change. The method follows Harness² (Xu et al., "Harness²: Recursive Agent Harnessing for an Open World", Google Cloud AI Research, 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224)). Without the flags below, `slag fix` runs exactly as described above.
+`slag fix --evolve K` and `--harness` are experimental. They implement Harness² (Xu et al., "Harness²: Recursive Agent Harnessing for an Open World", Google Cloud AI Research, 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224)): slag edits the harness it works in (prompt files, recipes, scripts, hooks), issue by issue, with no model change. `--evolve 1` runs up to four fix attempts and four improver sessions, plus validation retries, before it delivers, so expect several times the spend of a plain `slag fix`. A $2 cap applies by default. Without these flags, `slag fix` runs exactly as described above.
+
+<!-- harness2-result -->
+No measured accuracy result for `--evolve` is published yet.
 
 ```bash
 slag fix "export drops the last day"                   # fast path, no harness
@@ -350,20 +379,23 @@ sandbox_writable = ["~/data", "/srv/scratch"]  # extra writable paths
  │                        ├─ forge     ingots → anvils (≤3 ∥)     │
  │                        │             ├─ duel (twin casts+judge)│
  │                        │             └─ resmelt (one rewrite)  │
- │                        └─ assay     forged/cracked report      │
+ │                        ├─ warden    --temper: bar, verdict, gap│
+ │                        ├─ assay     forged/cracked report      │
+ │                        └─ fix       slag fix, --evolve         │
  │                                                                │
  │  engine/  agent loop · tools (read/write/edit/grep/bash)       │
- │           recipes · judge · events → narrator                  │
+ │           sandbox · hooks · MCP · pricing · recipes · judge    │
+ │  harness/ harness loader · validator · library                 │
  │  smith/   NativeSmith factories (work / plan / base)           │
- │  tui.rs · dashboard.rs   stream feed · Ratatui + steering      │
+ │  render/ · tui.rs · dashboard.rs   stream · Ratatui · tapes    │
  │  config.rs   key store · model roles · spend caps              │
  └───────────────┬────────────────────────────────────────────────┘
-                 │  HTTPS (chat completions, tool calls)
+                 │  HTTPS (chat completions or Responses, tool calls)
                  v
           OpenAI-compatible API (OpenRouter by default)
 ```
 
-The engine uses its own agent loop and OpenAI-compatible chat completions. It needs no vendor CLI.
+The engine runs its own agent loop over OpenAI-compatible chat completions, or the Responses API for OpenAI GPT-5.4 and later. It needs no vendor CLI.
 
 ## Commands
 
@@ -374,23 +406,37 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `slag fix ISSUE` | Fix one issue in this repository and commit it on a new branch |
 | `slag key [KEY] [--provider NAME]` | Show provider setup or store its key |
 | `slag cost` | Show session spend and an OpenRouter balance when available |
-| `slag status` | Show crucible state |
+| `slag status [--json]` | Show crucible state. `--json` prints one object: run id, ingots by status, spend, tokens, last event |
 | `slag resume` | Resume an existing forge |
+| `slag runs` | List past runs from the event logs |
+| `slag insights [--refresh]` | Offline analytics over the logs: forged and cracked ingots, heats, spend, tool errors, duel margins |
+| `slag ps` | List live forges on this machine |
+| `slag rewind [--ingot ID --heat N]` | Restore the workspace from an attempt checkpoint. Bare `slag rewind` takes the most recent attempt |
+| `slag replay FILE` | Play a recorded run (`logs/tape-*.jsonl` or an `engine-*.jsonl` log). `--speed`, `--tui`, `--at POINT`, `--hold SECS`, `--size WxH`, `--points` |
+| `slag hooks list` | Print the hook events, the exit-code contract, and the configured hooks |
 | `slag update` | Self-update to the latest release |
+
+`runs`, `insights`, `ps`, `rewind`, `replay` and `hooks` need no key or network.
 
 ## Flags
 
 | Flag | Effect |
 |------|--------|
 | `--tui` | Full-screen dashboard with crucible, live feed, and steering input |
+| `--temper N` | Judge the result against the goal with the warden, up to N rounds (default 0, off). See [Temper](#temper-the-warden---temper-n) |
 | `--anvils N` | Max parallel anvil workers (default 3) |
 | `--provider NAME` | Select the default provider |
 | `--auto` | Reset all four roles to the selected provider default |
 | `--model MODEL` | Worker model |
 | `--plan-model MODEL` | Planner model for grade 3+ ingots |
 | `--judge-model MODEL` | Duel judge model |
+| `--duel` | Give every solo ingot at least two casts (same as `SLAG_DUEL=on`) |
+| `--trace FILE` | Write a Chrome trace-event file, one lane per anvil, for chrome://tracing or Perfetto |
+| `--force` | Accept a one-word commission. Without it, slag refuses a lone bare word as a mistyped subcommand |
 | `--worktree` | Branch-per-ingot isolation. Not implemented yet, warns and runs in the shared checkout. |
 | `--no-sandbox` | Let shell commands write outside the workspace (see [Sandbox](#sandbox)) |
+
+Flags may come before or after the commission. `slag fix --help` lists the fix flags.
 
 ## Environment
 
@@ -406,11 +452,20 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `SLAG_SANDBOX` | `auto` (default) or `off` for the shell sandbox |
 | `SLAG_MAX_COST_INGOT` | Dollar ceiling for a single ingot session (file key `max_cost_per_ingot`). Default uncapped. |
 | `SLAG_MAX_COST_RUN` | Dollar ceiling for the whole run (file key `max_cost_per_run`). Default uncapped. |
+| `SLAG_CREDIT_FLOOR` | Warn at forge start when the OpenRouter balance is under this many dollars (file key `credit_floor`) |
+| `SLAG_COST_PER_MTOK` | Flat dollars per million tokens that spend caps charge for a response with no known price (default 5) |
+| `SLAG_MODEL_FALLBACK` | OpenRouter fallback model for capacity errors, sent in the same request (file key `fallback_model`) |
+| `SLAG_UNATTENDED_RETRY` | `1` keeps retrying 429 and 529 errors past the normal budget, with backoff up to 5 minutes (file key `unattended_retry`) |
+| `SLAG_MAX_RETRIES` | Provider request attempts (default 8) |
+| `SLAG_API_TIMEOUT_MS` | Provider request timeout in milliseconds (default 300000) |
 | `SLAG_REASONING_EFFORT` | `low`, `medium`, `high` for models that take it |
 | `SLAG_SCREENSHOT_CMD` | Shell command producing a screenshot for visual assay of web ingots |
 | `SLAG_CONFIG_DIR` | Move the config directory off `~/.config/slag` |
 | `SLAG_OPENROUTER_BASE` | Legacy OpenRouter-only base URL override |
-| `SLAG_CHAR_BUDGET` | Transcript char budget before an agent session compacts (default 600000). Lower it for small-context models. |
+| `SLAG_CHAR_BUDGET` | Transcript char budget before an agent session compacts (default 48000, less for a small model window). Lower it for small-context models. |
+| `SLAG_BASH_OUTPUT_CAP` | Bytes of shell output the smith sees per command (default 30000, ceiling 204800) |
+| `SLAG_ALLOW_DESTRUCTIVE` | `1` lets the smith run commands the destructive-command gate refuses, such as `rm -rf` |
+| `SLAG_DISABLE_HOOKS` | Turn off every hook for this run (file key `disable_all_hooks`) |
 | `SLAG_HARNESS_LIBRARY` | Harness library directory for `slag fix --evolve` and `--harness library` (file key `harness_library`) |
 | `SLAG_EVOLVE_BUDGET` / `SLAG_EVOLVE_TOKENS` | Dollar and token caps for `slag fix --evolve` (file key `evolve_budget` for dollars) |
 | `NO_COLOR` | Set to anything to drop color from the output |
@@ -429,10 +484,12 @@ The engine uses its own agent loop and OpenAI-compatible chat completions. It ne
 | `:max` | 5-8+ | Max retries before cracking |
 | `:smelt` | 0 / 1 | Re-smelt count. The founder writes 0; an ingot already re-smelted once carries 1 and cracks for good next time. |
 | `:proof` | shell command | Acceptance test (exit 0 = pass) |
+| `:bar` | string | The ingot's acceptance bar. With `--temper`, the warden judges it after the proof passes. Empty means the proof alone decides. |
 | `:work` | string | Task description for the smith |
 | `:duel` | `t` / `nil` | Twin-cast override. `t` forces a duel, `nil` blocks one, absent defers to `SLAG_DUEL`. Sequential ingots never duel either way. |
+| `:casts` | 1 / 2 / 3 | Cast-count override. Absent defers to `SLAG_DUEL` and the grade heuristics. |
 
-The parser accepts these eleven fields and keeps any other `:key value` pair you add, writing it back unchanged.
+The parser accepts these thirteen fields and keeps any other `:key value` pair you add, writing it back unchanged.
 
 ## Files
 
@@ -442,17 +499,24 @@ The parser accepts these eleven fields and keeps any other `:key value` pair you
 | `.slag/BLUEPRINT.md` | Surveyor analysis output |
 | `.slag/PLAN.md` | Ingot crucible (task list) |
 | `.slag/AGENTS.md` | Coordinator scratch notes. The coordinator creates a `## Alloy Recipes` stub. Forge prompts read this file. |
-| `.slag/BAR.md` | Acceptance criteria and required checks |
+| `.slag/BAR.md` | Acceptance bar and required checks. The warden judges against it. |
 | `.slag/PROGRESS.md` | Work history ledger |
-| `.slag/logs/` | Debug logs (slag heap) |
+| `.slag/logs/` | Debug logs (slag heap): `engine-*.jsonl` event logs, `tape-*.jsonl` recordings for `slag replay`, attempt checkpoints for `slag rewind`, the `slag insights` cache |
+| `.slag/checks/` | Verification probes and fixtures. Builders write here, reviewers cannot, and product tests must work without it. |
+| `.slag/session-costs.json` | Spend per run, for `slag cost`, `slag status --json` and the dashboard |
+| `.slag/layout` | Marker that pins the `.slag/` layout |
+| `.slag/evolve/<run>/` | The `slag fix --evolve` record (`record.json`) and improver sessions. `.slag/evolve/latest.json` copies the last record. |
+| `.slag/library/` | Optional per-repository harness library |
 | `recipes/<name>/RECIPE.md` | The real recipes. Each one is a markdown file with `---` frontmatter (name, description, optional requires_tools). slag indexes `./recipes/` and `~/.config/slag/recipes/` and offers the list to the smith. |
+
+Projects that already keep `PLAN.md` or `PRD.md` at the root use the same names at the root, with logs in `logs/`.
 
 ## Requirements
 
 - A key for your provider, or a local Ollama or LM Studio server
 - `git` (slag commits each forged ingot)
 
-`install.sh` reads the latest release tag from the GitHub API, downloads `slag-<arch>-<os>.tar.gz`, unpacks the `slag` binary into `~/.slag/bin`, and tells you to add that directory to your PATH. Releases currently carry one target: `slag-aarch64-apple-darwin.tar.gz` (macOS on Apple Silicon), alongside the same binary uncompressed and a `sha256.sum`. Everywhere else the download 404s, so build it:
+`install.sh` reads the latest release tag from the GitHub API, downloads `slag-<arch>-<os>.tar.gz`, unpacks the `slag` binary into `~/.slag/bin`, and tells you to add that directory to your PATH. The published v2.9.0 release carries one target: `slag-aarch64-apple-darwin.tar.gz` (macOS on Apple Silicon), alongside the same binary uncompressed and a `sha256.sum`. The next release ships four targets: Apple Silicon, Intel Mac, and Linux on x86_64 and aarch64. `install.sh` and `slag update` already handle all four. Until then, other platforms build from source:
 
 ```bash
 cargo install --path slag-rs
