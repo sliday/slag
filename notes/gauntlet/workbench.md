@@ -352,6 +352,17 @@ Goal (owner's words): "take this to the production level with impeccable TUI flo
 - BIGGEST_GAP: `agent.rs:943-947` aborts the read-only warden on any "review policy violation" tool outcome; a pytest traceback matched a sandbox marker after the real checks passed. Sent as efficiency r6 with idiomatic expectations and moving coordination files to `.slag/`.
 - Instrument correction: pytest exists at /opt/homebrew/bin/pytest.
 
+### efficiency r6 merged
+- Refused/failed review commands return as ordinary tool errors (only a model write attempt aborts); contracts derive conventional CLI interfaces (console script, package.json bin, stdin, --help, defaults); new commissions keep coordination files under ignored `.slag/` (old root locations still read).
+- Live gpt-6.1-sol: wc 68.7k / 106 s / $0.10 FORGED; csv 67.3k / 78 s / $0.08 FORGED; node 74.6k / 90 s UNVERIFIED (cited an unknown inspection id) → resume 12.3k / 13 s FORGED. Builder checks passed for install, console scripts, Node bin, stdin, help, defaults, wc boundaries; `git ls-files` shows no coordination files.
+- Integration: 1140 unit tests green, clippy clean. Critic commission-r5 running with order-swapped votes.
+
+### commission critic r5 (Fable, fresh, gpt-6.1-sol, order-swapped votes): WINNER bar, narrowly
+- slag: wc 107 s / 82k / $0.114 FORGED (matches wc incl. stdin and `-`, 9 tests); csv 82 s / 58k / $0.076 FORGED (installs, script plain/--pretty/stdin; no `__main__.py`; suite fails on a fresh clone without install); node 85 s / 58k / $0.074 FORGED (bin, default 10, stdin, --help, 7 tests; rejects positional `FILE 3`). No tracked coordination files. Codex: 113 / 124 / 79 s, 3-8x more tokens.
+- Votes (fx both orders agreed every pair): a codex, b codex, c split (critic slag both orders, fx codex). Totals 0-2-1.
+- Integrity pass; no UNVERIFIED.
+- BIGGEST_GAP: idiomatic first-check failures (fresh-clone suite, `python -m`, positional args). Sent as efficiency r7 with slag's marks in the repo (bootstrap commit name, committed `.slag/` ignore lines).
+
 ## Integration checklist (smoothing): all closed by the smoothing lane except where noted
 - Compiler warnings: baseline 21; target 0.
 - `shutdown.rs` tests drain every hook in the process; isolate them.
