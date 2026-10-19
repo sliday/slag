@@ -147,7 +147,7 @@ pub fn prepare_flux(ingot: &Ingot, slag: Option<&str>) -> String {
     flux.push_str("\n\nVERIFICATION CONTRACT: The independent reviewer runs the suite and CLI with a read-only filesystem. \
         Use in-memory data or committed fixtures under tests/fixtures. Create fixture files during construction, before verification. Tests must not create or delete workspace fixtures. \
         Use subprocess CLI tests to exercise each named flag and behavior. Assert exact expected results, not only exit codes or output shapes. Keep scratch files in TMPDIR, not the product tree. \
-        The documented suite must pass from a fresh clone without prior installation. Use source or module launches in tests, not an installed console command. For package installation probes, prepare a project virtual environment before review; never use global pip or bypass PEP 668. \
+        The documented suite must pass from a fresh clone without prior installation. Use source or module launches in tests, not an installed console command. The coordinator checks package installation in an isolated copy. Keep generated .venv, *.egg-info, and *.dist-info outside the product tree. Never use global pip or bypass PEP 668. \
         For named reference tools, check the requested behavior against the reference instead of guessing fixture expectations. \
         Inspect a failing assertion and its input before changing code or tests. Never change expectations just to fit the implementation.\n\n");
 
@@ -294,8 +294,9 @@ pub fn surveyor_prompt(ore: &str) -> String {
         ## 5. RISKS\n- High complexity areas\n- Integration points\n- External dependencies\n\n\
         ## 6. FORGING SEQUENCE\n1. Foundation (parallel, :solo t)\n2. Core logic\n3. Integration\n4. Polish/deploy\n\n\
         ## 7. ACCEPTANCE CRITERIA\n- Trace each named behavior, flag, CLI and package requirement to an observable check.\n\
+        - Put standard semantics and edge-case assertions before interface conveniences.\n\
         - Include actual CLI subprocess tests for requested flags and behavior.\n\
-        - Choose a read-only-compatible suite and CLI probes using in-memory data or committed fixtures.\n\
+        - Keep workspace paths read-only in tests and probes. Use in-memory data, committed fixtures, or private TMPDIR scratch.\n\
         - Add no unstated features, fixed test counts or packaging formats.\n\n\
         RULES:\n\
         - You are the EXPERT. Make ALL decisions yourself.\n\
@@ -381,13 +382,18 @@ fn founder_format_rules() -> String {
 }
 
 const DELIVERY_RULES: &str = "\
-    Judge the commission as a usable deliverable.\n\
+    Verify named behavior before interface conveniences.\n\
+    Derive semantics from the named operation or format, then test its boundary cases with exact expected results.\n\
+    Examples apply only to named behavior. Tail selects the last N lines (default 10), supports -n including 0 and +N, and follows complete appended records. Wc-like tools support -l/-w/-c and combined flags.\n\
+    CSV conversion handles BOM and quoted newlines, and rejects ragged rows without silent data loss. Unicode word frequency normalizes equivalent words with NFC.\n\
+    File/text stream operations process input incrementally. Follow tests cover appends and partial lines.\n\
+    Spend implementation and review effort on these behaviors before optional interfaces. Do not invent input aliases, unrelated features, or a test quota.\n\
     A requested CLI must run through its intended entry command in the delivered project.\n\
     Document the intended launch and test commands.\n\
     Include the local modules, dependency declarations, and configuration needed for that command.\n\
     For a package deliverable, include the metadata needed for its intended installation or distribution.\n\
     A Python package CLI supports its installed console script and python -m PACKAGE through __main__.py.\n\
-    File/text CLIs accept stdin without a file and with literal -. Named top-N arguments support FILE N and a flag.\n\
+    File/text CLIs accept stdin without a file and with literal -. Named top-N arguments support FILE N and a sensible default. Require a flag only when named.\n\
     The documented full suite passes from a fresh clone without prior installation.\n\
     Require installation only when the commission or its stated invocation requires it.\n\
     Do not require a packaging format, a publish step, or a fixed test count without that requirement.";
@@ -478,9 +484,9 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          Inspect the source and tests on disk.\n\
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
-         Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
+         Judge core semantics first. Inspect tests and successful runs for exact results on each named behavior and its boundary cases. Check interface conveniences after those behaviors.\n\
          Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
-         The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\
+         The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
          Do not edit files. Do not install packages. Do not run git commands.\n\
@@ -513,9 +519,9 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          Inspect the source and tests on disk.\n\
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
-         Inspect the tests to confirm that they exercise the named behaviors and flags through the real CLI.\n\
+         Judge core semantics first. Inspect tests and successful runs for exact results on each named behavior and its boundary cases. Check interface conveniences after those behaviors.\n\
          Python skips bytecode writes. Committed fixtures and in-memory inputs need no writes.\n\
-         The review filesystem stays read-only, including temporary directories. Never install packages or create fixtures.\n\
+         The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
          For visual or interactive work, inspect the interface.\n\
          Batch independent inspections into one tool turn. Use at most six tool turns, then return your verdict as text.\n\
@@ -800,6 +806,24 @@ mod tests {
             casts: None,
             extra: vec![],
         }
+    }
+
+    #[test]
+    fn builder_and_warden_prioritize_semantics_and_isolate_installs() {
+        let builder = prepare_flux(&sample_ingot(), None);
+        let reviewer = warden_prompt("tail a log", "required behavior");
+        for prompt in [&builder, &reviewer] {
+            let primary = prompt.find("Verify named behavior before interface conveniences").unwrap();
+            let cli = prompt.find("A requested CLI must run").unwrap();
+            assert!(primary < cli);
+            for required in ["partial lines", "quoted newlines", "NFC", "incrementally"] {
+                assert!(prompt.contains(required), "missing {required}");
+            }
+        }
+        assert!(builder.contains("checks package installation in an isolated copy"));
+        assert!(builder.contains("Keep generated .venv"));
+        assert!(reviewer.contains("private TMPDIR scratch"));
+        assert!(!reviewer.contains("including temporary directories"));
     }
 
     #[test]

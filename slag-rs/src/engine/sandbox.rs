@@ -141,6 +141,7 @@ pub struct Sandbox {
     /// `CARGO_TARGET_DIR` inside the root when the user's points outside.
     env: Vec<(String, PathBuf)>,
     read_only: bool,
+    review_temp: Option<tempfile::TempDir>,
     /// Landlock ruleset, built once in the parent and applied in each
     /// child between fork and exec.
     #[cfg(target_os = "linux")]
@@ -184,8 +185,16 @@ impl Sandbox {
         Self::with(Backend::None, Vec::new(), Locked::default())
     }
 
-    /// Deny filesystem writes, independent of the configured forge sandbox.
+    /// Deny workspace writes and allow one private temporary directory.
     pub fn read_only() -> std::io::Result<Self> {
+        let temp = tempfile::Builder::new().prefix("slag-review-").tempdir()?;
+        let mut sandbox = Self::for_scratch(temp.path())?;
+        sandbox.review_temp = Some(temp);
+        Ok(sandbox)
+    }
+
+    /// Allow writes only beneath `root`, without configured writable paths.
+    pub fn for_scratch(root: &Path) -> std::io::Result<Self> {
         let backend = backend();
         if backend == Backend::None {
             return Err(std::io::Error::new(
@@ -193,8 +202,12 @@ impl Sandbox {
                 "read-only review requires a working OS sandbox; no unconfined fallback",
             ));
         }
-        let mut sandbox = Self::with(backend, Vec::new(), Locked::default());
+        let path = root.canonicalize()?;
+        let mut sandbox = Self::with(backend, vec![path.clone()], Locked::default());
         sandbox.read_only = true;
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            sandbox.env.push((name.to_string(), path.clone()));
+        }
         #[cfg(target_os = "linux")]
         if backend == Backend::Landlock {
             sandbox.ruleset = landlock::read_only_ruleset(&sandbox.writable);
@@ -283,9 +296,14 @@ impl Sandbox {
             locked,
             env: Vec::new(),
             read_only: false,
+            review_temp: None,
             #[cfg(target_os = "linux")]
             ruleset,
         }
+    }
+
+    pub fn temp_dir(&self) -> Option<&Path> {
+        self.review_temp.as_ref().map(|temp| temp.path())
     }
 
     pub fn backend(&self) -> Backend {
@@ -1127,6 +1145,74 @@ mod tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "--bind" || arg == "--dev-bind"));
+    }
+
+    #[tokio::test]
+    async fn readonly_sandbox_allows_private_temp_and_cleans_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sb = match Sandbox::read_only() {
+            Ok(sb) => sb,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+                return;
+            }
+        };
+        let temp = sb.temp_dir().unwrap().to_path_buf();
+        assert_ne!(temp, std::env::temp_dir());
+        let output = sb.wrap("python3").args(["-B", "-c", r#"
+import os, pathlib, tempfile, threading, time
+root = pathlib.Path(os.environ['TMPDIR'])
+assert os.environ['TMP'] == str(root) == os.environ['TEMP']
+assert pathlib.Path(tempfile.gettempdir()) == root
+with tempfile.TemporaryDirectory() as directory:
+    log = pathlib.Path(directory) / 'follow.log'
+    log.write_text('old\n')
+    with log.open() as source:
+        source.seek(0, 2)
+        def append():
+            time.sleep(0.02)
+            with log.open('a') as target:
+                target.write('next')
+                target.flush()
+                time.sleep(0.02)
+                target.write(' line\n')
+        writer = threading.Thread(target=append)
+        writer.start()
+        received = ''
+        deadline = time.monotonic() + 2
+        while not received.endswith('\n') and time.monotonic() < deadline:
+            received += source.read()
+            time.sleep(0.01)
+        writer.join()
+        assert received == 'next line\n', repr(received)
+(root / 'marker').write_text('temporary')
+print('follow passed')
+"#]).current_dir(workspace.path()).output().await.unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(temp.join("marker").exists());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+        drop(sb);
+        assert!(!temp.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readonly_temp_symlink_cannot_allow_workspace_writes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sb = match Sandbox::read_only() {
+            Ok(sb) => sb,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+                return;
+            }
+        };
+        let link = sb.temp_dir().unwrap().join("workspace");
+        std::os::unix::fs::symlink(workspace.path(), &link).unwrap();
+        let output = sb.wrap("python3").args(["-B", "-c",
+            "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('blocked')"])
+            .arg(link.join("marker")).output().await.unwrap();
+        assert!(!output.status.success());
+        assert!(!workspace.path().join("marker").exists());
     }
 
     #[tokio::test]

@@ -214,11 +214,25 @@ pub async fn judge_artifact(
             }
         }
     } else { None };
+    let installed = if python_package_cli(&ore, &bar) {
+        match checkout::prepare_install(std::path::Path::new(".")).await {
+            Ok(checkout) => { commands.push(checkout.command.clone()); Some(checkout) }
+            Err(error) => {
+                let verdict = Verdict::unverified(format!("cannot prepare the isolated installation check: {error}"));
+                record(round, &verdict);
+                return Ok(verdict);
+            }
+        }
+    } else { None };
+    let install_context = installed.as_ref().map(|checkout| format!(
+        "ISOLATED INSTALL CHECK: {}\nThe coordinator installed committed HEAD in a separate temporary clone. First run the fresh-clone suite without installation. Then run this exact command in its own bash call. It checks installed console-script metadata and --help. Cite its successful ID.\n",
+        checkout.command,
+    )).unwrap_or_default();
     let fresh_context = fresh.as_ref().map(|checkout| format!(
         "FRESH CLONE CHECK: {}\nThe coordinator cloned committed HEAD without ignored files or prior package installs. Run this exact command in its own bash call. Cite its successful ID. A failure is a delivery gap.\n",
         checkout.command,
     )).unwrap_or_default();
-    let prompt = format!("REQUIRED RUN COMMANDS: {}\n\n{fresh_context}\n{}\n\n{}",
+    let prompt = format!("REQUIRED RUN COMMANDS: {}\n\n{fresh_context}{install_context}\n{}\n\n{}",
         serde_json::to_string(&commands).unwrap(), workspace_context(), crate::flux::warden_prompt(&ore, &bar));
     let raw = match smith
         .invoke(&prompt)
@@ -238,6 +252,14 @@ pub async fn judge_artifact(
     if verdict.is_unverified() { log_raw(&raw); }
     record(round, &verdict);
     Ok(verdict)
+}
+
+fn python_package_cli(ore: &str, bar: &str) -> bool {
+    let goal = ore.to_ascii_lowercase();
+    let cli = goal.contains("cli") || goal.contains("command-line") || goal.contains("command line");
+    let python = goal.contains("python") || bar.contains("python3 -m PACKAGE");
+    let package = goal.contains("package") || bar.contains("console-script entry point");
+    python && package && cli
 }
 
 fn fresh_suite(bar: &str, commands: &[String]) -> Option<String> {

@@ -178,7 +178,7 @@ PRD.md --> SURVEYOR --> BLUEPRINT.md --> FOUNDER --> PLAN.md --> FORGE --> PROGR
 
 ### Phase 1: SURVEYOR
 
-Small local commissions share a short contract between the builder and reviewer. The contract covers named behavior and conventional CLI interfaces: help, stdin, package entry points, and stated defaults. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation.
+Small local commissions share a short contract between the builder and reviewer. The contract checks named behavior and boundary cases first. It then checks conventional CLI interfaces: help, stdin, package entry points, and stated defaults. The reviewer runs the suite and CLI probes in a read-only sandbox. It also runs the suite from a fresh clone without prior project installation. Package installation checks use a separate temporary copy.
 
 The surveyor reads `.slag/PRD.md` (the ore). It writes `.slag/BLUEPRINT.md` with architecture decisions, dependencies, risks, and the forging sequence. It uses the plan model.
 
@@ -322,7 +322,7 @@ sandbox = "auto"                               # or "off"
 sandbox_writable = ["~/data", "/srv/scratch"]  # extra writable paths
 ```
 
-`--no-sandbox` or `SLAG_SANDBOX=off` turns it off. Reviewers (the warden) run their shell checks in a stricter read-only sandbox, which writes nothing at all and refuses background commands. `--no-sandbox` and `sandbox = "off"` deliberately do not reach that mode: without a working backend, slag refuses the reviewer's commands rather than run them unconfined. Precedence is flag, then environment, then file. A model writes every `:proof` and `CMD:` line, and `slag fix` can edit the test scripts it then runs, so slag runs proofs, CMD checks, and `slag fix` test runs in the same sandbox. A refused write shows up in the failure as `write blocked by slag's sandbox: <path>`. Test detection's Python probe (`import pytest` with the workspace's `.venv/bin/python` or `python3`) runs in the sandbox too. Hooks, `screenshot_cmd` and `[mcp]` servers stay outside it because you wrote them. They start in the workspace, so a bare `npx` or `python` there can pick up a package the model installed; give them absolute paths if that matters to you.
+`--no-sandbox` or `SLAG_SANDBOX=off` turns it off. Reviewers (the warden) run their shell checks in a stricter sandbox with a read-only workspace and private temporary scratch space. It refuses background commands. `--no-sandbox` and `sandbox = "off"` deliberately do not reach that mode: without a working backend, slag refuses the reviewer's commands rather than run them unconfined. Precedence is flag, then environment, then file. A model writes every `:proof` and `CMD:` line, and `slag fix` can edit the test scripts it then runs, so slag runs proofs, CMD checks, and `slag fix` test runs in the same sandbox. A refused write shows up in the failure as `write blocked by slag's sandbox: <path>`. Test detection's Python probe (`import pytest` with the workspace's `.venv/bin/python` or `python3`) runs in the sandbox too. Hooks, `screenshot_cmd` and `[mcp]` servers stay outside it because you wrote them. They start in the workspace, so a bare `npx` or `python` there can pick up a package the model installed; give them absolute paths if that matters to you.
 
 ## Architecture
 

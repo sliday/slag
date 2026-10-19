@@ -1654,9 +1654,16 @@ async fn review_shell(call: &ToolCall, root: Option<&std::path::Path>) -> ToolOu
         Ok(sandbox) => sandbox,
         Err(e) => return failed(e.to_string()),
     };
+    let Some(temp) = sandbox.temp_dir() else {
+        return failed("read-only review has no private temporary directory".into());
+    };
+    let command = match super::probe::materialize(command, temp) {
+        Ok(command) => command,
+        Err(error) => return failed(format!("cannot prepare review probe: {error}")),
+    };
     let timeout = args.get("timeout").and_then(serde_json::Value::as_u64).unwrap_or(20).clamp(1, 30);
     let mut cmd = sandbox.wrap("/bin/sh");
-    cmd.args(["-c", command]).current_dir(root)
+    cmd.args(["-c", &command]).current_dir(root)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("NODE_DISABLE_COMPILE_CACHE", "1")
         .env("PIP_NO_INDEX", "1")
@@ -2158,6 +2165,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readonly_review_shell_supports_tempfile_without_workspace_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test_temp.py"),
+            "import pathlib, tempfile, unittest\nclass TestTemp(unittest.TestCase):\n def test_temp(self):\n  with tempfile.TemporaryDirectory() as temp:\n   pathlib.Path(temp, 'fixture').write_text('ok')\n").unwrap();
+        let call = tc("suite", "bash", serde_json::json!({
+            "command": "python3 -m unittest -v",
+        }));
+        let result = review_shell(&call, Some(dir.path())).await;
+        if super::super::sandbox::backend() == super::super::sandbox::Backend::None {
+            assert!(result.is_error);
+        } else {
+            assert!(!result.is_error, "{}", result.output);
+            assert!(result.output.contains("Ran 1 test"));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
     async fn direct_builder_checks_are_readonly_but_construction_stays_writable() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("BAR.md"), "REQUIRED RUN COMMANDS: [\"python3 -m unittest\"]\n").unwrap();
@@ -2260,6 +2285,25 @@ mod tests {
         assert!(result.contains("[\"first\"] read_file \"artifact.py\""));
         assert_eq!(provider.requests().len(), 3);
         assert!(provider.requests()[2].messages.iter().all(|message| message.tool_call_id.as_deref() != Some("first")));
+    }
+
+    #[tokio::test]
+    async fn bounded_review_retains_source_through_required_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("artifact.py"), "SEMANTICS = 42\n").unwrap();
+        let mut replies = vec![resp_tools(vec![tc("source", "read_file", serde_json::json!({"path": "artifact.py"}))])];
+        for index in 0..5 {
+            replies.push(resp_tools(vec![tc(&format!("check{index}"), "read_file", serde_json::json!({"path": "artifact.py"}))]));
+        }
+        replies.push(resp_text("VERDICT: pass\nEVIDENCE: [\"source\"]", FinishReason::Stop));
+        let provider = MockProvider::new(replies);
+        let result = agent(provider.clone(), dir.path()).with_read_only_tools()
+            .with_required_inspection().with_max_turns(6).with_recent_rounds(6)
+            .run("review".into(), "inspect artifact".into()).await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&result).fulfilled);
+        let requests = provider.requests();
+        assert!(requests.last().unwrap().messages.iter().any(|message|
+            message.tool_call_id.as_deref() == Some("source") && message.content.contains("SEMANTICS = 42")));
     }
 
     #[tokio::test]
