@@ -1182,6 +1182,8 @@ impl ToolBox {
             .map_err(|e| SlagError::Tool(format!("failed to spawn shell: {e}")))?;
         #[cfg(unix)]
         let pgid = child.id();
+        #[cfg(unix)]
+        let _tracked = pgid.map(Tracked::new);
 
         // Item 56: race the wait against the interrupt so ctrl-C ends a
         // ten-minute proof now, not at the next turn boundary.
@@ -2727,6 +2729,42 @@ fn progress_verb(line: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Process groups of the shell commands running right now. A signal exit
+/// drops nothing, so `kill_on_drop` never fires there; `main` registers
+/// `kill_running` with the shutdown hooks instead.
+fn running() -> &'static Mutex<Vec<u32>> {
+    static RUNNING: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+    RUNNING.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// One running command's process group, listed until the command ends.
+struct Tracked(u32);
+
+impl Tracked {
+    fn new(pgid: u32) -> Self {
+        running().lock().unwrap_or_else(|e| e.into_inner()).push(pgid);
+        Self(pgid)
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        running().lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != self.0);
+    }
+}
+
+/// Kill every shell command slag started and has not seen finish.
+pub fn kill_running() {
+    let groups = std::mem::take(&mut *running().lock().unwrap_or_else(|e| e.into_inner()));
+    for pgid in groups {
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -9 -{pgid} 2>/dev/null"))
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 #[cfg(test)]

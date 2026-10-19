@@ -93,6 +93,7 @@ async fn main() {
     // events. Registrations come later, from whoever claims a resource.
     shutdown::install_panic_hook();
     shutdown::install_signal_handler();
+    shutdown::register(engine::tools::kill_running);
 
     // Idempotent fixups (deprecated model slugs, old crucible headers)
     // run before any command touches those files.

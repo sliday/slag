@@ -138,7 +138,7 @@ pub fn install_panic_hook() {
     });
 }
 
-/// Install the Ctrl-C handler: run the cleanups, then leave. Spawned on
+/// Install the Ctrl-C and SIGTERM handlers: run the cleanups, then leave. Spawned on
 /// the tokio runtime, so it needs one to already be running.
 ///
 /// The forge's *own* Ctrl-C (the dashboard's cancel key) never reaches
@@ -150,6 +150,18 @@ pub fn install_signal_handler() {
         if tokio::signal::ctrl_c().await.is_ok() {
             run_all();
             std::process::exit(130); // 128 + SIGINT, what a shell expects.
+        }
+    });
+    // `timeout`, a CI cancel and `docker stop` send SIGTERM. Without the
+    // same cleanups, every command slag started outlives it.
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            if term.recv().await.is_some() {
+                run_all();
+                std::process::exit(143); // 128 + SIGTERM.
+            }
         }
     });
 }

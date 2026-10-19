@@ -633,3 +633,59 @@ async fn a_deleted_test_is_put_back_and_its_lines_named() {
         .expect("a second attempt was briefed");
     assert!(retry.contains("- def test_b_keeps_working():"), "{retry}");
 }
+
+/// SIGTERM (`timeout`, a CI cancel, `docker stop`) runs the cleanups, so a
+/// command the smith started ends with slag instead of outliving it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_ends_the_command_the_smith_is_running() {
+    if std::process::Command::new("pgrep").arg("-x").arg("no-such-process").output().is_err() {
+        eprintln!("skipped: pgrep is not installed");
+        return;
+    }
+    let repo = buggy_repo();
+    // A duration unique to this test process, so a parallel run's sleep
+    // never counts as ours.
+    let sleep = format!("sleep {}", 300 + std::process::id() % 600);
+    let server = model(vec![tool("bash", json!({"command": format!("touch started && {sleep}")}))]).await;
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_slag"));
+    for var in ["SLAG_MODEL_PLAN", "SLAG_MODEL_ALT", "SLAG_MODEL_JUDGE", "SLAG_DUEL", "SLAG_REASONING_EFFORT"] {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd
+        .env("OPENROUTER_API_KEY", "sk-or-test")
+        .env("SLAG_OPENROUTER_BASE", server.uri())
+        .env("SLAG_MODEL_BASE", "test/base")
+        .env("SLAG_CONFIG_DIR", home.path())
+        .env("SLAG_SESSIONS_DIR", home.path().join("sessions"))
+        .env("HOME", home.path())
+        .env("NO_COLOR", "1")
+        .current_dir(repo.path())
+        .args(["fix", "value is wrong", "--test", "bash tests/check.sh"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = repo.path().join("started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !started.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    sh(repo.path(), &format!("kill -TERM {}", child.id()));
+    let status = tokio::task::spawn_blocking(move || child.wait().unwrap()).await.unwrap();
+    let alive = || std::process::Command::new("pgrep").args(["-f", &sleep]).output().unwrap().status.success();
+    let mut gone = false;
+    for _ in 0..50 {
+        if !alive() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = std::process::Command::new("pkill").args(["-f", &sleep]).status();
+    assert!(started.exists(), "the smith's command never started");
+    assert_eq!(status.code(), Some(143), "slag leaves as a shell expects after SIGTERM");
+    assert!(gone, "the smith's command outlived slag");
+}
