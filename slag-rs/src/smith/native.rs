@@ -171,14 +171,19 @@ impl NativeSmith {
         };
         if self.role == Role::Warden {
             system.push_str("\n\nREAD-ONLY REVIEW: You cannot write anywhere, including temporary directories. \
-                Read the source and tests first. Read logs/*_ASSAY_*.log for the coordinator's actual test output. \
-                Do not rerun unittest or pytest suites that create fixtures. Do not run py_compile or build commands. \
-                For Python syntax, use compile(open(path).read(), path, 'exec') in memory. \
-                For behavior, use existing files or in-memory inputs. Recorded proof plus source inspection can support a pass. \
+                Read the relevant source, tests, or document first. \
+                Use read-only-compatible checks, existing fixtures, or in-memory test inputs. \
+                Disable optional test caches. Python bytecode and Node compile caches are disabled by the harness. \
+                Return unverified if a required check needs writes or unavailable dependencies. \
                 A denied write ends this review as unverified. Return your verdict as text after inspection. \
                 EVIDENCE must be a JSON array of successful tool-call IDs from this session, for example [\"read-source\"]. \
                 Each successful tool result names its inspection ID. Do not put paths, commands, or prose in EVIDENCE. \
                 The coordinator resolves those IDs to the actual successful reads and commands.");
+        }
+        if self.mode == PromptMode::Review {
+            system.push_str("\nRun the declared test suite and requested CLI through bash before an artifact pass. \
+                A source read or old proof log cannot replace your own successful test and CLI runs. \
+                Cite the successful run IDs in EVIDENCE.");
         }
         let effort = if self.scope_only {
             Some(Effort::Low)
@@ -248,12 +253,15 @@ impl NativeSmith {
         }
         if self.mode == PromptMode::Forge {
             agent = agent.with_required_verification();
+            if self.grade == 1 && prompt_text.lines().any(|line| line.starts_with("REQUIRED RUN COMMANDS: ")) {
+                agent = agent.with_max_turns(16);
+            }
         }
         if self.role == Role::Warden {
             agent = agent.with_read_only_tools().with_max_turns(2);
         }
         if self.mode == PromptMode::Review {
-            agent = agent.with_read_only_tools().with_required_inspection().with_max_turns(6);
+            agent = agent.with_read_only_tools().with_required_inspection().with_required_runs().with_max_turns(6);
         }
         if self.scope_only {
             agent = agent.with_no_tools().with_max_turns(1);
@@ -334,7 +342,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "{\"direct\":true,\"proof\":\"python3 -m unittest\"}"}, "finish_reason": "stop"}],
+                "choices": [{"message": {"content": "{\"direct\":true,\"proof\":\"python3 -m unittest\",\"criteria\":[\"The local utility passes its requested unittest.\"],\"commands\":[]}"}, "finish_reason": "stop"}],
             })))
             .expect(1)
             .mount(&server)
@@ -345,7 +353,7 @@ mod tests {
         let smith = NativeSmith::scope(config, PathBuf::from("."), &EngineHooks::default());
         let proof = crate::pipeline::surveyor::direct_proof(&smith, "Create a local utility with a unittest.")
             .await.unwrap();
-        assert_eq!(proof.as_deref(), Some("python3 -m unittest"));
+        assert_eq!(proof.as_ref().map(|plan| plan.proof.as_str()), Some("python3 -m unittest"));
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -426,6 +434,37 @@ mod tests {
             assert!(results.iter().all(|message| message["content"].as_str().unwrap().contains("accepted")));
         }
         assert_eq!(std::fs::read_to_string(dir.path().join("output.txt")).unwrap(), "accepted\n");
+    }
+
+    #[tokio::test]
+    async fn artifact_warden_cannot_pass_with_only_source_reads() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("output.txt"), "accepted\n").unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let inspected = body["messages"].as_array().unwrap().iter()
+                    .any(|message| message["role"] == "tool");
+                let message = if inspected {
+                    serde_json::json!({"content": "VERDICT: pass\nEVIDENCE: [\"source\"]"})
+                } else {
+                    serde_json::json!({"tool_calls": [{"id": "source", "type": "function", "function": {
+                        "name": "read_file", "arguments": "{\"path\":\"output.txt\"}",
+                    }}]})
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": message, "finish_reason": if inspected { "stop" } else { "tool_calls" }}],
+                }))
+            }).expect(2).mount(&server).await;
+        let mut config = cfg();
+        config.base_url = server.uri();
+        let smith = NativeSmith::review(config, dir.path().into(), &EngineHooks::default());
+        let result = smith.invoke("Review output.txt.").await.unwrap();
+        assert!(crate::pipeline::warden::parse_verdict(&result).is_unverified(), "{result}");
     }
 
     #[tokio::test]
