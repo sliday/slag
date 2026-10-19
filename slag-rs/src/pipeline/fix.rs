@@ -1470,7 +1470,9 @@ fn review_gap(raw: &str) -> Option<String> {
 /// Remove files a session command created by accident: a name that starts
 /// with `-` or holds no letter is an argument that landed as a path
 /// (`touch -t 202601011200 x` on the wrong platform leaves `202601011200`
-/// behind). Only new files qualify; nothing the repository had is touched.
+/// behind), and a log, temp, or backup file outside the tests is output a
+/// trial run left lying around (`./prune.sh > result.log`). Only new files
+/// qualify; nothing the repository had is touched.
 fn sweep_debris(
     git: &Git,
     before: &BTreeMap<String, repo::Content>,
@@ -1482,7 +1484,10 @@ fn sweep_debris(
         .iter()
         .filter(|p| {
             let name = p.rsplit('/').next().unwrap_or(p);
-            (name.starts_with('-') || !name.chars().any(|c| c.is_ascii_alphabetic()))
+            let ext = name.rsplit_once('.').map_or("", |(_, e)| e);
+            let scratch = matches!(ext, "log" | "tmp" | "out" | "bak" | "orig" | "rej" | "swp")
+                && !repo::is_test_path(p);
+            (name.starts_with('-') || !name.chars().any(|c| c.is_ascii_alphabetic()) || scratch)
                 && git.original(before, p).is_none()
         })
         .cloned()
@@ -2783,7 +2788,7 @@ mod tests {
     fn stray_files_from_a_broken_command_never_reach_the_commit() {
         let (_dir, job, before, _) = fixed_repo();
         let git = job.git.as_ref().unwrap();
-        for junk in ["-t", "202601011200"] {
+        for junk in ["-t", "202601011200", "result.log"] {
             std::fs::write(job.cwd.join(junk), "").unwrap();
         }
         let mut changed = git.changed_since(&before);
@@ -2792,6 +2797,7 @@ mod tests {
         assert_eq!(changed, ["value.txt", "tests/check.sh"], "{changed:?}");
         assert!(!job.cwd.join("-t").exists() && !job.cwd.join("202601011200").exists());
         assert!(notes[0].contains("-t") && notes[0].contains("202601011200"), "{notes:?}");
+        assert!(notes[0].contains("result.log") && !job.cwd.join("result.log").exists(), "{notes:?}");
     }
 
     #[test]
