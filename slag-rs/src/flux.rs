@@ -382,18 +382,15 @@ fn founder_format_rules() -> String {
 }
 
 const DELIVERY_RULES: &str = "\
-    Verify named behavior before interface conveniences.\n\
-    Derive semantics from the named operation or format, then test its boundary cases with exact expected results.\n\
-    Examples apply only to named behavior. Tail selects the last N lines (default 10), supports -n including 0 and +N, and follows complete appended records. Wc-like tools support -l/-w/-c and combined flags.\n\
-    CSV conversion handles BOM and quoted newlines, and rejects ragged rows before writing any JSON output. Unicode word frequency normalizes equivalent words with NFC.\n\
-    File/text stream operations process input incrementally. Follow tests cover appends and partial lines.\n\
-    Spend implementation and review effort on these behaviors before optional interfaces. Do not invent input aliases, unrelated features, or a test quota.\n\
-    A requested CLI must run through its intended entry command in the delivered project.\n\
-    Document the intended launch and test commands.\n\
-    Include the local modules, dependency declarations, and configuration needed for that command.\n\
-    For a package deliverable, include the metadata needed for its intended installation or distribution.\n\
-    A Python package CLI supports its installed console script and python -m PACKAGE through __main__.py.\n\
-    Derive secondary interfaces from the tool kind. Unix stream filters such as wc, tail, CSV conversion, and word frequency accept stdin without a file and with literal -. Scalar parsers take their value positionally; do not add file or stdin interfaces. Named top-N arguments support FILE N and a sensible default. Require a flag only when named.\n\
+    Verify each named behavior and its mundane boundary probes before interface conveniences.\n\
+    Use the acceptance contract as the interface list. Add no aliases, packaging, or input modes beyond that contract and the commission.\n\
+    For each named operation, assert exact results at its relevant input boundaries and limits.\n\
+    For file readers, cover empty input, an unterminated final line, and non-UTF-8 bytes with a safe documented policy.\n\
+    Distinguish a final unterminated line in an initial snapshot from a partial appended line that follow must buffer.\n\
+    For text transforms, cover separators, punctuation, and Unicode. For retry/backoff, cover attempt limits and a finite delay cap, including jitter at the cap.\n\
+    Apply these cases only to the named behavior. Do not add features merely to provide more interfaces.\n\
+    Prefer standard parsers and serializers when they meet the contract. Use their format options instead of hand-written equivalents.\n\
+    Document the intended launch and test commands with their required local modules and dependencies.\n\
     The documented full suite passes from a fresh clone without prior installation.\n\
     Require installation only when the commission or its stated invocation requires it.\n\
     Do not require a packaging format, a publish step, or a fixed test count without that requirement.";
@@ -484,7 +481,7 @@ pub fn ingot_warden_prompt(work: &str, bar: &str) -> String {
          Inspect the source and tests on disk.\n\
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
-         Judge core semantics first. Inspect tests and successful runs for exact results on each named behavior and its boundary cases. Check interface conveniences after those behaviors.\n\
+         Check each named behavior and its listed boundary assertions first. Inspect test source and successful runs for exact expected results. Missing boundary assertions or failed probes cannot pass. Check interface conveniences afterward.\n\
          Python skips bytecode writes. Harness probes and reference fixtures live under .slag/checks/. They are not product deliverables. Product tests must pass without them.\n\
          The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures. Reject harness probes or comparison scripts in product paths.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
@@ -519,7 +516,7 @@ pub fn warden_prompt(ore: &str, bar: &str) -> String {
          Inspect the source and tests on disk.\n\
          Run the declared test suite and CLI probes under the read-only sandbox.\n\
          Run each required check in its own bash call. Known test output flags may differ. Preserve the program, suite selection, and CLI arguments. Cite those successful runs in EVIDENCE.\n\
-         Judge core semantics first. Inspect tests and successful runs for exact results on each named behavior and its boundary cases. Check interface conveniences after those behaviors.\n\
+         Check each named behavior and its listed boundary assertions first. Inspect test source and successful runs for exact expected results. Missing boundary assertions or failed probes cannot pass. Check interface conveniences afterward.\n\
          Python skips bytecode writes. Harness probes and reference fixtures live under .slag/checks/. They are not product deliverables. Product tests must pass without them.\n\
          The workspace stays read-only. Tests may use private TMPDIR scratch. Never install packages or create workspace fixtures. Reject harness probes or comparison scripts in product paths.\n\
          Return VERDICT: unverified if confinement prevents a required check. Do not treat that limit as an artifact defect.\n\
@@ -820,16 +817,19 @@ mod tests {
         let builder = prepare_flux(&sample_ingot(), None);
         let reviewer = warden_prompt("tail a log", "required behavior");
         for prompt in [&builder, &reviewer] {
-            let primary = prompt.find("Verify named behavior before interface conveniences").unwrap();
-            let cli = prompt.find("A requested CLI must run").unwrap();
+            let primary = prompt.find("Verify each named behavior and its mundane boundary probes").unwrap();
+            let cli = prompt.find("Document the intended launch").unwrap();
             assert!(primary < cli);
-            for required in ["partial lines", "quoted newlines", "NFC", "incrementally"] {
+            for required in ["unterminated final line", "non-UTF-8 bytes", "punctuation", "finite delay cap", "jitter at the cap"] {
                 assert!(prompt.contains(required), "missing {required}");
             }
         }
         assert!(builder.contains("checks package installation in an isolated copy"));
         assert!(builder.contains("Keep generated .venv"));
         assert!(reviewer.contains("private TMPDIR scratch"));
+        assert!(reviewer.contains("Missing boundary assertions or failed probes cannot pass"));
+        assert!(!reviewer.contains("-n +N"));
+        assert!(!reviewer.contains("accept stdin"));
         assert!(!reviewer.contains("including temporary directories"));
     }
 

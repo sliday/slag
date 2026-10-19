@@ -91,6 +91,8 @@ fn git(root: &Path, args: &[&str]) -> String {
 async fn direct_commission_protects_coordinator_state_and_seals_before_review() {
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-b", "main"]);
+    git(root.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-m", "User history"]);
     let server = MockServer::start().await;
     let review_root = root.path().to_path_buf();
     Mock::given(method("POST"))
@@ -164,7 +166,8 @@ async fn direct_commission_protects_coordinator_state_and_seals_before_review() 
     let ignore = git(root.path(), &["show", "HEAD:.gitignore"]);
     assert!(!ignore.lines().any(|line| matches!(line, "/.slag/" | "/logs/")), "{ignore}");
     let history = git(root.path(), &["log", "--oneline"]);
-    assert!(history.contains("chore: initialize project"), "{history}");
+    assert!(history.contains("User history"), "{history}");
+    assert!(!history.contains("chore: initialize project"), "{history}");
     assert!(!history.contains("fire: furnace lit"), "{history}");
     let ledger = std::fs::read_to_string(root.path().join(".slag/PROGRESS.md")).unwrap();
     assert_eq!(ledger.matches("heats:1").count(), 1, "{ledger}");
