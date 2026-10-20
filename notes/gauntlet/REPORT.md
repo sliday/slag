@@ -43,7 +43,10 @@ Method: every piece had a bar a critic could inspect, a builder, and a separate 
 4. Harness² shows no gain over plain retries at matched compute. Its library admits lessons backed only by tool-error deltas from unfixed tasks, and `--harness library` applies the best entry to every issue regardless of fit.
 5. The installed v2.9.0 on PATH turns `slag fix --help` into a paid commission (old parser); fixed in this branch, so cut the release.
 
-## Release 3.0.0 (prepared, not yet published)
+## Release 3.0.0 (published 2026-10-20)
+
+- Owner pushed tag `v3.0.0` (→ `6c86174`), published the release, and deployed slag.dev. GitHub marks v3.0.0 latest, with 8 assets plus `sha256.sum`.
+- Lead checks after publish: `slag update` took the owner's v2.9.0 to v3.0.0, and the installed binary's SHA-256 equals the built `slag-aarch64-apple-darwin`; `curl -fsSL https://slag.dev/install.sh | sh` installs `slag 3.0.0` into a clean macOS home and into a clean `debian:stable-slim` amd64 container; the live site serves the new install line and the Harness² row.
 
 - `slag-rs/Cargo.toml` is 3.0.0; commit `63f47d4` holds the bump, the README/CLAUDE.md/site release lines, and all four targets in `slag-rs/dist-local` (`publish-release.sh --check`: 8 assets pass).
 - Runtime: `slag 3.0.0` from each binary on its own platform (Linux arm64 and amd64 in `debian:stable-slim` under Apple `container`, Intel Mac under Rosetta, Apple Silicon native).
