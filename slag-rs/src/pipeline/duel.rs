@@ -666,8 +666,9 @@ mod tests {
             // On/Off flip the default.
             (DuelMode::On, 1, None, true, true),
             (DuelMode::Off, 5, None, true, false),
-            // :duel t forces, :duel nil blocks — regardless of mode/grade.
-            (DuelMode::Off, 1, Some(true), true, true),
+            // :duel t forces and :duel nil blocks whatever the grade, but
+            // off is the user's kill switch and beats :duel t.
+            (DuelMode::Off, 1, Some(true), true, false),
             (DuelMode::Auto, 1, Some(true), true, true),
             (DuelMode::On, 5, Some(false), true, false),
             (DuelMode::Auto, 5, Some(false), true, false),
