@@ -1688,16 +1688,27 @@ fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(),
                 .filter_map(|l| l.strip_prefix(prefix))
                 .any(|l| l.trim() == quote.trim())
         };
-        // A short quote such as "the" is in every issue and grounds nothing.
+        // Any answer other than yes is the reviewer disagreeing: that vetoes.
         if rows.iter().any(|row| {
-            row.removed_behavior_wrong != "yes"
-                || row.added_behavior_requested != "yes"
-                || row.preserves_checks != "yes"
-                || row.issue_quote.trim().chars().count() < 20
-                || !issue.contains(&row.issue_quote)
-                || !quoted('-', &row.removed_quote)
-                || !quoted('+', &row.added_quote)
+            row.removed_behavior_wrong != "yes" || row.added_behavior_requested != "yes" || row.preserves_checks != "yes"
         }) {
+            return Err(format!("the review did not approve {}: an answer is not yes", e.path));
+        }
+        // A row whose quotes are not lines of this diff, or whose issue quote
+        // is not the issue's own words (a short one such as "the" is in every
+        // issue), grounds nothing. Live reviewers add such rows beside exact
+        // ones, so they are dropped, and the exact rows must still ground the
+        // edit and cover every hunk that loses a check.
+        let rows: Vec<&TestEditReview> = rows
+            .into_iter()
+            .filter(|row| {
+                row.issue_quote.trim().chars().count() >= 20
+                    && issue.contains(&row.issue_quote)
+                    && quoted('-', &row.removed_quote)
+                    && quoted('+', &row.added_quote)
+            })
+            .collect();
+        if rows.is_empty() {
             return Err(format!("the review did not approve {} with yes answers and matching quotes", e.path));
         }
         // One quoted pair must not approve every change in the file: each
@@ -3574,6 +3585,30 @@ mod tests {
         assert_eq!(check_lines(collapse, '-'), 3);
         assert_eq!(check_lines(collapse, '+'), 1);
         assert_eq!(check_lines("+    // checks elsewhere\n+    if t.Error(x) {}\n", '+'), 1);
+    }
+
+    #[test]
+    fn an_ungrounded_extra_row_is_dropped_but_a_no_still_vetoes() {
+        let issue = "link() returns https://target, which is wrong; it must return #image.";
+        let old = "    assert_eq!(link(), \"https://target\");\n";
+        let new = "    assert_eq!(link(), \"#image\");\n";
+        let edit = EditedTest {
+            path: "tests/links.rs".into(),
+            removed: vec![old.trim().into()],
+            diff: similar::TextDiff::from_lines(old, new).unified_diff().to_string(),
+            original_tests: Some(old.as_bytes().to_vec()),
+        };
+        let row = |removed: &str, wrong: &str| serde_json::json!({
+            "path": "tests/links.rs", "removed_behavior_wrong": wrong, "added_behavior_requested": "yes",
+            "preserves_checks": "yes", "issue_quote": issue, "removed_quote": removed, "added_quote": new.trim(),
+        });
+        let answer = |rows: serde_json::Value| format!("VERDICT: pass\nGAP:\nTEST_EDITS: {rows}");
+        let exact = row(old.trim(), "yes");
+        let invented = row("assert_eq!(link(), \"never in the diff\");", "yes");
+        let edits = std::slice::from_ref(&edit);
+        assert!(agree_test_edits(&answer(serde_json::json!([exact.clone(), invented.clone()])), edits, issue).is_ok());
+        assert!(agree_test_edits(&answer(serde_json::json!([invented])), edits, issue).is_err());
+        assert!(agree_test_edits(&answer(serde_json::json!([exact, row(old.trim(), "no")])), edits, issue).is_err());
     }
 
     #[test]
