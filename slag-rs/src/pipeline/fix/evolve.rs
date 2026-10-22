@@ -807,6 +807,7 @@ impl Evolver<'_, '_> {
                         &changed,
                         &edited,
                         &checks[0].cmd,
+                        super::repro_timeout(&checks[0]),
                         self.baseline,
                         &rescuer,
                     )
@@ -839,8 +840,8 @@ impl Evolver<'_, '_> {
                 (p.clone(), what)
             })
             .collect();
-        let repro_rank = match repro {
-            Some(Repro::Regression { .. }) => 2,
+        let repro_rank = match &repro {
+            Some(r) if r.caught() => 2,
             Some(Repro::Baseline { .. }) => 1,
             _ => 0,
         };

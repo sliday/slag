@@ -569,6 +569,106 @@ async fn a_change_no_test_can_see_is_not_called_fixed() {
     assert!(stdout.contains("no test shows the change fixes anything"), "{stdout}");
 }
 
+/// The pyparsing shape: the new test never finishes against the original
+/// code. A timeout without the fix IS the reproduction, sized from the
+/// passing run, so the proof costs seconds, not the full TEST_TIMEOUT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_that_hangs_without_the_fix_is_the_reproduction() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+    std::fs::write(root.join("value.txt"), "1\n").unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("tests/check.sh"),
+        "for t in tests/test_*.sh; do [ -e \"$t\" ] || continue; bash \"$t\" || exit 1; done\n",
+    )
+    .unwrap();
+    sh(root, "git add -A && git commit -qm init");
+    let check = "bash tests/check.sh";
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "0"})),
+        tool(
+            "write_file",
+            json!({"path": "tests/test_hang.sh", "content": "while grep -qx 1 value.txt; do sleep 0.2; done\n"}),
+        ),
+        tool("finish", json!({"summary": "value.txt now holds 0; the read ends.", "cmd": check})),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+    ])
+    .await;
+
+    let started = std::time::Instant::now();
+    let out = slag_fix(root, &server, &["reads hang while value is 1", "--test", check]).await;
+    let secs = started.elapsed().as_secs();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("FIXED"), "{stdout}");
+    assert!(stdout.contains("timed out after 30s"), "the without-fix check got its own timeout: {stdout}");
+    assert!(stdout.contains("the code hangs"), "the hang is the reproduction: {stdout}");
+    assert!(secs < 50, "the proof must not wait out TEST_TIMEOUT: {secs}s");
+    let files = sh(root, "git show --name-only --format= HEAD");
+    assert!(files.contains("tests/test_hang.sh") && files.contains("value.txt"), "{files}");
+}
+
+/// The first test passes with and without the fix: one revision request
+/// through the review-gap path, and the revision's sharper test, failing
+/// without the fix, is the reproduction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_that_passes_without_the_fix_gets_one_revision() {
+    let repo = two_value_repo();
+    let server = model(vec![
+        tool("read_file", json!({"path": "b.txt"})),
+        tool("edit_file", json!({"path": "b.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/b.sh", "content": "grep -q . b.txt\n"})),
+        tool("finish", json!({"summary": "b.txt now holds 2.", "cmd": SUITE})),
+        // The revision makes the test fail on the original code.
+        tool("read_file", json!({"path": "tests/b.sh"})),
+        tool("write_file", json!({"path": "tests/b.sh", "content": "grep -qx 2 b.txt\n"})),
+        tool("finish", json!({"summary": "The test now wants 2 exactly.", "cmd": SUITE})),
+    ])
+    .await;
+
+    let out = slag_fix(repo.path(), &server, &["b should be 2", "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("FIXED"), "{stdout}");
+    assert!(stdout.contains("revised once after review"), "{stdout}");
+    assert!(stdout.contains("the new test catches the bug"), "{stdout}");
+    // The revision was briefed with the measured gap.
+    let revision = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .find(|body| body.contains("REVIEW: ONE GAP LEFT"))
+        .expect("a revision was briefed");
+    assert!(revision.contains("passes with the source change reverted"), "{revision}");
+}
+
+/// The one revision spent, the test still passes with and without the
+/// change: the verdict stays honest instead of calling it fixed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revision_that_still_proves_nothing_is_not_called_fixed() {
+    let repo = two_value_repo();
+    let server = model(vec![
+        // No test at all in the first attempt.
+        tool("read_file", json!({"path": "b.txt"})),
+        tool("edit_file", json!({"path": "b.txt", "old_string": "1", "new_string": "2"})),
+        tool("finish", json!({"summary": "b.txt now holds 2.", "cmd": SUITE})),
+        // The revision adds a test, but one that holds either way.
+        tool("write_file", json!({"path": "tests/b.sh", "content": "grep -q . b.txt\n"})),
+        tool("finish", json!({"summary": "Added a test.", "cmd": SUITE})),
+    ])
+    .await;
+
+    let out = slag_fix(repo.path(), &server, &["b should be 2", "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("no test shows the change fixes anything"), "{stdout}");
+}
+
 /// The user's own files never ride along: an untracked note, a tracked
 /// file with uncommitted edits, and an output file their shell redirects
 /// into that grows during the run. All three stay out of the commit and

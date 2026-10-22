@@ -66,6 +66,14 @@ const ISSUE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest a review may take before the verified fix lands without it.
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the without-the-fix check may run. A suite that passes with
+/// the fix in `passed.secs` shows a hang long before TEST_TIMEOUT, so the
+/// check gets ten times the passing run, bounded below by a slow starter
+/// and above by the usual ceiling.
+fn repro_timeout(passed: &Run) -> Duration {
+    Duration::from_secs_f64(passed.secs * 10.0).clamp(Duration::from_secs(30), TEST_TIMEOUT)
+}
+
 /// `slag fix`: resolve the key and the issue, then fix it under the
 /// dashboard or in stream mode.
 pub async fn run(
@@ -254,9 +262,19 @@ fn plural(n: u8, word: &str) -> String {
 enum Repro {
     /// With the source change reverted, the session's new test fails.
     Regression { status: String },
+    /// With the source change reverted, the check never finishes: for a
+    /// hang bug, that IS the reproduction.
+    Hangs { status: String },
     /// The test command failed before any edit and passes now.
     Baseline { status: String },
     NotShown(String),
+}
+
+impl Repro {
+    /// The new test pins the bug: it fails or hangs without the fix.
+    fn caught(&self) -> bool {
+        matches!(self, Repro::Regression { .. } | Repro::Hangs { .. })
+    }
 }
 
 /// Everything the final report needs.
@@ -559,6 +577,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         &changed,
         &paths(&edited),
         &proof_cmd,
+        repro_timeout(&out.checks[0]),
         baseline.as_ref(),
         &rescuer,
     )
@@ -582,7 +601,6 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         )
         .await?;
     let mut gap_open = found.as_ref().map(|g| g.text.clone());
-    let gap_kind = found.as_ref().map(|g| g.kind);
     out.phases.review += clock.elapsed().as_secs_f64();
     if let (Some(found), Some(git)) = (found, job.git.as_ref()) {
         let gap = found.text;
@@ -590,7 +608,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         let kept = keep(git, &changed);
         // What the first fix proved, so a revision can only add to it.
         let first_added = added_test(git, &before, &changed, &edited);
-        let first_caught = matches!(repro, Repro::Regression { .. });
+        let first_caught = repro.caught();
         let first_tests: Vec<(PathBuf, repo::Content)> = changed
             .iter()
             .zip(&kept)
@@ -621,6 +639,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                     &ch,
                     &paths(&ed),
                     &proof_cmd,
+                    repro_timeout(&c[0]),
                     baseline.as_ref(),
                     &rescuer,
                 )
@@ -640,12 +659,12 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                     worse = Some("did not close the gap");
                 } else if first_added && !added_test(git, &before, &ch, &ed) {
                     worse = Some("dropped the regression test");
-                } else if first_caught && !matches!(r, Repro::Regression { .. }) {
+                } else if first_caught && !r.caught() {
                     worse = Some("left tests that no longer catch the bug");
                 } else if found.kind == GapKind::Review && !first_tests.is_empty() {
                     // The first fix's tests encode the issue; against the
                     // revised source they must still pass.
-                    let run = swap_and_run(job, first_tests.clone(), &proof_cmd, &rescuer).await;
+                    let run = swap_and_run(job, first_tests.clone(), &proof_cmd, TEST_TIMEOUT, &rescuer).await;
                     if run.is_some_and(|run| !run.ok()) {
                         worse = Some("broke what the first fix's tests pin");
                     }
@@ -705,10 +724,8 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     // Tests that pass with and without the source change, after the one
     // chance to fix them, are no evidence the change does anything; with no
     // failing test before the edit either, nothing says the bug is gone.
-    let unproven = gap_open.is_some()
-        && matches!(gap_kind, Some(GapKind::PassesWithoutFix | GapKind::Orphan))
-        && without.as_ref().is_some_and(|run| run.ok())
-        && !matches!(repro, Repro::Baseline { .. });
+    let unproven =
+        without.as_ref().is_some_and(|run| run.ok()) && !matches!(repro, Repro::Baseline { .. });
     drop(without);
     out.repro = repro;
     if unproven {
@@ -825,6 +842,9 @@ fn note_repro(hooks: &EngineHooks, repro: &Repro, cmd: &str) {
         Repro::NotShown(why) => note(hooks, &format!("reproduction not shown: {why}"), false),
         Repro::Regression { status } => {
             note(hooks, &format!("reproduced: without the fix `{cmd}` gives {status}"), true)
+        }
+        Repro::Hangs { status } => {
+            note(hooks, &format!("reproduced: without the fix `{cmd}` hangs ({status})"), true)
         }
         Repro::Baseline { status } => {
             note(hooks, &format!("reproduced: the tests gave {status} before the fix"), true)
@@ -1078,7 +1098,7 @@ impl Ctx<'_> {
                     .map(|e| (git.top.join(&e.path), e.original_tests.clone()))
                     .collect();
                 let clock = std::time::Instant::now();
-                let run = swap_and_run(job, swaps, &checks[0].cmd, self.rescuer).await;
+                let run = swap_and_run(job, swaps, &checks[0].cmd, TEST_TIMEOUT, self.rescuer).await;
                 phases.verify += clock.elapsed().as_secs_f64();
                 let Some(run) = run else { return Err(SlagError::Cancelled) };
                 let removed = removed_text(&edited);
@@ -1274,7 +1294,7 @@ impl Ctx<'_> {
         for p in fresh.take(3) {
             let Ok(text) = std::fs::read_to_string(git.top.join(p)) else { continue };
             let swap = vec![(git.top.join(p), Some(repo::unrunnable(p, &text).into_bytes()))];
-            if swap_and_run(self.job, swap, cmd, self.rescuer).await.is_some_and(|run| run.ok()) {
+            if swap_and_run(self.job, swap, cmd, TEST_TIMEOUT, self.rescuer).await.is_some_and(|run| run.ok()) {
                 found.push(p.clone());
             }
         }
@@ -1321,7 +1341,7 @@ impl Ctx<'_> {
         class: bool,
     ) -> String {
         let without_fix = match (repro, without) {
-            (Repro::Regression { .. }, Some(run)) => format!(
+            (Repro::Regression { .. } | Repro::Hangs { .. }, Some(run)) => format!(
                 "`{}` gave {}. The end of its output:\n{}",
                 run.cmd,
                 run.status(),
@@ -1664,13 +1684,18 @@ fn squash(cmd: &str) -> String {
 
 /// Show the bug existed. The strongest proof is the session's own
 /// regression test failing with the source change taken back out; failing
-/// that, a test command that failed before the edit and passes after.
+/// that, a test command that failed before the edit and passes after. The
+/// check runs under `timeout`, sized from the passing run: a hang shows
+/// long before TEST_TIMEOUT, and for a hang bug the timeout itself is the
+/// proof.
+#[allow(clippy::too_many_arguments)]
 async fn reproduce(
     job: &Job,
     before: &BTreeMap<String, repo::Content>,
     changed: &[String],
     edited: &[String],
     cmd: &str,
+    timeout: Duration,
     baseline: Option<&Run>,
     rescuer: &Rescuer<'_>,
 ) -> (Repro, Option<Run>) {
@@ -1711,11 +1736,15 @@ async fn reproduce(
         .chain(edited.iter().filter(|p| !sources.contains(p)))
         .map(|p| (git.top.join(p), git.original(before, p)))
         .collect();
-    let Some(run) = swap_and_run(job, swaps, cmd, rescuer).await else {
+    let Some(run) = swap_and_run(job, swaps, cmd, timeout, rescuer).await else {
         return (Repro::NotShown("interrupted".into()), None);
     };
 
-    let repro = if run.unusable() {
+    let repro = if run.timed_out {
+        // The same check passed with the fix: never finishing without it
+        // is the hang the issue reports, not a check that says nothing.
+        Repro::Hangs { status: run.status() }
+    } else if run.unusable() {
         from_baseline()
             .unwrap_or_else(|| Repro::NotShown(format!("the check without the fix {}", run.status())))
     } else if run.ok() {
@@ -1736,6 +1765,7 @@ async fn swap_and_run(
     job: &Job,
     swaps: Vec<(PathBuf, repo::Content)>,
     cmd: &str,
+    timeout: Duration,
     rescuer: &Rescuer<'_>,
 ) -> Option<Run> {
     let fixed: Vec<Saved> = swaps
@@ -1758,7 +1788,7 @@ async fn swap_and_run(
         restore(&originals);
         s.phase = Phase::Swapped;
     }
-    let run = repo::run(cmd, &job.cwd, TEST_TIMEOUT).await;
+    let run = repo::run(cmd, &job.cwd, timeout).await;
     let mut s = swap.lock().unwrap_or_else(|e| e.into_inner());
     if s.phase != Phase::Swapped {
         // The rescue ran during the check and already put the fix back.
@@ -2111,6 +2141,9 @@ fn repro_line(repro: &Repro, cmd: Option<&str>) -> String {
         Repro::Regression { status } => {
             format!("With the source change reverted, `{cmd}` gives {status}: the new test catches the bug.")
         }
+        Repro::Hangs { status } => {
+            format!("With the source change reverted, `{cmd}` never finishes ({status}): the code hangs without the fix.")
+        }
         Repro::Baseline { status } => format!("Before the fix, `{cmd}` gave {status}."),
         Repro::NotShown(why) => format!("Not shown: {why}."),
     }
@@ -2410,6 +2443,9 @@ fn report_lines(out: &Outcome, w: usize) -> Vec<String> {
             Repro::Regression { status } => {
                 lines.push(proof_row(first, false, &format!("without the fix: {status}, so the new test catches the bug"), ""))
             }
+            Repro::Hangs { status } => {
+                lines.push(proof_row(first, false, &format!("without the fix: {status}, so the code hangs"), ""))
+            }
             Repro::Baseline { status } => lines.push(proof_row(first, false, &format!("before the fix: {status}"), "")),
             Repro::NotShown(why) => lines.push(format!(
                 "  {}  {} {}",
@@ -2664,7 +2700,7 @@ mod tests {
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
 
-        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await.0;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         assert_eq!(value(&job), "2\n", "fix restored");
 
@@ -2677,11 +2713,41 @@ mod tests {
         // A test that passes either way proves nothing; a failing baseline
         // is the fallback evidence.
         std::fs::write(job.cwd.join("value.txt"), "2\n").unwrap();
-        let weak = reproduce(&job, &before, &changed, &[], "true", None, &rescuer).await.0;
+        let weak = reproduce(&job, &before, &changed, &[], "true", TEST_TIMEOUT, None, &rescuer).await.0;
         assert!(matches!(weak, Repro::NotShown(_)), "{weak:?}");
         let base = Run { cmd: "t".into(), code: Some(1), output: String::new(), secs: 0.0, timed_out: false };
-        let fallback = reproduce(&job, &before, &changed, &[], "true", Some(&base), &rescuer).await.0;
+        let fallback = reproduce(&job, &before, &changed, &[], "true", TEST_TIMEOUT, Some(&base), &rescuer).await.0;
         assert_eq!(fallback, Repro::Baseline { status: "exit 1".into() });
+    }
+
+    /// The without-the-fix check runs under its own timeout: ten times the
+    /// passing run, never under 30s, never over TEST_TIMEOUT.
+    #[test]
+    fn the_without_fix_timeout_scales_with_the_passing_run() {
+        let run = |secs: f64| Run { cmd: "t".into(), code: Some(0), output: String::new(), secs, timed_out: false };
+        assert_eq!(repro_timeout(&run(0.5)), Duration::from_secs(30));
+        assert_eq!(repro_timeout(&run(10.0)), Duration::from_secs(100));
+        assert_eq!(repro_timeout(&run(120.0)), TEST_TIMEOUT);
+    }
+
+    /// A hang bug: the new test never finishes against the original code.
+    /// The check ends at its own timeout, not TEST_TIMEOUT, and the
+    /// timeout itself is the reproduction.
+    #[tokio::test]
+    async fn a_check_that_hangs_without_the_fix_is_the_reproduction() {
+        let (_dir, job, before, changed) = fixed_repo();
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+
+        let hangs = "while grep -qx 1 value.txt; do sleep 0.05; done";
+        let clock = std::time::Instant::now();
+        let (repro, run) =
+            reproduce(&job, &before, &changed, &[], hangs, Duration::from_secs(2), None, &rescuer).await;
+        assert_eq!(repro, Repro::Hangs { status: "timed out after 2s".into() });
+        assert!(run.unwrap().timed_out);
+        assert!(clock.elapsed() < Duration::from_secs(15), "the check ends at its own timeout");
+        assert_eq!(value(&job), "2\n", "fix restored");
     }
 
     /// The race that lost a fix: the rescue fired after it was registered
@@ -2694,7 +2760,7 @@ mod tests {
         let fire_at_once = |hook: Box<dyn FnOnce() + Send>| hook();
         let rescuer = Rescuer { register: &fire_at_once, stop: no_stop };
 
-        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await.0;
         assert_eq!(repro, Repro::NotShown("interrupted".into()));
         assert_eq!(value(&job), "2\n", "the fix is on disk");
     }
@@ -2710,7 +2776,7 @@ mod tests {
 
         let check = "echo seen > seen.txt; while [ ! -f continue.txt ]; do sleep 0.01; done; bash tests/check.sh";
         let (repro, during) = tokio::join!(
-            reproduce(&job, &before, &changed, &[], check, None, &rescuer),
+            reproduce(&job, &before, &changed, &[], check, TEST_TIMEOUT, None, &rescuer),
             async {
                 while !job.cwd.join("seen.txt").exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2771,7 +2837,7 @@ mod tests {
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
         let cmd = "python3 -m unittest discover -s tests";
-        let (repro, _) = reproduce(&job, &before, &changed, &[], cmd, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &[], cmd, TEST_TIMEOUT, None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
 
         // Same second, same size again: only a purged cache recompiles.
@@ -2817,7 +2883,7 @@ mod tests {
         let rescuer = Rescuer { register: &keep, stop: no_stop };
         let started = std::time::SystemTime::now();
         let writes_bytecode = "env -u PYTHONDONTWRITEBYTECODE python3 -m unittest discover -s tests";
-        let (repro, _) = reproduce(&job, &before, &changed, &[], writes_bytecode, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &[], writes_bytecode, TEST_TIMEOUT, None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
 
         let secs = |t: std::time::SystemTime| {
@@ -3148,7 +3214,7 @@ mod tests {
         let slot = Slot::default();
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
-        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await.0;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         let mode = std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "the restored script is still executable");
