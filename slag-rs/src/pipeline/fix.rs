@@ -64,7 +64,9 @@ const REVIEW_DIFF_BYTES: usize = 16_000;
 /// How long the issue's own command may run before slag stops waiting.
 const ISSUE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest a review may take before the verified fix lands without it.
-const REVIEW_TIMEOUT: Duration = Duration::from_secs(10);
+/// Measured on gpt-6.1-sol: reviews take 2-15s, and a 10s cap skipped the
+/// review (and its bug-class and test-edit checks) in 3 of 24 runs.
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How long the without-the-fix check may run. The swap rebuilds the
 /// original code, a cost the incremental passing run never paid, so the
