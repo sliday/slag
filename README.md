@@ -449,6 +449,7 @@ Flags may come before or after the commission. `slag fix --help` lists the fix f
 | `SLAG_MODEL_BASE` / `_PLAN` / `_ALT` / `_JUDGE` / `_EDITOR` | Per-role model ids |
 | `SLAG_DUEL` | `auto` (default), `on`, `off` (`off` gives every ingot one cast, even one the plan pins with `:casts` or `:duel t`) |
 | `SLAG_DUEL_ROUNDS` | Override the duel round cap |
+| `SLAG_TEST_TIMEOUT` | Seconds `slag fix` lets one test run take (default 300). The check without the fix gets 3 times the slower of the passing and baseline runs, within this ceiling; a timeout there proves the bug only when the issue reports a hang |
 | `SLAG_SANDBOX` | `auto` (default) or `off` for the shell sandbox |
 | `SLAG_MAX_COST_INGOT` | Dollar ceiling for a single ingot session (file key `max_cost_per_ingot`). Default uncapped. |
 | `SLAG_MAX_COST_RUN` | Dollar ceiling for the whole run (file key `max_cost_per_run`). Default uncapped. |
