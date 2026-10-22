@@ -352,8 +352,7 @@ fn founder_format_rules() -> String {
         - :bar = what DONE means for this ingot, stated so a reviewer can \
         inspect it. The proof shows something appeared; the bar says whether \
         the ingot's goal was met. Name the observable behaviour, not the file: \
-        \"running `calc \\\"2+3*4\\\"` prints 14\" beats \"calc.js exists\".\n\
-        - :duel = t (force multi-cast duel) | nil (block it) | omit for auto (grade-gated)\n\n\
+        \"running `calc \\\"2+3*4\\\"` prints 14\" beats \"calc.js exists\".\n\n\
         PROOF COMMANDS:\n\
         - test -f FILE / test -d DIR\n\
         - grep -q PATTERN FILE\n\
@@ -971,6 +970,7 @@ mod tests {
     fn founder_prompt_does_not_ask_for_casts() {
         let prompt = founder_prompt("build it", "the plan");
         assert!(!prompt.contains(":casts"), "only users pin casts");
+        assert!(!prompt.contains(":duel"), "only users force or block a duel");
         assert!(!prompt.contains("CASTS HEURISTICS"));
     }
 
