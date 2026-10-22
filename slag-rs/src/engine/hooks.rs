@@ -615,7 +615,12 @@ pub async fn run_command_in(def: &HookDef, payload: &HookPayload, scope: &Comman
 /// Dispatch one hook on its kind. Every kind funnels into the same
 /// `HookOutcome`, so the exit-code protocol of item 69 stays the single
 /// vocabulary the caller has to understand.
-pub async fn run_hook(snap: &HookSnapshot, def: &HookDef, payload: &HookPayload) -> HookOutcome {
+pub async fn run_hook(
+    snap: &HookSnapshot,
+    def: &HookDef,
+    payload: &HookPayload,
+    events: Option<&crate::engine::EventTx>,
+) -> HookOutcome {
     let started = Instant::now();
     if snap.scope.read_only && !matches!(def.kind, HookKind::Command(_)) {
         return failed(def, started, format!("hook `{}`: a harness hook must be a command", def.name));
@@ -631,7 +636,7 @@ pub async fn run_hook(snap: &HookSnapshot, def: &HookDef, payload: &HookPayload)
                 cfg.base_url.clone(),
             );
             let model = model.clone().unwrap_or_else(|| cfg.model_judge.clone());
-            run_prompt(def, payload, &provider, &model, prompt).await
+            run_prompt(def, payload, &provider, &model, prompt, events).await
         }
         HookKind::Agent { prompt, model } => {
             let Some(cfg) = &snap.engine else {
@@ -660,18 +665,25 @@ fn no_config(name: &str) -> String {
 
 /// One LLM call answering allow or block, through `judge.rs::rule`.
 /// Injectable provider, so the decision logic tests without a network.
+/// The call counts in run spend and reports its tokens like any other.
 pub async fn run_prompt(
     def: &HookDef,
     payload: &HookPayload,
     provider: &dyn crate::engine::Provider,
     model: &str,
     instruction: &str,
+    events: Option<&crate::engine::EventTx>,
 ) -> HookOutcome {
+    use crate::engine::Provider;
     let started = Instant::now();
+    let provider = crate::engine::agent::SpendTracked::new(provider, Default::default());
+    if let Some(tx) = events {
+        provider.set_event_sink(tx.clone());
+    }
     let body = payload.to_stdin();
     let ruled = tokio::time::timeout(
         def.timeout,
-        crate::engine::tools::judge::rule(provider, model, instruction, &body),
+        crate::engine::tools::judge::rule(&provider, model, instruction, &body),
     )
     .await;
     match ruled {
@@ -1270,7 +1282,7 @@ pub async fn fire_with(
         }
 
         announce_start(&tx, def);
-        let outcome = run_hook(snap, def, &payload).await;
+        let outcome = run_hook(snap, def, &payload, tx.as_ref()).await;
         announce_finish(&tx, def, &outcome);
         if let Some(ctx) = &outcome.context {
             run.context.push(ctx.clone());
@@ -1893,6 +1905,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_prompt_hook_call_reports_its_tokens() {
+        struct Priced;
+        impl crate::engine::Provider for Priced {
+            fn chat(
+                &self,
+                _req: crate::engine::ChatRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::engine::NormalizedResponse,
+                                crate::error::SlagError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::engine::NormalizedResponse {
+                        model: None,
+                        content: r#"{"decision":"allow","reason":"fine"}"#.into(),
+                        tool_calls: vec![],
+                        finish_reason: crate::engine::FinishReason::Stop,
+                        reasoning: None,
+                        reasoning_details: None,
+                        usage: crate::engine::Usage {
+                            total_tokens: 90,
+                            cost: Some(0.01),
+                            ..Default::default()
+                        },
+                    })
+                })
+            }
+        }
+        let def = kind_hook(HookKind::Prompt { prompt: "gate".into(), model: None });
+        let (tx, mut rx) = crate::engine::events::channel();
+        let out = run_prompt(&def, &gate_payload(), &Priced, "x/y", "gate", Some(&tx)).await;
+        assert_eq!(out.code, 0, "{out:?}");
+        match rx.try_recv().expect("a tokens event") {
+            crate::engine::EngineEvent::Tokens { usage } => assert_eq!(usage.total_tokens, 90),
+            other => panic!("expected tokens, got {other:?}"),
+        }
+    }
+
     #[test]
     fn kind_parses_all_four_spellings() {
         let c = HookDef::parse("pre_tool", "cmd=./guard.sh", 0).expect("cmd");
@@ -1947,7 +2004,7 @@ mod tests {
             prompt: "refuse secret reads".into(),
             model: None,
         });
-        let out = run_prompt(&def, &gate_payload(), &gate, "x/y", "refuse secret reads").await;
+        let out = run_prompt(&def, &gate_payload(), &gate, "x/y", "refuse secret reads", None).await;
         assert_eq!(out.code, 2);
         assert_eq!(out.block.as_deref(), Some("touches .env"));
     }
@@ -1959,7 +2016,7 @@ mod tests {
             prompt: "gate".into(),
             model: None,
         });
-        let out = run_prompt(&def, &gate_payload(), &gate, "x/y", "gate").await;
+        let out = run_prompt(&def, &gate_payload(), &gate, "x/y", "gate", None).await;
         assert_eq!(out.code, 0);
         assert!(out.block.is_none());
         assert_eq!(out.context.as_deref(), Some("reads a test fixture"));
@@ -1974,7 +2031,7 @@ mod tests {
             prompt: "gate".into(),
             model: None,
         });
-        let out = run_prompt(&def, &gate_payload(), &gate, "x/y", "gate").await;
+        let out = run_prompt(&def, &gate_payload(), &gate, "x/y", "gate", None).await;
         assert_eq!(out.code, CODE_FAILED);
         assert!(out.block.is_none());
     }
