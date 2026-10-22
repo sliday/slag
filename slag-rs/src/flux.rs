@@ -331,7 +331,7 @@ pub fn founder_addendum_prompt(addendum: &str, blueprint: &str, done: &str) -> S
 }
 
 /// The output contract every founder prompt shares: template, fields,
-/// casts heuristics, proof shapes, rules. One copy, because a second one
+/// proof shapes, rules. One copy, because a second one
 /// drifts and only the drifted branch gets debugged.
 fn founder_format_rules() -> String {
     "OUTPUT: S-expressions only. One per line. No prose.\n\n\
@@ -353,14 +353,7 @@ fn founder_format_rules() -> String {
         inspect it. The proof shows something appeared; the bar says whether \
         the ingot's goal was met. Name the observable behaviour, not the file: \
         \"running `calc \\\"2+3*4\\\"` prints 14\" beats \"calc.js exists\".\n\
-        - :duel = t (force multi-cast duel) | nil (block it) | omit for auto (grade-gated)\n\
-        - :casts = 1|2|3 parallel smiths forging the ingot; omit for auto\n\n\
-        CASTS HEURISTICS (set :casts per ingot):\n\
-        - 1: grade <= 2, mechanical work (create/rename/config), a deterministic proof \
-        (test -f / grep -q), or :solo nil\n\
-        - 2: grade 3-4, design-choice work (API shape, refactor strategy, UX), or a retry \
-        after a crack\n\
-        - 3: grade 5, or taste-dominant polish work\n\n\
+        - :duel = t (force multi-cast duel) | nil (block it) | omit for auto (grade-gated)\n\n\
         PROOF COMMANDS:\n\
         - test -f FILE / test -d DIR\n\
         - grep -q PATTERN FILE\n\
@@ -975,13 +968,10 @@ mod tests {
     }
 
     #[test]
-    fn founder_prompt_documents_the_casts_field() {
+    fn founder_prompt_does_not_ask_for_casts() {
         let prompt = founder_prompt("build it", "the plan");
-        assert!(prompt.contains(":casts = 1|2|3"), "field table must list :casts");
-        assert!(prompt.contains("CASTS HEURISTICS"), "heuristics block missing");
-        for tier in ["- 1: grade <= 2", "- 2: grade 3-4", "- 3: grade 5"] {
-            assert!(prompt.contains(tier), "missing tier {tier:?}");
-        }
+        assert!(!prompt.contains(":casts"), "only users pin casts");
+        assert!(!prompt.contains("CASTS HEURISTICS"));
     }
 
     /// The re-melt prompt carries whole-job spend restored from

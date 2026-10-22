@@ -606,8 +606,8 @@ impl EngineConfig {
     ///
     /// Sequential ingots always get one cast — overlapping sequential
     /// work from multiple casts is a merge-conflict factory. `SLAG_DUEL=off`
-    /// is the user's kill switch and comes next: the founder writes the
-    /// pins below, so a pin must not spend what the user turned off. Then
+    /// is the user's kill switch and comes next: it must beat the pins
+    /// below, which a user may have left in a plan. Then
     /// an explicit `:casts` pin wins, then the legacy `:duel` override,
     /// then `SLAG_DUEL=on` (at least 2), then the work-shape heuristics.
     /// The heuristics apply only when `model_alt` differs from
