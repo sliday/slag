@@ -1641,18 +1641,36 @@ fn hunks(diff: &str) -> Vec<Vec<&str>> {
     out
 }
 
+/// The rows of the single `TEST_EDITS:` answer. Reviewers pretty-print the
+/// JSON array across lines (measured on gpt-6.1-sol) or fence it, so the
+/// answer is the first complete JSON value after the marker, not its line.
+fn test_edit_rows(raw: &str) -> Result<Vec<TestEditReview>, String> {
+    let markers: Vec<usize> = raw.lines()
+        .scan(0usize, |at, l| { let start = *at; *at += l.len() + 1; Some((start, l)) })
+        .filter_map(|(start, l)| {
+            let lead = l.len() - l.trim_start().len();
+            l.trim_start().starts_with("TEST_EDITS:").then_some(start + lead + "TEST_EDITS:".len())
+        })
+        .collect();
+    let [at] = markers.as_slice() else {
+        return Err("the review gave no single TEST_EDITS answer".into());
+    };
+    let rest = raw[*at..].trim_start();
+    let rest = rest.strip_prefix("```json").or_else(|| rest.strip_prefix("```")).unwrap_or(rest);
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<Vec<TestEditReview>>()
+        .next()
+        .and_then(Result::ok)
+        .ok_or_else(|| "the review gave an invalid TEST_EDITS answer".to_string())
+}
+
 fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(), String> {
     if let Some(e) = edited.iter().find(|e| !e.diff.lines().any(|l| {
         l.strip_prefix('+').is_some_and(|added| !added.trim().is_empty())
     })) {
         return Err(format!("{} deletes checks without replacement lines", e.path));
     }
-    let answers: Vec<&str> = raw.lines().filter_map(|l| l.trim().strip_prefix("TEST_EDITS:")).collect();
-    let [answer] = answers.as_slice() else {
-        return Err("the review gave no single TEST_EDITS answer".into());
-    };
-    let rows: Vec<TestEditReview> = serde_json::from_str(answer)
-        .map_err(|_| "the review gave an invalid TEST_EDITS answer".to_string())?;
+    let rows = test_edit_rows(raw)?;
     if let Some(row) = rows.iter().find(|r| !edited.iter().any(|e| e.path == r.path)) {
         return Err(format!("the review answered for {}, which no edit changed", row.path));
     }
@@ -3556,6 +3574,19 @@ mod tests {
         assert_eq!(check_lines(collapse, '-'), 3);
         assert_eq!(check_lines(collapse, '+'), 1);
         assert_eq!(check_lines("+    // checks elsewhere\n+    if t.Error(x) {}\n", '+'), 1);
+    }
+
+    #[test]
+    fn a_pretty_printed_or_fenced_test_edits_answer_parses() {
+        let row = r#"{"path":"t.py","removed_behavior_wrong":"yes","added_behavior_requested":"yes","preserves_checks":"yes","issue_quote":"q","removed_quote":"a","added_quote":"b"}"#;
+        let pretty = format!("VERDICT: pass\nGAP:\nTEST_EDITS: [\n  {row},\n  {row}\n]\n");
+        assert_eq!(test_edit_rows(&pretty).unwrap().len(), 2);
+        let fenced = format!("VERDICT: pass\nTEST_EDITS:\n```json\n[{row}]\n```\n");
+        assert_eq!(test_edit_rows(&fenced).unwrap().len(), 1);
+        assert_eq!(test_edit_rows(&format!("TEST_EDITS: [{row}]")).unwrap().len(), 1);
+        assert!(test_edit_rows("VERDICT: pass\nGAP:").is_err());
+        assert!(test_edit_rows("TEST_EDITS: [oops").is_err());
+        assert!(test_edit_rows(&format!("TEST_EDITS: [{row}]\nTEST_EDITS: [{row}]")).is_err());
     }
 
     #[test]
