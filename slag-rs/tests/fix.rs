@@ -225,6 +225,58 @@ async fn a_reviewer_gap_gets_one_revision_that_lands_with_the_fix() {
     assert!(files.contains("tests/test_value_is_two.sh") && files.contains("value.txt"), "{files}");
 }
 
+/// The pycparser shape: the first fix and its test cover the reported input
+/// and pass their own proof. The review names one variant the test never
+/// tries; that gap gets the one revision, quoted in its brief, and no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bug_class_gap_gets_one_revision_that_names_the_variant() {
+    let repo = buggy_repo();
+    let gap = "the test tries only the reported read; also read value.txt through cat in tests/value_test.sh";
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/value_test.sh", "content": "grep -qx 2 value.txt\n"})),
+        tool("finish", json!({"summary": "value.txt:1 now holds 2.", "cmd": SUITE})),
+        json!({"text": format!("VERDICT: fail\nGAP: {gap}")}),
+        tool("read_file", json!({"path": "tests/value_test.sh"})),
+        tool("write_file", json!({
+            "path": "tests/value_test.sh",
+            "content": "grep -qx 2 value.txt && test \"$(cat value.txt)\" = 2\n",
+        })),
+        tool("finish", json!({"summary": "The test reads the value both ways.", "cmd": SUITE})),
+        // Never used: one revision, no second review.
+        json!({"text": "VERDICT: fail\nGAP: also read value.txt through head in tests/value_test.sh"}),
+    ])
+    .await;
+
+    let out = slag_fix(repo.path(), &server, &["value is wrong", "--test", SUITE]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("revised once after review; the revision closed the gap"), "{stdout}");
+    let bodies: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/chat/completions"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    // A session's first request carries its brief; later turns repeat it.
+    let briefs: Vec<String> = bodies
+        .iter()
+        .filter(|b| b["messages"].as_array().is_some_and(|m| m.iter().all(|m| m["role"] != "assistant")))
+        .map(Value::to_string)
+        .collect();
+    assert!(briefs[0].contains("one example of a bug class"), "{}", briefs[0]);
+    let reviews: Vec<&String> = briefs.iter().filter(|b| b.contains("ROLE: reviewer of a bug fix")).collect();
+    assert_eq!(reviews.len(), 1, "one review");
+    assert!(reviews[0].contains("BUG CLASS"), "{}", reviews[0]);
+    let revisions: Vec<&String> = briefs.iter().filter(|b| b.contains("REVIEW: ONE GAP LEFT")).collect();
+    assert_eq!(revisions.len(), 1, "exactly one revision brief");
+    assert!(revisions[0].contains(gap), "{}", revisions[0]);
+    assert_eq!(sh(repo.path(), "git show HEAD:tests/value_test.sh").trim(), "grep -qx 2 value.txt && test \"$(cat value.txt)\" = 2");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revision_that_breaks_the_fix_is_rolled_back() {
     let repo = buggy_repo();
@@ -367,6 +419,18 @@ async fn a_declared_change_the_issue_asks_for_lands_in_plain_sight() {
     assert!(stdout.contains("without the fix"), "a new test shows the bug: {stdout}");
     let body = sh(repo.path(), "git log -1 --format=%B");
     assert!(body.contains("changed existing tests: tests/a.sh"), "{body}");
+    // The agreement review has no revision behind it, so it asks nothing
+    // about the bug class.
+    let reviews: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .filter(|b| b.contains("ROLE: reviewer of a bug fix"))
+        .collect();
+    assert_eq!(reviews.len(), 2);
+    assert!(reviews[0].contains("BUG CLASS") && !reviews[1].contains("BUG CLASS"));
 }
 
 /// The sh-backup-rotate shape: the session read the reported behavior as

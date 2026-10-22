@@ -607,9 +607,8 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         the same input, the same defaults (where the user passed no argument, pass \
         none), asserting the result the issue says is expected. When the issue reports \
         a command (a script, a demo, a CLI), test the call that command makes.\n\
-        - then one test for each other case the issue lists, and one boundary next to \
-        the reported case only when the issue implies a limit. Nothing the issue does \
-        not ask about.\n\
+        - then one test for each other case the issue lists, and the variants of step \
+        4. Nothing unrelated to the bug.\n\
         - concise, in the existing tests' idiom: one assertion per behavior, no \
         repeated setup, no new helper unless the existing tests have one, imports at \
         the top of the file. About the length of the existing tests.\n\
@@ -634,8 +633,13 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
         every case it names. Change only what the cause needs: no new guards or \
         validation, and no change to messages, flags, redirections, or behavior the \
         issue does not ask about. Keep public names and signatures.\n\
-        4. Run the full test command. Your test and the existing ones must pass.\n\
-        5. Finish. summary: the root cause as path:line, the fix, the reproduction. \
+        4. The reported input is one example of a bug class. Vary it where the same \
+        cause could still bite: the syntax or statement form around it, nesting, \
+        boundaries, empty and repeated cases, other paths into the same code. Run the \
+        variants against your fix. Put each one that reaches the root cause into the \
+        regression test (a loop or table over the inputs), and fix the code until all pass.\n\
+        5. Run the full test command. Your test and the existing ones must pass.\n\
+        6. Finish. summary: the root cause as path:line, the fix, the reproduction. \
         cmd: the full test command, which now runs your regression test.\n\n\
         RULES:\n\
         - Never delete, skip, weaken, or rewrite a line of an existing test. slag \
@@ -653,9 +657,10 @@ pub fn fix_prompt(issue: &str, context: &str, retry: Option<&str>) -> String {
 /// The reviewer's brief for a passing fix: one model call, no tools, a
 /// fresh context. It reads the issue, the diff, and what the new tests did
 /// with the fix reverted, and names at most one gap the fixer then gets a
-/// single chance to close. The four checks are the ways a green fix still
-/// loses to a careful human: a symptom patch, a test that does not encode
-/// the reported case, a test in the wrong file, a test that cannot run.
+/// single chance to close. The checks are the ways a green fix still loses
+/// to a careful human: a symptom patch, a test that does not encode the
+/// reported case, a test in the wrong file, a test that cannot run, and
+/// with `class` a fix and test that cover only the reported example.
 pub fn fix_review_prompt(
     issue: &str,
     diff: &str,
@@ -663,6 +668,7 @@ pub fn fix_review_prompt(
     without_fix: &str,
     existing: &str,
     platform: &str,
+    class: bool,
 ) -> String {
     // Only a fix that rewrote existing tests gets the existing-behavior
     // check: offered on every review, weak reviewers misread it as a
@@ -675,6 +681,18 @@ pub fn fix_review_prompt(
          ask, the fix breaks what the user relied on: fail, and say which expectation to \
          restore.\n"
             .to_string()
+    };
+    // A model's proof cannot see missing generality: its own test passes on
+    // the reported input. Only the review that can send a fix back asks.
+    let class_check = if class {
+        "5. BUG CLASS: the fix and the tests cover the bug class, not only the reported \
+         input: the same cause reached through another syntax or statement form around \
+         it, nesting, a boundary, an empty or repeated case, or another path into the \
+         code. When only the literal example is covered and another form plausibly \
+         still fails, fail, and as the gap name one concrete variant the tests do not \
+         try: the exact input, and the test file to add it to.\n"
+    } else {
+        ""
     };
     format!(
         "ROLE: reviewer of a bug fix. You did not write it and you owe its author \
@@ -698,14 +716,15 @@ pub fn fix_review_prompt(
          the same call or command with the same input and defaults (no explicit \
          argument where the user passed none), asserting the result the issue expects; \
          every other case the issue lists has a test. A test that only restates the new \
-         code, or checks something the issue never mentions, misses.\n\
+         code, or checks something unrelated to the bug, misses.\n\
          3. PLACE: each new test sits in the test file for the module it tests, or in \
          a new file named after that module beside the existing tests. A test added to \
          a file for a different module misses.\n\
          4. VALID: with the fix reverted, the new tests fail on an assertion about the \
          reported behavior. A failure from the test itself (a flag this platform does \
          not accept, a syntax or import error, a missing file) misses, and so does a \
-         test that depends on timing or on file creation order.\n\n\
+         test that depends on timing or on file creation order.\n\
+         {class_check}\n\
          Reply with exactly these two lines and nothing after them:\n\
          VERDICT: pass or fail\n\
          GAP: empty on pass. On fail, one instruction the author can act on: what to \

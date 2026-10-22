@@ -1246,7 +1246,7 @@ impl Ctx<'_> {
             )));
         }
 
-        let prompt = self.review_prompt(changed, test_files, repro, without, edited, declared);
+        let prompt = self.review_prompt(changed, test_files, repro, without, edited, declared, true);
         match review(self.config, self.hooks, &prompt).await {
             Ok(Review::Gap(gap)) => Ok(Some(Gap { text: gap, kind: GapKind::Review })),
             Ok(_) => {
@@ -1294,7 +1294,10 @@ impl Ctx<'_> {
         edited: &[EditedTest],
         declared: &str,
     ) -> Result<Result<(), String>, SlagError> {
-        let prompt = self.review_prompt(changed, test_files, repro, without, edited, Some(declared));
+        // Agreement on the test change only: a variant this review names has
+        // no revision left to close it, and would sink a verified fix.
+        let prompt =
+            self.review_prompt(changed, test_files, repro, without, edited, Some(declared), false);
         match review(self.config, self.hooks, &prompt).await {
             Ok(Review::Pass) => Ok(Ok(())),
             Ok(Review::Gap(gap)) => Ok(Err(gap)),
@@ -1304,6 +1307,9 @@ impl Ctx<'_> {
         }
     }
 
+    /// `class` adds the bug-class check: only for the review whose gap gets
+    /// a revision.
+    #[allow(clippy::too_many_arguments)]
     fn review_prompt(
         &self,
         changed: &[String],
@@ -1312,6 +1318,7 @@ impl Ctx<'_> {
         without: Option<&Run>,
         edited: &[EditedTest],
         declared: Option<&str>,
+        class: bool,
     ) -> String {
         let without_fix = match (repro, without) {
             (Repro::Regression { .. }, Some(run)) => format!(
@@ -1346,6 +1353,7 @@ impl Ctx<'_> {
             &without_fix,
             &existing,
             repo::platform(),
+            class,
         )
     }
 }
@@ -2890,14 +2898,34 @@ mod tests {
         assert!(prompt.contains("REVIEW: ONE GAP LEFT"), "{prompt}");
         assert!(prompt.contains("assert export_csv on 2024-01-01..03") && prompt.contains("+fixed line"));
         assert!(!prompt.contains("PREVIOUS ATTEMPT FAILED"), "a passing fix is not a failure");
-        let review = crate::flux::fix_review_prompt("the issue", "the diff", "tests/a.py", "exit 1", "untouched", repo::platform());
+        let review = crate::flux::fix_review_prompt("the issue", "the diff", "tests/a.py", "exit 1", "untouched", repo::platform(), true);
         assert!(!review.contains("EXISTING BEHAVIOR"), "only offered when old tests changed");
         assert!(review.contains("Never ask the author to restore the behavior the issue reports"));
-        let declared = crate::flux::fix_review_prompt("i", "d", "t", "w", "The fix rewrites lines", "p");
+        let declared = crate::flux::fix_review_prompt("i", "d", "t", "w", "The fix rewrites lines", "p", true);
         assert!(declared.contains("EXISTING BEHAVIOR"), "{declared}");
         for part in ["ROOT CAUSE", "THE ISSUE'S CASES", "PLACE", "VALID", "VERDICT: pass or fail", "the diff"] {
             assert!(review.contains(part), "{part} missing");
         }
+    }
+
+    /// The pycparser shape: a fix and a test for the literal example pass
+    /// their own proof and still miss the same bug one statement form over.
+    #[test]
+    fn the_brief_and_the_review_ask_for_the_bug_class_not_only_the_example() {
+        let prompt = crate::flux::fix_prompt("issue", "", None);
+        assert!(prompt.contains("one example of a bug class"), "{prompt}");
+        assert!(prompt.contains("the syntax or statement form around it, nesting"), "{prompt}");
+        assert!(prompt.contains("into the regression test (a loop or table over the inputs)"), "{prompt}");
+        assert!(prompt.contains("the variants of step 4"), "{prompt}");
+        let review = crate::flux::fix_review_prompt("i", "d", "t", "w", "untouched", "p", true);
+        assert!(review.contains("5. BUG CLASS"), "{review}");
+        assert!(review.contains("name one concrete variant the tests do not try"), "{review}");
+        assert!(!review.contains("never mentions, misses"), "a variant test is no stray test: {review}");
+        let agreement = crate::flux::fix_review_prompt("i", "d", "t", "w", "The fix rewrites lines", "p", false);
+        assert!(!agreement.contains("BUG CLASS"), "{agreement}");
+        // A named variant is an ordinary gap, so it gets the one revision.
+        let raw = "VERDICT: fail\nGAP: add `if (TT) TT++;` as the loop body in tests/test_c_parser.py";
+        assert!(matches!(read_review(raw), Review::Gap(g) if g.contains("if (TT) TT++;")));
     }
 
     #[test]
