@@ -1247,7 +1247,7 @@ impl Ctx<'_> {
         }
 
         let prompt = self.review_prompt(changed, test_files, repro, without, edited, declared, true);
-        match review(self.config, self.hooks, &prompt).await {
+        match review(self.config, self.hooks, self.smith.budget.as_ref(), &prompt).await {
             Ok(Review::Gap(gap)) => Ok(Some(Gap { text: gap, kind: GapKind::Review })),
             Ok(_) => {
                 note(self.hooks, "review: pass", true);
@@ -1298,7 +1298,7 @@ impl Ctx<'_> {
         // no revision left to close it, and would sink a verified fix.
         let prompt =
             self.review_prompt(changed, test_files, repro, without, edited, Some(declared), false);
-        match review(self.config, self.hooks, &prompt).await {
+        match review(self.config, self.hooks, self.smith.budget.as_ref(), &prompt).await {
             Ok(Review::Pass(raw)) => Ok(agree_test_edits(&raw, edited, &self.issue.render())),
             Ok(Review::Gap(gap)) => Ok(Err(gap)),
             Ok(Review::Unclear) => Ok(Err("the review gave no clear verdict".into())),
@@ -1415,6 +1415,7 @@ enum Review {
 async fn review(
     config: &EngineConfig,
     hooks: &EngineHooks,
+    budget: Option<&crate::engine::agent::SharedBudget>,
     prompt: &str,
 ) -> Result<Review, SlagError> {
     use crate::engine::Provider;
@@ -1424,7 +1425,8 @@ async fn review(
             config.base_url.clone(),
         ),
         crate::engine::agent::SpendAccum::default(),
-    );
+    )
+    .with_shared_budget(budget.cloned());
     if let Some(tx) = &hooks.events {
         provider.set_event_sink(tx.clone());
     }

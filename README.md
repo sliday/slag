@@ -216,7 +216,7 @@ The main loop. For each ingot:
 
 Independent ingots (`:solo t`) run on up to 3 parallel anvils. Dependent ingots (`:solo nil`) run sequentially after.
 
-Eligible independent ingots use two or three casts in separate git worktrees, with minimal, robust, or creative direction prompts. A judge model assays passing casts, then slag merges the winner. Auto mode uses work shape and grade: grades 3-4 usually use two casts, grade 5 or taste-heavy work uses three, and mechanical work stays single-cast. `:casts`, `:duel`, and `SLAG_DUEL` can override the choice. Cast B may use the same model as cast A.
+Eligible independent ingots use two or three casts in separate git worktrees, with minimal, robust, or creative direction prompts. A judge model assays passing casts, then slag merges the winner. Auto mode duels only when `model_alt` differs from `model_base`; with matched models, which is the default, every ingot gets one cast. With distinct models it uses work shape and grade: grades 3-4 usually use two casts, grade 5 or taste-heavy work uses three, and mechanical work stays single-cast. `:casts`, `:duel`, and `SLAG_DUEL` can override the choice, and `on` or a pin duels matched models.
 
 ### Temper: the warden (`--temper N`)
 

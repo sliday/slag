@@ -590,15 +590,15 @@ impl EngineConfig {
     }
 
     /// Grade-gated duel qualification (plan section 9 rule 1): Auto duels
-    /// grade 3 and above. Matched models no longer disqualify a duel: the
-    /// opposing direction prompts (minimal / robust / creative) carry the
-    /// diversity, so even two casts of `openrouter/auto` explore
-    /// different solutions.
+    /// grade 3 and above, and only when `model_alt` differs from
+    /// `model_base`. A duel of one model against itself cost about 60% more
+    /// in measured builds and changed no outcome. `On` still duels
+    /// matched models.
     pub fn duel_qualifies(&self, grade: u8) -> bool {
         match self.duel {
             DuelMode::On => true,
             DuelMode::Off => false,
-            DuelMode::Auto => grade >= HIGH_GRADE,
+            DuelMode::Auto => grade >= HIGH_GRADE && self.model_alt != self.model_base,
         }
     }
 
@@ -610,6 +610,8 @@ impl EngineConfig {
     /// pins below, so a pin must not spend what the user turned off. Then
     /// an explicit `:casts` pin wins, then the legacy `:duel` override,
     /// then `SLAG_DUEL=on` (at least 2), then the work-shape heuristics.
+    /// The heuristics apply only when `model_alt` differs from
+    /// `model_base`; with matched models Auto gives one cast.
     /// Crack-retry escalation (heat > 0 bumps 1 → 2) lives in the forge
     /// scheduler, not here.
     pub fn casts_for(&self, ingot: &Ingot) -> u8 {
@@ -627,6 +629,7 @@ impl EngineConfig {
         match self.duel {
             DuelMode::Off => 1,
             DuelMode::On => heuristic_casts(ingot).max(2),
+            DuelMode::Auto if self.model_alt == self.model_base => 1,
             DuelMode::Auto => heuristic_casts(ingot),
         }
     }
@@ -2145,17 +2148,22 @@ openrouter_api_key = "old-key"
         clear_engine_env();
     }
 
-    /// Matched models no longer disqualify an Auto duel: the direction
-    /// prompts (minimal / robust / creative) carry the diversity, so two
-    /// casts of `openrouter/auto` still explore different solutions.
+    /// Matched models keep an Auto duel shut: it spent about 60% more and
+    /// changed no outcome. A distinct `model_alt` opens it by grade, and
+    /// `On` duels matched models.
     #[test]
-    fn auto_duel_no_longer_requires_distinct_models() {
+    fn auto_duel_needs_distinct_models() {
         let mut config = test_config();
         config.model_alt = config.model_base.clone();
+        assert!(!config.duel_qualifies(5));
+        assert!(!config.duel_qualifies(HIGH_GRADE));
+
+        config.model_alt = "other/alt-model".into();
         assert!(config.duel_qualifies(5));
         assert!(config.duel_qualifies(HIGH_GRADE));
         assert!(!config.duel_qualifies(HIGH_GRADE - 1));
 
+        config.model_alt = config.model_base.clone();
         config.duel = DuelMode::On;
         assert!(config.duel_qualifies(1));
     }
@@ -2210,6 +2218,26 @@ openrouter_api_key = "old-key"
                 "solo {solo} grade {grade} work {work:?} proof {proof:?}"
             );
         }
+    }
+
+    #[test]
+    fn casts_for_auto_gives_one_cast_when_the_models_match() {
+        let mut config = test_config(); // DuelMode::Auto
+        config.model_alt = config.model_base.clone();
+        let studio = casts_ingot(true, 5, "rebuild the engine", "cargo test");
+        let polish = casts_ingot(true, 2, "polish the landing page", "true");
+        assert_eq!(config.casts_for(&studio), 1);
+        assert_eq!(config.casts_for(&polish), 1);
+
+        config.model_alt = "other/alt-model".into();
+        assert_eq!(config.casts_for(&studio), 3, "a distinct alt model restores the heuristics");
+
+        config.model_alt = config.model_base.clone();
+        let mut pinned = studio.clone();
+        pinned.casts = Some(2);
+        assert_eq!(config.casts_for(&pinned), 2, "a pin keeps its meaning");
+        config.duel = DuelMode::On;
+        assert_eq!(config.casts_for(&studio), 3, "on keeps its meaning");
     }
 
     #[test]

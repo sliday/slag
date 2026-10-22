@@ -1964,11 +1964,25 @@ pub struct SpendTracked<P> {
     inner: P,
     accum: SpendAccum,
     run_cap: Option<f64>,
+    shared_budget: Option<SharedBudget>,
+    events: std::sync::Mutex<Option<EventTx>>,
 }
 
 impl<P: Provider> SpendTracked<P> {
     pub fn new(inner: P, accum: SpendAccum) -> Self {
-        Self { inner, accum, run_cap: crate::config::run_cost_cap() }
+        Self {
+            inner,
+            accum,
+            run_cap: crate::config::run_cost_cap(),
+            shared_budget: None,
+            events: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Fold every response into a shared budget too, as a smith's calls are.
+    pub fn with_shared_budget(mut self, budget: Option<SharedBudget>) -> Self {
+        self.shared_budget = budget;
+        self
     }
 
     /// Override the run-wide cap (`new` reads config/env; the agent's
@@ -1986,6 +2000,7 @@ impl<P: Provider> Provider for SpendTracked<P> {
     ) -> Pin<Box<dyn Future<Output = Result<NormalizedResponse, SlagError>> + Send + '_>> {
         let accum = self.accum.clone();
         let run_cap = self.run_cap;
+        let events = self.events.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Box::pin(async move {
             if let Some(cap) = run_cap {
                 let spent = crate::config::run_spend_dollars();
@@ -1999,13 +2014,21 @@ impl<P: Provider> Provider for SpendTracked<P> {
                 *accum.lock().unwrap() += c;
                 crate::config::add_run_spend(c);
             }
+            if let Some(budget) = &self.shared_budget {
+                budget.fold(&resp.usage);
+            }
+            // The call's tokens reach the run totals and the cost ledger
+            // the same way a smith's do.
+            emit(&events, EngineEvent::Tokens { usage: resp.usage.clone() });
             Ok(resp)
         })
     }
 
     /// Observability wiring must survive the spend wrapper: forward the
-    /// heartbeat sink and cancel flag to the wrapped provider.
+    /// heartbeat sink and cancel flag to the wrapped provider, and keep the
+    /// sink to report this wrapper's own calls.
     fn set_event_sink(&self, tx: EventTx) {
+        *self.events.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
         self.inner.set_event_sink(tx)
     }
 
@@ -4236,6 +4259,48 @@ mod tests {
         };
         tracked.chat(req).await.expect("chat ok");
         assert!((*acc.lock().unwrap() - 0.5).abs() < 1e-9, "judge cost tracked");
+    }
+
+    #[tokio::test]
+    async fn spend_tracked_provider_reports_judge_tokens_and_folds_the_shared_budget() {
+        let mut resp = resp_text("verdict", FinishReason::Stop);
+        resp.usage = Usage {
+            total_tokens: 300,
+            cost: Some(0.25),
+            role: Some(Role::Judge),
+            ..Default::default()
+        };
+        let inner = MockProvider {
+            script: Mutex::new(vec![resp].into()),
+            requests: Mutex::new(Vec::new()),
+        };
+        let budget = SharedBudget::new(10.0, 1_000_000);
+        let tracked = SpendTracked::new(inner, SpendAccum::default())
+            .with_run_cap(None)
+            .with_shared_budget(Some(budget.clone()));
+        let (tx, mut rx) = crate::engine::events::channel();
+        tracked.set_event_sink(tx);
+
+        let req = ChatRequest {
+            model: "judge/model".into(),
+            messages: vec![ChatMessage::user("rule")],
+            tools: vec![],
+            effort: None,
+            max_tokens: None,
+            role: Role::Judge,
+            retry: RetryPolicy::side(),
+        };
+        tracked.chat(req).await.expect("chat ok");
+
+        match rx.try_recv().expect("a tokens event") {
+            EngineEvent::Tokens { usage } => {
+                assert_eq!(usage.role, Some(Role::Judge));
+                assert_eq!(usage.cost, Some(0.25));
+            }
+            other => panic!("expected tokens, got {other:?}"),
+        }
+        assert!((budget.dollars() - 0.25).abs() < 1e-9, "shared budget counts the judge");
+        assert_eq!(budget.tokens(), 300);
     }
 
     #[tokio::test]

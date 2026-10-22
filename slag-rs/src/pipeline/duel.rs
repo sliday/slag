@@ -688,6 +688,14 @@ mod tests {
     }
 
     #[test]
+    fn auto_policy_needs_distinct_models() {
+        let mut c = cfg(DuelMode::Auto);
+        c.model_alt = c.model_base.clone();
+        assert!(!should_duel(&c, &ingot("ix", true, 5, None, "true")));
+        assert!(should_duel(&c, &ingot("ix", true, 1, Some(true), "true")));
+    }
+
+    #[test]
     fn base64_matches_known_vectors() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");

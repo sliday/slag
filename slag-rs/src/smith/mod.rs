@@ -118,10 +118,27 @@ pub fn make_base_smith(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith
     Box::new(native::NativeSmith::plan(cfg.clone(), workspace_root(), hooks))
 }
 
-/// Check if response text contains unresolved questions
+/// Grammar, regex and type notation reads as a question to the `?` check:
+/// `range := whitespace? set (...)* whitespace?` ends in `?`.
+fn is_notation(line: &str) -> bool {
+    [":=", "->", "=>", ")*", ")+", ")?", "]*", "]+", "]?", " | "]
+        .iter()
+        .any(|marker| line.contains(marker))
+}
+
+/// Check if response text contains unresolved questions. Code fences and
+/// notation lines are not questions.
 pub fn has_questions(text: &str) -> bool {
+    let mut fenced = false;
     for line in text.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || is_notation(trimmed) {
+            continue;
+        }
         if trimmed.ends_with('?') {
             return true;
         }
@@ -293,5 +310,15 @@ mod tests {
         assert!(has_questions("Should we use React or Vue?"));
         assert!(!has_questions("# Blueprint\nThis is a plan."));
         assert!(!has_questions("Create the file structure."));
+    }
+
+    #[test]
+    fn grammar_and_fenced_lines_are_not_questions() {
+        assert!(!has_questions("range := whitespace? set (...)* whitespace?"));
+        assert!(!has_questions("expr ::= term (op term)?"));
+        assert!(!has_questions("fn parse(s: &str) -> Option<Ast>?"));
+        assert!(!has_questions("# Grammar\n```\nWhat is this?\nvalue := digit+ sign?\n```\nDone."));
+        assert!(has_questions("# Grammar\nrange := a b?\n\nWhich parser should we use?"));
+        assert!(has_questions("```\ncode\n```\nShould the range be inclusive?"));
     }
 }
