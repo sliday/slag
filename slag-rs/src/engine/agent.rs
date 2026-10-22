@@ -34,6 +34,9 @@ pub(crate) const CHARS_PER_TOKEN: usize = 4;
 /// Budget when the model window is unknown: sized like a window, so a
 /// session keeps what it read instead of paying to read it again.
 const DEFAULT_TOKEN_BUDGET: usize = 100_000;
+/// Ceiling on a window-derived budget: every call re-sends the history, so
+/// even cached it costs and slows each turn. A 1M window keeps 200k.
+const MAX_TOKEN_BUDGET: usize = 200_000;
 /// An over-budget turn compacts down to budget / this, so the history
 /// grows a long way before the next rewrite of the cached prefix.
 const COMPACT_TARGET_DIV: usize = 2;
@@ -195,10 +198,11 @@ fn budget_for_window(window_tokens: u64) -> usize {
     (usable as usize).max(TOKEN_BUDGET_FLOOR)
 }
 
-/// Session budget: `SLAG_CHAR_BUDGET` wins, then the model window, then
-/// the window-sized default.
+/// Session budget: `SLAG_CHAR_BUDGET` wins at any size, then the model
+/// window up to `MAX_TOKEN_BUDGET`, then the window-sized default.
 fn session_token_budget(env: Option<usize>, window_tokens: Option<u64>) -> usize {
-    env.or(window_tokens.map(budget_for_window)).unwrap_or(DEFAULT_TOKEN_BUDGET)
+    env.or(window_tokens.map(|w| budget_for_window(w).min(MAX_TOKEN_BUDGET)))
+        .unwrap_or(DEFAULT_TOKEN_BUDGET)
 }
 
 /// Usage anchor for token estimation: the provider's reported
@@ -4300,8 +4304,10 @@ mod tests {
 
         let sized = agent(provider.clone(), dir.path()).with_context_window(Some(131_072));
         assert_eq!(sized.token_budget, budget_for_window(131_072));
-        let large = agent(provider.clone(), dir.path()).with_context_window(Some(400_000));
-        assert_eq!(large.token_budget, 400_000 - (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize);
+        let large = agent(provider.clone(), dir.path()).with_context_window(Some(180_000));
+        assert_eq!(large.token_budget, 180_000 - (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize);
+        let huge = agent(provider.clone(), dir.path()).with_context_window(Some(1_000_000));
+        assert_eq!(huge.token_budget, MAX_TOKEN_BUDGET);
         // Unknown window keeps whatever budget was already in place.
         let unknown = agent(provider, dir.path()).with_context_window(None);
         assert_eq!(unknown.token_budget, default_budget);
@@ -4310,9 +4316,10 @@ mod tests {
     #[test]
     fn the_session_budget_follows_the_window_unless_the_env_overrides_it() {
         let reserves = (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize;
-        // A large window gives a large budget.
-        assert_eq!(session_token_budget(None, Some(400_000)), 400_000 - reserves);
-        assert_eq!(session_token_budget(None, Some(1_000_000)), 1_000_000 - reserves);
+        // A large window gives a large budget, up to the 200k ceiling.
+        assert_eq!(session_token_budget(None, Some(180_000)), 180_000 - reserves);
+        assert_eq!(session_token_budget(None, Some(400_000)), 200_000);
+        assert_eq!(session_token_budget(None, Some(1_000_000)), 200_000);
         // An unknown window gets a window-sized default.
         assert_eq!(session_token_budget(None, None), 100_000);
         // A small window keeps its own small budget.
@@ -4322,6 +4329,9 @@ mod tests {
         let env = parse_char_budget(Some("48000".into()));
         assert_eq!(session_token_budget(env, Some(400_000)), 12_000);
         assert_eq!(session_token_budget(env, None), 12_000);
+        // The override may exceed the ceiling.
+        let env = parse_char_budget(Some("2000000".into()));
+        assert_eq!(session_token_budget(env, Some(1_000_000)), 500_000);
     }
 
     #[test]

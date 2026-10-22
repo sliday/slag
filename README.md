@@ -462,7 +462,7 @@ Flags may come before or after the commission. `slag fix --help` lists the fix f
 | `SLAG_SCREENSHOT_CMD` | Shell command producing a screenshot for visual assay of web ingots |
 | `SLAG_CONFIG_DIR` | Move the config directory off `~/.config/slag` |
 | `SLAG_OPENROUTER_BASE` | Legacy OpenRouter-only base URL override |
-| `SLAG_CHAR_BUDGET` | Transcript char budget before an agent session compacts (default: the model window less reserves, 400000 when the window is unknown). Lower it for small-context models. |
+| `SLAG_CHAR_BUDGET` | Transcript char budget before an agent session compacts (default: the model window less reserves, at most 800000, and 400000 when the window is unknown). Lower it for small-context models. |
 | `SLAG_BASH_OUTPUT_CAP` | Bytes of shell output the smith sees per command (default 30000, ceiling 204800) |
 | `SLAG_ALLOW_DESTRUCTIVE` | `1` lets the smith run commands the destructive-command gate refuses, such as `rm -rf` |
 | `SLAG_DISABLE_HOOKS` | Turn off every hook for this run (file key `disable_all_hooks`) |
