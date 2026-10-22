@@ -68,9 +68,10 @@ const REVIEW_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the without-the-fix check may run. The swap rebuilds the
 /// original code, a cost the incremental passing run never paid, so the
-/// check gets the largest of ten times the passing run, three times the
-/// baseline run before any edit (which compiled the original code too),
-/// and a slow-starter floor, capped by the usual ceiling. A baseline that
+/// check gets three times the slower of the passing run and the baseline
+/// run before any edit (which compiled the original code too), with a
+/// slow-starter floor, capped by the usual ceiling. A larger factor would
+/// make a slow suite (38s) wait out the whole ceiling on every hang. A baseline that
 /// is missing or timed out says nothing about the rebuild: the check gets
 /// the full ceiling, as it did before the timeout was sized at all.
 fn repro_timeout(passed: &Run, baseline: Option<&Run>) -> Duration {
@@ -78,7 +79,7 @@ fn repro_timeout(passed: &Run, baseline: Option<&Run>) -> Duration {
         Some(b) if !b.timed_out => b.secs,
         _ => return TEST_TIMEOUT,
     };
-    Duration::from_secs_f64((passed.secs * 10.0).max(baseline * 3.0))
+    Duration::from_secs_f64(passed.secs.max(baseline) * 3.0)
         .clamp(Duration::from_secs(30), TEST_TIMEOUT)
 }
 
@@ -2759,13 +2760,15 @@ mod tests {
         let run = |secs: f64| Run { cmd: "t".into(), code: Some(0), output: String::new(), secs, timed_out: false };
         // The floor: both runs fast.
         assert_eq!(repro_timeout(&run(0.5), Some(&run(3.0))), Duration::from_secs(30));
-        // The passing run dominates.
-        assert_eq!(repro_timeout(&run(10.0), Some(&run(3.0))), Duration::from_secs(100));
+        // The passing run dominates. A slow suite (38s, the pyparsing
+        // case) gets 3x, not a ceiling it would always hit.
+        assert_eq!(repro_timeout(&run(38.0), Some(&run(3.0))), Duration::from_secs(114));
         // The baseline dominates: the swap's rebuild dwarfs the incremental
         // passing run, and 30s would call a slow finish a hang.
         assert_eq!(repro_timeout(&run(0.5), Some(&run(20.0))), Duration::from_secs(60));
         // The ceiling binds either term.
         assert_eq!(repro_timeout(&run(120.0), Some(&run(3.0))), TEST_TIMEOUT);
+        assert_eq!(repro_timeout(&run(10.0), Some(&run(3.0))), Duration::from_secs(30));
         assert_eq!(repro_timeout(&run(0.5), Some(&run(150.0))), TEST_TIMEOUT);
     }
 
