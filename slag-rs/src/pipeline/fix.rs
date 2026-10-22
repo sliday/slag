@@ -1822,13 +1822,13 @@ async fn inside(
         })
         .collect();
     let mut tried = Vec::new();
-    // A rewritten block that grew reads two ways: an old test edited and a
-    // new one added after it, or an old expectation that grew. Try both in
-    // that order; the checks below reject a wrong reading.
-    for split in [true, false] {
+    // Lines inserted next to a rewrite may be a new test or part of the
+    // rewritten old one. Each reading keeps fewer of them as new; the
+    // checks below reject a wrong reading.
+    for reading in [repo::Reading::AllNew, repo::Reading::Grown, repo::Reading::Paragraph] {
         let parts: Vec<(&String, String, String)> = texts
             .iter()
-            .filter_map(|(p, old, new)| repo::insertions(old, new, split).map(|(kept, rest)| (*p, kept, rest)))
+            .filter_map(|(p, old, new)| repo::insertions(old, new, reading).map(|(kept, rest)| (*p, kept, rest)))
             .collect();
         if parts.is_empty() || tried.contains(&parts) {
             continue;

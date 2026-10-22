@@ -571,6 +571,58 @@ async fn a_new_test_inside_an_edited_file_that_passes_without_the_fix_is_not_sho
     assert_eq!(sh(repo.path(), "git branch --show-current").trim(), "main");
 }
 
+/// The docutils H2 shape: the session corrects an old expected tree that
+/// pins the bug, which also grows a line, and adds a separate test function
+/// to the same file. The grown line goes back with its old expectation;
+/// the new function stays, and it fails without the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grown_expectation_goes_back_and_a_new_test_function_beside_it_is_the_reproduction() {
+    let repo = tempfile::tempdir().unwrap();
+    let render = |tree: &str| format!("def render():\n    return {tree:?}\n");
+    let tests = |tree: &str, more: &str| {
+        format!(
+            "import unittest\n\nfrom render import render\n\n\nclass TestRender(unittest.TestCase):\n    \
+             def test_tree(self):\n        self.assertEqual(render(), \"\"\"\\\n{tree}\"\"\")\n{more}"
+        )
+    };
+    let (old_tree, new_tree) =
+        ("<ref ids=\"a\">\n    <img>\n<ref>\n    <img>\n", "<ref>\n    <img ids=\"a\">\n<ref>\n    <img>\n<note>\n");
+    sh(repo.path(), "git init -q -b main && git config user.email t@t && git config user.name t");
+    std::fs::write(repo.path().join("render.py"), render(old_tree)).unwrap();
+    std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+    std::fs::write(repo.path().join("tests/test_render.py"), tests(old_tree, "")).unwrap();
+    sh(repo.path(), "git add -A && git commit -qm init");
+    let added = "\n    def test_the_image_carries_the_id(self):\n        self.assertIn('<img ids=\"a\">', render())\n";
+    let server = model(vec![
+        tool("read_file", json!({"path": "render.py"})),
+        tool("write_file", json!({"path": "render.py", "content": render(new_tree)})),
+        tool("read_file", json!({"path": "tests/test_render.py"})),
+        tool("write_file", json!({"path": "tests/test_render.py", "content": tests(new_tree, added)})),
+        tool("finish", json!({
+            "summary": "The id moves to the image.\nchanged existing tests: tests/test_render.py: it pins the id on the ref",
+            "cmd": PY,
+        })),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+        json!({"text": format!("VERDICT: pass\nGAP:\nTEST_EDITS: {}", json!([{
+            "path": "tests/test_render.py",
+            "removed_behavior_wrong": "yes",
+            "added_behavior_requested": "yes",
+            "preserves_checks": "yes",
+            "issue_quote": "the id belongs on the <img>",
+            "removed_quote": "<ref ids=\"a\">",
+            "added_quote": "<img ids=\"a\">",
+        }]))}),
+    ])
+    .await;
+
+    let issue = "render() puts ids=\"a\" on the <ref> wrapper; the id belongs on the <img>, and a <note> follows.";
+    let out = slag_fix(repo.path(), &server, &[issue, "--test", PY, "--tries", "1"]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("the new test catches the bug"), "{stdout}");
+    assert!(!stdout.contains("not shown"), "{stdout}");
+}
+
 /// The sh-backup-rotate shape: the session read the reported behavior as
 /// the intended one and wrote a test that pins the bug, changing no code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -467,39 +467,69 @@ pub fn removed_lines(old: &str, new: &str) -> Vec<String> {
         .collect()
 }
 
+/// How `insertions` reads lines inserted next to a rewrite. Each reading
+/// keeps fewer lines as new than the one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// Every inserted line is new, what a rewritten block grew included:
+    /// an old test edited, then a new one added right after it.
+    AllNew,
+    /// A rewritten block that grew is one rewrite up to its first blank
+    /// line: an old expectation that grew a line.
+    Grown,
+    /// As `Grown`, and an inserted block is part of a rewrite when no blank
+    /// line separates the two: an old expectation rewritten in pieces.
+    Paragraph,
+}
+
 /// Take apart what `new` did to `old`, line by line: `old` with only the
 /// lines `new` inserted, so every line it deleted or rewrote is back, and
-/// `new` without those lines. A rewritten block that grew is a rewrite,
-/// whole, unless `split`, which reads the lines past its old length as
-/// inserted: an old test edited, then a new one added right after it. An
-/// inserted block that resembles a deleted or rewritten one is an old test
-/// moved, not a new one. `None` when nothing but blank lines was inserted.
-pub fn insertions(old: &str, new: &str, split: bool) -> Option<(String, String)> {
+/// `new` without those lines. `reading` decides which lines next to a
+/// rewrite count as inserted. An inserted block that resembles a deleted or
+/// rewritten one is an old test moved, not a new one. `None` when nothing
+/// but blank lines was inserted.
+pub fn insertions(old: &str, new: &str, reading: Reading) -> Option<(String, String)> {
     use similar::{DiffOp, TextDiff};
     fn words<'a>(lines: &[&'a str]) -> Vec<&'a str> {
         lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect()
+    }
+    fn blank(line: &str) -> bool {
+        line.trim().is_empty()
     }
     // A last line without its newline differs from the same line with one.
     let ended = |s: &str| if s.is_empty() || s.ends_with('\n') { s.to_string() } else { format!("{s}\n") };
     let (old, new) = (ended(old), ended(new));
     let diff = TextDiff::from_lines(old.as_str(), new.as_str());
     let (was, now) = (diff.old_slices(), diff.new_slices());
-    let gone: Vec<Vec<&str>> = diff
-        .ops()
-        .iter()
-        .filter(|op| matches!(op, DiffOp::Delete { .. } | DiffOp::Replace { .. }))
-        .map(|op| words(&was[op.old_range()]))
-        .collect();
+    let ops = diff.ops();
+    let rewrite = |op: &DiffOp| matches!(op, DiffOp::Delete { .. } | DiffOp::Replace { .. });
+    let gone: Vec<Vec<&str>> =
+        ops.iter().filter(|op| rewrite(op)).map(|op| words(&was[op.old_range()])).collect();
     let moved = |lines: &[&str]| {
         let lines = words(lines);
         !lines.is_empty() && gone.iter().any(|g| TextDiff::from_slices(g, &lines).ratio() >= 0.5)
     };
+    // Can the insert at `i` reach a rewrite without crossing a blank line?
+    let near = |i: usize| {
+        let stop = |j: &usize| rewrite(&ops[*j]) || now[ops[*j].new_range()].iter().any(|l| blank(l));
+        let hit = |j: Option<usize>| j.is_some_and(|j| rewrite(&ops[j]));
+        let lines = &now[ops[i].new_range()];
+        (!lines.first().is_some_and(|l| blank(l)) && hit((0..i).rev().find(stop)))
+            || (!lines.last().is_some_and(|l| blank(l)) && hit((i + 1..ops.len()).find(stop)))
+    };
     let (mut kept, mut rest, mut any) = (String::new(), String::new(), false);
-    for op in diff.ops() {
+    for (i, op) in ops.iter().enumerate() {
         let (a, b) = (&was[op.old_range()], &now[op.new_range()]);
         let grew: &[&str] = match op {
+            DiffOp::Insert { .. } if reading == Reading::Paragraph && near(i) => &[],
             DiffOp::Insert { .. } => b,
-            DiffOp::Replace { .. } if split && b.len() > a.len() => &b[a.len()..],
+            DiffOp::Replace { .. } if b.len() > a.len() => {
+                let extra = &b[a.len()..];
+                match reading {
+                    Reading::AllNew => extra,
+                    _ => &extra[extra.iter().position(|l| blank(l)).unwrap_or(extra.len())..],
+                }
+            }
             _ => &[],
         };
         let fresh: &[&str] = if moved(grew) { &[] } else { grew };
@@ -1230,29 +1260,55 @@ mod tests {
         let old = "import f\nassert f(1) == 1\n# b\nassert f(2) == 2\nassert f(2) != 0\n# c\n# end\n";
         // Rewrite the first check, delete the two after it, add one.
         let new = "import f\nassert f(1) == 9\n# b\n# c\nassert f(3) == 3\n# end\n";
-        let (kept, rest) = insertions(old, new, true).unwrap();
+        let (kept, rest) = insertions(old, new, Reading::AllNew).unwrap();
         assert_eq!(
             kept,
             "import f\nassert f(1) == 1\n# b\nassert f(2) == 2\nassert f(2) != 0\n# c\nassert f(3) == 3\n# end\n",
             "the insert stays; the rewrite and the deletion are restored"
         );
         assert_eq!(rest, "import f\nassert f(1) == 9\n# b\n# c\n# end\n", "the session's file without the insert");
-        assert_eq!(insertions(old, &old.replace("== 2", "== 8"), true), None, "a rewrite alone inserts nothing");
-        assert_eq!(insertions(old, &old.replace("# c\n", "# c\n\n\n"), true), None, "blank lines are not tests");
+        let rewritten = old.replace("== 2", "== 8");
+        assert_eq!(insertions(old, &rewritten, Reading::AllNew), None, "a rewrite alone inserts nothing");
+        let spaced = old.replace("# c\n", "# c\n\n\n");
+        assert_eq!(insertions(old, &spaced, Reading::AllNew), None, "blank lines are not tests");
     }
 
     #[test]
-    fn a_rewritten_block_that_grew_splits_only_when_asked() {
+    fn a_rewritten_block_that_grew_is_new_only_past_a_blank_line_unless_all_is_new() {
         // The last test edited and a new one right after it: one block.
         let old = "class T:\n    def test_a(self):\n        assert f(1) == 1\n";
         let new = "class T:\n    def test_a(self):\n        assert f(1) == 9\n\n    def test_b(self):\n        assert f(2) == 2\n";
-        let (kept, rest) = insertions(old, new, true).unwrap();
-        assert_eq!(kept, format!("{old}\n    def test_b(self):\n        assert f(2) == 2\n"));
-        assert_eq!(rest, "class T:\n    def test_a(self):\n        assert f(1) == 9\n");
-        assert_eq!(insertions(old, new, false), None, "unsplit, the whole block is a rewrite");
+        for reading in [Reading::AllNew, Reading::Grown, Reading::Paragraph] {
+            let (kept, rest) = insertions(old, new, reading).unwrap();
+            assert_eq!(kept, format!("{old}\n    def test_b(self):\n        assert f(2) == 2\n"), "{reading:?}");
+            assert_eq!(rest, "class T:\n    def test_a(self):\n        assert f(1) == 9\n", "{reading:?}");
+        }
+        // An expectation that grew a line: new only when all is new.
+        let old = "check(\"\"\"\n<a x>\n\"\"\")\n";
+        let new = "check(\"\"\"\n<a>\n<b x>\n\"\"\")\n";
+        let (kept, _) = insertions(old, new, Reading::AllNew).unwrap();
+        assert_eq!(kept, "check(\"\"\"\n<a x>\n<b x>\n\"\"\")\n");
+        assert_eq!(insertions(old, new, Reading::Grown), None);
         // No trailing newline on either side is still the same block.
-        let (kept, _) = insertions(old.trim_end(), &format!("{old}    def test_b(self): pass"), true).unwrap();
+        let old = "class T:\n    def test_a(self):\n        assert f(1) == 1\n";
+        let (kept, _) = insertions(old.trim_end(), &format!("{old}    def test_b(self): pass"), Reading::AllNew).unwrap();
         assert_eq!(kept, format!("{old}    def test_b(self): pass\n"));
+    }
+
+    /// The docutils H2 shape: an expectation rewritten so that one of its
+    /// old lines matches a new one, which splits the rewrite into a delete
+    /// and an insert, plus a new test function after a blank line.
+    #[test]
+    fn an_expectation_rewritten_in_pieces_is_one_rewrite_in_the_paragraph_reading() {
+        let tree = |lines: &str| format!("    def test_tree(self):\n        check(\"\"\"\\\n{lines}\"\"\")\n");
+        let added = "\n    def test_new(self):\n        check_id()\n";
+        let old = tree("<ref ids=\"a\">\n    <img>\n<ref>\n    <img>\n");
+        let new = tree("<ref>\n    <img ids=\"a\">\n<ref>\n    <img>\n<note>\n") + added;
+        let (grown, _) = insertions(&old, &new, Reading::Grown).unwrap();
+        assert!(grown.contains("<note>"), "a lone insert inside the expectation reads as new: {grown}");
+        let (kept, rest) = insertions(&old, &new, Reading::Paragraph).unwrap();
+        assert_eq!(kept, format!("{old}{added}"), "only the new function is new");
+        assert_eq!(rest, tree("<ref>\n    <img ids=\"a\">\n<ref>\n    <img>\n<note>\n"));
     }
 
     #[test]
@@ -1260,8 +1316,9 @@ mod tests {
         let old = "def test_a():\n    x = load()\n    assert x.a == 1\n\ndef test_b():\n    assert g() == 2\n";
         // test_a moves below test_b with its expectation rewritten.
         let new = "def test_b():\n    assert g() == 2\n\ndef test_a():\n    x = load()\n    assert x.a == 9\n";
-        assert_eq!(insertions(old, new, true), None);
-        assert_eq!(insertions(old, new, false), None);
+        for reading in [Reading::AllNew, Reading::Grown, Reading::Paragraph] {
+            assert_eq!(insertions(old, new, reading), None, "{reading:?}");
+        }
     }
 
     #[test]
