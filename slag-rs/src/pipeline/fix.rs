@@ -1496,15 +1496,18 @@ struct TestEditReview {
 /// Lines of a test diff that look like a check (assert, expect, should,
 /// require, a comparison, a Go `t.Error`), per sign.
 fn check_lines(diff: &str, sign: char) -> usize {
-    const MARKS: [&str; 10] =
-        ["assert", "expect", "should", "check", "require", "==", "!=", "t.error", "t.fatal", "verify"];
+    // Whole words or operators only, and never in a comment: deleting an
+    // outdated `# TODO: … should go …` note is not dropping a check.
+    static MARKS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let marks = MARKS.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(assert\w*|expect|should|check|require|verify)\b|==|!=|\bt\.(error|fatal)").unwrap()
+    });
     let header = if sign == '-' { "---" } else { "+++" };
     diff.lines()
         .filter(|l| l.starts_with(sign) && !l.starts_with(header))
-        .filter(|l| {
-            let l = l.to_lowercase();
-            MARKS.iter().any(|m| l.contains(m))
-        })
+        .map(|l| l[1..].trim_start())
+        .filter(|l| !["#", "//", "/*", "*", "--"].iter().any(|c| l.starts_with(c)))
+        .filter(|l| marks.is_match(l))
         .count()
 }
 
@@ -3040,6 +3043,17 @@ mod tests {
 
         let corrected = edit(&old.replace("total(0), 0", "total(0), 1"));
         assert!(agree_test_edits(&answer(&corrected), std::slice::from_ref(&corrected), issue).is_ok());
+    }
+
+    #[test]
+    fn a_removed_comment_is_not_a_dropped_check() {
+        // The docutils fix deletes an outdated TODO that says "should".
+        let diff = "--- a/t.py\n+++ b/t.py\n-# TODO: Anonymous links to a \"clickable image should go\n-        <reference refuri=\"x\">\n+        <reference refid=\"y\">\n";
+        assert_eq!(check_lines(diff, '-'), 0);
+        let collapse = "-    assert a == 1\n-    assert_eq!(b, 2);\n-    expect(c).toBe(3)\n+    assert True\n";
+        assert_eq!(check_lines(collapse, '-'), 3);
+        assert_eq!(check_lines(collapse, '+'), 1);
+        assert_eq!(check_lines("+    // checks elsewhere\n+    if t.Error(x) {}\n", '+'), 1);
     }
 
     #[test]
