@@ -289,18 +289,21 @@ fn fresh_suite(bar: &str, commands: &[String]) -> Option<String> {
     {
         return Some(suite);
     }
-    commands.iter().find(|command| {
-        let Ok(words) = shell_words::split(command) else { return false };
-        let words = words.iter().skip_while(|word| word.split_once('=').is_some_and(|(key, _)|
-            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))).collect::<Vec<_>>();
-        let Some(program) = words.first().and_then(|word| std::path::Path::new(word).file_name())
-            .and_then(|name| name.to_str()) else { return false };
-        let args = words.iter().skip(1).map(|word| word.as_str()).collect::<Vec<_>>();
-        program.starts_with("python") && args.windows(2).any(|args| args[0] == "-m" && matches!(args[1], "unittest" | "pytest"))
-            || program == "pytest"
-            || program == "node" && args.contains(&"--test")
-            || matches!(program, "cargo" | "go" | "npm" | "pnpm" | "yarn" | "bun") && args.contains(&"test")
-    }).cloned()
+    commands.iter().find(|command| is_test_command(command)).cloned()
+}
+
+/// Whether a shell command runs a test suite through a known runner.
+pub(crate) fn is_test_command(command: &str) -> bool {
+    let Ok(words) = shell_words::split(command) else { return false };
+    let words = words.iter().skip_while(|word| word.split_once('=').is_some_and(|(key, _)|
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))).collect::<Vec<_>>();
+    let Some(program) = words.first().and_then(|word| std::path::Path::new(word).file_name())
+        .and_then(|name| name.to_str()) else { return false };
+    let args = words.iter().skip(1).map(|word| word.as_str()).collect::<Vec<_>>();
+    program.starts_with("python") && args.windows(2).any(|args| args[0] == "-m" && matches!(args[1], "unittest" | "pytest"))
+        || program == "pytest"
+        || program == "node" && args.contains(&"--test")
+        || matches!(program, "cargo" | "go" | "npm" | "pnpm" | "yarn" | "bun") && args.contains(&"test")
 }
 
 fn artifact_commands(bar: &str) -> Vec<String> {

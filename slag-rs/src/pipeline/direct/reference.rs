@@ -21,7 +21,12 @@ pub(super) struct Checks {
 
 pub(super) fn named_tool(commission: &str) -> Option<String> {
     let pattern = regex::Regex::new(r#"(?i)\b(?:like|compatible with|equivalent to)\s+(?:(?:the|unix|gnu|bsd|posix)\s+)*[`'"]?([a-z][a-z0-9_-]*)"#).ok()?;
-    Some(pattern.captures(commission)?[1].to_string())
+    // "print like this:" in a long spec names an example, not a tool.
+    let tool = pattern.captures_iter(commission).map(|found| found[1].to_string()).find(|word| !matches!(
+        word.to_ascii_lowercase().as_str(),
+        "this" | "that" | "these" | "those" | "so" | "such" | "it" | "a" | "an" | "any" | "other" | "above" | "below" | "follows"
+    ));
+    tool
 }
 
 pub(super) fn checks(commission: &str, reference: Option<Reference>) -> Result<Checks, &'static str> {

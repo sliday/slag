@@ -236,6 +236,113 @@ async fn direct_commission_keeps_the_final_warden_failure() {
     server.verify().await;
 }
 
+/// A detailed spec the size of the measured builds (1.3k to 6.5k characters).
+fn long_commission() -> String {
+    let mut spec = String::from("write wc.py that counts words in a file through `count_words(path)`, with a unittest.\n\n## Contract\n\n");
+    while spec.chars().count() < 6_000 {
+        spec.push_str("A word is a maximal run of non-whitespace characters. The script reads the named file as UTF-8 and prints the count followed by a newline. ");
+    }
+    let mut spec: String = spec.chars().take(5_999).collect();
+    spec.push('.');
+    spec
+}
+
+fn readme_repo() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("README.md"), "# wc\n\nCounts words.\n").unwrap();
+    git(root.path(), &["init", "-b", "main"]);
+    git(root.path(), &["add", "README.md"]);
+    git(root.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-m", "Readme"]);
+    root
+}
+
+/// The scope call and the direct smith, scripted. Any other phase (a
+/// survey, a founder, a warden) fails the test; the smith writes `source`.
+fn direct_build(commission: &str, source: &'static str) -> impl Fn(&wiremock::Request) -> ResponseTemplate {
+    let order = format!("[i1] {commission}\n");
+    move |request: &wiremock::Request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let messages = body["messages"].to_string();
+        if messages.contains("Choose the work scope") {
+            return response(json!({"content": direct_scope().to_string()}));
+        }
+        if messages.contains("=== RE-SMELT ANALYSIS ===") {
+            return response(json!({"content": "IMPOSSIBLE: the count stays wrong"}));
+        }
+        let prompt = body["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user").unwrap()["content"].as_str().unwrap();
+        assert!(prompt.contains("=== FORGE ORDER ==="), "only the scope call and the smith may run: {messages}");
+        assert!(prompt.contains(&order), "the work item keeps the whole commission");
+        assert_eq!(body["model"], "test/plan", "a long spec forges at the plan grade");
+        if tool_results(&body).is_empty() {
+            response(json!({"content": null, "tool_calls": [
+                tool("source", "write_file", json!({"path": "wc.py", "content": source})),
+                tool("tests", "write_file", json!({"path": "test_wc.py", "content": TEST})),
+            ]}))
+        } else {
+            response(json!({"content": format!("CMD: {PROOF}")}))
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_spec_in_a_readme_repo_forges_directly_without_temper() {
+    let root = readme_repo();
+    let config = tempfile::tempdir().unwrap();
+    let commission = long_commission();
+    assert_eq!(commission.chars().count(), 6_000);
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(direct_build(&commission, SOURCE))
+        .expect(3)
+        .mount(&server).await;
+
+    base_command(root.path(), config.path(), &server)
+        .arg(&commission)
+        .assert()
+        .success()
+        .stdout(contains("One local task, proved by its contract"))
+        .stdout(contains("FORGED"));
+    let plan = std::fs::read_to_string(root.path().join(".slag/PLAN.md")).unwrap();
+    assert_eq!(plan.matches("(ingot ").count(), 1, "{plan}");
+    assert!(plan.contains(":status forged"), "{plan}");
+    assert!(plan.contains(":grade 3"), "{plan}");
+    assert!(plan.contains(&commission), "{plan}");
+    let bar = std::fs::read_to_string(root.path().join(".slag/BAR.md")).unwrap();
+    assert!(bar.contains("in its stated form: count_words(path)."), "{bar}");
+    let ledger = std::fs::read_to_string(root.path().join(".slag/PROGRESS.md")).unwrap();
+    assert!(ledger.contains("heats:1"), "{ledger}");
+    assert!(!ledger.contains("Warden round"), "{ledger}");
+    assert!(git(root.path(), &["ls-files"]).lines().any(|path| path == "README.md"));
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_build_whose_proof_fails_is_not_forged() {
+    let root = readme_repo();
+    let config = tempfile::tempdir().unwrap();
+    let commission = long_commission();
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(direct_build(&commission, "def count_words(path):\n    return 0\n\nprint(0)\n"))
+        .expect(8)
+        .mount(&server).await;
+
+    let output = base_command(root.path(), config.path(), &server)
+        .arg(&commission)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("FORGED"), "{output:?}");
+    let plan = std::fs::read_to_string(root.path().join(".slag/PLAN.md")).unwrap();
+    assert!(plan.contains(":status cracked"), "{plan}");
+    assert!(plan.contains(":heat 3"), "{plan}");
+    let ledger = std::fs::read_to_string(root.path().join(".slag/PROGRESS.md")).unwrap();
+    assert!(!ledger.contains("heats:"), "{ledger}");
+    assert!(!ledger.contains("Warden round"), "{ledger}");
+    server.verify().await;
+}
+
 fn resumed_project(proof: &str) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     for (name, content) in [

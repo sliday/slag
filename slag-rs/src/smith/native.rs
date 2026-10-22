@@ -17,6 +17,16 @@ use crate::engine::tools::ToolBox;
 use crate::engine::{Effort, EventTx, Provider};
 use crate::error::SlagError;
 
+/// Turns for the direct path's single smith. It builds the whole commission
+/// in one session, where the full path spreads it over several 40-turn
+/// ingots; an append-only history keeps a long session cached.
+const DIRECT_MAX_TURNS: usize = 80;
+
+/// Only a direct contract's blueprint carries this line.
+fn direct_contract(prompt: &str) -> bool {
+    prompt.lines().any(|line| line.starts_with("REQUIRED RUN COMMANDS: "))
+}
+
 /// Engine-backed smith. One invoke = one full agent session.
 pub struct NativeSmith {
     cfg: EngineConfig,
@@ -292,8 +302,8 @@ impl NativeSmith {
         }
         if self.mode == PromptMode::Forge {
             agent = agent.with_required_verification();
-            if self.grade == 1 && prompt_text.lines().any(|line| line.starts_with("REQUIRED RUN COMMANDS: ")) {
-                agent = agent.with_max_turns(16);
+            if direct_contract(prompt_text) {
+                agent = agent.with_max_turns(DIRECT_MAX_TURNS);
             }
         }
         if self.role == Role::Warden {
@@ -420,6 +430,43 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "low");
         assert!(body.get("tools").is_none_or(|tools| tools.as_array().unwrap().is_empty()));
         assert!(body["messages"][0]["content"].as_str().unwrap().len() < 300);
+    }
+
+    #[tokio::test]
+    async fn a_direct_contract_gives_the_smith_eighty_turns() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for grade in [1, crate::config::HIGH_GRADE] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("spec.txt"), "rule\n").unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/chat/completions"))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    let turn = body["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "tool").count();
+                    let message = if body["messages"].to_string().contains("no more tool budget") {
+                        serde_json::json!({"content": "CMD: true"})
+                    } else {
+                        serde_json::json!({"content": null, "tool_calls": [{"id": format!("read-{turn}"), "type": "function", "function": {
+                            "name": "read_file", "arguments": "{\"path\":\"spec.txt\"}",
+                        }}]})
+                    };
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": message, "finish_reason": "stop"}],
+                    }))
+                }).mount(&server).await;
+            let mut config = cfg();
+            config.base_url = server.uri();
+            let smith = NativeSmith::forge(config, "default", grade, dir.path().into(), &EngineHooks::default());
+            let _ = smith.invoke("=== FORGE ORDER ===\nBuild the spec.\nREQUIRED RUN COMMANDS: [\"true\"]\n").await;
+            let rounds = server.received_requests().await.unwrap().iter()
+                .filter(|request| request.url.path() == "/chat/completions")
+                .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["messages"]
+                    .as_array().unwrap().iter().filter(|message| message["role"] == "tool").count())
+                .max();
+            assert_eq!(rounds, Some(DIRECT_MAX_TURNS), "grade {grade}: tool rounds before the turn cap");
+        }
     }
 
     #[tokio::test]

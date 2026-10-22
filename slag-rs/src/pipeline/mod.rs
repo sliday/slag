@@ -402,9 +402,7 @@ pub async fn run(
         }
     }
 
-    let direct_candidate = commission.is_some_and(|c| c.chars().count() <= 800)
-        && empty_project(std::path::Path::new("."))
-        && temper_rounds > 0;
+    let direct_candidate = qualifies_for_direct(commission, std::path::Path::new("."));
 
     let prior_head = commission.and_then(|_| review_head());
     // Fire furnace if needed
@@ -423,7 +421,13 @@ pub async fn run(
         match surveyor::direct_proof(smith.as_ref(), commission.unwrap()).await? {
             Some(plan) => {
                 found_direct(commission.unwrap(), &plan)?;
-                tui::status_line("=", tui::COLD, "One local task, one final warden");
+                // The ingot's proof is the contract's suite and probes, so
+                // FORGED still means they passed. Only --temper adds a warden.
+                tui::status_line("=", tui::COLD, if temper_rounds > 0 {
+                    "One local task, one final warden"
+                } else {
+                    "One local task, proved by its contract"
+                });
                 true
             }
             None => false,
@@ -723,10 +727,51 @@ fn pending_goal_gap(path: &std::path::Path) -> Option<(usize, String)> {
     Some((round, gap.to_string()))
 }
 
+/// Longest commission the direct path takes. A detailed spec of a few
+/// thousand characters still describes one local build, and one session
+/// builds it faster and cheaper than a survey, a plan and serial ingots.
+const DIRECT_COMMISSION_CHARS: usize = 8_000;
+
+fn qualifies_for_direct(commission: Option<&str>, root: &std::path::Path) -> bool {
+    commission.is_some_and(|c| c.chars().count() <= DIRECT_COMMISSION_CHARS) && empty_project(root)
+}
+
+/// A project is empty when it holds no product yet: only hidden entries
+/// (`.git`, `.slag`, `.gitignore`), slag's legacy `logs`, and documents
+/// such as README, LICENSE, CHANGELOG and a `docs` folder of text files.
 fn empty_project(root: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else { return false };
     entries.filter_map(Result::ok).all(|entry| {
-        matches!(entry.file_name().to_str(), Some(".git" | ".gitignore" | "logs" | ".slag"))
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { return false };
+        let Ok(kind) = entry.file_type() else { return false };
+        name.starts_with('.') || name == "logs"
+            || kind.is_file() && document_file(&name, true)
+            || kind.is_dir() && matches!(name.as_str(), "docs" | "doc") && document_tree(&entry.path())
+    })
+}
+
+/// A top-level project document (`top`), or any text document inside a
+/// docs folder.
+fn document_file(name: &str, top: bool) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let extension = name.rsplit_once('.').map_or("", |(_, extension)| extension);
+    let text = matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown" | "txt" | "rst" | "adoc");
+    if !top { return text }
+    (text || extension.is_empty()) && matches!(stem.to_ascii_uppercase().as_str(),
+        "README" | "LICENSE" | "LICENCE" | "COPYING" | "CHANGELOG" | "CHANGES" | "HISTORY"
+            | "NOTICE" | "AUTHORS" | "CONTRIBUTING" | "CODE_OF_CONDUCT" | "SECURITY")
+}
+
+fn document_tree(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    entries.filter_map(Result::ok).all(|entry| {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else { return false };
+        match entry.file_type() {
+            _ if name.starts_with('.') => true,
+            Ok(kind) if kind.is_dir() => document_tree(&entry.path()),
+            Ok(kind) if kind.is_file() => document_file(&name, false),
+            _ => false,
+        }
     })
 }
 
@@ -784,7 +829,10 @@ fn found_direct(commission: &str, plan: &direct::DirectPlan) -> Result<(), SlagE
     ))?;
     let mut ingot = crate::sexp::parser::parse_ingot("(ingot :id \"i1\")").unwrap();
     ingot.solo = false;
-    ingot.grade = 1;
+    // A detailed spec is the whole build in one session; give it the
+    // effort and model the full path gives a complex ingot. A short
+    // request keeps the grade-1 settings it was tuned on.
+    ingot.grade = if direct::detailed(commission) { crate::config::HIGH_GRADE } else { 1 };
     ingot.max = 3;
     ingot.casts = Some(1);
     ingot.bar.clear();
@@ -1139,6 +1187,43 @@ mod coordinator_tests {
         assert!(empty_project(dir.path()));
         std::fs::write(dir.path().join("existing.py"), "print(1)\n").unwrap();
         assert!(!empty_project(dir.path()));
+    }
+
+    #[test]
+    fn a_repository_of_documents_and_dot_folders_is_still_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in [".git", ".github/workflows", "docs/guides"] {
+            std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+        }
+        for file in ["README.md", "LICENSE", "CHANGELOG.md", "docs/design.md", "docs/guides/setup.txt", ".github/workflows/ci.yml"] {
+            std::fs::write(dir.path().join(file), "text\n").unwrap();
+        }
+        assert!(empty_project(dir.path()));
+        std::fs::write(dir.path().join("docs/build.py"), "print(1)\n").unwrap();
+        assert!(!empty_project(dir.path()), "code in docs/ is product code");
+        std::fs::remove_file(dir.path().join("docs/build.py")).unwrap();
+        for entry in ["notes.md", "README.py", "src"] {
+            let path = dir.path().join(entry);
+            if entry == "src" { std::fs::create_dir(&path).unwrap() } else { std::fs::write(&path, "x\n").unwrap() }
+            assert!(!empty_project(dir.path()), "{entry}");
+            if entry == "src" { std::fs::remove_dir(&path).unwrap() } else { std::fs::remove_file(&path).unwrap() }
+        }
+        assert!(empty_project(dir.path()));
+    }
+
+    #[test]
+    fn the_direct_gate_takes_a_long_spec_in_a_readme_repo_without_temper() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "# kvlog\n").unwrap();
+        let spec = "kvlog rule. ".repeat(500);
+        assert_eq!(spec.chars().count(), 6_000);
+        assert!(qualifies_for_direct(Some(&spec), dir.path()));
+        assert!(qualifies_for_direct(Some(&"x".repeat(DIRECT_COMMISSION_CHARS)), dir.path()));
+        assert!(!qualifies_for_direct(Some(&"x".repeat(DIRECT_COMMISSION_CHARS + 1)), dir.path()));
+        assert!(!qualifies_for_direct(None, dir.path()));
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        assert!(!qualifies_for_direct(Some(&spec), dir.path()), "an existing product needs a survey");
     }
 }
 

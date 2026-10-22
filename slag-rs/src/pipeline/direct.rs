@@ -5,6 +5,19 @@ mod reference;
 const PACKAGE_CRITERION: &str = "Include installation metadata and importable modules for the requested package. Document its intended installation and launch or import commands.";
 const CLI_CRITERION: &str = "Judge named behavior and boundary cases before interface conveniences. Use subprocess checks with exact expected results for the named behavior and flags. Run the stated CLI launch.";
 const TEST_CRITERION: &str = "Run a nonempty full test suite that exercises the commission's named behavior. Its documented command must pass in a fresh clone without prior installation.";
+const INTERFACE_CRITERION: &str = "Provide and check each interface the commission states, in its stated form:";
+
+/// Past this length a commission is a detailed specification, not a short
+/// request: the scope gets more criteria, so a long spec keeps its rules.
+const DETAILED_COMMISSION_CHARS: usize = 800;
+
+pub(crate) fn detailed(commission: &str) -> bool {
+    commission.chars().count() > DETAILED_COMMISSION_CHARS
+}
+
+fn max_criteria(commission: &str) -> usize {
+    if detailed(commission) { 24 } else { 12 }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct DirectPlan {
@@ -42,12 +55,21 @@ pub fn scope_prompt(commission: &str) -> String {
          The coordinator supplies immutable-content fixtures for empty input and an unterminated final text record.\n\
          Compare only the requested behavior using the reference tool's documented semantics. Include other classic cases in the suite."
     )).unwrap_or_default();
+    let (fits, criteria) = if detailed(commission) {
+        ("a self-contained local program or library with a clear local interface that one build session can deliver, even from a long, detailed specification. It does not suit",
+         "List primary behavior criteria first, then interface criteria. Write one criterion for each stated interface and rule group: each function or method signature, command, flag, input or output format, exit status, and error rule. \
+          Use up to 24 criteria; do not merge distinct rules to save space. Keep routing and harness limits out of criteria.\n\
+          Take probe expectations from the commission's own examples and stated rules.")
+    } else {
+        ("small local utilities with a clear local interface, without",
+         "List primary behavior criteria first, then a few secondary interface criteria. Target six short criteria. Keep routing and harness limits out of criteria.")
+    };
     format!(
         "Choose the work scope for a fresh, empty project.\n\
          COMMISSION: {commission}\n\
-         Routing only: direct=true suits small local utilities with a clear local interface, without external services, UI, deployment, or architectural research.\n\
+         Routing only: direct=true suits {fits} external services, UI, deployment, or architectural research.\n\
          Return only {example} or {{\"direct\":false}}.\n\
-         List primary behavior criteria first, then a few secondary interface criteria. Target six short criteria. Keep routing and harness limits out of criteria.\n\
+         {criteria}\n\
          Derive observable inputs/results from the standard meaning of the named operations and formats. Give EACH named behavior must-pass probes with exact expected results for its mundane edge cases. Put these probes in the suite or commands, not prose alone. Keep these primary checks before interface checks.\n\
          Examples apply only to named operations. Tail selects the final lines (default 10); test empty input, fewer lines, -n 0, an unterminated final line, appends, and partial records.\n\
          A regex filter searches each line, including an unterminated final line at EOF; invalid patterns fail with a useful error. A wc-like tool includes -l/-w/-c and combined flags.\n\
@@ -76,7 +98,7 @@ pub fn scope_prompt(commission: &str) -> String {
 }
 
 fn scope_json(raw: &str) -> Option<&str> {
-    if raw.len() > 8_192 { return None }
+    if raw.len() > 16_384 { return None }
     let raw = raw.trim();
     if let Some(body) = raw.strip_prefix("```json\n").or_else(|| raw.strip_prefix("```json\r\n")) {
         body.strip_suffix("\n```").map(str::trim)
@@ -146,7 +168,7 @@ pub fn complete_reference(commission: &str, scope: &str, reply: &str) -> Option<
 
 pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
     let choice: ScopeChoice = serde_json::from_str(scope_json(raw)?).ok()?;
-    if !choice.direct || choice.criteria.is_empty() || choice.criteria.len() > 12 { return None }
+    if !choice.direct || choice.criteria.is_empty() || choice.criteria.len() > max_criteria(commission) { return None }
     let requested_node_tests = commission.to_ascii_lowercase().contains("node:test");
     let proof = if requested_node_tests { "node --test" } else { choice.proof.trim() };
     if proof.is_empty() || proof.len() > 1_024 || proof.chars().any(char::is_control)
@@ -192,13 +214,18 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
     let lower = commission.to_lowercase();
     let cli = regex::Regex::new(r"\b(cli|command[- ]line|script|executable)\b").ok()?;
     let script = regex::Regex::new(r"\b[\w.-]+\.(py|js|mjs|cjs|ts|sh|rb|pl|ps1)\b").ok()?;
-    let library = regex::Regex::new(r"\b(library|module|function|api)\b").ok()?;
+    let library = regex::Regex::new(r"\b(library|module|function|api|exports?)\b").ok()?;
     let needs_cli = cli.is_match(&lower) || script.is_match(&lower) && !library.is_match(&lower);
     if commands.is_empty() && needs_cli {
         return None;
     }
     let flag = regex::Regex::new(r#"(?:^|[\s`'"(,;/])(-{1,2}[A-Za-z][A-Za-z0-9_-]*)"#).ok()?;
-    for stated in flag.captures_iter(commission) {
+    // A stated test command's flags (`-s` in `python3 -m unittest discover
+    // -s tests`) belong to the test runner, not the product.
+    let product_text = code_spans(commission).into_iter()
+        .filter(|span| super::warden::is_test_command(span))
+        .fold(commission.to_string(), |text, span| text.replace(&format!("`{span}`"), " "));
+    for stated in flag.captures_iter(&product_text) {
         let named = &stated[1];
         if !criteria.iter().any(|item| flag.captures_iter(item).any(|found| &found[1] == named))
             || !tokens.iter().any(|token| token == named || token.strip_prefix(named).is_some_and(|rest| rest.starts_with('=')))
@@ -206,6 +233,16 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
             return None;
         }
     }
+    let mut interfaces = String::new();
+    for interface in stated_interfaces(commission)? {
+        if criteria.iter().any(|item| mentions(item, &interface)) { continue }
+        if !interfaces.is_empty() && interfaces.chars().count() + interface.chars().count() > 300 {
+            criteria.push(format!("{interfaces}."));
+            interfaces.clear();
+        }
+        interfaces = if interfaces.is_empty() { format!("{INTERFACE_CRITERION} {interface}") } else { format!("{interfaces}; {interface}") };
+    }
+    if !interfaces.is_empty() { criteria.push(format!("{interfaces}.")); }
     let package = regex::Regex::new(r"\bpackages?\b").ok()?.is_match(&lower);
     let tests = regex::Regex::new(r"\b(tests?|unittests?|pytest|node:test)\b").ok()?.is_match(&lower);
     for (required, criterion) in [(package, PACKAGE_CRITERION), (needs_cli, CLI_CRITERION), (tests, TEST_CRITERION)] {
@@ -217,6 +254,59 @@ pub fn parse_scope(raw: &str, commission: &str) -> Option<DirectPlan> {
     if let Some(criterion) = reference.criterion { criteria.push(criterion); }
     commands.extend(reference.commands);
     Some(DirectPlan { proof: proof.to_string(), criteria, commands, fixtures: reference.fixtures })
+}
+
+/// Inline code spans outside fenced blocks, from lines whose backticks pair up.
+fn code_spans(text: &str) -> Vec<&str> {
+    let mut fenced = false;
+    let mut spans = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") { fenced = !fenced; continue }
+        let parts: Vec<&str> = line.split('`').collect();
+        if !fenced && parts.len() % 2 == 1 {
+            spans.extend(parts.into_iter().skip(1).step_by(2).map(str::trim).filter(|span| !span.is_empty()));
+        }
+    }
+    spans
+}
+
+/// The call signatures and usage lines a commission states in code spans:
+/// `parse(str)`, `Sheet.get(ref)`, `get KEY`, `python3 sheet.py FILE`.
+/// An ALL-CAPS callable such as `SUM(A1:B2)` is formula syntax, not an
+/// interface to provide.
+fn stated_interfaces(commission: &str) -> Option<Vec<String>> {
+    let call = regex::Regex::new(r"^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\([^()]*\)$").ok()?;
+    let placeholder = regex::Regex::new(r"^[A-Z][A-Z0-9_]*$").ok()?;
+    let word = regex::Regex::new(r"^(?:[a-z0-9][\w./-]*|-{1,2}[A-Za-z][\w-]*)$").ok()?;
+    let mut found: Vec<String> = Vec::new();
+    for span in code_spans(commission) {
+        let stated = match call.captures(span) {
+            Some(name) => name[1].chars().any(|c| c.is_ascii_lowercase()),
+            None => {
+                let words: Vec<&str> = span.split_whitespace().collect();
+                words.len() >= 2 && !words[0].starts_with('-') && word.is_match(words[0])
+                    && words[1..].iter().all(|item| placeholder.is_match(item) || word.is_match(item))
+                    && words[1..].iter().any(|item| placeholder.is_match(item))
+            }
+        };
+        if stated && !found.iter().any(|previous| previous == span) {
+            found.push(span.to_string());
+        }
+    }
+    Some(found)
+}
+
+/// Whether a criterion names a stated interface: a call by its callable
+/// name as a whole word, a usage line verbatim.
+fn mentions(criterion: &str, interface: &str) -> bool {
+    let Some((name, _)) = interface.split_once('(').filter(|(name, _)| !name.contains(' ')) else {
+        return criterion.contains(interface);
+    };
+    let part = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$');
+    criterion.match_indices(name).any(|(at, _)| {
+        !criterion[..at].chars().next_back().is_some_and(part)
+            && !criterion[at + name.len()..].chars().next().is_some_and(part)
+    })
 }
 
 fn write_redirection(command: &str) -> bool {
@@ -616,5 +706,84 @@ mod tests {
         ] {
             assert!(parse_scope(&malformed, "Count words.").is_none());
         }
+    }
+
+    fn detailed_commission() -> String {
+        let mut text = String::from("Create dependency-free CommonJS `semver.js`; export `parse(str)`, `compare(a,b)`, and \
+            `satisfies(version,range)`; add `node:test` tests under `test/` for `node --test`.\n");
+        while !detailed(&text) {
+            text.push_str("Each rule names an exact result for its boundary cases.\n");
+        }
+        text
+    }
+
+    #[test]
+    fn a_detailed_spec_asks_for_a_criterion_per_interface() {
+        let long = scope_prompt(&detailed_commission());
+        assert!(long.contains("even from a long, detailed specification"));
+        assert!(long.contains("one criterion for each stated interface and rule group"));
+        assert!(long.contains("Use up to 24 criteria"));
+        assert!(long.contains("Take probe expectations from the commission's own examples"));
+        assert!(!long.contains("Target six short criteria"));
+        let short = scope_prompt("a Python CLI with tests");
+        assert!(short.contains("direct=true suits small local utilities"));
+        assert!(short.contains("Target six short criteria"));
+    }
+
+    #[test]
+    fn a_detailed_spec_keeps_each_stated_interface_in_the_bar() {
+        let commission = detailed_commission();
+        let criteria: Vec<String> = (1..=20).map(|n| format!("parse(str) and compare(a,b) hold rule {n}.")).collect();
+        let raw = serde_json::json!({"direct": true, "proof": "node --test", "criteria": criteria, "commands": []}).to_string();
+        let plan = parse_scope(&raw, &commission).unwrap();
+        assert_eq!(plan.proof, "node --test");
+        let added: Vec<_> = plan.criteria.iter().filter(|item| item.starts_with(INTERFACE_CRITERION)).collect();
+        assert_eq!(added, [&format!("{INTERFACE_CRITERION} satisfies(version,range).")]);
+        assert!(!plan.criteria.contains(&CLI_CRITERION.to_string()), "an exported library is not a CLI");
+        let again = serde_json::json!({"direct": true, "proof": "node --test", "criteria": plan.criteria, "commands": []}).to_string();
+        assert_eq!(parse_scope(&again, &commission).unwrap().criteria, plan.criteria);
+        assert!(parse_scope(&answer(serde_json::json!(criteria[..13])), "Count words with unittest.").is_none(),
+            "a short request keeps its twelve-criterion cap");
+    }
+
+    #[test]
+    fn a_detailed_spec_may_return_a_long_contract() {
+        let commission = detailed_commission();
+        let rule = |n: usize| format!("Rule {n}: parse(str), compare(a,b) and satisfies(version,range) {}", "keep exact results. ".repeat(12));
+        let probe = format!("node -e \"require('./semver.js'); {}\"", "void 0; ".repeat(70));
+        let contract = |count: usize| serde_json::to_string_pretty(&serde_json::json!({
+            "direct": true, "proof": "node --test", "criteria": (1..=count).map(rule).collect::<Vec<_>>(), "commands": [probe, probe.replace("void", "null")],
+        })).unwrap();
+        assert!(contract(24).len() > 8_192);
+        assert_eq!(parse_scope(&contract(24), &commission).unwrap().criteria.len(), 25);
+        assert!(parse_scope(&contract(25), &commission).is_none());
+    }
+
+    #[test]
+    fn a_stated_test_command_is_not_a_product_flag() {
+        let commission = "Build `sheet.py`, a command-line program run as `python3 sheet.py FILE`. Its tests pass with `python3 -m unittest discover -s tests`.";
+        let raw = answer_with_commands(serde_json::json!(["python3 sheet.py FILE prints each cell."]), &["python3 sheet.py .slag/checks/cells.txt"]);
+        let plan = parse_scope(&raw, commission).unwrap();
+        assert!(!plan.criteria.iter().any(|item| item.starts_with(INTERFACE_CRITERION)), "{:?}", plan.criteria);
+        assert!(parse_scope(&raw, &format!("{commission} Add `--strict`.")).is_none(), "a product flag still needs a criterion and a probe");
+    }
+
+    #[test]
+    fn an_example_introduced_with_like_is_not_a_reference_tool() {
+        assert_eq!(reference::named_tool("Values print like this: 2.0 prints as 2."), None);
+        assert_eq!(reference::named_tool("Print like this, and count like wc."), Some("wc".into()));
+        let raw = answer_with_commands(serde_json::json!(["python3 sheet.py FILE prints cells."]), &["python3 sheet.py cells.txt"]);
+        assert!(parse_scope(&raw, "A command-line program `python3 sheet.py FILE`. Values print like this: 2.0 prints as 2.").is_some());
+    }
+
+    #[test]
+    fn stated_interfaces_are_calls_and_usage_lines_outside_fences() {
+        let commission = "Run `kvlog --db PATH` with `set KEY VALUE`, `get KEY` or `list`; print `KEY=VALUE` lines.\n\
+            Use `Sheet.get(ref)`, and formulas such as `SUM(A1:B2)` or `NAME(arg, ...)`.\n```text\n`hidden(x)`\n```\nAn odd ` backtick.";
+        assert_eq!(stated_interfaces(commission).unwrap(), ["kvlog --db PATH", "set KEY VALUE", "get KEY", "Sheet.get(ref)"]);
+        assert!(mentions("Sheet.get(ref) returns the value.", "Sheet.get(ref)"));
+        assert!(!mentions("Sheet.getter returns the value.", "Sheet.get(ref)"));
+        assert!(mentions("get KEY prints the value.", "get KEY"));
+        assert!(!mentions("get prints the value.", "get KEY"));
     }
 }
