@@ -1493,6 +1493,21 @@ struct TestEditReview {
     added_quote: String,
 }
 
+/// Lines of a test diff that look like a check (assert, expect, should,
+/// require, a comparison, a Go `t.Error`), per sign.
+fn check_lines(diff: &str, sign: char) -> usize {
+    const MARKS: [&str; 10] =
+        ["assert", "expect", "should", "check", "require", "==", "!=", "t.error", "t.fatal", "verify"];
+    let header = if sign == '-' { "---" } else { "+++" };
+    diff.lines()
+        .filter(|l| l.starts_with(sign) && !l.starts_with(header))
+        .filter(|l| {
+            let l = l.to_lowercase();
+            MARKS.iter().any(|m| l.contains(m))
+        })
+        .count()
+}
+
 fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(), String> {
     if let Some(e) = edited.iter().find(|e| !e.diff.lines().any(|l| {
         l.strip_prefix('+').is_some_and(|added| !added.trim().is_empty())
@@ -1509,6 +1524,10 @@ fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(),
         return Err("the review must answer for each edited test".into());
     }
     for e in edited {
+        let (lost, kept) = (check_lines(&e.diff, '-'), check_lines(&e.diff, '+'));
+        if kept < lost {
+            return Err(format!("{} drops from {lost} check lines to {kept}", e.path));
+        }
         let rows: Vec<&TestEditReview> = rows.iter().filter(|r| r.path == e.path).collect();
         let [row] = rows.as_slice() else {
             return Err(format!("the review must answer once for {}", e.path));
@@ -2989,6 +3008,38 @@ mod tests {
         assert!(matches!(read_review("VERDICT: fail\nGAP: add the boundary"), Review::Gap(g) if g == "add the boundary"));
         assert!(matches!(read_review("Looks plausible, I think."), Review::Unclear));
         assert!(matches!(read_review("VERDICT: fail\nGAP:"), Review::Unclear));
+    }
+
+    #[test]
+    fn a_test_edit_may_not_collapse_many_checks_into_fewer() {
+        let issue = "totals are wrong";
+        let old: String = (0..40).map(|i| format!("    assert_eq!(total({i}), {i});\n")).collect();
+        let edit = |new: &str| EditedTest {
+            path: "tests/t.rs".into(),
+            removed: vec![],
+            diff: similar::TextDiff::from_lines(old.as_str(), new).unified_diff().to_string(),
+            original_tests: Some(old.as_bytes().to_vec()),
+        };
+        let answer = |e: &EditedTest| {
+            let removed = e.diff.lines().find_map(|l| l.strip_prefix('-').filter(|_| !l.starts_with("---"))).unwrap();
+            let added = e.diff.lines().find_map(|l| l.strip_prefix('+').filter(|_| !l.starts_with("+++"))).unwrap();
+            let row = serde_json::json!([{
+                "path": "tests/t.rs",
+                "removed_behavior_wrong": "yes",
+                "added_behavior_requested": "yes",
+                "preserves_checks": "yes",
+                "issue_quote": issue,
+                "removed_quote": removed.trim(),
+                "added_quote": added.trim(),
+            }]);
+            format!("VERDICT: pass\nGAP:\nTEST_EDITS: {row}")
+        };
+        let collapsed = edit("    assert!(true);\n");
+        let err = agree_test_edits(&answer(&collapsed), std::slice::from_ref(&collapsed), issue).unwrap_err();
+        assert!(err.contains("40 check lines to 1"), "{err}");
+
+        let corrected = edit(&old.replace("total(0), 0", "total(0), 1"));
+        assert!(agree_test_edits(&answer(&corrected), std::slice::from_ref(&corrected), issue).is_ok());
     }
 
     #[test]
