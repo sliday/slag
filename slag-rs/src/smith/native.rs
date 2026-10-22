@@ -270,12 +270,14 @@ impl NativeSmith {
         // default): a 32k model compacts before it 400s, a 1M model does
         // not throw context away at the fixed default.
         let window = if self.scope_only { None } else { provider.context_length(&model).await };
+        let cache = provider.prompt_cache(&model);
         let toolbox = ToolBox::new(&self.root)
             .with_policy(crate::engine::policy::Policy::from_config())
             .with_steer(self.hooks.steer.clone())
             .with_harness_recipes(self.harness.as_ref().and_then(|h| h.recipe_root()));
         let mut agent = ForgeAgent::new(provider, toolbox, &model)
             .with_coordinator_root(self.root.clone())
+            .with_prompt_cache(cache)
             .with_context_window(window)
             .with_effort(effort)
             .with_ingot_spend(self.ingot_spend.clone())

@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::agent::PromptCache;
 use super::{
     CancelFlag, ChatMessage, ChatRequest, EngineEvent, EventTx, FinishReason, NormalizedResponse,
     Provider, RetryPolicy, ToolCall, Usage,
@@ -317,6 +318,17 @@ impl OpenRouter {
         }
     }
 
+    /// The prompt cache `model` gets on the connection it resolves to. It
+    /// sets how much history a session keeps (see `prompt_cached`). The
+    /// auto router is `Routed`: the agent checks each model it picks.
+    pub fn prompt_cache(&self, model: &str) -> PromptCache {
+        match crate::config::resolve_connection(model, self.provider, &self.api_key, &self.base_url) {
+            Ok((ProviderPreset::OpenRouter, _, _, model)) if model == crate::config::AUTO_MODEL => PromptCache::Routed,
+            Ok((provider, _, _, model)) if prompt_cached(provider, &model) => PromptCache::Cached,
+            _ => PromptCache::None,
+        }
+    }
+
     /// The `/models` index, fetched at most once per client. Both the
     /// window cache and the price table come out of this single request.
     /// A failed fetch still caches (empty windows, disk-cached prices), so
@@ -420,6 +432,9 @@ impl OpenRouter {
             if let Some(fb) = self.fallback_model.as_deref().filter(|fb| *fb != req.model) {
                 body["models"] = json!([req.model, fb]);
             }
+        }
+        if self.provider == ProviderPreset::OpenRouter {
+            mark_cache_breakpoints(&mut body, &req.model);
         }
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req
@@ -1042,6 +1057,47 @@ fn reasoning_effort(provider: ProviderPreset, model: &str, effort: super::Effort
 const OMIT_TOOL_CHOICE: u8 = 1;
 const OMIT_PARALLEL_TOOLS: u8 = 2;
 const OMIT_EMPTY_TOOL_CONTENT: u8 = 4;
+const OMIT_CACHE_CONTROL: u8 = 8;
+
+/// OpenRouter vendors whose models read a growing history from a prompt
+/// cache: the first four cache on their own, `anthropic/` at the
+/// breakpoints `mark_cache_breakpoints` sends.
+const CACHING_VENDORS: [&str; 5] = ["openai/", "google/", "x-ai/", "deepseek/", "anthropic/"];
+
+/// Whether `model` on `provider` reads a growing history from a prompt
+/// cache. Direct presets that cache on their own count; Anthropic's
+/// OpenAI compatibility layer does not cache, and local, custom and the
+/// remaining hosted servers give slag no cache to count on.
+pub(crate) fn prompt_cached(provider: ProviderPreset, model: &str) -> bool {
+    match provider {
+        ProviderPreset::OpenAI | ProviderPreset::DeepSeek | ProviderPreset::Gemini | ProviderPreset::Xai => true,
+        ProviderPreset::OpenRouter => CACHING_VENDORS.iter().any(|vendor| model.starts_with(vendor)),
+        _ => false,
+    }
+}
+
+/// Anthropic caches only at explicit breakpoints. A Claude request gets
+/// two: one on the system prompt, in OpenRouter's content-part format, so
+/// it stays cached through a compaction, and OpenRouter's top-level field,
+/// which puts the other on the last cacheable block and moves it as the
+/// history grows (the last message is usually a tool result, and OpenRouter
+/// takes only a string there). The auto router may pick any vendor, so its
+/// requests get only the top-level field and keep a plain system string.
+fn mark_cache_breakpoints(body: &mut Value, model: &str) {
+    let claude = model.starts_with("anthropic/");
+    if !claude && model != crate::config::AUTO_MODEL {
+        return;
+    }
+    let system = body["messages"].as_array_mut()
+        .and_then(|messages| messages.iter_mut().find(|m| m["role"] == "system"))
+        .filter(|_| claude);
+    if let Some(system) = system {
+        if let Some(text) = system["content"].as_str().filter(|t| !t.is_empty()).map(str::to_string) {
+            system["content"] = json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]);
+        }
+    }
+    body["cache_control"] = json!({"type": "ephemeral"});
+}
 
 fn apply_quirks(body: &mut Value, quirks: u8) {
     let object = body.as_object_mut().unwrap();
@@ -1050,6 +1106,18 @@ fn apply_quirks(body: &mut Value, quirks: u8) {
     }
     if quirks & OMIT_PARALLEL_TOOLS != 0 {
         object.remove("parallel_tool_calls");
+    }
+    if quirks & OMIT_CACHE_CONTROL != 0 {
+        object.remove("cache_control");
+        for message in object.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
+            let text = message["content"].as_array()
+                .filter(|parts| parts.len() == 1 && parts[0].get("cache_control").is_some())
+                .and_then(|parts| parts[0]["text"].as_str())
+                .map(str::to_string);
+            if let Some(text) = text {
+                message["content"] = json!(text);
+            }
+        }
     }
     if quirks & OMIT_EMPTY_TOOL_CONTENT != 0 {
         if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
@@ -1076,6 +1144,9 @@ fn rejected_tool_shape(body: &Value, error: &str) -> Option<u8> {
     }
     if error.contains("parallel_tool_calls") && body.get("parallel_tool_calls").is_some() {
         return Some(OMIT_PARALLEL_TOOLS);
+    }
+    if error.contains("cache_control") && body.get("cache_control").is_some() {
+        return Some(OMIT_CACHE_CONTROL);
     }
     if error.contains("content") && (error.contains("empty") || error.contains("null") || error.contains("tool_call")) {
         let mut adjusted = body.clone();
@@ -2204,6 +2275,55 @@ mod tests {
         assert_eq!(body["tools"][0]["function"]["name"], json!("read_file"));
         assert_eq!(body["reasoning"], json!({ "effort": "high" }));
         assert_eq!(body["usage"], json!({ "include": true }));
+    }
+
+    #[test]
+    fn claude_and_auto_requests_carry_cache_breakpoints() {
+        let mut req = request(vec![spec()], None);
+        req.model = "anthropic/claude-sonnet-5.5".into();
+        let body = body_builder().build_body(&req);
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(body["messages"][0]["content"], json!([
+            {"type": "text", "text": "you are slag", "cache_control": {"type": "ephemeral"}},
+        ]));
+        assert_eq!(body["messages"][1]["content"], json!("forge it"));
+        // The auto router may pick any vendor: only the top-level field,
+        // which OpenRouter applies where the pick caches.
+        req.model = crate::config::AUTO_MODEL.into();
+        let body = body_builder().build_body(&req);
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(body["messages"][0]["content"], json!("you are slag"));
+        // Vendors that cache on their own get no markers, and neither does
+        // Anthropic's own OpenAI-compatible endpoint, which ignores them.
+        let mut req = request(vec![spec()], None);
+        req.model = "openai/gpt-6.1-sol".into();
+        assert!(!body_builder().build_body(&req).to_string().contains("cache_control"));
+        req.model = "claude-sonnet-5.5".into();
+        let direct = OpenRouter::with_provider(ProviderPreset::Anthropic, "sk-test", "http://localhost:0");
+        assert!(!direct.build_body(&req).to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn the_prompt_cache_follows_the_provider_and_the_vendor() {
+        let routed = pinned(ProviderPreset::OpenRouter.base_url());
+        for model in ["anthropic/claude-sonnet-5.5", "openai/gpt-6.1-sol", "google/gemini-3-pro", "x-ai/grok-5", "deepseek/deepseek-v4"] {
+            assert_eq!(routed.prompt_cache(model), PromptCache::Cached, "{model}");
+        }
+        for model in ["meta-llama/llama-4-maverick", "mistralai/devstral-2", "qwen/qwen3-coder"] {
+            assert_eq!(routed.prompt_cache(model), PromptCache::None, "{model}");
+        }
+        assert_eq!(routed.prompt_cache(crate::config::AUTO_MODEL), PromptCache::Routed);
+        for preset in [ProviderPreset::OpenAI, ProviderPreset::DeepSeek, ProviderPreset::Gemini, ProviderPreset::Xai] {
+            let client = OpenRouter::with_provider(preset, "sk-test", preset.base_url());
+            assert_eq!(client.prompt_cache(preset.default_model()), PromptCache::Cached, "{preset:?}");
+        }
+        for preset in [ProviderPreset::Anthropic, ProviderPreset::Groq, ProviderPreset::Cerebras, ProviderPreset::Mistral,
+            ProviderPreset::Together, ProviderPreset::Fireworks, ProviderPreset::Ollama, ProviderPreset::LmStudio] {
+            let client = OpenRouter::with_provider(preset, "sk-test", preset.base_url());
+            assert_eq!(client.prompt_cache(preset.default_model()), PromptCache::None, "{preset:?}");
+        }
+        let custom = OpenRouter::with_provider(ProviderPreset::Custom, "sk-test", "http://localhost:8080/v1");
+        assert_eq!(custom.prompt_cache("anthropic/claude-sonnet-5.5"), PromptCache::None);
     }
 
     #[test]
@@ -4037,6 +4157,30 @@ mod tests {
         let provider = OpenRouter::with_provider(ProviderPreset::Cerebras, "test-key", server.uri());
         provider.chat(request(vec![spec()], None)).await.unwrap();
         provider.chat(request(vec![spec()], None)).await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rejected_cache_breakpoints_retry_once_without_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(|r: &wiremock::Request| String::from_utf8_lossy(&r.body).contains("cache_control"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "cache_control: Extra inputs are not permitted"}
+            })))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(|r: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&r.body).unwrap();
+                !body.to_string().contains("cache_control") && body["messages"][0]["content"] == "you are slag"
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .expect(2).mount(&server).await;
+        let provider = pinned(&server.uri());
+        let mut req = request(vec![spec()], None);
+        req.model = "anthropic/claude-sonnet-5.5".into();
+        provider.chat(req.clone()).await.unwrap();
+        provider.chat(req).await.unwrap();
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 

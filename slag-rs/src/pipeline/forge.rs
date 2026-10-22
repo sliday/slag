@@ -928,10 +928,12 @@ async fn resume_session(
         provider.set_cancel_flag(cancel.clone());
     }
     let window = provider.context_length(&model).await;
+    let cache = provider.prompt_cache(&model);
     let toolbox = ToolBox::new(".")
         .with_policy(crate::engine::policy::Policy::from_config())
         .with_steer(hooks.steer.clone());
     let mut agent = ForgeAgent::new(provider, toolbox, &model)
+        .with_prompt_cache(cache)
         .with_context_window(window)
         .with_coordinator_root(std::path::PathBuf::from("."))
         .with_resume(true)

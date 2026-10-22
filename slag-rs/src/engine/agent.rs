@@ -37,6 +37,9 @@ const DEFAULT_TOKEN_BUDGET: usize = 100_000;
 /// Ceiling on a window-derived budget: every call re-sends the history, so
 /// even cached it costs and slows each turn. A 1M window keeps 200k.
 const MAX_TOKEN_BUDGET: usize = 200_000;
+/// Budget with no prompt cache to count on: every call re-bills the whole
+/// history, so the session stays small.
+const UNCACHED_TOKEN_BUDGET: usize = 12_000;
 /// An over-budget turn compacts down to budget / this, so the history
 /// grows a long way before the next rewrite of the cached prefix.
 const COMPACT_TARGET_DIV: usize = 2;
@@ -198,11 +201,29 @@ fn budget_for_window(window_tokens: u64) -> usize {
     (usable as usize).max(TOKEN_BUDGET_FLOOR)
 }
 
-/// Session budget: `SLAG_CHAR_BUDGET` wins at any size, then the model
-/// window up to `MAX_TOKEN_BUDGET`, then the window-sized default.
-fn session_token_budget(env: Option<usize>, window_tokens: Option<u64>) -> usize {
-    env.or(window_tokens.map(|w| budget_for_window(w).min(MAX_TOKEN_BUDGET)))
-        .unwrap_or(DEFAULT_TOKEN_BUDGET)
+/// Session budget: `SLAG_CHAR_BUDGET` wins at any size. With a prompt
+/// cache, the model window up to `MAX_TOKEN_BUDGET`, else the window-sized
+/// default; without one, the window up to `UNCACHED_TOKEN_BUDGET`.
+fn session_token_budget(env: Option<usize>, window_tokens: Option<u64>, cached: bool) -> usize {
+    let (cap, unknown) = if cached {
+        (MAX_TOKEN_BUDGET, DEFAULT_TOKEN_BUDGET)
+    } else {
+        (UNCACHED_TOKEN_BUDGET, UNCACHED_TOKEN_BUDGET)
+    };
+    env.or(window_tokens.map(|w| budget_for_window(w).min(cap))).unwrap_or(unknown)
+}
+
+/// What reads a session's growing history back between calls. It sets
+/// how much history the session keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptCache {
+    /// No cache to count on: every call re-bills the history.
+    None,
+    /// The provider caches it, on its own or at slag's breakpoints.
+    Cached,
+    /// A router picks the model per call: cached until a response names a
+    /// model whose vendor has no cache.
+    Routed,
 }
 
 /// Usage anchor for token estimation: the provider's reported
@@ -490,6 +511,9 @@ pub struct ForgeAgent {
     required_reads: Vec<String>,
     /// A budget shared with other sessions, checked at every turn.
     shared_budget: Option<SharedBudget>,
+    /// Model window in tokens, when known.
+    window: Option<u64>,
+    prompt_cache: PromptCache,
 }
 
 impl ForgeAgent {
@@ -500,7 +524,7 @@ impl ForgeAgent {
             model: model.into(),
             effort: None,
             max_turns: DEFAULT_MAX_TURNS,
-            token_budget: session_token_budget(env_token_budget(), None),
+            token_budget: session_token_budget(env_token_budget(), None, false),
             cost_cap: crate::config::ingot_cost_cap(),
             run_cap: crate::config::run_cost_cap(),
             ingot_spend: SpendAccum::default(),
@@ -522,6 +546,8 @@ impl ForgeAgent {
             tool_allowlist: None,
             required_reads: Vec::new(),
             shared_budget: None,
+            window: None,
+            prompt_cache: PromptCache::None,
         }
     }
 
@@ -643,8 +669,17 @@ impl ForgeAgent {
     /// both.
     pub fn with_context_window(mut self, window_tokens: Option<u64>) -> Self {
         if window_tokens.is_some() {
-            self.token_budget = session_token_budget(env_token_budget(), window_tokens);
+            self.window = window_tokens;
+            self.token_budget = session_token_budget(env_token_budget(), self.window, self.prompt_cache != PromptCache::None);
         }
+        self
+    }
+
+    /// Say what caches this session's history. A cached session keeps a
+    /// window-sized history; an uncached one, the conservative budget.
+    pub fn with_prompt_cache(mut self, cache: PromptCache) -> Self {
+        self.prompt_cache = cache;
+        self.token_budget = session_token_budget(env_token_budget(), self.window, cache != PromptCache::None);
         self
     }
 
@@ -770,6 +805,7 @@ impl ForgeAgent {
             }
         };
         let mut token_budget = self.token_budget;
+        let mut routed = self.prompt_cache == PromptCache::Routed;
         let mut anchor: Option<TokenAnchor> = None;
         let mut budget_warned = false;
         // Output-cap recovery ladder state (item 51): silent escalation
@@ -872,6 +908,20 @@ impl ForgeAgent {
                         routed: routed.to_string(),
                     },
                 );
+            }
+            // A router pick whose vendor has no prompt cache re-bills the
+            // whole history on every call: from here the session keeps the
+            // conservative budget.
+            if let Some(pick) = resp.model.as_deref().filter(|m| routed && *m != self.model) {
+                if !super::provider::prompt_cached(crate::config::ProviderPreset::OpenRouter, pick) {
+                    routed = false;
+                    if env_token_budget().is_none() {
+                        token_budget = token_budget.min(session_token_budget(None, self.window, false));
+                        emit(&self.events, EngineEvent::Warning {
+                            message: format!("{pick} has no prompt cache; the context budget drops to {token_budget} tokens"),
+                        });
+                    }
+                }
             }
             emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
             self.track_spend(&resp.usage);
@@ -1104,11 +1154,12 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             record_rewrite(tw, &messages);
         }
         // The tools stay in the request so it shares the cached prefix of
-        // every turn before it. A reply that still calls a tool is dropped
-        // and asked once more without them.
+        // every turn before it. A finish call is the summary asked for; a
+        // reply that calls any other tool is dropped and asked once more
+        // without them.
         let mut with_tools = true;
         let resp = loop {
-            let resp = match self
+            let mut resp = match self
                 .chat_shrinking(&mut messages, with_tools, &mut token_budget, &mut anchor, &mut out_tokens, tw)
                 .await
             {
@@ -1121,6 +1172,17 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
             self.track_spend(&resp.usage);
             if with_tools && !resp.tool_calls.is_empty() {
+                if let Some(call) = resp.tool_calls.iter().find(|c| c.name == "finish") {
+                    let outcome = self.dispatch_batch(std::slice::from_ref(call)).await.remove(0);
+                    if !outcome.is_error && (!require_verification || has_verification_command(&outcome.output)) {
+                        resp.content = if resp.content.trim().is_empty() {
+                            outcome.output
+                        } else {
+                            format!("{}\n\n{}", resp.content, outcome.output)
+                        };
+                        break resp;
+                    }
+                }
                 with_tools = false;
                 emit(&self.events, EngineEvent::Warning {
                     message: "the turn-limit summary called a tool; asking again without tools".into(),
@@ -2799,6 +2861,7 @@ mod tests {
             crate::config::ProviderPreset::Custom, "", server.uri(),
         ));
         let result = ForgeAgent::new(provider, ToolBox::new(dir.path()), "test/model")
+            .with_prompt_cache(PromptCache::Cached)
             .with_cost_cap(None)
             .with_run_cap(None)
             .run("You are the smith.\n".repeat(100), "Build the module.\n".repeat(20))
@@ -3191,6 +3254,44 @@ mod tests {
         }
         let last_user = last.messages.iter().rev().find(|m| m.role == "user").unwrap();
         assert!(last_user.content.contains("no more tool budget"));
+    }
+
+    #[tokio::test]
+    async fn a_turn_limit_finish_call_is_the_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let read = || tc("c1", "read_file", serde_json::json!({"path": "a.txt"}));
+        let finish = |args: serde_json::Value| resp_tools(vec![tc("f", "finish", args)]);
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![read()]),
+            finish(serde_json::json!({"summary": "Done.", "cmd": "python3 -m unittest"})),
+        ]);
+        let result = agent(provider.clone(), dir.path())
+            .with_required_verification()
+            .with_max_turns(1)
+            .run("system".into(), "task".into())
+            .await
+            .unwrap();
+        assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
+        assert!(result.contains("Done."));
+        assert_eq!(provider.requests().len(), 2, "no uncached re-ask");
+
+        // A finish with no command cannot pass the proof gate: ask again.
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![read()]),
+            finish(serde_json::json!({"summary": "Done."})),
+            resp_text("Done.\nCMD: python3 -m unittest", FinishReason::Stop),
+        ]);
+        let result = agent(provider.clone(), dir.path())
+            .with_required_verification()
+            .with_max_turns(1)
+            .run("system".into(), "task".into())
+            .await
+            .unwrap();
+        assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].tools.is_empty());
     }
 
     #[tokio::test]
@@ -3925,6 +4026,7 @@ mod tests {
         let provider = FlakyProvider::new(script);
 
         let result = ForgeAgent::new(provider.clone(), ToolBox::new(dir.path()), "test/model")
+            .with_prompt_cache(PromptCache::Cached)
             .with_cost_cap(None)
             .with_run_cap(None)
             .run("system".into(), "task".into())
@@ -4302,12 +4404,20 @@ mod tests {
         let base = agent(provider.clone(), dir.path());
         let default_budget = base.token_budget;
 
-        let sized = agent(provider.clone(), dir.path()).with_context_window(Some(131_072));
+        let cached = || agent(provider.clone(), dir.path()).with_prompt_cache(PromptCache::Cached);
+        let sized = cached().with_context_window(Some(131_072));
         assert_eq!(sized.token_budget, budget_for_window(131_072));
-        let large = agent(provider.clone(), dir.path()).with_context_window(Some(180_000));
+        let large = cached().with_context_window(Some(180_000));
         assert_eq!(large.token_budget, 180_000 - (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize);
-        let huge = agent(provider.clone(), dir.path()).with_context_window(Some(1_000_000));
+        let huge = cached().with_context_window(Some(1_000_000));
         assert_eq!(huge.token_budget, MAX_TOKEN_BUDGET);
+        // The cache and the window combine in either order; a router
+        // counts as cached until it picks a vendor without a cache.
+        let late = agent(provider.clone(), dir.path()).with_context_window(Some(180_000)).with_prompt_cache(PromptCache::Routed);
+        assert_eq!(late.token_budget, large.token_budget);
+        // With no cache to count on, a 1M window keeps the conservative budget.
+        let uncached = agent(provider.clone(), dir.path()).with_context_window(Some(1_000_000));
+        assert_eq!(uncached.token_budget, UNCACHED_TOKEN_BUDGET);
         // Unknown window keeps whatever budget was already in place.
         let unknown = agent(provider, dir.path()).with_context_window(None);
         assert_eq!(unknown.token_budget, default_budget);
@@ -4317,21 +4427,71 @@ mod tests {
     fn the_session_budget_follows_the_window_unless_the_env_overrides_it() {
         let reserves = (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize;
         // A large window gives a large budget, up to the 200k ceiling.
-        assert_eq!(session_token_budget(None, Some(180_000)), 180_000 - reserves);
-        assert_eq!(session_token_budget(None, Some(400_000)), 200_000);
-        assert_eq!(session_token_budget(None, Some(1_000_000)), 200_000);
+        assert_eq!(session_token_budget(None, Some(180_000), true), 180_000 - reserves);
+        assert_eq!(session_token_budget(None, Some(400_000), true), 200_000);
+        assert_eq!(session_token_budget(None, Some(1_000_000), true), 200_000);
         // An unknown window gets a window-sized default.
-        assert_eq!(session_token_budget(None, None), 100_000);
+        assert_eq!(session_token_budget(None, None, true), 100_000);
         // A small window keeps its own small budget.
-        assert_eq!(session_token_budget(None, Some(32_768)), 32_768 - reserves);
-        assert_eq!(session_token_budget(None, Some(8_192)), TOKEN_BUDGET_FLOOR);
+        assert_eq!(session_token_budget(None, Some(32_768), true), 32_768 - reserves);
+        assert_eq!(session_token_budget(None, Some(8_192), true), TOKEN_BUDGET_FLOOR);
         // SLAG_CHAR_BUDGET wins over any window.
         let env = parse_char_budget(Some("48000".into()));
-        assert_eq!(session_token_budget(env, Some(400_000)), 12_000);
-        assert_eq!(session_token_budget(env, None), 12_000);
+        assert_eq!(session_token_budget(env, Some(400_000), true), 12_000);
+        assert_eq!(session_token_budget(env, None, true), 12_000);
         // The override may exceed the ceiling.
         let env = parse_char_budget(Some("2000000".into()));
-        assert_eq!(session_token_budget(env, Some(1_000_000)), 500_000);
+        assert_eq!(session_token_budget(env, Some(1_000_000), true), 500_000);
+        // Without a prompt cache every call re-bills the history: the
+        // conservative budget, smaller still for a small window.
+        assert_eq!(session_token_budget(None, None, false), UNCACHED_TOKEN_BUDGET);
+        assert_eq!(session_token_budget(None, Some(1_000_000), false), UNCACHED_TOKEN_BUDGET);
+        assert_eq!(session_token_budget(None, Some(8_192), false), TOKEN_BUDGET_FLOOR);
+        assert_eq!(session_token_budget(env, None, false), 500_000);
+    }
+
+    #[tokio::test]
+    async fn a_local_provider_with_no_window_keeps_the_conservative_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for preset in [crate::config::ProviderPreset::Ollama, crate::config::ProviderPreset::LmStudio] {
+            let provider = Arc::new(crate::engine::provider::OpenRouter::with_provider(preset, "", preset.base_url()));
+            let (window, cache) = (provider.context_length("qwen3").await, provider.prompt_cache("qwen3"));
+            assert_eq!((window, cache), (None, PromptCache::None));
+            let agent = ForgeAgent::new(provider, ToolBox::new(dir.path()), "qwen3")
+                .with_prompt_cache(cache)
+                .with_context_window(window);
+            assert_eq!(agent.token_budget, UNCACHED_TOKEN_BUDGET, "{preset:?}");
+        }
+    }
+
+    /// Budget each turn's context gauge reported.
+    async fn gauge_budgets(pick: &str) -> Vec<usize> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let mut first = resp_tools(vec![tc("c1", "read_file", serde_json::json!({"path": "a.txt"}))]);
+        first.model = Some(pick.into());
+        let provider = MockProvider::new(vec![first, resp_text("done", FinishReason::Stop)]);
+        let (tx, mut rx) = crate::engine::events::channel();
+        agent(provider, dir.path())
+            .with_prompt_cache(PromptCache::Routed)
+            .with_events(tx)
+            .run("system".into(), "task".into())
+            .await
+            .unwrap();
+        let mut budgets = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::ContextGauge { budget_tokens, .. } = event {
+                budgets.push(budget_tokens);
+            }
+        }
+        budgets
+    }
+
+    #[tokio::test]
+    async fn a_router_pick_without_a_prompt_cache_drops_to_the_conservative_budget() {
+        assert_eq!(gauge_budgets("meta-llama/llama-4-maverick").await, [DEFAULT_TOKEN_BUDGET, UNCACHED_TOKEN_BUDGET]);
+        assert_eq!(gauge_budgets("anthropic/claude-sonnet-5.5").await, [DEFAULT_TOKEN_BUDGET, DEFAULT_TOKEN_BUDGET]);
+        assert_eq!(gauge_budgets("openai/gpt-6.1-sol").await, [DEFAULT_TOKEN_BUDGET, DEFAULT_TOKEN_BUDGET]);
     }
 
     #[test]

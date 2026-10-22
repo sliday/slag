@@ -1198,9 +1198,11 @@ impl Evolver<'_, '_> {
             }
         }
         let window = provider.context_length(&model).await;
+        let cache = provider.prompt_cache(&model);
         let toolbox = crate::engine::tools::ToolBox::new(ws).with_policy(crate::engine::policy::Policy::from_config());
         let mut agent = crate::engine::agent::ForgeAgent::new(provider, toolbox, &model)
             .with_role(crate::engine::Role::Harness)
+            .with_prompt_cache(cache)
             .with_context_window(window)
             .with_effort(config.effort.or(Some(crate::engine::Effort::Medium)))
             .with_cost_cap(None)
