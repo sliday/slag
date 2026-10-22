@@ -1299,7 +1299,7 @@ impl Ctx<'_> {
         let prompt =
             self.review_prompt(changed, test_files, repro, without, edited, Some(declared), false);
         match review(self.config, self.hooks, &prompt).await {
-            Ok(Review::Pass) => Ok(Ok(())),
+            Ok(Review::Pass(raw)) => Ok(agree_test_edits(&raw, edited, &self.issue.render())),
             Ok(Review::Gap(gap)) => Ok(Err(gap)),
             Ok(Review::Unclear) => Ok(Err("the review gave no clear verdict".into())),
             Err(e) if e.is_deterministic_provider() => Err(e),
@@ -1341,8 +1341,8 @@ impl Ctx<'_> {
         let existing = match declared {
             Some(said) if !edited.is_empty() => format!(
                 "The fix rewrites lines of existing tests, and the original tests fail \
-                 against it. Its own account: {said}\nThe lines it removed:\n{}",
-                removed_text(edited)
+                 against it. Its own account: {said}\nExact test changes (- removed, + added):\n{}",
+                edited.iter().map(|e| format!("{}:\n{}", e.path, e.diff)).collect::<Vec<_>>().join("\n")
             ),
             _ => "untouched: every line of every pre-existing test is as it was".to_string(),
         };
@@ -1406,7 +1406,7 @@ fn added_test(
 /// a gap to act on; `None` on a pass, and on a reply too garbled to act on.
 /// What one review said.
 enum Review {
-    Pass,
+    Pass(String),
     Gap(String),
     /// A reply with no readable verdict, or a fail with no gap to act on.
     Unclear,
@@ -1455,9 +1455,75 @@ fn read_review(raw: &str) -> Review {
     // rule that a pass needs evidence does not apply to it.
     let v = super::warden::parse_verdict(raw);
     if raw.contains("VERDICT") && (v.fulfilled || v.gap.contains("without inspection evidence")) {
-        return Review::Pass;
+        return Review::Pass(raw.to_string());
     }
     Review::Unclear
+}
+
+#[derive(serde::Deserialize)]
+struct TestEditReview {
+    path: String,
+    removed_behavior_wrong: String,
+    added_behavior_requested: String,
+    preserves_checks: String,
+    issue_quote: String,
+    removed_quote: String,
+    added_quote: String,
+}
+
+fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(), String> {
+    if let Some(e) = edited.iter().find(|e| !e.diff.lines().any(|l| {
+        l.strip_prefix('+').is_some_and(|added| !added.trim().is_empty())
+    })) {
+        return Err(format!("{} deletes checks without replacement lines", e.path));
+    }
+    let answers: Vec<&str> = raw.lines().filter_map(|l| l.trim().strip_prefix("TEST_EDITS:")).collect();
+    // Keep plain-pass compatibility for an explicit request to replace
+    // numeric expectations without changing the surrounding check.
+    if answers.is_empty() && edited.iter().all(|e| {
+        let request = regex::Regex::new(&format!(
+            r"(?i)(?:^|[.;!?\n])\s*{}(?:\s+pins\s+[^.;!?\n]+?\s+and)?\s+must change\s*(?:[.;!?]|$)",
+            regex::escape(&e.path),
+        )).unwrap();
+        let numbers = regex::Regex::new(r"\b\d+(?:\.\d+)?\b").unwrap();
+        let shape = |prefix| e.diff.lines()
+            .filter_map(|l| l.strip_prefix(prefix))
+            .map(|l| numbers.replace_all(l.trim(), "<number>").into_owned())
+            .collect::<Vec<_>>();
+        request.is_match(issue) && shape('-') == shape('+')
+    }) {
+        return Ok(());
+    }
+    let [answer] = answers.as_slice() else {
+        return Err("the review gave no single TEST_EDITS answer".into());
+    };
+    let rows: Vec<TestEditReview> = serde_json::from_str(answer)
+        .map_err(|_| "the review gave an invalid TEST_EDITS answer".to_string())?;
+    if rows.len() != edited.len() {
+        return Err("the review must answer for each edited test".into());
+    }
+    for e in edited {
+        let rows: Vec<&TestEditReview> = rows.iter().filter(|r| r.path == e.path).collect();
+        let [row] = rows.as_slice() else {
+            return Err(format!("the review must answer once for {}", e.path));
+        };
+        let quoted = |prefix, quote: &str| {
+            !quote.trim().is_empty() && e.diff.lines()
+                .filter_map(|l| l.strip_prefix(prefix))
+                .any(|l| l.trim() == quote.trim())
+        };
+        if row.removed_behavior_wrong != "yes"
+            || row.added_behavior_requested != "yes"
+            || row.preserves_checks != "yes"
+            || row.issue_quote.trim().is_empty()
+            || !issue.contains(&row.issue_quote)
+            || !quoted('-', &row.removed_quote)
+            || !quoted('+', &row.added_quote)
+        {
+            return Err(format!("the review did not approve {} with yes answers and matching quotes", e.path));
+        }
+    }
+    Ok(())
 }
 
 /// Read the reviewer's reply: a gap only on an explicit fail that names
@@ -1723,6 +1789,8 @@ struct EditedTest {
     path: String,
     /// The lines it lost, trimmed.
     removed: Vec<String>,
+    /// The complete test diff, including indentation and added lines.
+    diff: String,
     /// What the original tests look like against the session's source:
     /// the whole original file, or, for a source file with an inline test
     /// module, the session's code above the module and the original
@@ -1748,6 +1816,8 @@ fn edited_old_tests(
                 return (!removed.is_empty()).then(|| EditedTest {
                     path: p.clone(),
                     removed,
+                    diff: similar::TextDiff::from_lines(old.as_str(), new.as_deref().unwrap_or(""))
+                        .unified_diff().to_string(),
                     original_tests: Some(old.clone().into_bytes()),
                 });
             }
@@ -1758,6 +1828,7 @@ fn edited_old_tests(
             (!removed.is_empty()).then(|| EditedTest {
                 path: p.clone(),
                 removed,
+                diff: similar::TextDiff::from_lines(old_tests, new_tests).unified_diff().to_string(),
                 original_tests: Some(format!("{new_code}{old_tests}").into_bytes()),
             })
         })
@@ -2850,7 +2921,7 @@ mod tests {
 
     #[test]
     fn a_change_to_old_tests_counts_as_declared_only_when_every_file_is_named() {
-        let edited = |path: &str| EditedTest { path: path.into(), removed: vec![], original_tests: None };
+        let edited = |path: &str| EditedTest { path: path.into(), removed: vec![], diff: String::new(), original_tests: None };
         let both = [edited("tests/preview.test.js"), edited("tests/limits.test.js")];
         let said = "Fixed the slice.\nchanged existing tests: tests/preview.test.js: the issue asks for 20 code points";
         assert!(declaration(said, &both).is_none(), "limits.test.js went unsaid");
@@ -2862,10 +2933,115 @@ mod tests {
 
     #[test]
     fn a_review_pass_needs_the_word_and_nothing_else_counts() {
-        assert!(matches!(read_review("VERDICT: pass\nGAP:"), Review::Pass));
+        assert!(matches!(read_review("VERDICT: pass\nGAP:"), Review::Pass(_)));
         assert!(matches!(read_review("VERDICT: fail\nGAP: add the boundary"), Review::Gap(g) if g == "add the boundary"));
         assert!(matches!(read_review("Looks plausible, I think."), Review::Unclear));
         assert!(matches!(read_review("VERDICT: fail\nGAP:"), Review::Unclear));
+    }
+
+    #[test]
+    fn test_edit_agreement_needs_grounded_yes_answers_for_each_path() {
+        let issue = "link() returns https://target, which is wrong; it must return #image.";
+        let old = "    assert_eq!(link(), \"https://target\");\n";
+        let new = "    assert_eq!(link(), \"#image\");\n";
+        let edit = EditedTest {
+            path: "tests/links.rs".into(),
+            removed: vec![old.trim().into()],
+            diff: similar::TextDiff::from_lines(old, new).unified_diff().to_string(),
+            original_tests: Some(old.as_bytes().to_vec()),
+        };
+        let row = serde_json::json!({
+            "path": "tests/links.rs",
+            "removed_behavior_wrong": "yes",
+            "added_behavior_requested": "yes",
+            "preserves_checks": "yes",
+            "issue_quote": issue,
+            "removed_quote": old.trim(),
+            "added_quote": new.trim(),
+        });
+        let agree = |rows: serde_json::Value, edits: &[EditedTest]| {
+            agree_test_edits(&format!("VERDICT: pass\nGAP:\nTEST_EDITS: {rows}"), edits, issue)
+        };
+        assert!(agree(serde_json::json!([row]), std::slice::from_ref(&edit)).is_ok());
+        for (field, value) in [
+            ("removed_behavior_wrong", "no"),
+            ("added_behavior_requested", "no"),
+            ("preserves_checks", "no"),
+            ("issue_quote", "the issue never said this"),
+            ("removed_quote", "assert_eq!(link(), \"other\");"),
+            ("added_quote", "assert_eq!(link(), \"other\");"),
+            ("added_quote", "#image"),
+            ("path", "tests/other.rs"),
+        ] {
+            let mut bad = row.clone();
+            bad[field] = value.into();
+            assert!(agree(serde_json::json!([bad]), std::slice::from_ref(&edit)).is_err(), "{field}");
+        }
+        assert!(agree(serde_json::json!([]), std::slice::from_ref(&edit)).is_err());
+        assert!(agree_test_edits("VERDICT: pass\nGAP:", std::slice::from_ref(&edit), issue).is_err());
+        assert!(agree_test_edits("TEST_EDITS: invalid", std::slice::from_ref(&edit), issue).is_err());
+        assert!(agree_test_edits(
+            "VERDICT: pass\nGAP:", std::slice::from_ref(&edit),
+            "tests/links.rs must change neither its scope nor unrelated expectations.",
+        ).is_err());
+        for unrelated in [
+            "Neither tests/links.rs nor tests/other.rs must change.",
+            "tests/links.rsx must change.",
+        ] {
+            assert!(agree_test_edits("VERDICT: pass\nGAP:", std::slice::from_ref(&edit), unrelated).is_err());
+        }
+        let mut deleted = edit.clone();
+        deleted.diff = similar::TextDiff::from_lines(old, "").unified_diff().to_string();
+        assert!(agree_test_edits(
+            "VERDICT: pass\nGAP:", &[deleted], "tests/links.rs pins the old value and must change.",
+        ).is_err());
+        let mut weakened = edit.clone();
+        weakened.diff = similar::TextDiff::from_lines(old, "    // Checked elsewhere.\n").unified_diff().to_string();
+        assert!(agree_test_edits(
+            "VERDICT: pass\nGAP:", &[weakened], "tests/links.rs pins the old value and must change.",
+        ).is_err());
+        let answer = format!("TEST_EDITS: {}", serde_json::json!([row]));
+        assert!(agree_test_edits(&format!("{answer}\n{answer}"), std::slice::from_ref(&edit), issue).is_err());
+        for field in ["issue_quote", "removed_quote", "added_quote", "preserves_checks"] {
+            let mut missing = row.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(agree(serde_json::json!([missing]), std::slice::from_ref(&edit)).is_err(), "{field}");
+            let mut empty = row.clone();
+            empty[field] = "".into();
+            assert!(agree(serde_json::json!([empty]), std::slice::from_ref(&edit)).is_err(), "{field}");
+        }
+        let mut other = edit.clone();
+        other.path = "tests/other.rs".into();
+        let edits = [edit, other];
+        assert!(agree(serde_json::json!([row]), &edits).is_err());
+        assert!(agree(serde_json::json!([row, row]), &edits).is_err());
+        let mut second = row.clone();
+        second["path"] = "tests/other.rs".into();
+        assert!(agree(serde_json::json!([row, second]), &edits).is_ok());
+    }
+
+    #[test]
+    fn edited_test_diffs_keep_all_changed_lines_and_their_indentation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        let old = (0..40).map(|i| format!("    assert_eq!(f({i}), 1);\n")).collect::<String>();
+        std::fs::write(root.join("tests/old.rs"), &old).unwrap();
+        let inline = format!("fn f() {{}}\n#[cfg(test)]\nmod tests {{\n{old}}}\n");
+        std::fs::write(root.join("lib.rs"), &inline).unwrap();
+        sh(root, "git add -A && git commit -qm init");
+        let git = Git::open(root).unwrap();
+        let before = git.snapshot();
+        std::fs::write(root.join("tests/old.rs"), old.replace(", 1)", ", 2)")).unwrap();
+        std::fs::write(root.join("lib.rs"), inline.replace("fn f() {}", "fn f() { return; }").replace(", 1)", ", 2)")).unwrap();
+        let edits = edited_old_tests(&git, &before, &git.changed_since(&before));
+        assert_eq!(edits.len(), 2);
+        for e in edits {
+            assert!(e.diff.contains("-    assert_eq!(f(0), 1);"), "{}", e.diff);
+            assert!(e.diff.contains("+    assert_eq!(f(39), 2);"), "{}", e.diff);
+            assert!(!e.diff.contains("fn f()"), "only test changes: {}", e.diff);
+        }
     }
 
     #[test]
@@ -2873,6 +3049,7 @@ mod tests {
         let edited = |line: &str| vec![EditedTest {
             path: "tests/preview.test.js".into(),
             removed: vec![line.into()],
+            diff: String::new(),
             original_tests: None,
         }];
         let issue = "makePreview(\"🎉\".repeat(25), 20) splits an emoji";

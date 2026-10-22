@@ -676,10 +676,24 @@ pub fn fix_review_prompt(
     let existing_check = if existing.starts_with("untouched") {
         String::new()
     } else {
-        "0. EXISTING BEHAVIOR: the fix rewrites existing tests, so the issue text must \
-         explicitly ask for the exact behavior the new expectations pin. Without that \
-         ask, the fix breaks what the user relied on: fail, and say which expectation to \
-         restore.\n"
+        "0. EXISTING BEHAVIOR: compare each edited test with the issue text.\n\
+         Do the removed assertions expect the behavior the issue reports as wrong?\n\
+         Do the added assertions expect the behavior the issue asks for?\n\
+         Does the edit preserve the checks and their scope?\n\
+         Answer yes only with quotes from the issue and the exact removed and added lines.\n\
+         The issue need not name a test if its old assertion expects the reported bug.\n\
+         Reject edits that loosen or delete checks, or change behavior outside the issue.\n\
+         Reject uncertain test edits.\n"
+            .to_string()
+    };
+    let test_edits = if existing.starts_with("untouched") {
+        String::new()
+    } else {
+        "\nAdd one TEST_EDITS: line with a JSON array after GAP.\n\
+         Include one object for each edited test path.\n\
+         Use this schema:\n\
+         {\"path\":\"tests/example.py\",\"removed_behavior_wrong\":\"yes or no\",\"added_behavior_requested\":\"yes or no\",\"preserves_checks\":\"yes or no\",\"issue_quote\":\"exact issue text\",\"removed_quote\":\"one complete removed line\",\"added_quote\":\"one complete added line\"}\n\
+         Judge all changes in each path, including checks outside the quoted lines."
             .to_string()
     };
     // A model's proof cannot see missing generality: its own test passes on
@@ -705,7 +719,7 @@ pub fn fix_review_prompt(
          PLATFORM: {platform}\n\n\
          The issue reports a bug. Never ask the author to restore the behavior the \
          issue reports as wrong, to expect it in a test, or to remove a test that checks \
-         what the issue says should happen. When unsure, pass.\n\n\
+         what the issue says should happen. For checks other than test edits, pass when unsure.\n\n\
          Check these in order. Fail only on a clear miss, never on style:\n\
          {existing_check}\
          1. ROOT CAUSE: the source change fixes the cause the issue describes where it \
@@ -725,10 +739,10 @@ pub fn fix_review_prompt(
          not accept, a syntax or import error, a missing file) misses, and so does a \
          test that depends on timing or on file creation order.\n\
          {class_check}\n\
-         Reply with exactly these two lines and nothing after them:\n\
+         Reply with these verdict lines:\n\
          VERDICT: pass or fail\n\
          GAP: empty on pass. On fail, one instruction the author can act on: what to \
-         change, in which file."
+         change, in which file.{test_edits}"
     )
 }
 

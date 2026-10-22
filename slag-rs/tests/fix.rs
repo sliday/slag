@@ -433,6 +433,63 @@ async fn a_declared_change_the_issue_asks_for_lands_in_plain_sight() {
     assert!(reviews[0].contains("BUG CLASS") && !reviews[1].contains("BUG CLASS"));
 }
 
+async fn correct_buggy_expectation(answer: &str) -> (TempDir, MockServer, std::process::Output) {
+    let repo = two_value_repo();
+    let review = json!({
+        "path": "tests/a.sh",
+        "removed_behavior_wrong": answer,
+        "added_behavior_requested": "yes",
+        "preserves_checks": "yes",
+        "issue_quote": "a.txt contains 1, which is wrong. It must contain 2.",
+        "removed_quote": "grep -qx 1 a.txt",
+        "added_quote": "grep -qx 2 a.txt",
+    });
+    let server = model(vec![
+        tool("read_file", json!({"path": "a.txt"})),
+        tool("edit_file", json!({"path": "a.txt", "old_string": "1", "new_string": "2"})),
+        tool("read_file", json!({"path": "tests/a.sh"})),
+        tool("edit_file", json!({"path": "tests/a.sh", "old_string": "-qx 1", "new_string": "-qx 2"})),
+        tool("write_file", json!({"path": "tests/a_is_two.sh", "content": "grep -qx 2 a.txt\n"})),
+        tool("finish", json!({
+            "summary": "Corrected a.txt.\nchanged existing tests: tests/a.sh: it asserts the reported wrong value",
+            "cmd": SUITE,
+        })),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+        json!({"text": format!("VERDICT: pass\nGAP:\nTEST_EDITS: {}", json!([review]))}),
+    ])
+    .await;
+    let issue = "a.txt contains 1, which is wrong. It must contain 2.";
+    let out = slag_fix(repo.path(), &server, &[issue, "--test", SUITE, "--tries", "1"]).await;
+    (repo, server, out)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_existing_expectation_of_the_reported_bug_can_change_with_quoted_review() {
+    let (repo, server, out) = correct_buggy_expectation("yes").await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("changed existing tests: tests/a.sh"), "{stdout}");
+    assert!(stdout.contains("without the fix"), "{stdout}");
+    assert_eq!(sh(repo.path(), "git show HEAD:tests/a.sh").trim(), "grep -qx 2 a.txt");
+    assert!(sh(repo.path(), "git log -1 --format=%B").contains("changed existing tests: tests/a.sh"));
+    let requests = server.received_requests().await.unwrap();
+    let review = requests.iter().filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .filter_map(|v| v["messages"][0]["content"].as_str().map(str::to_owned))
+        .find(|p| p.contains("TEST_EDITS:")).expect("a structured review question");
+    for text in ["a.txt contains 1, which is wrong", "grep -qx 1 a.txt", "grep -qx 2 a.txt", "preserves_checks"] {
+        assert!(review.contains(text), "{text} missing: {review}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_review_no_on_the_reported_bug_keeps_the_existing_test_guard() {
+    let (repo, _server, out) = correct_buggy_expectation("no").await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("NOT FIXED") && stdout.contains("without the review agreeing"), "{stdout}");
+    assert_eq!(sh(repo.path(), "git branch --show-current").trim(), "main");
+}
+
 /// The sh-backup-rotate shape: the session read the reported behavior as
 /// the intended one and wrote a test that pins the bug, changing no code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
