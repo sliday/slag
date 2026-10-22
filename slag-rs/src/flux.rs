@@ -682,9 +682,11 @@ pub fn fix_review_prompt(
         String::new()
     } else {
         "\nAdd one TEST_EDITS: line with a JSON array after GAP.\n\
-         Include one object for each edited test path.\n\
+         Include one object for each changed check: each diff hunk that removes or rewrites a check line needs its own object, quoting one removed line of that hunk.\n\
+         Several objects may share a path. Every edited test path needs at least one.\n\
          Use this schema:\n\
-         {\"path\":\"tests/example.py\",\"removed_behavior_wrong\":\"yes or no\",\"added_behavior_requested\":\"yes or no\",\"preserves_checks\":\"yes or no\",\"issue_quote\":\"exact issue text\",\"removed_quote\":\"one complete removed line\",\"added_quote\":\"one complete added line\"}\n\
+         {\"path\":\"tests/example.py\",\"removed_behavior_wrong\":\"yes or no\",\"added_behavior_requested\":\"yes or no\",\"preserves_checks\":\"yes or no\",\"issue_quote\":\"exact issue text, 20 characters or more\",\"removed_quote\":\"one complete removed line\",\"added_quote\":\"one complete added line\"}\n\
+         A check that compared against a value and now only tests that something exists or is true loses that value: answer preserves_checks no, unless the issue says that value is wrong.\n\
          Judge all changes in each path, including checks outside the quoted lines."
             .to_string()
     };

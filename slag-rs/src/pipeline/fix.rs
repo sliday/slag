@@ -1504,22 +1504,102 @@ struct TestEditReview {
     added_quote: String,
 }
 
-/// Lines of a test diff that look like a check (assert, expect, should,
-/// require, a comparison, a Go `t.Error`), per sign.
-fn check_lines(diff: &str, sign: char) -> usize {
+/// A line that looks like a check: assert, expect, should, require, a
+/// comparison, a Go `t.Error`.
+fn is_check(line: &str) -> bool {
     // Whole words or operators only, and never in a comment: deleting an
     // outdated `# TODO: … should go …` note is not dropping a check.
     static MARKS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let marks = MARKS.get_or_init(|| {
         regex::Regex::new(r"(?i)\b(assert\w*|expect|should|check|require|verify)\b|==|!=|\bt\.(error|fatal)").unwrap()
     });
+    let line = line.trim_start();
+    !["#", "//", "/*", "*", "--"].iter().any(|c| line.starts_with(c)) && marks.is_match(line)
+}
+
+/// Lines of a test diff that look like a check, per sign.
+fn check_lines(diff: &str, sign: char) -> usize {
     let header = if sign == '-' { "---" } else { "+++" };
     diff.lines()
-        .filter(|l| l.starts_with(sign) && !l.starts_with(header))
-        .map(|l| l[1..].trim_start())
-        .filter(|l| !["#", "//", "/*", "*", "--"].iter().any(|c| l.starts_with(c)))
-        .filter(|l| marks.is_match(l))
+        .filter(|l| !l.starts_with(header))
+        .filter_map(|l| l.strip_prefix(sign))
+        .filter(|l| is_check(l))
         .count()
+}
+
+/// A check that pins a value with an equality: `==`, `!=`, assertEqual
+/// and its kin, toBe, toEqual, assert_eq!, deepEqual.
+fn pins(line: &str) -> bool {
+    static PINS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        regex::Regex::new(
+            r"==|!=|\bassert\w*Equals?\b|\bassertIs\b|\bassert_(?:eq|ne)!|\.(?:toBe|toEqual|toStrictEqual)\(|\b(?:equal|notEqual|strictEqual|deepEqual|deepStrictEqual)\(|\.to\s+eq\b",
+        )
+        .unwrap()
+    })
+    .is_match(line)
+}
+
+/// The concrete values a line names: numbers, quoted strings, and None,
+/// null, nil, undefined. Booleans are left out: `== True` and plain
+/// truthiness check the same thing.
+fn values(line: &str) -> Vec<&str> {
+    static VALUES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    VALUES
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`|\b\d+(?:\.\d+)?\b|\b(?:None|null|nil|undefined)\b"#,
+            )
+            .unwrap()
+        })
+        .find_iter(line)
+        .map(|m| m.as_str().trim_matches(|c| matches!(c, '"' | '\'' | '`')))
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// Does `text` name `value`, as a whole word when the value is one?
+fn mentions(text: &str, value: &str) -> bool {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let (head, tail) = (word(value.chars().next()), word(value.chars().last()));
+    let pattern = format!(
+        "{}{}{}",
+        if head { r"\b" } else { "" },
+        regex::escape(value),
+        if tail { r"\b" } else { "" }
+    );
+    regex::Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
+}
+
+/// The values a hunk stops pinning: a removed equality check against
+/// concrete values whose closest added check pins nothing and no longer
+/// names them, as `assert x == 5` becoming `assert x is not None`.
+fn dropped_values<'a>(removed: &[&'a str], added: &[&str]) -> Vec<&'a str> {
+    let checks: Vec<&str> = added.iter().copied().filter(|l| is_check(l)).collect();
+    let near = |a: &str, b: &str| similar::TextDiff::from_chars(a.trim(), b.trim()).ratio();
+    removed
+        .iter()
+        .filter(|l| is_check(l) && pins(l))
+        .find_map(|r| {
+            let closest = checks.iter().max_by(|a, b| near(r, a).total_cmp(&near(r, b)))?;
+            let gone: Vec<&str> = values(r).into_iter().filter(|v| !mentions(closest, v)).collect();
+            (!pins(closest) && !gone.is_empty()).then_some(gone)
+        })
+        .unwrap_or_default()
+}
+
+/// The hunks of a unified diff, each as its lines. Lines before the first
+/// `@@` form a hunk of their own, file headers left out.
+fn hunks(diff: &str) -> Vec<Vec<&str>> {
+    let mut out = vec![Vec::new()];
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            out.push(Vec::new());
+        } else if !line.starts_with("---") && !line.starts_with("+++") {
+            out.last_mut().expect("never empty").push(line);
+        }
+    }
+    out
 }
 
 fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(), String> {
@@ -1534,8 +1614,8 @@ fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(),
     };
     let rows: Vec<TestEditReview> = serde_json::from_str(answer)
         .map_err(|_| "the review gave an invalid TEST_EDITS answer".to_string())?;
-    if rows.len() != edited.len() {
-        return Err("the review must answer for each edited test".into());
+    if let Some(row) = rows.iter().find(|r| !edited.iter().any(|e| e.path == r.path)) {
+        return Err(format!("the review answered for {}, which no edit changed", row.path));
     }
     for e in edited {
         let (lost, kept) = (check_lines(&e.diff, '-'), check_lines(&e.diff, '+'));
@@ -1543,23 +1623,48 @@ fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(),
             return Err(format!("{} drops from {lost} check lines to {kept}", e.path));
         }
         let rows: Vec<&TestEditReview> = rows.iter().filter(|r| r.path == e.path).collect();
-        let [row] = rows.as_slice() else {
-            return Err(format!("the review must answer once for {}", e.path));
-        };
+        if rows.is_empty() {
+            return Err(format!("the review must answer for {}", e.path));
+        }
         let quoted = |prefix, quote: &str| {
             !quote.trim().is_empty() && e.diff.lines()
                 .filter_map(|l| l.strip_prefix(prefix))
                 .any(|l| l.trim() == quote.trim())
         };
-        if row.removed_behavior_wrong != "yes"
-            || row.added_behavior_requested != "yes"
-            || row.preserves_checks != "yes"
-            || row.issue_quote.trim().is_empty()
-            || !issue.contains(&row.issue_quote)
-            || !quoted('-', &row.removed_quote)
-            || !quoted('+', &row.added_quote)
-        {
+        // A short quote such as "the" is in every issue and grounds nothing.
+        if rows.iter().any(|row| {
+            row.removed_behavior_wrong != "yes"
+                || row.added_behavior_requested != "yes"
+                || row.preserves_checks != "yes"
+                || row.issue_quote.trim().chars().count() < 20
+                || !issue.contains(&row.issue_quote)
+                || !quoted('-', &row.removed_quote)
+                || !quoted('+', &row.added_quote)
+        }) {
             return Err(format!("the review did not approve {} with yes answers and matching quotes", e.path));
+        }
+        // One quoted pair must not approve every change in the file: each
+        // hunk that loses a check needs a row quoting one of its lines.
+        for hunk in hunks(&e.diff) {
+            let removed: Vec<&str> = hunk.iter().filter_map(|l| l.strip_prefix('-')).collect();
+            let Some(check) = removed.iter().find(|l| is_check(l)) else { continue };
+            let covering: Vec<&&TestEditReview> = rows
+                .iter()
+                .filter(|r| removed.iter().any(|l| l.trim() == r.removed_quote.trim()))
+                .collect();
+            if covering.is_empty() {
+                return Err(format!("the review quoted no line of the {} change that removes `{}`", e.path, check.trim()));
+            }
+            let added: Vec<&str> = hunk.iter().filter_map(|l| l.strip_prefix('+')).collect();
+            let gone = dropped_values(&removed, &added);
+            if !gone.is_empty() && !covering.iter().any(|r| gone.iter().all(|v| mentions(&r.issue_quote, v))) {
+                return Err(format!(
+                    "{} stops checking for {}: a weaker check replaces it, and the quoted issue text \
+                     never says that value is wrong",
+                    e.path,
+                    gone.join(", ")
+                ));
+            }
         }
     }
     Ok(())
@@ -3238,7 +3343,7 @@ mod tests {
 
     #[test]
     fn a_test_edit_may_not_collapse_many_checks_into_fewer() {
-        let issue = "totals are wrong";
+        let issue = "total(0) gives 0, and those totals are wrong";
         let old: String = (0..40).map(|i| format!("    assert_eq!(total({i}), {i});\n")).collect();
         let edit = |new: &str| EditedTest {
             path: "tests/t.rs".into(),
@@ -3360,6 +3465,96 @@ mod tests {
         assert!(agree(serde_json::json!([row, second]), &edits).is_ok());
     }
 
+    /// A test edit as `edited_old_tests` reports it.
+    fn graded(old: &str, new: &str) -> EditedTest {
+        EditedTest {
+            path: "tests/t.py".into(),
+            removed: repo::removed_lines(old, new),
+            diff: similar::TextDiff::from_lines(old, new).unified_diff().to_string(),
+            original_tests: Some(old.as_bytes().to_vec()),
+        }
+    }
+
+    /// A reviewer row that says yes to everything, with these quotes.
+    fn row(issue_quote: &str, removed: &str, added: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": "tests/t.py",
+            "removed_behavior_wrong": "yes",
+            "added_behavior_requested": "yes",
+            "preserves_checks": "yes",
+            "issue_quote": issue_quote,
+            "removed_quote": removed,
+            "added_quote": added,
+        })
+    }
+
+    fn agreed(rows: &[serde_json::Value], edit: &EditedTest, issue: &str) -> Result<(), String> {
+        let answer = format!("VERDICT: pass\nGAP:\nTEST_EDITS: {}", serde_json::json!(rows));
+        agree_test_edits(&answer, std::slice::from_ref(edit), issue)
+    }
+
+    /// Two rewritten checks far apart are two hunks: a row quoting one of
+    /// them approves only that one. A hunk that removes no check line, such
+    /// as an expected tree, needs no row of its own.
+    #[test]
+    fn each_hunk_that_removes_a_check_needs_its_own_quoted_row() {
+        let issue = "price(1) returns 10 and price(2) returns 20; both are wrong, they must be 11 and 21.";
+        let filler: String = (0..12).map(|i| format!("# note {i}\n")).collect();
+        let old = format!(
+            "assert price(1) == 10\n{filler}assert price(2) == 20\n{filler}TREE = \"\"\"\n<ref ids=\"a\">\n\"\"\"\n"
+        );
+        let new = old.replace("== 10", "== 11").replace("== 20", "== 21").replace("<ref ids", "<ref refid");
+        let edit = graded(&old, &new);
+        assert_eq!(hunks(&edit.diff).iter().filter(|h| !h.is_empty()).count(), 3, "{}", edit.diff);
+        let quote = "price(1) returns 10 and price(2) returns 20";
+        let first = row(quote, "assert price(1) == 10", "assert price(1) == 11");
+        let second = row(quote, "assert price(2) == 20", "assert price(2) == 21");
+        let err = agreed(std::slice::from_ref(&first), &edit, issue).unwrap_err();
+        assert!(err.contains("removes `assert price(2) == 20`"), "{err}");
+        assert!(agreed(&[first, second], &edit, issue).is_ok(), "one row per changed check");
+    }
+
+    #[test]
+    fn an_issue_quote_shorter_than_twenty_characters_grounds_nothing() {
+        let issue = "link() returns https://target, which is wrong; it must return #image.";
+        let (old, new) = ("assert link() == 'https://target'", "assert link() == '#image'");
+        let edit = graded(&format!("{old}\n"), &format!("{new}\n"));
+        let quoted = |quote: &str| agreed(&[row(quote, old, new)], &edit, issue);
+        assert!(quoted("the").is_err());
+        assert!(quoted("link() returns http").is_err(), "19 characters");
+        assert!(quoted("link() returns https").is_ok(), "20 characters");
+    }
+
+    /// `assert x == 5` becoming `assert x is not None` keeps the count of
+    /// check lines and loses the value: not an edit the issue asks for,
+    /// unless the quoted issue text names that value.
+    #[test]
+    fn a_check_that_stops_pinning_its_value_is_rejected_unless_the_issue_names_it() {
+        let issue = "parse('x') returns 5, which is wrong: it must return a Node, whose id varies.";
+        let vague = "it must return a Node, whose id varies";
+        for (old, new) in [
+            ("assert parse('x') == 5", "assert parse('x') is not None"),
+            ("self.assertEqual(parse('x'), 5)", "self.assertTrue(parse('x'))"),
+            ("expect(parse('x')).toBe(5)", "expect(parse('x')).toBeTruthy()"),
+            ("assert_eq!(parse(\"x\"), Some(5));", "assert!(parse(\"x\").is_some());"),
+            ("assert parse('x') == 5", "assert True"),
+        ] {
+            let edit = graded(&format!("{old}\n"), &format!("{new}\n"));
+            let err = agreed(&[row(vague, old, new)], &edit, issue).unwrap_err();
+            assert!(err.contains("stops checking for") && err.contains('5'), "{old} -> {new}: {err}");
+            assert!(agreed(&[row("parse('x') returns 5, which is wrong", old, new)], &edit, issue).is_ok(), "{old}");
+        }
+        // A value changed, or the same value kept, is no weakening.
+        for (old, new) in [
+            ("assert parse('x') == 5", "assert parse('x') == 6"),
+            ("assert parse('x') == None", "assert parse('x') is None"),
+            ("self.assertEqual(parse('x'), 5)", "self.assertIn(5, parse('x'))"),
+        ] {
+            let edit = graded(&format!("{old}\n"), &format!("{new}\n"));
+            assert!(agreed(&[row(vague, old, new)], &edit, issue).is_ok(), "{old} -> {new}");
+        }
+    }
+
     #[test]
     fn edited_test_diffs_keep_all_changed_lines_and_their_indentation() {
         let dir = tempfile::tempdir().unwrap();
@@ -3420,6 +3615,9 @@ mod tests {
         assert!(review.contains("Never ask the author to restore the behavior the issue reports"));
         let declared = crate::flux::fix_review_prompt("i", "d", "t", "w", "The fix rewrites lines", "p", true);
         assert!(declared.contains("EXISTING BEHAVIOR"), "{declared}");
+        for rule in ["one object for each changed check", "20 characters or more", "answer preserves_checks no"] {
+            assert!(declared.contains(rule), "{rule} missing: {declared}");
+        }
         for part in ["ROOT CAUSE", "THE ISSUE'S CASES", "PLACE", "VALID", "VERDICT: pass or fail", "the diff"] {
             assert!(review.contains(part), "{part} missing");
         }
