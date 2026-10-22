@@ -1761,10 +1761,10 @@ async fn reproduce(
     // The source goes back to its pre-session content, and so does any
     // pre-existing test the session edited: the bug must be caught by the
     // new tests, never by old ones rewritten to fit the fix.
+    let olds: Vec<&String> = edited.iter().filter(|p| !sources.contains(p)).collect();
     let swaps: Vec<(PathBuf, repo::Content)> = sources
         .iter()
-        .copied()
-        .chain(edited.iter().filter(|p| !sources.contains(p)))
+        .chain(&olds)
         .map(|p| (git.top.join(p), git.original(before, p)))
         .collect();
     let Some(run) = swap_and_run(job, swaps, cmd, timeout, rescuer).await else {
@@ -1779,12 +1779,100 @@ async fn reproduce(
         from_baseline()
             .unwrap_or_else(|| Repro::NotShown(format!("the check without the fix {}", run.status())))
     } else if run.ok() {
-        from_baseline()
-            .unwrap_or_else(|| Repro::NotShown("the new test also passes without the fix".into()))
+        match inside(job, before, &sources, &olds, cmd, timeout, rescuer, &run).await {
+            None => return (Repro::NotShown("interrupted".into()), None),
+            Some(Ok((repro, run))) => return (repro, Some(run)),
+            Some(Err(why)) => from_baseline().unwrap_or(Repro::NotShown(why)),
+        }
     } else {
         Repro::Regression { status: run.status() }
     };
     (repro, Some(run))
+}
+
+/// New tests the session put inside a pre-existing test file it also
+/// edited: a unittest class, a table of cases. Restored whole, the file
+/// loses them, so when that check passes, run it again with every line the
+/// session deleted or rewrote back as it was and only the lines it
+/// inserted kept. A failure there proves the bug only when it is clean:
+/// nothing fails to load that loaded in `restored`, and the session's
+/// tests without the kept lines still pass with the fix, so those lines
+/// are new tests, not an old expectation that grew. `Err` says why there
+/// is no proof; `None` means the rescue ran.
+#[allow(clippy::too_many_arguments)]
+async fn inside(
+    job: &Job,
+    before: &BTreeMap<String, repo::Content>,
+    sources: &[&String],
+    olds: &[&String],
+    cmd: &str,
+    timeout: Duration,
+    rescuer: &Rescuer<'_>,
+    restored: &Run,
+) -> Option<Result<(Repro, Run), String>> {
+    let mut why = "the new test also passes without the fix".to_string();
+    let Some(git) = &job.git else { return Some(Err(why)) };
+    let texts: Vec<(&String, String, String)> = olds
+        .iter()
+        .filter_map(|p| {
+            let old = String::from_utf8(git.original(before, p)?).ok()?;
+            Some((*p, old, std::fs::read_to_string(git.top.join(p)).ok()?))
+        })
+        .collect();
+    let mut tried = Vec::new();
+    // A rewritten block that grew reads two ways: an old test edited and a
+    // new one added after it, or an old expectation that grew. Try both in
+    // that order; the checks below reject a wrong reading.
+    for split in [true, false] {
+        let parts: Vec<(&String, String, String)> = texts
+            .iter()
+            .filter_map(|(p, old, new)| repo::insertions(old, new, split).map(|(kept, rest)| (*p, kept, rest)))
+            .collect();
+        if parts.is_empty() || tried.contains(&parts) {
+            continue;
+        }
+        let names = parts.iter().map(|(p, ..)| p.as_str()).collect::<Vec<_>>().join(", ");
+        let swaps = sources
+            .iter()
+            .map(|p| (git.top.join(p), git.original(before, p)))
+            .chain(olds.iter().map(|p| {
+                let kept = parts.iter().find(|(q, ..)| q == p).map(|(_, kept, _)| kept.clone().into_bytes());
+                (git.top.join(p), kept.or_else(|| git.original(before, p)))
+            }))
+            .collect();
+        let run = swap_and_run(job, swaps, cmd, timeout, rescuer).await?;
+        if run.ok() {
+            // Fewer kept lines cannot fail where more passed.
+            return Some(Err(why));
+        }
+        let broken = repo::load_errors(&run.output)
+            .into_iter()
+            .find(|e| !restored.output.contains(e))
+            .map(str::to_string)
+            .or_else(|| (run.unusable() && !run.timed_out).then(|| run.status()));
+        if let Some(e) = broken {
+            why = format!("the tests added inside {names} do not run with the old lines back ({e})");
+            tried.push(parts);
+            continue;
+        }
+        let control = parts.iter().map(|(p, _, rest)| (git.top.join(p), Some(rest.clone().into_bytes()))).collect();
+        let check = swap_and_run(job, control, cmd, timeout, rescuer).await?;
+        if !check.ok() {
+            why = format!(
+                "the lines added inside {names} belong to old tests: without them, `{cmd}` gives {} with the fix",
+                check.status()
+            );
+            tried.push(parts);
+            continue;
+        }
+        let repro = if run.timed_out {
+            Repro::Hangs { status: run.status() }
+        } else {
+            Repro::Regression { status: run.status() }
+        };
+        return Some(Ok((repro, run)));
+    }
+    Some(Err(why))
 }
 
 /// Put `swaps` on disk in place of the current files, run `cmd`, and put
@@ -2749,6 +2837,81 @@ mod tests {
         let base = Run { cmd: "t".into(), code: Some(1), output: String::new(), secs: 0.0, timed_out: false };
         let fallback = reproduce(&job, &before, &changed, &[], "true", TEST_TIMEOUT, Some(&base), &rescuer).await.0;
         assert_eq!(fallback, Repro::Baseline { status: "exit 1".into() });
+    }
+
+    /// `old` committed, then the session's `new` on top: the job, the
+    /// snapshot, what changed, and the old tests it edited.
+    #[allow(clippy::type_complexity)]
+    fn session(
+        old: &[(&str, &str)],
+        new: &[(&str, &str)],
+    ) -> (tempfile::TempDir, Job, BTreeMap<String, repo::Content>, Vec<String>, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let put = |files: &[(&str, &str)]| {
+            for (path, body) in files {
+                std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                std::fs::write(root.join(path), body).unwrap();
+            }
+        };
+        sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+        put(old);
+        sh(root, "git add -A && git commit -qm init");
+        let job = job_in(root);
+        let git = job.git.as_ref().unwrap();
+        let before = git.snapshot();
+        put(new);
+        let changed = git.changed_since(&before);
+        let edited = edited_old_tests(git, &before, &changed).into_iter().map(|e| e.path).collect();
+        (dir, job, before, changed, edited)
+    }
+
+    /// An old expectation that grew a line is a rewrite, inserted or not:
+    /// the session's tests without that line fail with the fix, so the
+    /// line belongs to an old test and is never the proof.
+    #[tokio::test]
+    async fn an_old_expectation_that_grew_a_line_is_not_the_reproduction() {
+        let check = |lines: &str| format!("diff out.txt - <<'EOF'\n{lines}EOF\n");
+        let (_dir, job, before, changed, edited) = session(
+            &[("out.txt", "a\nb\n"), ("tests/check.sh", &check("a\nb\n"))],
+            &[("out.txt", "A\nb\nc\n"), ("tests/check.sh", &check("A\nb\nc\n"))],
+        );
+        assert_eq!(edited, ["tests/check.sh"]);
+        let rescuer = Rescuer { register: &|_| {}, stop: no_stop };
+        let (repro, _) = reproduce(&job, &before, &changed, &edited, "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await;
+        let Repro::NotShown(why) = &repro else { panic!("{repro:?}") };
+        assert!(why.contains("inside tests/check.sh belong to old tests"), "{why}");
+        assert_eq!(std::fs::read_to_string(job.cwd.join("tests/check.sh")).unwrap(), check("A\nb\nc\n"));
+        assert_eq!(std::fs::read_to_string(job.cwd.join("out.txt")).unwrap(), "A\nb\nc\n");
+    }
+
+    /// A new test that needs a name the session added to an old import
+    /// line: with that line restored, the test file fails to load, and a
+    /// file that does not load proves nothing.
+    #[tokio::test]
+    async fn new_tests_that_do_not_load_with_the_old_lines_are_not_the_reproduction() {
+        let calc = |double: &str| format!("def double(x):\n    return {double}\n\n\ndef half(x):\n    return x // 2\n");
+        let test = |import: &str, rest: &str| {
+            format!("import unittest\nfrom calc import {import}\n\n\nclass T(unittest.TestCase):\n    def test_three(self):\n{rest}")
+        };
+        let (_dir, job, before, changed, edited) = session(
+            &[("calc.py", &calc("x + 2")), ("tests/test_calc.py", &test("double", "        self.assertEqual(double(3), 5)\n"))],
+            &[
+                ("calc.py", &calc("x * 2")),
+                (
+                    "tests/test_calc.py",
+                    &test(
+                        "double, half",
+                        "        self.assertEqual(double(3), 6)\n\n    def test_half(self):\n        self.assertEqual(half(4), 2)\n",
+                    ),
+                ),
+            ],
+        );
+        let rescuer = Rescuer { register: &|_| {}, stop: no_stop };
+        let cmd = "python3 -m unittest discover -s tests";
+        let (repro, _) = reproduce(&job, &before, &changed, &edited, cmd, TEST_TIMEOUT, None, &rescuer).await;
+        let Repro::NotShown(why) = &repro else { panic!("{repro:?}") };
+        assert!(why.contains("inside tests/test_calc.py do not run with the old lines back (NameError)"), "{why}");
     }
 
     /// The without-the-fix check runs under its own timeout: the largest of

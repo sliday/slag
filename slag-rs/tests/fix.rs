@@ -498,6 +498,79 @@ async fn a_review_no_on_the_reported_bug_keeps_the_existing_test_guard() {
     assert_eq!(sh(repo.path(), "git branch --show-current").trim(), "main");
 }
 
+const PY: &str = "python3 -m unittest discover -s tests";
+
+/// `tests/test_calc.py` with `test_three` running `body`.
+fn calc_tests(body: &str) -> String {
+    format!("import unittest\n\nfrom calc import double\n\n\nclass TestDouble(unittest.TestCase):\n    def test_three(self):\n{body}")
+}
+
+/// The docutils shape: the one test file pins the reported bug, and the
+/// session corrects that expectation, declared, and adds `new_test` to the
+/// same file, right after it.
+async fn new_test_inside_an_edited_file(new_test: &str) -> (TempDir, std::process::Output) {
+    let repo = tempfile::tempdir().unwrap();
+    sh(repo.path(), "git init -q -b main && git config user.email t@t && git config user.name t");
+    std::fs::write(repo.path().join("calc.py"), "def double(x):\n    return x + 2\n").unwrap();
+    std::fs::create_dir_all(repo.path().join("tests")).unwrap();
+    std::fs::write(repo.path().join("tests/test_calc.py"), calc_tests("        self.assertEqual(double(3), 5)\n")).unwrap();
+    sh(repo.path(), "git add -A && git commit -qm init");
+    let tests = calc_tests(&format!("        self.assertEqual(double(3), 6)\n\n{new_test}"));
+    let server = model(vec![
+        tool("read_file", json!({"path": "calc.py"})),
+        tool("edit_file", json!({"path": "calc.py", "old_string": "x + 2", "new_string": "x * 2"})),
+        tool("read_file", json!({"path": "tests/test_calc.py"})),
+        tool("write_file", json!({"path": "tests/test_calc.py", "content": tests})),
+        tool("finish", json!({
+            "summary": "double(x) now returns x * 2.\nchanged existing tests: tests/test_calc.py: it pins the reported 5",
+            "cmd": PY,
+        })),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+        json!({"text": format!("VERDICT: pass\nGAP:\nTEST_EDITS: {}", json!([{
+            "path": "tests/test_calc.py",
+            "removed_behavior_wrong": "yes",
+            "added_behavior_requested": "yes",
+            "preserves_checks": "yes",
+            "issue_quote": "double(3) returns 5; it must return 6",
+            "removed_quote": "self.assertEqual(double(3), 5)",
+            "added_quote": "self.assertEqual(double(3), 6)",
+        }]))}),
+    ])
+    .await;
+    let issue = "double(3) returns 5; it must return 6. tests/test_calc.py pins the 5.";
+    let out = slag_fix(repo.path(), &server, &[issue, "--test", PY, "--tries", "1"]).await;
+    (repo, out)
+}
+
+/// The reversal puts back the old line the session rewrote and keeps the
+/// test it added beside it: that test fails without the fix, which is the
+/// reproduction a whole-file restore lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_test_inside_an_edited_test_file_is_the_reproduction() {
+    let (repo, out) =
+        new_test_inside_an_edited_file("    def test_four(self):\n        self.assertEqual(double(4), 8)\n").await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("the new test catches the bug"), "{stdout}");
+    assert!(!stdout.contains("not shown"), "{stdout}");
+    let committed = sh(repo.path(), "git show HEAD:tests/test_calc.py");
+    assert!(committed.contains("double(3), 6)") && committed.contains("def test_four"), "{committed}");
+}
+
+/// The same shape with a new test that holds on the old code too: no
+/// reproduction, and no fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_test_inside_an_edited_file_that_passes_without_the_fix_is_not_shown() {
+    let (repo, out) =
+        new_test_inside_an_edited_file("    def test_two(self):\n        self.assertEqual(double(2), 4)\n").await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("NOT FIXED"), "{stdout}");
+    assert!(stdout.contains("the new test also passes without the fix"), "{stdout}");
+    assert!(!stdout.contains("the new test catches the bug"), "{stdout}");
+    assert_eq!(sh(repo.path(), "git branch --show-current").trim(), "main");
+}
+
 /// The sh-backup-rotate shape: the session read the reported behavior as
 /// the intended one and wrote a test that pins the bug, changing no code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

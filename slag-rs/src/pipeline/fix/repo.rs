@@ -467,6 +467,60 @@ pub fn removed_lines(old: &str, new: &str) -> Vec<String> {
         .collect()
 }
 
+/// Take apart what `new` did to `old`, line by line: `old` with only the
+/// lines `new` inserted, so every line it deleted or rewrote is back, and
+/// `new` without those lines. A rewritten block that grew is a rewrite,
+/// whole, unless `split`, which reads the lines past its old length as
+/// inserted: an old test edited, then a new one added right after it. An
+/// inserted block that resembles a deleted or rewritten one is an old test
+/// moved, not a new one. `None` when nothing but blank lines was inserted.
+pub fn insertions(old: &str, new: &str, split: bool) -> Option<(String, String)> {
+    use similar::{DiffOp, TextDiff};
+    fn words<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+        lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect()
+    }
+    // A last line without its newline differs from the same line with one.
+    let ended = |s: &str| if s.is_empty() || s.ends_with('\n') { s.to_string() } else { format!("{s}\n") };
+    let (old, new) = (ended(old), ended(new));
+    let diff = TextDiff::from_lines(old.as_str(), new.as_str());
+    let (was, now) = (diff.old_slices(), diff.new_slices());
+    let gone: Vec<Vec<&str>> = diff
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, DiffOp::Delete { .. } | DiffOp::Replace { .. }))
+        .map(|op| words(&was[op.old_range()]))
+        .collect();
+    let moved = |lines: &[&str]| {
+        let lines = words(lines);
+        !lines.is_empty() && gone.iter().any(|g| TextDiff::from_slices(g, &lines).ratio() >= 0.5)
+    };
+    let (mut kept, mut rest, mut any) = (String::new(), String::new(), false);
+    for op in diff.ops() {
+        let (a, b) = (&was[op.old_range()], &now[op.new_range()]);
+        let grew: &[&str] = match op {
+            DiffOp::Insert { .. } => b,
+            DiffOp::Replace { .. } if split && b.len() > a.len() => &b[a.len()..],
+            _ => &[],
+        };
+        let fresh: &[&str] = if moved(grew) { &[] } else { grew };
+        any |= fresh.iter().any(|l| !l.trim().is_empty());
+        kept.extend(a.iter().chain(fresh).copied());
+        rest.extend(b[..b.len() - fresh.len()].iter().copied());
+    }
+    any.then_some((kept, rest))
+}
+
+/// The marks of a check that never ran its assertions: a syntax error, a
+/// missing import or name, a compile error, a missing command. The exit
+/// code says a test failed; these say the test file did not load.
+pub fn load_errors(output: &str) -> Vec<&str> {
+    let mark = regex::Regex::new(
+        r"SyntaxError|IndentationError|TabError|ImportError|ModuleNotFoundError|NameError|ReferenceError|Cannot find module|error TS\d+|error\[E\d+\]|could not compile|syntax error|\.go:\d+:\d+: undefined:|LoadError|uninitialized constant|command not found|cannot find symbol|Unresolved reference|Parse error",
+    )
+    .unwrap();
+    mark.find_iter(output).map(|m| m.as_str()).collect()
+}
+
 /// Split a source file at its inline test module (`#[cfg(test)]`, the
 /// Rust convention): the code above it, and the tests from it on. `None`
 /// when the file has no such module.
@@ -1169,6 +1223,53 @@ mod tests {
         assert!(removed_lines(old, reindented).is_empty(), "indentation is not an edit");
         assert!(removed_lines(old, &format!("{old}test('b', () => {{}});\n")).is_empty(), "additions only");
         assert_eq!(removed_lines("a\nb\n", "").len(), 2, "a deleted file loses every line");
+    }
+
+    #[test]
+    fn insertions_stay_and_rewrites_and_deletions_go_back() {
+        let old = "import f\nassert f(1) == 1\n# b\nassert f(2) == 2\nassert f(2) != 0\n# c\n# end\n";
+        // Rewrite the first check, delete the two after it, add one.
+        let new = "import f\nassert f(1) == 9\n# b\n# c\nassert f(3) == 3\n# end\n";
+        let (kept, rest) = insertions(old, new, true).unwrap();
+        assert_eq!(
+            kept,
+            "import f\nassert f(1) == 1\n# b\nassert f(2) == 2\nassert f(2) != 0\n# c\nassert f(3) == 3\n# end\n",
+            "the insert stays; the rewrite and the deletion are restored"
+        );
+        assert_eq!(rest, "import f\nassert f(1) == 9\n# b\n# c\n# end\n", "the session's file without the insert");
+        assert_eq!(insertions(old, &old.replace("== 2", "== 8"), true), None, "a rewrite alone inserts nothing");
+        assert_eq!(insertions(old, &old.replace("# c\n", "# c\n\n\n"), true), None, "blank lines are not tests");
+    }
+
+    #[test]
+    fn a_rewritten_block_that_grew_splits_only_when_asked() {
+        // The last test edited and a new one right after it: one block.
+        let old = "class T:\n    def test_a(self):\n        assert f(1) == 1\n";
+        let new = "class T:\n    def test_a(self):\n        assert f(1) == 9\n\n    def test_b(self):\n        assert f(2) == 2\n";
+        let (kept, rest) = insertions(old, new, true).unwrap();
+        assert_eq!(kept, format!("{old}\n    def test_b(self):\n        assert f(2) == 2\n"));
+        assert_eq!(rest, "class T:\n    def test_a(self):\n        assert f(1) == 9\n");
+        assert_eq!(insertions(old, new, false), None, "unsplit, the whole block is a rewrite");
+        // No trailing newline on either side is still the same block.
+        let (kept, _) = insertions(old.trim_end(), &format!("{old}    def test_b(self): pass"), true).unwrap();
+        assert_eq!(kept, format!("{old}    def test_b(self): pass\n"));
+    }
+
+    #[test]
+    fn a_moved_and_edited_old_test_is_not_an_insertion() {
+        let old = "def test_a():\n    x = load()\n    assert x.a == 1\n\ndef test_b():\n    assert g() == 2\n";
+        // test_a moves below test_b with its expectation rewritten.
+        let new = "def test_b():\n    assert g() == 2\n\ndef test_a():\n    x = load()\n    assert x.a == 9\n";
+        assert_eq!(insertions(old, new, true), None);
+        assert_eq!(insertions(old, new, false), None);
+    }
+
+    #[test]
+    fn load_errors_are_named_and_assertions_are_not() {
+        let py = "NameError: name 'half' is not defined\nImportError: Failed to import test module: test_x\n";
+        assert_eq!(load_errors(py), ["NameError", "ImportError"]);
+        assert_eq!(load_errors("error[E0425]: cannot find value `x`\ntests/a.sh: line 3: syntax error"), ["error[E0425]", "syntax error"]);
+        assert!(load_errors("AssertionError: 5 != 6\nFAILED (failures=1)").is_empty());
     }
 
     #[test]
