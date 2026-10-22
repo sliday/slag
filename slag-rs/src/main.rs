@@ -70,6 +70,11 @@ async fn main() {
     }
     if let Some(m) = &cli.model {
         std::env::set_var("SLAG_MODEL_BASE", m);
+        // --auto pinned the duel model too; keep it on the work model so
+        // `--auto --model X` does not open a duel of X against auto.
+        if cli.auto {
+            std::env::set_var("SLAG_MODEL_ALT", m);
+        }
     }
     if let Some(m) = &cli.plan_model {
         std::env::set_var("SLAG_MODEL_PLAN", m);
@@ -327,15 +332,17 @@ async fn run_key(key: Option<String>) -> Result<(), error::SlagError> {
         }
     };
 
-    // The alt and judge roles only run when a duel does. Matched models
-    // no longer idle them: the direction prompts carry cast diversity,
-    // so only SLAG_DUEL=off parks these roles now.
+    // The alt and judge roles only run when a duel does: never under
+    // SLAG_DUEL=off, and under auto only when alt differs from work.
     let duels = cfg.as_ref().is_some_and(|c| c.duel_qualifies(5));
-    let idle = (!duels).then_some("idle — SLAG_DUEL=off");
+    let idle = (!duels).then_some(match cfg.as_ref().map(|c| c.duel) {
+        Some(config::DuelMode::Off) => "idle — SLAG_DUEL=off",
+        _ => "idle — same model as work",
+    });
     let duel_state = match cfg.as_ref().map(|c| c.duel) {
         Some(config::DuelMode::On) => "on — solo ingots forge with 2-3 casts",
         Some(config::DuelMode::Off) => "off — every ingot forges with a single cast",
-        _ => "auto — 1-3 casts by grade/work; direction prompts carry diversity",
+        _ => "auto — 1-3 casts by grade/work when alt differs from work",
     };
     let models = [
         ("work", base.as_str(), None),
