@@ -119,11 +119,21 @@ pub fn make_base_smith(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith
 }
 
 /// Grammar, regex and type notation reads as a question to the `?` check:
-/// `range := whitespace? set (...)* whitespace?` ends in `?`.
+/// `range := whitespace? set (...)* whitespace?` ends in `?`. A bare `)?` or
+/// `]?` also ends real questions ("Should it accept (JSON)?"), so those
+/// count only on a definition line or a line of under three plain words.
 fn is_notation(line: &str) -> bool {
-    [":=", ")*", ")+", ")?", "]*", "]+", "]?"]
-        .iter()
-        .any(|marker| line.contains(marker))
+    if [":=", ")*", ")+", "]*", "]+"].iter().any(|marker| line.contains(marker)) {
+        return true;
+    }
+    if !line.contains(")?") && !line.contains("]?") {
+        return false;
+    }
+    let words = line
+        .split_whitespace()
+        .filter(|w| w.chars().all(|c| c.is_alphabetic() || c == '\''))
+        .count();
+    words < 3
 }
 
 /// Check if response text contains unresolved questions. Code fences and
@@ -316,6 +326,11 @@ mod tests {
     fn grammar_and_fenced_lines_are_not_questions() {
         assert!(!has_questions("range := whitespace? set (...)* whitespace?"));
         assert!(!has_questions("expr ::= term (op term)?"));
+        assert!(!has_questions("expr ::= term (op term)?"));
+        assert!(!has_questions("(a b)?"));
+        assert!(!has_questions("item[0-9]?"));
+        assert!(has_questions("Do you want pagination (cursor-based)?"));
+        assert!(has_questions("Should it accept (JSON)?"));
         assert!(has_questions("Postgres | SQLite?"));
         assert!(has_questions("map a -> b?"));
         assert!(!has_questions("# Grammar\n```\nWhat is this?\nvalue := digit+ sign?\n```\nDone."));
