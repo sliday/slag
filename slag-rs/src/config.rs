@@ -471,7 +471,7 @@ pub struct EngineConfig {
     pub model_base: String,
     pub model_plan: String,
     /// Cast B model. Set it to a different family than `model_base` to
-    /// make a duel worth its cost; left at the default it matches base.
+    /// make a duel worth its cost; left unset it follows `model_base`.
     pub model_alt: String,
     /// Assayer model. Same story: a distinct family judges more usefully.
     pub model_judge: String,
@@ -518,7 +518,15 @@ impl EngineConfig {
 
         let model_base = role_model(&entries, "SLAG_MODEL_BASE", "model_base", provider);
         let model_plan = role_model(&entries, "SLAG_MODEL_PLAN", "model_plan", provider);
-        let model_alt = role_model(&entries, "SLAG_MODEL_ALT", "model_alt", provider);
+        // Unset, cast B follows the resolved base model, so naming a base
+        // model never opens a duel of that model against `openrouter/auto`.
+        let model_alt = if env_nonempty("SLAG_MODEL_ALT").is_some()
+            || file_value(&entries, "model_alt").is_some()
+        {
+            role_model(&entries, "SLAG_MODEL_ALT", "model_alt", provider)
+        } else {
+            model_base.clone()
+        };
         let model_judge = role_model(&entries, "SLAG_MODEL_JUDGE", "model_judge", provider);
 
         let uses_active = [&model_base, &model_plan, &model_alt, &model_judge]
@@ -1744,6 +1752,28 @@ openrouter_api_key = "old-key"
         std::env::set_var("SLAG_CONFIG_DIR", dir.path());
         std::fs::write(dir.path().join("config.toml"), "model_base = m\n").unwrap();
         assert!(mcp_servers().is_empty());
+        clear_engine_env();
+    }
+
+    #[test]
+    fn an_unset_alt_model_follows_the_base_model_and_keeps_auto_to_one_cast() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_engine_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("SLAG_CONFIG_DIR", dir.path());
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or-x");
+        std::env::set_var("SLAG_MODEL_BASE", "qwen/qwen3-coder");
+
+        let config = EngineConfig::load().unwrap();
+        assert_eq!(config.model_alt, "qwen/qwen3-coder");
+        let ingot = casts_ingot(true, 5, "rebuild the engine", "cargo test");
+        assert_eq!(config.casts_for(&ingot), 1);
+
+        std::env::set_var("SLAG_MODEL_ALT", "other/alt-model");
+        let config = EngineConfig::load().unwrap();
+        assert_eq!(config.model_alt, "other/alt-model");
+        assert_eq!(config.casts_for(&ingot), 3, "an explicit alt opens the duel");
+
         clear_engine_env();
     }
 
