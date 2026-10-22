@@ -2885,6 +2885,28 @@ mod tests {
         assert_eq!(std::fs::read_to_string(job.cwd.join("out.txt")).unwrap(), "A\nb\nc\n");
     }
 
+    /// The docutils shape: an old expectation rewritten into more lines,
+    /// and a new check added after it. Read as an edit plus a new line, the
+    /// grown expectation fails the control; read as one rewrite, it goes
+    /// back whole and the new check alone fails without the fix.
+    #[tokio::test]
+    async fn a_rewrite_that_grew_goes_back_whole_when_the_split_reading_is_wrong() {
+        let check = |lines: &str, extra: &str| format!("set -e\ndiff out.txt - <<'EOF'\n{lines}EOF\n{extra}");
+        let (_dir, job, before, changed, edited) = session(
+            &[("out.txt", "a\nb\n"), ("n.txt", "1\n"), ("tests/check.sh", &check("a\nb\n", ""))],
+            &[
+                ("out.txt", "A\nc\nb\n"),
+                ("n.txt", "2\n"),
+                ("tests/check.sh", &check("A\nc\nb\n", "grep -qx 2 n.txt\n")),
+            ],
+        );
+        let rescuer = Rescuer { register: &|_| {}, stop: no_stop };
+        let (repro, without) = reproduce(&job, &before, &changed, &edited, "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await;
+        assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
+        assert!(without.is_some_and(|run| !run.ok()), "the failing run is the one reported");
+        assert_eq!(std::fs::read_to_string(job.cwd.join("n.txt")).unwrap(), "2\n", "fix restored");
+    }
+
     /// A new test that needs a name the session added to an old import
     /// line: with that line restored, the test file fails to load, and a
     /// file that does not load proves nothing.
