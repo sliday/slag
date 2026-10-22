@@ -121,7 +121,7 @@ pub fn make_base_smith(cfg: &EngineConfig, hooks: &EngineHooks) -> Box<dyn Smith
 /// Grammar, regex and type notation reads as a question to the `?` check:
 /// `range := whitespace? set (...)* whitespace?` ends in `?`.
 fn is_notation(line: &str) -> bool {
-    [":=", "->", "=>", ")*", ")+", ")?", "]*", "]+", "]?", " | "]
+    [":=", ")*", ")+", ")?", "]*", "]+", "]?"]
         .iter()
         .any(|marker| line.contains(marker))
 }
@@ -316,7 +316,8 @@ mod tests {
     fn grammar_and_fenced_lines_are_not_questions() {
         assert!(!has_questions("range := whitespace? set (...)* whitespace?"));
         assert!(!has_questions("expr ::= term (op term)?"));
-        assert!(!has_questions("fn parse(s: &str) -> Option<Ast>?"));
+        assert!(has_questions("Postgres | SQLite?"));
+        assert!(has_questions("map a -> b?"));
         assert!(!has_questions("# Grammar\n```\nWhat is this?\nvalue := digit+ sign?\n```\nDone."));
         assert!(has_questions("# Grammar\nrange := a b?\n\nWhich parser should we use?"));
         assert!(has_questions("```\ncode\n```\nShould the range be inclusive?"));
