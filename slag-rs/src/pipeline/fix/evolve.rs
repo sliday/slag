@@ -807,7 +807,7 @@ impl Evolver<'_, '_> {
                         &changed,
                         &edited,
                         &checks[0].cmd,
-                        super::repro_timeout(&checks[0]),
+                        super::repro_timeout(&checks[0], self.baseline),
                         self.baseline,
                         &rescuer,
                     )

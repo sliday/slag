@@ -66,12 +66,20 @@ const ISSUE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest a review may take before the verified fix lands without it.
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the without-the-fix check may run. A suite that passes with
-/// the fix in `passed.secs` shows a hang long before TEST_TIMEOUT, so the
-/// check gets ten times the passing run, bounded below by a slow starter
-/// and above by the usual ceiling.
-fn repro_timeout(passed: &Run) -> Duration {
-    Duration::from_secs_f64(passed.secs * 10.0).clamp(Duration::from_secs(30), TEST_TIMEOUT)
+/// How long the without-the-fix check may run. The swap rebuilds the
+/// original code, a cost the incremental passing run never paid, so the
+/// check gets the largest of ten times the passing run, three times the
+/// baseline run before any edit (which compiled the original code too),
+/// and a slow-starter floor, capped by the usual ceiling. A baseline that
+/// is missing or timed out says nothing about the rebuild: the check gets
+/// the full ceiling, as it did before the timeout was sized at all.
+fn repro_timeout(passed: &Run, baseline: Option<&Run>) -> Duration {
+    let baseline = match baseline {
+        Some(b) if !b.timed_out => b.secs,
+        _ => return TEST_TIMEOUT,
+    };
+    Duration::from_secs_f64((passed.secs * 10.0).max(baseline * 3.0))
+        .clamp(Duration::from_secs(30), TEST_TIMEOUT)
 }
 
 /// `slag fix`: resolve the key and the issue, then fix it under the
@@ -577,7 +585,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         &changed,
         &paths(&edited),
         &proof_cmd,
-        repro_timeout(&out.checks[0]),
+        repro_timeout(&out.checks[0], baseline.as_ref()),
         baseline.as_ref(),
         &rescuer,
     )
@@ -639,7 +647,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                     &ch,
                     &paths(&ed),
                     &proof_cmd,
-                    repro_timeout(&c[0]),
+                    repro_timeout(&c[0], baseline.as_ref()),
                     baseline.as_ref(),
                     &rescuer,
                 )
@@ -1707,9 +1715,9 @@ fn squash(cmd: &str) -> String {
 /// Show the bug existed. The strongest proof is the session's own
 /// regression test failing with the source change taken back out; failing
 /// that, a test command that failed before the edit and passes after. The
-/// check runs under `timeout`, sized from the passing run: a hang shows
-/// long before TEST_TIMEOUT, and for a hang bug the timeout itself is the
-/// proof.
+/// check runs under `timeout`, sized from the passing and baseline runs: a
+/// hang shows long before TEST_TIMEOUT, and for a hang bug the timeout
+/// itself is the proof.
 #[allow(clippy::too_many_arguments)]
 async fn reproduce(
     job: &Job,
@@ -2742,14 +2750,39 @@ mod tests {
         assert_eq!(fallback, Repro::Baseline { status: "exit 1".into() });
     }
 
-    /// The without-the-fix check runs under its own timeout: ten times the
-    /// passing run, never under 30s, never over TEST_TIMEOUT.
+    /// The without-the-fix check runs under its own timeout: the largest of
+    /// ten times the passing run, three times the baseline run (which paid
+    /// the compile the passing run skipped), and a 30s floor, capped at
+    /// TEST_TIMEOUT.
     #[test]
-    fn the_without_fix_timeout_scales_with_the_passing_run() {
+    fn the_without_fix_timeout_scales_with_the_passing_and_baseline_runs() {
         let run = |secs: f64| Run { cmd: "t".into(), code: Some(0), output: String::new(), secs, timed_out: false };
-        assert_eq!(repro_timeout(&run(0.5)), Duration::from_secs(30));
-        assert_eq!(repro_timeout(&run(10.0)), Duration::from_secs(100));
-        assert_eq!(repro_timeout(&run(120.0)), TEST_TIMEOUT);
+        // The floor: both runs fast.
+        assert_eq!(repro_timeout(&run(0.5), Some(&run(3.0))), Duration::from_secs(30));
+        // The passing run dominates.
+        assert_eq!(repro_timeout(&run(10.0), Some(&run(3.0))), Duration::from_secs(100));
+        // The baseline dominates: the swap's rebuild dwarfs the incremental
+        // passing run, and 30s would call a slow finish a hang.
+        assert_eq!(repro_timeout(&run(0.5), Some(&run(20.0))), Duration::from_secs(60));
+        // The ceiling binds either term.
+        assert_eq!(repro_timeout(&run(120.0), Some(&run(3.0))), TEST_TIMEOUT);
+        assert_eq!(repro_timeout(&run(0.5), Some(&run(150.0))), TEST_TIMEOUT);
+    }
+
+    /// A baseline that never ran or never finished cannot size the rebuild,
+    /// so the check gets TEST_TIMEOUT, as it did before the timeout was
+    /// sized at all.
+    #[test]
+    fn the_without_fix_timeout_falls_back_to_the_ceiling_without_a_baseline() {
+        let run = |secs: f64, timed_out: bool| Run {
+            cmd: "t".into(),
+            code: Some(0),
+            output: String::new(),
+            secs,
+            timed_out,
+        };
+        assert_eq!(repro_timeout(&run(0.5, false), None), TEST_TIMEOUT);
+        assert_eq!(repro_timeout(&run(0.5, false), Some(&run(20.0, true))), TEST_TIMEOUT);
     }
 
     /// A hang bug: the new test never finishes against the original code.

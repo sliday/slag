@@ -611,6 +611,49 @@ async fn a_check_that_hangs_without_the_fix_is_the_reproduction() {
     assert!(files.contains("tests/test_hang.sh") && files.contains("value.txt"), "{files}");
 }
 
+/// The without-the-fix run rebuilds the original code, a cost the
+/// incremental passing run never paid. Here that run sleeps past ten times
+/// the passing run but well within three times the baseline, then fails:
+/// a regression, never a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_check_that_fails_without_the_fix_is_a_regression_not_a_hang() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+    std::fs::write(root.join("value.txt"), "1\n").unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    // With the fix the check is quick. Without it (or before any edit) the
+    // original code is rebuilt first: 12s before the session has written
+    // its test, 32s on the reproduction swap.
+    std::fs::write(
+        root.join("tests/check.sh"),
+        "if grep -qx 2 value.txt; then\n  bash tests/test_value.sh\n\
+         elif [ -f tests/test_value.sh ]; then\n  sleep 32\n  bash tests/test_value.sh\n\
+         else\n  sleep 12\nfi\n",
+    )
+    .unwrap();
+    sh(root, "git add -A && git commit -qm init");
+    let check = "bash tests/check.sh";
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/test_value.sh", "content": "grep -qx 2 value.txt\n"})),
+        tool("finish", json!({"summary": "value.txt now holds 2.", "cmd": check})),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+    ])
+    .await;
+
+    let out = slag_fix(root, &server, &["value is wrong", "--test", check]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("FIXED"), "{stdout}");
+    // 32s is past ten times the passing run, so only the baseline term
+    // (3 * 12s) lets the check finish and report exit 1.
+    assert!(stdout.contains("without the fix: exit 1, so the new test catches the bug"), "{stdout}");
+    assert!(!stdout.contains("the code hangs"), "a slow finish is not a hang: {stdout}");
+    assert!(!stdout.contains("timed out after 30s"), "{stdout}");
+}
+
 /// The first test passes with and without the fix: one revision request
 /// through the review-gap path, and the revision's sharper test, failing
 /// without the fix, is the reproduction.
