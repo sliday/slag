@@ -1478,22 +1478,6 @@ fn agree_test_edits(raw: &str, edited: &[EditedTest], issue: &str) -> Result<(),
         return Err(format!("{} deletes checks without replacement lines", e.path));
     }
     let answers: Vec<&str> = raw.lines().filter_map(|l| l.trim().strip_prefix("TEST_EDITS:")).collect();
-    // Keep plain-pass compatibility for an explicit request to replace
-    // numeric expectations without changing the surrounding check.
-    if answers.is_empty() && edited.iter().all(|e| {
-        let request = regex::Regex::new(&format!(
-            r"(?i)(?:^|[.;!?\n])\s*{}(?:\s+pins\s+[^.;!?\n]+?\s+and)?\s+must change\s*(?:[.;!?]|$)",
-            regex::escape(&e.path),
-        )).unwrap();
-        let numbers = regex::Regex::new(r"\b\d+(?:\.\d+)?\b").unwrap();
-        let shape = |prefix| e.diff.lines()
-            .filter_map(|l| l.strip_prefix(prefix))
-            .map(|l| numbers.replace_all(l.trim(), "<number>").into_owned())
-            .collect::<Vec<_>>();
-        request.is_match(issue) && shape('-') == shape('+')
-    }) {
-        return Ok(());
-    }
     let [answer] = answers.as_slice() else {
         return Err("the review gave no single TEST_EDITS answer".into());
     };

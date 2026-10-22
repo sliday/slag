@@ -407,7 +407,15 @@ async fn a_declared_change_the_issue_asks_for_lands_in_plain_sight() {
         })),
         // The usual review, then the one a declared change must pass.
         json!({"text": "VERDICT: pass\nGAP:"}),
-        json!({"text": "VERDICT: pass\nGAP:"}),
+        json!({"text": format!("VERDICT: pass\nGAP:\nTEST_EDITS: {}", json!([{
+            "path": "tests/a.sh",
+            "removed_behavior_wrong": "yes",
+            "added_behavior_requested": "yes",
+            "preserves_checks": "yes",
+            "issue_quote": "a.txt must hold 2, not 1",
+            "removed_quote": "grep -qx 1 a.txt",
+            "added_quote": "grep -qx 2 a.txt",
+        }]))}),
     ])
     .await;
 
