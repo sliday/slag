@@ -202,7 +202,7 @@ Environment knobs not covered above: `SLAG_DUEL`, `SLAG_DUEL_ROUNDS`, `SLAG_REAS
 
 Behavior constants in `config.rs`: `MAX_ANVILS = 3` (parallel ingot slots), `HIGH_GRADE = 3` (plan-model threshold), `MAX_ITERATE = 3` (self-iteration rounds).
 
-`DuelMode::Auto` uses work shape and grade to select one, two, or three casts for independent ingots. Grades 3-4 usually use two casts, grade 5 or taste-heavy work uses three, and mechanical work stays single-cast. `:casts`, `:duel`, and `SLAG_DUEL` override the choice. Direction prompts distinguish casts, so `model_alt` may match `model_base`.
+`DuelMode::Auto` uses work shape and grade to select one, two, or three casts for independent ingots. Grades 3-4 usually use two casts, grade 5 or taste-heavy work uses three, and mechanical work stays single-cast. `SLAG_DUEL=off` is a kill switch: one cast everywhere, beating `:casts` and `:duel` pins (the founder writes those). Otherwise a `:casts` pin wins, then `:duel`, then `SLAG_DUEL=on`. Direction prompts distinguish casts, so `model_alt` may match `model_base`.
 
 ### Commands
 

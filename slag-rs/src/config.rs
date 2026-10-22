@@ -605,13 +605,15 @@ impl EngineConfig {
     /// Resolve how many casts forge this ingot (adaptive cast count).
     ///
     /// Sequential ingots always get one cast — overlapping sequential
-    /// work from multiple casts is a merge-conflict factory. After that
-    /// gate: an explicit `:casts` pin wins, then the legacy `:duel`
-    /// override, then `SLAG_DUEL` (off forces 1, on forces at least 2),
-    /// then the work-shape heuristics. Crack-retry escalation (heat > 0
-    /// bumps 1 → 2) lives in the forge scheduler, not here.
+    /// work from multiple casts is a merge-conflict factory. `SLAG_DUEL=off`
+    /// is the user's kill switch and comes next: the founder writes the
+    /// pins below, so a pin must not spend what the user turned off. Then
+    /// an explicit `:casts` pin wins, then the legacy `:duel` override,
+    /// then `SLAG_DUEL=on` (at least 2), then the work-shape heuristics.
+    /// Crack-retry escalation (heat > 0 bumps 1 → 2) lives in the forge
+    /// scheduler, not here.
     pub fn casts_for(&self, ingot: &Ingot) -> u8 {
-        if !ingot.solo {
+        if !ingot.solo || self.duel == DuelMode::Off {
             return 1;
         }
         if let Some(n) = ingot.casts {
@@ -2218,7 +2220,7 @@ openrouter_api_key = "old-key"
         assert_eq!(config.casts_for(&ingot), 3, "pin beats heuristics");
 
         config.duel = DuelMode::Off;
-        assert_eq!(config.casts_for(&ingot), 3, "pin beats SLAG_DUEL=off");
+        assert_eq!(config.casts_for(&ingot), 1, "SLAG_DUEL=off beats a pin");
 
         ingot.casts = Some(1);
         config.duel = DuelMode::On;
@@ -2244,11 +2246,14 @@ openrouter_api_key = "old-key"
         let studio = casts_ingot(true, 5, "rebuild the engine", "cargo test");
         assert_eq!(config.casts_for(&studio), 3, "on keeps the 3-cast tier");
 
-        // Legacy :duel override sits between the pin and the mode.
+        // Legacy :duel override sits between the pin and the mode, but
+        // off is the kill switch.
         config.duel = DuelMode::Off;
         let mut forced = simple.clone();
         forced.duel = Some(true);
-        assert_eq!(config.casts_for(&forced), 2, ":duel t beats off");
+        assert_eq!(config.casts_for(&forced), 1, "off beats :duel t");
+        config.duel = DuelMode::Auto;
+        assert_eq!(config.casts_for(&forced), 2, ":duel t beats auto");
         config.duel = DuelMode::On;
         let mut blocked = design.clone();
         blocked.duel = Some(false);

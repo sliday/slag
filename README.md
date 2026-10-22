@@ -447,7 +447,7 @@ Flags may come before or after the commission. `slag fix --help` lists the fix f
 | `SLAG_BASE_URL` | Override the selected provider's API root |
 | `SLAG_<PROVIDER>_BASE_URL` | Override one provider's API root in a mixed run |
 | `SLAG_MODEL_BASE` / `_PLAN` / `_ALT` / `_JUDGE` / `_EDITOR` | Per-role model ids |
-| `SLAG_DUEL` | `auto` (default), `on`, `off` |
+| `SLAG_DUEL` | `auto` (default), `on`, `off` (`off` gives every ingot one cast, even one the plan pins with `:casts` or `:duel t`) |
 | `SLAG_DUEL_ROUNDS` | Override the duel round cap |
 | `SLAG_SANDBOX` | `auto` (default) or `off` for the shell sandbox |
 | `SLAG_MAX_COST_INGOT` | Dollar ceiling for a single ingot session (file key `max_cost_per_ingot`). Default uncapped. |
