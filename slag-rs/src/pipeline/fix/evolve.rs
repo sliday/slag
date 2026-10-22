@@ -808,6 +808,8 @@ impl Evolver<'_, '_> {
                         &edited,
                         &checks[0].cmd,
                         super::repro_timeout(&checks[0], self.baseline),
+                        super::test_timeout(),
+                        super::names_a_hang(&format!("{}\n{}", ctx.issue.title, ctx.issue.body)),
                         self.baseline,
                         &rescuer,
                     )

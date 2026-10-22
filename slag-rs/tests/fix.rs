@@ -91,6 +91,18 @@ fn buggy_repo() -> TempDir {
 /// Run `slag fix` in `repo` against `server`, with a scratch home so no
 /// developer key, model pin, or session registry leaks in.
 async fn slag_fix(repo: &Path, server: &MockServer, args: &[&str]) -> std::process::Output {
+    slag_fix_full(repo, server, args, &[], 60).await
+}
+
+/// `slag_fix` with extra environment (e.g. SLAG_TEST_TIMEOUT) and a longer
+/// leash for runs whose proof waits out a real timeout.
+async fn slag_fix_full(
+    repo: &Path,
+    server: &MockServer,
+    args: &[&str],
+    env: &[(&str, &str)],
+    timeout_secs: u64,
+) -> std::process::Output {
     let home = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_slag"));
     for var in ["SLAG_MODEL_PLAN", "SLAG_MODEL_ALT", "SLAG_MODEL_JUDGE", "SLAG_DUEL", "SLAG_REASONING_EFFORT"] {
@@ -103,10 +115,11 @@ async fn slag_fix(repo: &Path, server: &MockServer, args: &[&str]) -> std::proce
         .env("SLAG_SESSIONS_DIR", home.path().join("sessions"))
         .env("HOME", home.path())
         .env("NO_COLOR", "1")
+        .envs(env.iter().copied())
         .current_dir(repo)
         .arg("fix")
         .args(args)
-        .timeout(Duration::from_secs(60));
+        .timeout(Duration::from_secs(timeout_secs));
     tokio::task::spawn_blocking(move || {
         let out = cmd.output().unwrap();
         drop(home);
@@ -777,6 +790,92 @@ async fn a_slow_check_that_fails_without_the_fix_is_a_regression_not_a_hang() {
     assert!(stdout.contains("without the fix: exit 1, so the new test catches the bug"), "{stdout}");
     assert!(!stdout.contains("the code hangs"), "a slow finish is not a hang: {stdout}");
     assert!(!stdout.contains("timed out after 30s"), "{stdout}");
+}
+
+/// The same slow rebuild, but past the sized timeout: the first
+/// without-the-fix run times out at the 30s floor. The issue reports no
+/// hang, so the check reruns once at the full TEST_TIMEOUT, and its exit
+/// code decides: a regression, not a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_check_past_the_sized_timeout_is_a_regression_when_no_hang_is_reported() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+    std::fs::write(root.join("value.txt"), "1\n").unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    // With the fix the check is quick. Without it the original code is
+    // rebuilt first: 32s, just past the 30s floor of the sized timeout.
+    std::fs::write(
+        root.join("tests/check.sh"),
+        "if grep -qx 2 value.txt; then\n  bash tests/test_value.sh\n\
+         elif [ -f tests/test_value.sh ]; then\n  sleep 32\n  bash tests/test_value.sh\nfi\n",
+    )
+    .unwrap();
+    sh(root, "git add -A && git commit -qm init");
+    let check = "bash tests/check.sh";
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool("write_file", json!({"path": "tests/test_value.sh", "content": "grep -qx 2 value.txt\n"})),
+        tool("finish", json!({"summary": "value.txt now holds 2.", "cmd": check})),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+    ])
+    .await;
+
+    let out = slag_fix_full(root, &server, &["value is wrong", "--test", check], &[], 150).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("FIXED"), "{stdout}");
+    assert!(stdout.contains("without the fix: exit 1, so the new test catches the bug"), "{stdout}");
+    assert!(!stdout.contains("the code hangs"), "a slow finish is not a hang: {stdout}");
+}
+
+/// A polling test for a plain value bug never finishes without the fix,
+/// but the issue reports no hang: the timeout is not the reproduction,
+/// and the rerun at the ceiling times out too, so nothing is shown.
+/// SLAG_TEST_TIMEOUT shrinks both waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_polling_test_that_never_finishes_without_the_fix_is_not_called_a_hang() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    sh(root, "git init -q -b main && git config user.email t@t && git config user.name t");
+    std::fs::write(root.join("value.txt"), "1\n").unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("tests/check.sh"),
+        "for t in tests/test_*.sh; do [ -e \"$t\" ] || continue; bash \"$t\" || exit 1; done\n",
+    )
+    .unwrap();
+    sh(root, "git add -A && git commit -qm init");
+    let check = "bash tests/check.sh";
+    let server = model(vec![
+        tool("read_file", json!({"path": "value.txt"})),
+        tool("edit_file", json!({"path": "value.txt", "old_string": "1", "new_string": "2"})),
+        tool(
+            "write_file",
+            json!({"path": "tests/test_poll.sh", "content": "while ! grep -qx 2 value.txt; do sleep 0.2; done\n"}),
+        ),
+        tool("finish", json!({"summary": "value.txt now holds 2.", "cmd": check})),
+        json!({"text": "VERDICT: pass\nGAP:"}),
+    ])
+    .await;
+
+    let started = std::time::Instant::now();
+    let out = slag_fix_full(
+        root,
+        &server,
+        &["value.txt should hold 2", "--test", check],
+        &[("SLAG_TEST_TIMEOUT", "8")],
+        90,
+    )
+    .await;
+    let secs = started.elapsed().as_secs();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("FIXED"), "{stdout}");
+    assert!(stdout.contains("reproduction not shown"), "{stdout}");
+    assert!(!stdout.contains("the code hangs"), "a polling test is not a hang: {stdout}");
+    assert!(secs < 60, "two shrunk timeouts, not two full ceilings: {secs}s");
 }
 
 /// The first test passes with and without the fix: one revision request

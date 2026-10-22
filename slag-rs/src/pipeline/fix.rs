@@ -48,6 +48,17 @@ const FIX_ID: &str = "fix";
 /// Ceiling for any one test run slag makes. A suite slower than this is
 /// not one a quick fix can afford to run three times.
 const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `TEST_TIMEOUT`, or the shrink a test run asks for: the integration
+/// suite must not wait out real timeouts to see a timeout handled.
+fn test_timeout() -> Duration {
+    std::env::var("SLAG_TEST_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(TEST_TIMEOUT)
+}
 /// How much of the repository's file list reaches the prompt.
 const FILE_LIST_CAP: usize = 200;
 const FILE_LIST_BYTES: usize = 8_000;
@@ -77,12 +88,35 @@ const REVIEW_TIMEOUT: Duration = Duration::from_secs(45);
 /// is missing or timed out says nothing about the rebuild: the check gets
 /// the full ceiling, as it did before the timeout was sized at all.
 fn repro_timeout(passed: &Run, baseline: Option<&Run>) -> Duration {
+    let ceiling = test_timeout();
     let baseline = match baseline {
         Some(b) if !b.timed_out => b.secs,
-        _ => return TEST_TIMEOUT,
+        _ => return ceiling,
     };
     Duration::from_secs_f64(passed.secs.max(baseline) * 3.0)
-        .clamp(Duration::from_secs(30), TEST_TIMEOUT)
+        .clamp(Duration::from_secs(30).min(ceiling), ceiling)
+}
+
+/// Does the issue report a hang? Only then is a check that never finishes
+/// the reproduction: a slow rebuild of the reverted source, or a polling
+/// test for a plain bug, looks exactly the same. Whole words, so "change"
+/// is not "hang".
+fn names_a_hang(issue: &str) -> bool {
+    let words: Vec<String> = issue
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    const WORDS: &[&str] = &[
+        "hang", "hangs", "hanging", "freeze", "freezes", "frozen", "stuck", "timeout", "deadlock",
+    ];
+    if words.iter().any(|w| WORDS.contains(&w.as_str())) {
+        return true;
+    }
+    let flat = words.join(" ");
+    ["never returns", "never finishes", "infinite loop", "times out"]
+        .iter()
+        .any(|p| flat.contains(p))
 }
 
 /// `slag fix`: resolve the key and the issue, then fix it under the
@@ -273,8 +307,8 @@ fn plural(n: u8, word: &str) -> String {
 enum Repro {
     /// With the source change reverted, the session's new test fails.
     Regression { status: String },
-    /// With the source change reverted, the check never finishes: for a
-    /// hang bug, that IS the reproduction.
+    /// With the source change reverted, the check never finishes, and the
+    /// issue reports a hang: that IS the reproduction.
     Hangs { status: String },
     /// The test command failed before any edit and passes now.
     Baseline { status: String },
@@ -581,6 +615,7 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
     };
     let edited = edited_now(&changed);
     let clock = std::time::Instant::now();
+    let hang = names_a_hang(&format!("{}\n{}", issue.title, issue.body));
     let proof_cmd = out.checks[0].cmd.clone();
     let (mut repro, mut without) = reproduce(
         job,
@@ -589,6 +624,8 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
         &paths(&edited),
         &proof_cmd,
         repro_timeout(&out.checks[0], baseline.as_ref()),
+        test_timeout(),
+        hang,
         baseline.as_ref(),
         &rescuer,
     )
@@ -651,6 +688,8 @@ async fn fix(job: &Job, config: &EngineConfig, hooks: &EngineHooks) -> Result<Ou
                     &paths(&ed),
                     &proof_cmd,
                     repro_timeout(&c[0], baseline.as_ref()),
+                    test_timeout(),
+                    hang,
                     baseline.as_ref(),
                     &rescuer,
                 )
@@ -1824,8 +1863,9 @@ fn squash(cmd: &str) -> String {
 /// regression test failing with the source change taken back out; failing
 /// that, a test command that failed before the edit and passes after. The
 /// check runs under `timeout`, sized from the passing and baseline runs: a
-/// hang shows long before TEST_TIMEOUT, and for a hang bug the timeout
-/// itself is the proof.
+/// hang shows long before `ceiling`. The timeout itself is the proof only
+/// when the issue reports a hang (`hang`); otherwise the check reruns once
+/// at `ceiling` and its exit code decides.
 #[allow(clippy::too_many_arguments)]
 async fn reproduce(
     job: &Job,
@@ -1834,6 +1874,8 @@ async fn reproduce(
     edited: &[String],
     cmd: &str,
     timeout: Duration,
+    ceiling: Duration,
+    hang: bool,
     baseline: Option<&Run>,
     rescuer: &Rescuer<'_>,
 ) -> (Repro, Option<Run>) {
@@ -1874,11 +1916,22 @@ async fn reproduce(
         .chain(&olds)
         .map(|p| (git.top.join(p), git.original(before, p)))
         .collect();
-    let Some(run) = swap_and_run(job, swaps, cmd, timeout, rescuer).await else {
+    let Some(mut run) = swap_and_run(job, swaps.clone(), cmd, timeout, rescuer).await else {
         return (Repro::NotShown("interrupted".into()), None);
     };
+    // A timeout is the reproduction only when the issue reports a hang.
+    // Otherwise the swap's rebuild of the reverted source may simply be
+    // slow, or the new test may poll for a result the old code never
+    // produces: rerun once at the full ceiling and decide on the exit
+    // code. A second timeout shows nothing.
+    if run.timed_out && !hang {
+        let Some(rerun) = swap_and_run(job, swaps, cmd, ceiling, rescuer).await else {
+            return (Repro::NotShown("interrupted".into()), None);
+        };
+        run = rerun;
+    }
 
-    let repro = if run.timed_out {
+    let repro = if run.timed_out && hang {
         // The same check passed with the fix: never finishing without it
         // is the hang the issue reports, not a check that says nothing.
         Repro::Hangs { status: run.status() }
@@ -1886,7 +1939,7 @@ async fn reproduce(
         from_baseline()
             .unwrap_or_else(|| Repro::NotShown(format!("the check without the fix {}", run.status())))
     } else if run.ok() {
-        match inside(job, before, &sources, &olds, cmd, timeout, rescuer, &run).await {
+        match inside(job, before, &sources, &olds, cmd, timeout, hang, ceiling * 2, rescuer, &run).await {
             None => return (Repro::NotShown("interrupted".into()), None),
             Some(Ok((repro, run))) => return (repro, Some(run)),
             Some(Err(why)) => from_baseline().unwrap_or(Repro::NotShown(why)),
@@ -1904,8 +1957,11 @@ async fn reproduce(
 /// inserted kept. A failure there proves the bug only when it is clean:
 /// nothing fails to load that loaded in `restored`, and the session's
 /// tests without the kept lines still pass with the fix, so those lines
-/// are new tests, not an old expectation that grew. `Err` says why there
-/// is no proof; `None` means the rescue ran.
+/// are new tests, not an old expectation that grew. Three readings with up
+/// to two runs each can cost six slow suite runs on a path that mostly
+/// ends without proof, so the readings stop when their total run passes
+/// `cap`, and the report line says so. `Err` says why there is no proof;
+/// `None` means the rescue ran.
 #[allow(clippy::too_many_arguments)]
 async fn inside(
     job: &Job,
@@ -1914,6 +1970,8 @@ async fn inside(
     olds: &[&String],
     cmd: &str,
     timeout: Duration,
+    hang: bool,
+    cap: Duration,
     rescuer: &Rescuer<'_>,
     restored: &Run,
 ) -> Option<Result<(Repro, Run), String>> {
@@ -1927,6 +1985,8 @@ async fn inside(
         })
         .collect();
     let mut tried = Vec::new();
+    let started = std::time::Instant::now();
+    let capped = |why: &str| format!("{why}; the line-level checks stopped at their time cap");
     // Lines inserted next to a rewrite may be a new test or part of the
     // rewritten old one. Each reading keeps fewer of them as new; the
     // checks below reject a wrong reading.
@@ -1947,6 +2007,9 @@ async fn inside(
                 (git.top.join(p), kept.or_else(|| git.original(before, p)))
             }))
             .collect();
+        if started.elapsed() >= cap {
+            return Some(Err(capped(&why)));
+        }
         let run = swap_and_run(job, swaps, cmd, timeout, rescuer).await?;
         if run.ok() {
             // Fewer kept lines cannot fail where more passed.
@@ -1956,11 +2019,15 @@ async fn inside(
             .into_iter()
             .find(|e| !restored.output.contains(e))
             .map(str::to_string)
-            .or_else(|| (run.unusable() && !run.timed_out).then(|| run.status()));
+            // A timeout proves a hang only when the issue reports one.
+            .or_else(|| (run.unusable() && !(run.timed_out && hang)).then(|| run.status()));
         if let Some(e) = broken {
             why = format!("the tests added inside {names} do not run with the old lines back ({e})");
             tried.push(parts);
             continue;
+        }
+        if started.elapsed() >= cap {
+            return Some(Err(capped(&why)));
         }
         let control = parts.iter().map(|(p, _, rest)| (git.top.join(p), Some(rest.clone().into_bytes()))).collect();
         let check = swap_and_run(job, control, cmd, timeout, rescuer).await?;
@@ -1972,6 +2039,7 @@ async fn inside(
             tried.push(parts);
             continue;
         }
+        // A timeout only reaches here when the issue reports a hang.
         let repro = if run.timed_out {
             Repro::Hangs { status: run.status() }
         } else {
@@ -2926,7 +2994,7 @@ mod tests {
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
 
-        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await.0;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         assert_eq!(value(&job), "2\n", "fix restored");
 
@@ -2939,10 +3007,10 @@ mod tests {
         // A test that passes either way proves nothing; a failing baseline
         // is the fallback evidence.
         std::fs::write(job.cwd.join("value.txt"), "2\n").unwrap();
-        let weak = reproduce(&job, &before, &changed, &[], "true", TEST_TIMEOUT, None, &rescuer).await.0;
+        let weak = reproduce(&job, &before, &changed, &[], "true", TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await.0;
         assert!(matches!(weak, Repro::NotShown(_)), "{weak:?}");
         let base = Run { cmd: "t".into(), code: Some(1), output: String::new(), secs: 0.0, timed_out: false };
-        let fallback = reproduce(&job, &before, &changed, &[], "true", TEST_TIMEOUT, Some(&base), &rescuer).await.0;
+        let fallback = reproduce(&job, &before, &changed, &[], "true", TEST_TIMEOUT, TEST_TIMEOUT, false, Some(&base), &rescuer).await.0;
         assert_eq!(fallback, Repro::Baseline { status: "exit 1".into() });
     }
 
@@ -2985,7 +3053,7 @@ mod tests {
         );
         assert_eq!(edited, ["tests/check.sh"]);
         let rescuer = Rescuer { register: &|_| {}, stop: no_stop };
-        let (repro, _) = reproduce(&job, &before, &changed, &edited, "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &edited, "bash tests/check.sh", TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await;
         let Repro::NotShown(why) = &repro else { panic!("{repro:?}") };
         assert!(why.contains("inside tests/check.sh belong to old tests"), "{why}");
         assert_eq!(std::fs::read_to_string(job.cwd.join("tests/check.sh")).unwrap(), check("A\nb\nc\n"));
@@ -3008,7 +3076,7 @@ mod tests {
             ],
         );
         let rescuer = Rescuer { register: &|_| {}, stop: no_stop };
-        let (repro, without) = reproduce(&job, &before, &changed, &edited, "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await;
+        let (repro, without) = reproduce(&job, &before, &changed, &edited, "bash tests/check.sh", TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         assert!(without.is_some_and(|run| !run.ok()), "the failing run is the one reported");
         assert_eq!(std::fs::read_to_string(job.cwd.join("n.txt")).unwrap(), "2\n", "fix restored");
@@ -3038,7 +3106,7 @@ mod tests {
         );
         let rescuer = Rescuer { register: &|_| {}, stop: no_stop };
         let cmd = "python3 -m unittest discover -s tests";
-        let (repro, _) = reproduce(&job, &before, &changed, &edited, cmd, TEST_TIMEOUT, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &edited, cmd, TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await;
         let Repro::NotShown(why) = &repro else { panic!("{repro:?}") };
         assert!(why.contains("inside tests/test_calc.py do not run with the old lines back (NameError)"), "{why}");
     }
@@ -3093,11 +3161,117 @@ mod tests {
         let hangs = "while grep -qx 1 value.txt; do sleep 0.05; done";
         let clock = std::time::Instant::now();
         let (repro, run) =
-            reproduce(&job, &before, &changed, &[], hangs, Duration::from_secs(2), None, &rescuer).await;
+            reproduce(&job, &before, &changed, &[], hangs, Duration::from_secs(2), TEST_TIMEOUT, true, None, &rescuer).await;
         assert_eq!(repro, Repro::Hangs { status: "timed out after 2s".into() });
         assert!(run.unwrap().timed_out);
         assert!(clock.elapsed() < Duration::from_secs(15), "the check ends at its own timeout");
         assert_eq!(value(&job), "2\n", "fix restored");
+    }
+
+    /// Only an issue that names a hang lets a timeout stand as the
+    /// reproduction. Whole words: "change" is not "hang".
+    #[test]
+    fn a_timeout_is_proof_only_when_the_issue_names_a_hang() {
+        for text in [
+            "reads hang while value is 1",
+            "the parser hangs on nested input",
+            "the UI freezes on open",
+            "worker stuck at 99%",
+            "Never returns for an empty file",
+            "an infinite loop in resolve",
+            "the request times out",
+            "client hit a timeout",
+            "a deadlock between workers",
+        ] {
+            assert!(names_a_hang(text), "{text}");
+        }
+        for text in [
+            "value is wrong",
+            "change the default greeting",
+            "the export is slow",
+            "wrong total when the cart has two items",
+        ] {
+            assert!(!names_a_hang(text), "{text}");
+        }
+    }
+
+    /// The issue reports no hang, so a timeout proves nothing: the check
+    /// runs once more at the full ceiling, and a slow finish there is a
+    /// regression, never a hang.
+    #[tokio::test]
+    async fn a_timeout_without_a_hang_reported_reruns_at_the_full_ceiling() {
+        let (_dir, job, before, changed) = fixed_repo();
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+
+        // Past the sized timeout, well inside the ceiling.
+        let slow = "sleep 2; bash tests/check.sh";
+        let (repro, run) = reproduce(
+            &job, &before, &changed, &[], slow,
+            Duration::from_secs(1), Duration::from_secs(10), false, None, &rescuer,
+        ).await;
+        assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
+        assert!(run.is_some_and(|r| !r.timed_out), "the rerun's exit code decides");
+        assert_eq!(value(&job), "2\n", "fix restored");
+    }
+
+    /// A polling test for a plain bug never finishes without the fix, but
+    /// the issue reports no hang: a second timeout is not shown as proof.
+    #[tokio::test]
+    async fn a_second_timeout_without_a_hang_reported_shows_nothing() {
+        let (_dir, job, before, changed) = fixed_repo();
+        let slot = Slot::default();
+        let keep = |hook| *slot.lock().unwrap() = Some(hook);
+        let rescuer = Rescuer { register: &keep, stop: no_stop };
+
+        let polls = "while grep -qx 1 value.txt; do sleep 0.05; done";
+        let clock = std::time::Instant::now();
+        let (repro, run) = reproduce(
+            &job, &before, &changed, &[], polls,
+            Duration::from_secs(1), Duration::from_secs(2), false, None, &rescuer,
+        ).await;
+        assert_eq!(repro, Repro::NotShown("the check without the fix timed out after 2s".into()));
+        assert!(run.unwrap().timed_out);
+        assert!(clock.elapsed() < Duration::from_secs(10), "one rerun, not a loop: {:?}", clock.elapsed());
+        assert_eq!(value(&job), "2\n", "fix restored");
+    }
+
+    /// Three readings with two runs each can cost six slow suite runs on a
+    /// path that mostly ends without proof: the readings stop at their
+    /// time cap, and the report line says so. This is the docutils shape,
+    /// where the second reading proves the bug; capped after the first
+    /// reading, it proves nothing.
+    #[tokio::test]
+    async fn line_level_readings_stop_at_their_time_cap() {
+        let check = |lines: &str, extra: &str| format!("set -e\ndiff out.txt - <<'EOF'\n{lines}EOF\n{extra}");
+        let (_dir, job, before, changed, edited) = session(
+            &[("out.txt", "a\nb\n"), ("n.txt", "1\n"), ("tests/check.sh", &check("a\nb\n", ""))],
+            &[
+                ("out.txt", "A\nc\nb\n"),
+                ("n.txt", "2\n"),
+                ("tests/check.sh", &check("A\nc\nb\n", "grep -qx 2 n.txt\n")),
+            ],
+        );
+        let rescuer = Rescuer { register: &|_| {}, stop: no_stop };
+        let sources: Vec<&String> = changed.iter().filter(|p| !repo::is_test_path(p)).collect();
+        let olds: Vec<&String> = edited.iter().collect();
+        let restored = Run { cmd: "t".into(), code: Some(0), output: String::new(), secs: 1.0, timed_out: false };
+
+        let slow = "sleep 1; bash tests/check.sh";
+        let result = inside(
+            &job, &before, &sources, &olds, slow,
+            Duration::from_secs(10), false, Duration::from_millis(1500), &rescuer, &restored,
+        ).await;
+        let Some(Err(why)) = result else { panic!("{result:?}") };
+        assert!(why.contains("the line-level checks stopped at their time cap"), "{why}");
+        // The cap, not a missing proof: without it the next reading shows
+        // the regression.
+        let result = inside(
+            &job, &before, &sources, &olds, slow,
+            Duration::from_secs(10), false, Duration::from_secs(600), &rescuer, &restored,
+        ).await;
+        assert!(matches!(result, Some(Ok((Repro::Regression { .. }, _)))), "{result:?}");
     }
 
     /// The race that lost a fix: the rescue fired after it was registered
@@ -3110,7 +3284,7 @@ mod tests {
         let fire_at_once = |hook: Box<dyn FnOnce() + Send>| hook();
         let rescuer = Rescuer { register: &fire_at_once, stop: no_stop };
 
-        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await.0;
         assert_eq!(repro, Repro::NotShown("interrupted".into()));
         assert_eq!(value(&job), "2\n", "the fix is on disk");
     }
@@ -3126,7 +3300,7 @@ mod tests {
 
         let check = "echo seen > seen.txt; while [ ! -f continue.txt ]; do sleep 0.01; done; bash tests/check.sh";
         let (repro, during) = tokio::join!(
-            reproduce(&job, &before, &changed, &[], check, TEST_TIMEOUT, None, &rescuer),
+            reproduce(&job, &before, &changed, &[], check, TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer),
             async {
                 while !job.cwd.join("seen.txt").exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3187,7 +3361,7 @@ mod tests {
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
         let cmd = "python3 -m unittest discover -s tests";
-        let (repro, _) = reproduce(&job, &before, &changed, &[], cmd, TEST_TIMEOUT, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &[], cmd, TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
 
         // Same second, same size again: only a purged cache recompiles.
@@ -3233,7 +3407,7 @@ mod tests {
         let rescuer = Rescuer { register: &keep, stop: no_stop };
         let started = std::time::SystemTime::now();
         let writes_bytecode = "env -u PYTHONDONTWRITEBYTECODE python3 -m unittest discover -s tests";
-        let (repro, _) = reproduce(&job, &before, &changed, &[], writes_bytecode, TEST_TIMEOUT, None, &rescuer).await;
+        let (repro, _) = reproduce(&job, &before, &changed, &[], writes_bytecode, TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
 
         let secs = |t: std::time::SystemTime| {
@@ -3700,7 +3874,7 @@ mod tests {
         let slot = Slot::default();
         let keep = |hook| *slot.lock().unwrap() = Some(hook);
         let rescuer = Rescuer { register: &keep, stop: no_stop };
-        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, None, &rescuer).await.0;
+        let repro = reproduce(&job, &before, &changed, &[], "bash tests/check.sh", TEST_TIMEOUT, TEST_TIMEOUT, false, None, &rescuer).await.0;
         assert_eq!(repro, Repro::Regression { status: "exit 1".into() });
         let mode = std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "the restored script is still executable");
