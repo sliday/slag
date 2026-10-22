@@ -27,13 +27,16 @@ use super::{
 use crate::error::SlagError;
 
 const DEFAULT_MAX_TURNS: usize = 40;
-const CHAR_BUDGET: usize = 48_000;
-const RECENT_TOOL_ROUNDS: usize = 2;
 const REVIEW_VIOLATION: &str = "review policy violation:";
 /// chars/4 is the estimation rule for text appended since the last usage
 /// anchor; token budgets convert to char targets through the same ratio.
 pub(crate) const CHARS_PER_TOKEN: usize = 4;
-const DEFAULT_TOKEN_BUDGET: usize = CHAR_BUDGET / CHARS_PER_TOKEN;
+/// Budget when the model window is unknown: sized like a window, so a
+/// session keeps what it read instead of paying to read it again.
+const DEFAULT_TOKEN_BUDGET: usize = 100_000;
+/// An over-budget turn compacts down to budget / this, so the history
+/// grows a long way before the next rewrite of the cached prefix.
+const COMPACT_TARGET_DIV: usize = 2;
 /// Room reserved out of the model window for its own output.
 const OUTPUT_RESERVE_TOKENS: u64 = 16_384;
 /// Headroom so compaction fires before the hard window edge.
@@ -192,6 +195,12 @@ fn budget_for_window(window_tokens: u64) -> usize {
     (usable as usize).max(TOKEN_BUDGET_FLOOR)
 }
 
+/// Session budget: `SLAG_CHAR_BUDGET` wins, then the model window, then
+/// the window-sized default.
+fn session_token_budget(env: Option<usize>, window_tokens: Option<u64>) -> usize {
+    env.or(window_tokens.map(budget_for_window)).unwrap_or(DEFAULT_TOKEN_BUDGET)
+}
+
 /// Usage anchor for token estimation: the provider's reported
 /// `prompt_tokens` covers everything sent on the last call exactly; only
 /// messages appended since are estimated at chars/4. Anchors replace each
@@ -227,18 +236,19 @@ fn context_pct(used_tokens: u64, budget_tokens: usize) -> u8 {
 }
 
 /// Token-driven compaction: when the estimate exceeds the budget, prune
-/// enough chars to cover the overshoot (at chars/4). Any prune invalidates
+/// down to `target` tokens (at chars/4). Any prune invalidates
 /// the anchor — pruned history no longer matches its counted tokens.
 fn compact_to_tokens(
     messages: &mut Vec<ChatMessage>,
     token_budget: usize,
+    target: usize,
     anchor: &mut Option<TokenAnchor>,
 ) -> bool {
     let est = estimate_tokens(messages, *anchor);
     if est <= token_budget as u64 {
         return false;
     }
-    let over_chars = (est as usize - token_budget) * CHARS_PER_TOKEN;
+    let over_chars = (est as usize).saturating_sub(target) * CHARS_PER_TOKEN;
     let target = convo_chars(messages).saturating_sub(over_chars);
     let changed = compact(messages, target);
     if changed {
@@ -486,7 +496,7 @@ impl ForgeAgent {
             model: model.into(),
             effort: None,
             max_turns: DEFAULT_MAX_TURNS,
-            token_budget: env_token_budget().unwrap_or(DEFAULT_TOKEN_BUDGET),
+            token_budget: session_token_budget(env_token_budget(), None),
             cost_cap: crate::config::ingot_cost_cap(),
             run_cap: crate::config::run_cost_cap(),
             ingot_spend: SpendAccum::default(),
@@ -502,7 +512,7 @@ impl ForgeAgent {
             require_inspection: false,
             require_runs: false,
             coordinator_root: None,
-            recent_tool_rounds: RECENT_TOOL_ROUNDS,
+            recent_tool_rounds: usize::MAX,
             role: Role::Smith,
             harness_hooks: None,
             tool_allowlist: None,
@@ -511,8 +521,6 @@ impl ForgeAgent {
         }
     }
 
-    /// Keep the last `rounds` tool rounds verbatim (default 2). A session
-    /// that reads many files to compare them needs them all in view.
     /// Draw on a budget other sessions share. Pair it with
     /// `with_cost_cap(None)`: the shared caps then bind, and a model with no
     /// price is charged nothing it was not charged.
@@ -521,6 +529,9 @@ impl ForgeAgent {
         self
     }
 
+    /// Keep only the last `rounds` tool rounds verbatim. The default keeps
+    /// them all: the history stays append-only, so the provider's prompt
+    /// cache covers it, and compaction waits for the token budget.
     pub fn with_recent_rounds(mut self, rounds: usize) -> Self {
         self.recent_tool_rounds = rounds.max(1);
         self
@@ -623,13 +634,12 @@ impl ForgeAgent {
         self
     }
 
-    /// Cap the default budget to a smaller model window after reserves.
-    /// `None` keeps the default; `SLAG_CHAR_BUDGET` overrides both.
+    /// Size the budget to the model window after reserves, large or
+    /// small. `None` keeps the current budget; `SLAG_CHAR_BUDGET` overrides
+    /// both.
     pub fn with_context_window(mut self, window_tokens: Option<u64>) -> Self {
-        if env_token_budget().is_none() {
-            if let Some(window) = window_tokens {
-                self.token_budget = budget_for_window(window).min(DEFAULT_TOKEN_BUDGET);
-            }
+        if window_tokens.is_some() {
+            self.token_budget = session_token_budget(env_token_budget(), window_tokens);
         }
         self
     }
@@ -796,7 +806,7 @@ impl ForgeAgent {
                 anchor = None;
                 record_rewrite(tw, &messages);
             }
-            if compact_to_tokens(&mut messages, token_budget, &mut anchor) {
+            if compact_to_tokens(&mut messages, token_budget, token_budget / COMPACT_TARGET_DIV, &mut anchor) {
                 record_rewrite(tw, &messages);
             }
             let used = estimate_tokens(&messages, anchor);
@@ -1086,21 +1096,35 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
             anchor = None;
             record_rewrite(tw, &messages);
         }
-        if compact_to_tokens(&mut messages, token_budget, &mut anchor) {
+        if compact_to_tokens(&mut messages, token_budget, token_budget / COMPACT_TARGET_DIV, &mut anchor) {
             record_rewrite(tw, &messages);
         }
-        let resp = match self
-            .chat_shrinking(&mut messages, false, &mut token_budget, &mut anchor, &mut out_tokens, tw)
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                emit(&self.events, EngineEvent::Error { message: e.to_string() });
-                return Err(e);
+        // The tools stay in the request so it shares the cached prefix of
+        // every turn before it. A reply that still calls a tool is dropped
+        // and asked once more without them.
+        let mut with_tools = true;
+        let resp = loop {
+            let resp = match self
+                .chat_shrinking(&mut messages, with_tools, &mut token_budget, &mut anchor, &mut out_tokens, tw)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    emit(&self.events, EngineEvent::Error { message: e.to_string() });
+                    return Err(e);
+                }
+            };
+            emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
+            self.track_spend(&resp.usage);
+            if with_tools && !resp.tool_calls.is_empty() {
+                with_tools = false;
+                emit(&self.events, EngineEvent::Warning {
+                    message: "the turn-limit summary called a tool; asking again without tools".into(),
+                });
+                continue;
             }
+            break resp;
         };
-        emit(&self.events, EngineEvent::Tokens { usage: resp.usage.clone() });
-        self.track_spend(&resp.usage);
         let content = if require_verification {
             resp.content.lines().map(|line| match line.trim_start().split_once(':') {
                 Some((key, command)) if key.eq_ignore_ascii_case("cmd") => format!("CMD:{command}"),
@@ -1242,7 +1266,7 @@ and {MAX_CONTINUE_NUDGES} continuation nudges"
                     }
                     let can_prune = *token_budget > TOKEN_BUDGET_FLOOR;
                     *token_budget = (*token_budget / 2).max(TOKEN_BUDGET_FLOOR);
-                    if can_prune && compact_to_tokens(messages, *token_budget, anchor) {
+                    if can_prune && compact_to_tokens(messages, *token_budget, *token_budget, anchor) {
                         record_rewrite(tw, messages);
                         emit(
                             &self.events,
@@ -2251,11 +2275,11 @@ mod tests {
             ["a.md", "b.md", "c.md"].iter().filter(|n| last.iter().any(|m| m.role == "tool" && m.content.contains(&format!("evidence {n}")))).count()
         };
         let short = MockProvider::new(script());
-        agent(short.clone(), dir.path()).without_finish().run("s".into(), "t".into()).await.unwrap();
-        assert_eq!(kept(&short), 2, "the default keeps two rounds verbatim");
+        agent(short.clone(), dir.path()).without_finish().with_recent_rounds(2).run("s".into(), "t".into()).await.unwrap();
+        assert_eq!(kept(&short), 2, "a bound keeps that many rounds verbatim");
         let long = MockProvider::new(script());
-        agent(long.clone(), dir.path()).without_finish().with_recent_rounds(usize::MAX).run("s".into(), "t".into()).await.unwrap();
-        assert_eq!(kept(&long), 3);
+        agent(long.clone(), dir.path()).without_finish().run("s".into(), "t".into()).await.unwrap();
+        assert_eq!(kept(&long), 3, "the default keeps every round");
     }
 
     #[tokio::test]
@@ -2701,7 +2725,7 @@ mod tests {
         }
         script.push(resp_text("done", FinishReason::Stop));
         let provider = MockProvider::new(script);
-        agent(provider.clone(), dir.path()).run("system".into(), "original task".into()).await.unwrap();
+        agent(provider.clone(), dir.path()).with_recent_rounds(2).run("system".into(), "original task".into()).await.unwrap();
         let requests = provider.requests();
         let last = &requests.last().unwrap().messages;
         assert_eq!(last[1].content, "original task");
@@ -2713,6 +2737,90 @@ mod tests {
             std::fs::read_to_string(dir.path().join(format!("f{i}.txt"))).unwrap().len()
         }).sum();
         assert!(convo_chars(last) < full_file_chars);
+    }
+
+    /// Leading messages two recorded request bodies share, and their bytes
+    /// plus the tool schemas: what a prefix cache can serve on the later one.
+    fn shared_prefix(prev: &serde_json::Value, next: &serde_json::Value) -> (usize, usize) {
+        if prev["tools"] != next["tools"] {
+            return (0, 0);
+        }
+        let (a, b) = (prev["messages"].as_array().unwrap(), next["messages"].as_array().unwrap());
+        let same = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        let bytes: usize = b[..same].iter().map(|m| m.to_string().len()).sum();
+        (same, bytes + next["tools"].to_string().len())
+    }
+
+    #[tokio::test]
+    async fn under_budget_requests_extend_the_previous_request_byte_for_byte() {
+        use serde_json::{json, Value};
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            std::fs::write(dir.path().join(format!("m{i}.py")), format!("def f{i}(x):\n    return x + {i}\n").repeat(100)).unwrap();
+        }
+        let call = |n: usize, name: &str, args: Value| json!({"content": null, "tool_calls": [{
+            "id": format!("c{n}"), "type": "function", "function": {"name": name, "arguments": args.to_string()},
+        }]});
+        let script = vec![
+            call(0, "read_file", json!({"path": "m0.py"})),
+            call(1, "read_file", json!({"path": "m1.py"})),
+            call(2, "glob", json!({"pattern": "*.py"})),
+            call(3, "read_file", json!({"path": "m2.py"})),
+            call(4, "grep", json!({"pattern": "def f3", "output_mode": "content"})),
+            call(5, "read_file", json!({"path": "m3.py"})),
+            call(6, "write_file", json!({"path": "new.py", "content": "def g(x):\n    return x\n".repeat(20)})),
+            call(7, "edit_file", json!({"path": "new.py", "old_string": "def g(x):\n    return x\n", "new_string": "def g(x):\n    return -x\n"})),
+            call(8, "read_file", json!({"path": "m4.py"})),
+            call(9, "read_file", json!({"path": "m5.py"})),
+            json!({"content": "done"}),
+        ];
+        let turns = script.len();
+        let server = MockServer::start().await;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let message = script[next.fetch_add(1, Ordering::SeqCst)].clone();
+                let finish = if message["tool_calls"].is_null() { "stop" } else { "tool_calls" };
+                let prompt = body["messages"].to_string().len() / CHARS_PER_TOKEN;
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": message, "finish_reason": finish}],
+                    "usage": {"prompt_tokens": prompt, "completion_tokens": 20, "total_tokens": prompt + 20},
+                }))
+            })
+            .mount(&server)
+            .await;
+        let provider = Arc::new(crate::engine::provider::OpenRouter::with_provider(
+            crate::config::ProviderPreset::Custom, "", server.uri(),
+        ));
+        let result = ForgeAgent::new(provider, ToolBox::new(dir.path()), "test/model")
+            .with_cost_cap(None)
+            .with_run_cap(None)
+            .run("You are the smith.\n".repeat(100), "Build the module.\n".repeat(20))
+            .await
+            .unwrap();
+        assert_eq!(result, "done");
+
+        let bodies: Vec<Value> = server.received_requests().await.unwrap().iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap()).collect();
+        assert_eq!(bodies.len(), turns);
+        let (mut sent, mut cached) = (0usize, 0usize);
+        for (i, body) in bodies.iter().enumerate() {
+            let size = body["messages"].to_string().len() + body["tools"].to_string().len();
+            let (same, shared) = if i == 0 { (0, 0) } else { shared_prefix(&bodies[i - 1], body) };
+            sent += size;
+            cached += shared;
+            eprintln!("request {i}: {} messages, {size} bytes, {same} leading messages ({shared} bytes) as before",
+                body["messages"].as_array().unwrap().len());
+        }
+        eprintln!("session: {sent} bytes sent, {cached} cacheable, {} uncached", sent - cached);
+        for (i, pair) in bodies.windows(2).enumerate() {
+            let (prev, next) = (pair[0]["messages"].as_array().unwrap(), pair[1]["messages"].as_array().unwrap());
+            assert!(next.len() > prev.len() && next[..prev.len()] == prev[..],
+                "request {} rewrote history request {i} sent", i + 1);
+            assert_eq!(pair[0]["tools"], pair[1]["tools"]);
+        }
     }
 
     #[test]
@@ -2812,7 +2920,7 @@ mod tests {
         assert_eq!(crate::proof::extract_cmd(&result).as_deref(), Some("python3 -m unittest"));
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].tools.is_empty());
+        assert_eq!(tool_names(&requests[1]), tool_names(&requests[0]));
         assert!(requests[1].messages.last().unwrap().content.contains("CMD: <verification command>"));
     }
 
@@ -3044,8 +3152,12 @@ mod tests {
         assert!(tool_msgs[1].content.starts_with("ERROR: "));
     }
 
+    fn tool_names(req: &ChatRequest) -> Vec<String> {
+        req.tools.iter().map(|t| t.name.clone()).collect()
+    }
+
     #[tokio::test]
-    async fn max_turns_forces_a_final_no_tools_summary() {
+    async fn max_turns_forces_a_final_summary_on_the_cached_prefix() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
 
@@ -3066,9 +3178,40 @@ mod tests {
         let requests = provider.requests();
         assert_eq!(requests.len(), 3);
         let last = &requests[2];
-        assert!(last.tools.is_empty(), "final call must offer no tools");
+        assert!(!last.tools.is_empty());
+        assert_eq!(tool_names(last), tool_names(&requests[1]), "the final call keeps the cached tool prefix");
+        let before = &requests[1].messages;
+        assert!(last.messages.len() > before.len());
+        for (sent, kept) in before.iter().zip(&last.messages) {
+            assert_eq!((&sent.role, &sent.content, &sent.tool_call_id), (&kept.role, &kept.content, &kept.tool_call_id));
+        }
         let last_user = last.messages.iter().rev().find(|m| m.role == "user").unwrap();
         assert!(last_user.content.contains("no more tool budget"));
+    }
+
+    #[tokio::test]
+    async fn a_turn_limit_summary_that_calls_a_tool_is_asked_again_without_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let read = || tc("c1", "read_file", serde_json::json!({"path": "a.txt"}));
+        let mut stray = resp_tools(vec![read()]);
+        stray.content = "One more look first.".into();
+        let provider = MockProvider::new(vec![
+            resp_tools(vec![read()]),
+            stray,
+            resp_text("summary after budget", FinishReason::Stop),
+        ]);
+        let result = agent(provider.clone(), dir.path())
+            .with_max_turns(1)
+            .run("system".into(), "task".into())
+            .await
+            .expect("run ok");
+        assert_eq!(result, "summary after budget");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[1].tools.is_empty());
+        assert!(requests[2].tools.is_empty(), "the re-ask offers no tools");
+        assert_eq!(requests[2].messages.len(), requests[1].messages.len(), "the stray reply is dropped");
     }
 
     #[tokio::test]
@@ -3761,6 +3904,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_overflow_under_the_window_sized_default_still_shrinks_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", "z".repeat(99));
+        for i in 0..7 {
+            std::fs::write(dir.path().join(format!("w{i}.txt")), line.repeat(400)).unwrap();
+        }
+        // Seven 40k-char reads stay under the 100k-token default, so the
+        // turn loop never compacts. The real window is smaller: the
+        // provider rejects, and the shrink path must recover alone.
+        let mut script: Vec<Result<NormalizedResponse, String>> = (0..7)
+            .map(|i| Ok(resp_tools(vec![tc(&format!("c{i}"), "read_file", serde_json::json!({"path": format!("w{i}.txt")}))])))
+            .collect();
+        script.push(Err("400 Bad Request: maximum context length is 65536 tokens".into()));
+        script.push(Ok(resp_text("done", FinishReason::Stop)));
+        let provider = FlakyProvider::new(script);
+
+        let result = ForgeAgent::new(provider.clone(), ToolBox::new(dir.path()), "test/model")
+            .with_cost_cap(None)
+            .with_run_cap(None)
+            .run("system".into(), "task".into())
+            .await
+            .expect("the overflow must be recovered by compaction");
+        assert_eq!(result, "done");
+
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 9, "seven turns, the rejected call, one retry");
+        let (rejected, retry) = (&requests[7].messages, &requests[8].messages);
+        assert!(rejected.iter().all(|m| !m.content.starts_with("[pruned old tool result")));
+        assert!(retry.iter().any(|m| m.content.starts_with("[pruned old tool result")));
+        assert!(convo_chars(retry) <= DEFAULT_TOKEN_BUDGET / 2 * CHARS_PER_TOKEN);
+        for (i, m) in retry.iter().enumerate() {
+            if let Some(id) = m.tool_call_id.as_deref() {
+                assert!(retry[..i].iter().any(|a| a.tool_calls.as_ref().is_some_and(|cs| cs.iter().any(|c| c.id == id))));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn first_turn_overflow_with_nothing_prunable_propagates() {
         let dir = tempfile::tempdir().unwrap();
         let provider = FlakyProvider::new(vec![
@@ -4118,10 +4299,29 @@ mod tests {
         let default_budget = base.token_budget;
 
         let sized = agent(provider.clone(), dir.path()).with_context_window(Some(131_072));
-        assert_eq!(sized.token_budget, DEFAULT_TOKEN_BUDGET);
+        assert_eq!(sized.token_budget, budget_for_window(131_072));
+        let large = agent(provider.clone(), dir.path()).with_context_window(Some(400_000));
+        assert_eq!(large.token_budget, 400_000 - (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize);
         // Unknown window keeps whatever budget was already in place.
         let unknown = agent(provider, dir.path()).with_context_window(None);
         assert_eq!(unknown.token_budget, default_budget);
+    }
+
+    #[test]
+    fn the_session_budget_follows_the_window_unless_the_env_overrides_it() {
+        let reserves = (OUTPUT_RESERVE_TOKENS + COMPACT_BUFFER_TOKENS) as usize;
+        // A large window gives a large budget.
+        assert_eq!(session_token_budget(None, Some(400_000)), 400_000 - reserves);
+        assert_eq!(session_token_budget(None, Some(1_000_000)), 1_000_000 - reserves);
+        // An unknown window gets a window-sized default.
+        assert_eq!(session_token_budget(None, None), 100_000);
+        // A small window keeps its own small budget.
+        assert_eq!(session_token_budget(None, Some(32_768)), 32_768 - reserves);
+        assert_eq!(session_token_budget(None, Some(8_192)), TOKEN_BUDGET_FLOOR);
+        // SLAG_CHAR_BUDGET wins over any window.
+        let env = parse_char_budget(Some("48000".into()));
+        assert_eq!(session_token_budget(env, Some(400_000)), 12_000);
+        assert_eq!(session_token_budget(env, None), 12_000);
     }
 
     #[test]
@@ -4130,6 +4330,53 @@ mod tests {
         assert_eq!(parse_char_budget(Some("400000".into())), Some(100_000));
         assert_eq!(parse_char_budget(Some("0".into())), None);
         assert_eq!(parse_char_budget(Some("junk".into())), None);
+    }
+
+    /// `next` repeats every message of `prev` and adds more: the request a
+    /// prefix cache serves in full.
+    fn extends(prev: &[ChatMessage], next: &[ChatMessage]) -> bool {
+        next.len() > prev.len()
+            && prev.iter().zip(next).all(|(a, b)| {
+                (&a.role, &a.content, &a.tool_call_id) == (&b.role, &b.content, &b.tool_call_id)
+                    && a.tool_calls.as_ref().map(|c| c.iter().map(|t| &t.id).collect::<Vec<_>>())
+                        == b.tool_calls.as_ref().map(|c| c.iter().map(|t| &t.id).collect::<Vec<_>>())
+            })
+    }
+
+    #[tokio::test]
+    async fn compaction_waits_for_the_budget_then_halves_the_history_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", "q".repeat(99));
+        for i in 0..14 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), line.repeat(40)).unwrap();
+        }
+        let mut script: Vec<NormalizedResponse> = (0..14)
+            .map(|i| resp_tools(vec![tc(&format!("c{i}"), "read_file", serde_json::json!({"path": format!("f{i}.txt")}))]))
+            .collect();
+        script.push(resp_text("done", FinishReason::Stop));
+        let provider = MockProvider::new(script);
+        let budget_chars = 40_000;
+        agent(provider.clone(), dir.path())
+            .with_char_budget(budget_chars)
+            .run("system".into(), "task".into())
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 15);
+        let rewrites: Vec<usize> = (1..requests.len())
+            .filter(|&i| !extends(&requests[i - 1].messages, &requests[i].messages))
+            .collect();
+        assert_eq!(rewrites.len(), 1, "one large step, not a trim every turn: {rewrites:?}");
+        let at = rewrites[0];
+        // Under budget, nothing was rewritten.
+        assert!(convo_chars(&requests[at - 1].messages) <= budget_chars);
+        // The step that fired cut the history to half the budget.
+        let compacted = &requests[at].messages;
+        assert!(convo_chars(compacted) <= budget_chars / COMPACT_TARGET_DIV);
+        assert!(convo_chars(compacted) < convo_chars(&requests[at - 1].messages));
+        assert!(compacted.iter().any(|m| m.content.starts_with("[pruned old tool result")));
+        assert_eq!(compacted[1].content, "task");
     }
 
     #[tokio::test]
